@@ -1,0 +1,11 @@
+# Zig build
+.zig-cache/
+zig-out/
+
+# Editor / OS
+*.swp
+*~
+.DS_Store
+
+# Local review store (product data; not source)
+.rv/

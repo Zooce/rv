@@ -1,0 +1,14 @@
+[tools]
+zig = "0.16.0"
+
+[tasks.build]
+description = "Build all artifacts (rv stub + tui_demo)"
+run = "zig build"
+
+[tasks.demo]
+description = "Build and run the interactive TUI demo"
+run = "zig build run-demo"
+
+[tasks."demo-build"]
+description = "Build the TUI demo only"
+run = "zig build"
