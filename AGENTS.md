@@ -7,6 +7,11 @@ Project rules for `rv`.
 - Use **mise** as the tool and script manager for this project (tool versions, tasks, and project scripts). Prefer `mise run <task>` / tasks defined in `mise.toml` over ad-hoc scripts when a task exists or should exist.
 - Use **goal** for task tracking. Create, start, update, and complete work with `goal` rather than informal TODO lists or untracked notes.
 
+## Code style
+
+- **Least execution necessary.** Prefer the shortest correct path: one atomic take over peek-then-take, no redundant checks, no extra branches that only restate the same work. Do more only when the extra work is required for correctness (for example peek in a wait loop so a later `poll` can still take).
+- **Local symmetry.** When nearby code handles parallel cases (e.g. winch vs quit flags), keep the same structure and the same API pattern unless a real difference forces divergence. Asymmetry should signal intent, not habit.
+
 ## Session start
 
 At the start of a new session in this project:

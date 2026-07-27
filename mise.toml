@@ -5,6 +5,9 @@ zig = "0.16.0"
 description = "Build all artifacts (rv stub + tui_demo)"
 run = "zig build"
 
+[tasks.test]
+run = "zig build test --summary all --test-timeout 500ms"
+
 [tasks.demo]
 description = "Build and run the interactive TUI demo"
 run = "zig build run-demo"

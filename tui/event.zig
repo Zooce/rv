@@ -52,18 +52,17 @@ pub const PollError = Tty.ReadError || error{Unexpected};
 pub fn poll(t: *Tty, timeout_ms: i32) PollError!?Event {
     // Signal handlers only set flags. Check those *before* we might block on read.
 
-    // 1) Resize pending?
+    // 1) Resize pending? take clears the flag.
     if (t.takeWinch()) {
         // Flag was set by SIGWINCH; ask the kernel for the actual new size.
         const size = t.getSize() catch |err| switch (err) {
             else => return error.Unexpected, // ioctl failed — treat as hard error
         };
-        return .{ .resize = size }; // deliver size to the app
+        return .{ .resize = size };
     }
 
-    // 2) Soft quit pending?
-    if (t.peekQuit()) {
-        _ = t.takeQuit(); // clear the flag
+    // 2) Soft quit pending? same as winch: one take, then return the event.
+    if (t.takeQuit()) {
         return .quit;
     }
 
@@ -71,10 +70,13 @@ pub fn poll(t: *Tty, timeout_ms: i32) PollError!?Event {
     var byte: [1]u8 = undefined; // single-byte scratch buffer
     const n = try readWithTimeout(t, &byte, timeout_ms);
     if (n == 0) {
-        // Timeout (or sliced wait woke for a flag). Re-check resize.
+        // Timeout, or wait returned early because a flag is set. Check again.
         if (t.takeWinch()) {
             const size = t.getSize() catch return error.Unexpected;
             return .{ .resize = size };
+        }
+        if (t.takeQuit()) {
+            return .quit;
         }
         return null; // genuine timeout / no event
     }
@@ -100,8 +102,8 @@ fn readWithTimeout(t: *Tty, buf: []u8, timeout_ms: i32) Tty.ReadError!usize {
     if (timeout_ms < 0) {
         // Indefinite wait, implemented as a loop of short timed polls.
         while (true) {
-            // If a signal already fired, bail out with 0 so poll() can handle it.
-            if (t.takeWinch() or t.peekQuit()) return 0;
+            // Peek only: take would clear the flag before poll can return it.
+            if (t.peekWinch() or t.peekQuit()) return 0;
             const n = t.readTimeout(buf, 200) catch |err| switch (err) {
                 error.WouldBlock => continue, // shouldn't happen often; keep waiting
                 else => |e| return e, // real I/O error
@@ -191,13 +193,15 @@ fn decodeCsi(t: *Tty) PollError!Event {
 fn mapCsiFinal(final: u8, params: []const u8) Event {
     // params might be "1;5" for Ctrl+Arrow, etc. — ignored in this iteration.
     _ = params;
-    return .{ .key = switch (final) {
-        'A' => .up, // CSI A
-        'B' => .down, // CSI B
-        'C' => .right, // CSI C
-        'D' => .left, // CSI D
-        else => .unknown, // Home/End/F-keys etc. not mapped yet
-    } };
+    return .{
+        .key = switch (final) {
+            'A' => .up, // CSI A
+            'B' => .down, // CSI B
+            'C' => .right, // CSI C
+            'D' => .left, // CSI D
+            else => .unknown, // Home/End/F-keys etc. not mapped yet
+        },
+    };
 }
 
 // Keep a reference so the type is "used" if we lean on it later.
@@ -208,4 +212,23 @@ comptime {
 test "Key tags" {
     const k: Key = .{ .char = 'a' };
     try std.testing.expect(k == .char);
+}
+
+// Contract: infinite-wait may wake because SIGWINCH is pending, but must not
+// clear the flag — only takeWinch (when returning .resize) may clear it.
+test "readWithTimeout infinite wait does not clear winch" {
+    // Dummy Tty: wait path checks flags before any fd I/O when winch is set.
+    var t: Tty = .{
+        .fd = -1,
+        .original = undefined,
+        .owns_fd = false,
+    };
+    Tty.testingSetWinch(true);
+    defer Tty.testingSetWinch(false);
+
+    var buf: [1]u8 = undefined;
+    const n = try readWithTimeout(&t, &buf, -1);
+    try std.testing.expectEqual(@as(usize, 0), n);
+    // After wake, flag must still be observable so poll can takeWinch → .resize.
+    try std.testing.expect(t.peekWinch());
 }

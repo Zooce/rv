@@ -228,22 +228,35 @@ pub const Tty = struct {
     }
 
     /// true once per **SIGWINCH** (signal: window change); clears the flag.
+    /// Call only when returning a `.resize` event (or another explicit consumer).
     pub fn takeWinch(self: *const Tty) bool {
         _ = self; // flag is process-global, not per-instance
         // swap(false): read old value and clear in one atomic step.
         return g.winch.swap(false, .acq_rel);
     }
 
-    /// true once if quit was requested via the soft flag (clears it).
+    /// Look at winch without clearing. Wait paths peek; poll takes on return.
+    pub fn peekWinch(self: *const Tty) bool {
+        _ = self;
+        return g.winch.load(.acquire);
+    }
+
+    /// true once if soft quit was requested; clears the flag.
+    /// Call only when returning a `.quit` event (or another explicit consumer).
     pub fn takeQuit(self: *const Tty) bool {
         _ = self;
         return g.quit.swap(false, .acq_rel);
     }
 
-    /// Look at quit without clearing (for the sliced-wait loop).
+    /// Look at quit without clearing. Wait paths peek; poll takes on return.
     pub fn peekQuit(self: *const Tty) bool {
         _ = self;
         return g.quit.load(.acquire);
+    }
+
+    /// Test-only: set the process-global SIGWINCH flag without raising a signal.
+    pub fn testingSetWinch(v: bool) void {
+        g.winch.store(v, .release);
     }
 
     /// Cooked (default shell) vs raw:
