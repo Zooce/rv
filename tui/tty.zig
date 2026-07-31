@@ -73,8 +73,6 @@ pub const Tty = struct {
     write_buf: [8192]u8 = undefined,
     /// How many bytes in `write_buf` are currently valid.
     write_len: usize = 0,
-    /// true if `deinit` should `close(fd)` (we opened `/dev/tty` ourselves).
-    owns_fd: bool,
 
     /// Errors `open` can return (mapped from OS failures).
     pub const OpenError = error{
@@ -123,7 +121,6 @@ pub const Tty = struct {
         var self: Tty = .{
             .fd = fd,
             .original = original,
-            .owns_fd = true, // we opened it, so we close it
         };
 
         // Step 3: cook → raw (kernel stops line-editing / echoing / ISIG).
@@ -136,6 +133,11 @@ pub const Tty = struct {
         g.active.store(true, .release); // mark ownership active
         g.winch.store(false, .release); // clear stale resize flag
         g.quit.store(false, .release); // clear stale quit flag
+
+        // After raw mode is on, any later open failure must restore before close:
+        // the caller never gets a Tty to deinit. errdefer runs LIFO, so this
+        // runs before the outer close(fd) errdefer.
+        errdefer emergencyRestore();
 
         // Install SIGINT/SIGTERM/SIGWINCH/… handlers that know about `g`.
         installSignalHandlers();
@@ -151,13 +153,12 @@ pub const Tty = struct {
         return self; // caller owns this; must call deinit()
     }
 
-    /// Release ownership: restore modes, then close the fd if we opened it.
+    /// Release ownership: restore modes, then close the fd.
     pub fn deinit(self: *Tty) void {
         self.restore(); // escapes + termios back to original
-        if (self.owns_fd and self.fd >= 0) {
+        if (self.fd >= 0) {
             _ = posix.system.close(self.fd); // give the fd back to the kernel
             self.fd = -1; // poison so double-deinit is a no-op
-            self.owns_fd = false;
         }
     }
 
@@ -255,6 +256,7 @@ pub const Tty = struct {
     }
 
     /// Test-only: set the process-global SIGWINCH flag without raising a signal.
+    /// Used by event.zig's wait-loop regression test (no real SIGWINCH).
     pub fn testingSetWinch(v: bool) void {
         g.winch.store(v, .release);
     }
@@ -489,4 +491,77 @@ comptime {
 test "Size layout" {
     const s = Size{ .cols = 80, .rows = 24 };
     try std.testing.expect(s.cols == 80);
+}
+
+// Contract: emergencyRestore puts termios back and clears g.active.
+// open wires errdefer emergencyRestore() after raw mode; this tests the
+// restore mechanism on a PTY (never touches the real interactive tty).
+test "emergencyRestore restores termios and clears active" {
+    if (builtin.os.tag != .linux) return error.SkipZigTest;
+
+    // Unix98 PTY pair — termios victim for restore, not open()'s fd source.
+    const PtyPair = struct {
+        master: posix.fd_t,
+        slave: posix.fd_t,
+
+        fn open() !@This() {
+            const flags: posix.O = .{
+                .ACCMODE = .RDWR,
+                .NOCTTY = true,
+                .CLOEXEC = true,
+            };
+            const master = posix.openat(posix.AT.FDCWD, "/dev/ptmx", flags, 0) catch return error.Unexpected;
+            errdefer _ = posix.system.close(master);
+
+            // Unlock the slave (grantpt is a no-op on Linux for /dev/ptmx).
+            var lock: c_int = 0;
+            const unlock_rc = posix.system.ioctl(master, posix.T.IOCSPTLCK, @intFromPtr(&lock));
+            if (posix.errno(unlock_rc) != .SUCCESS) return error.Unexpected;
+
+            var pty_n: c_uint = 0;
+            const n_rc = posix.system.ioctl(master, posix.T.IOCGPTN, @intFromPtr(&pty_n));
+            if (posix.errno(n_rc) != .SUCCESS) return error.Unexpected;
+
+            var path_buf: [64]u8 = undefined;
+            const path = try std.fmt.bufPrint(&path_buf, "/dev/pts/{d}", .{pty_n});
+            const slave = posix.openat(posix.AT.FDCWD, path, flags, 0) catch return error.Unexpected;
+            return .{ .master = master, .slave = slave };
+        }
+    };
+
+    const pair = try PtyPair.open();
+    defer _ = posix.system.close(pair.master);
+    defer _ = posix.system.close(pair.slave);
+
+    const original = try posix.tcgetattr(pair.slave);
+    // Safety net: never leave the PTY raw or global ownership dangling.
+    defer {
+        _ = g.active.swap(false, .acq_rel);
+        g.fd = -1;
+        posix.tcsetattr(pair.slave, .NOW, original) catch {};
+    }
+
+    var t: Tty = .{
+        .fd = pair.slave,
+        .original = original,
+    };
+    try t.enterRawMode();
+
+    // Same publish sequence open() uses after raw mode (before fallible setup).
+    g.fd = pair.slave;
+    g.original = original;
+    g.active.store(true, .release);
+
+    // Sanity: raw mode turned off canonical echo bits.
+    const mid = try posix.tcgetattr(pair.slave);
+    try std.testing.expect(!mid.lflag.ECHO);
+    try std.testing.expect(!mid.lflag.ICANON);
+
+    emergencyRestore();
+
+    const after = try posix.tcgetattr(pair.slave);
+    try std.testing.expect(after.lflag.ECHO == original.lflag.ECHO);
+    try std.testing.expect(after.lflag.ICANON == original.lflag.ICANON);
+    try std.testing.expect(after.lflag.ISIG == original.lflag.ISIG);
+    try std.testing.expect(!g.active.load(.acquire));
 }

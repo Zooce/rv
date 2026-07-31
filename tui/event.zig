@@ -221,7 +221,6 @@ test "readWithTimeout infinite wait does not clear winch" {
     var t: Tty = .{
         .fd = -1,
         .original = undefined,
-        .owns_fd = false,
     };
     Tty.testingSetWinch(true);
     defer Tty.testingSetWinch(false);
