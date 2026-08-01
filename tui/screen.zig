@@ -14,6 +14,7 @@
 //! Both CUP and SGR are **CSI** sequences (Control Sequence Introducer: `ESC […`).
 
 const std = @import("std");
+const builtin = @import("builtin");
 const tty_mod = @import("tty.zig"); // need Tty.write / Size / reset_attrs
 const Tty = tty_mod.Tty;
 const Size = tty_mod.Size;
@@ -216,8 +217,16 @@ pub const Screen = struct {
         self.cursor = null;
     }
 
-    /// Diff front vs back, emit only what changed, then copy front → back.
+    /// Diff front vs back, emit only what changed, then commit front → back.
+    ///
+    /// Retry safety: on any write/flush failure we discard the userspace write
+    /// buffer and leave `back` / `dirty_all` uncommitted so the next present
+    /// re-emits a full clean frame instead of prepending onto a half-frame or
+    /// skipping cells that never reached the terminal.
     pub fn present(self: *Screen, t: *Tty) !void {
+        // Drop partial CSI/glyph bytes if we error mid-frame (or mid-flush).
+        errdefer t.write_len = 0;
+
         // Remember the last SGR we sent so we don't re-send identical styles.
         var last_style: ?Style = null;
         // Track where we believe the *terminal* cursor is (-1 = unknown).
@@ -233,10 +242,8 @@ pub const Screen = struct {
                 const cell = self.front[idx]; // desired content
 
                 // width 0 = continuation of a wide glyph: don't emit a second char.
+                // Back commit is deferred until after a successful flush.
                 if (cell.width == 0) {
-                    if (self.dirty_all or !cell.eql(self.back[idx])) {
-                        self.back[idx] = cell; // still update back for a clean diff next time
-                    }
                     x +%= 1; // wrapping add (x is u16; saturating isn't needed here)
                     continue;
                 }
@@ -267,13 +274,7 @@ pub const Screen = struct {
                 // Printing advances the terminal cursor by `width` columns.
                 cursor_x = x + cell.width;
 
-                // Record that the terminal now matches front for this cell.
-                self.back[idx] = cell;
-                if (cell.width == 2 and x + 1 < self.cols) {
-                    // Also sync the continuation cell in the back buffer.
-                    const cidx = self.index(x + 1, y);
-                    self.back[cidx] = self.front[cidx];
-                }
+                // Do not update `back` here — only after flush succeeds below.
 
                 x +%= cell.width; // next column after this glyph
             }
@@ -291,6 +292,10 @@ pub const Screen = struct {
         }
 
         try t.flush(); // push the whole frame's buffered escapes in one go
+
+        // Commit only after the terminal received the frame. Full front→back
+        // keeps continuation cells and dirty_all paths consistent for the next diff.
+        @memcpy(self.back, self.front);
         self.dirty_all = false; // subsequent presents are incremental
     }
 };
@@ -387,4 +392,53 @@ test "cell eql" {
     const a = Cell.blank();
     const b = Cell.blank();
     try std.testing.expect(a.eql(b));
+}
+
+// Contract: failed present must be safe to retry.
+// - discard any partial userspace write buffer (stale CSI must not prepend next frame)
+// - do not commit back until the frame is fully flushed (no half-updated diff state)
+test "present failure discards write buffer and does not commit back" {
+    if (builtin.os.tag != .linux) return error.SkipZigTest;
+
+    // Write end of a pipe whose read end is closed → flush/write gets BrokenPipe.
+    const dead = try tty_mod.TestingPipe.open();
+    dead.closeRead();
+    defer dead.closeWrite();
+
+    var t: Tty = .{
+        .fd = dead.write,
+        .original = undefined,
+    };
+
+    var screen = try Screen.init(std.testing.allocator, .{ .cols = 4, .rows = 2 });
+    defer screen.deinit();
+
+    // Pre-present back is blank (init). Snapshot cell 0 for the no-commit check.
+    const back0 = screen.back[0];
+    try std.testing.expect(back0.eql(Cell.blank()));
+
+    // Force a real emit path (CUP / SGR / glyphs) so write_buf fills before flush.
+    screen.putStr(0, 0, "ab", .{});
+    screen.dirty_all = true;
+
+    try std.testing.expectError(error.BrokenPipe, screen.present(&t));
+
+    // Primary bug: partial escape stream must not remain queued for the next present.
+    try std.testing.expectEqual(@as(usize, 0), t.write_len);
+
+    // Back must not look "presented" when the terminal never got the frame.
+    try std.testing.expect(screen.back[0].eql(back0));
+    // dirty_all stays set so the next present re-emits safely.
+    try std.testing.expect(screen.dirty_all);
+
+    // Retry on a live sink: must succeed and commit front → back.
+    const live = try tty_mod.TestingPipe.open();
+    defer live.closeRead();
+    defer live.closeWrite();
+    t.fd = live.write;
+
+    try screen.present(&t);
+    try std.testing.expectEqual(@as(usize, 0), t.write_len);
+    try std.testing.expect(screen.front[0].eql(screen.back[0]));
+    try std.testing.expect(!screen.dirty_all);
 }
