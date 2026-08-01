@@ -11,6 +11,7 @@ Project rules for `rv`.
 
 - **Least execution necessary.** Prefer the shortest correct path: one atomic take over peek-then-take, no redundant checks, no extra branches that only restate the same work. Do more only when the extra work is required for correctness (for example peek in a wait loop so a later `poll` can still take).
 - **Local symmetry.** When nearby code handles parallel cases (e.g. winch vs quit flags), keep the same structure and the same API pattern unless a real difference forces divergence. Asymmetry should signal intent, not habit.
+- **Test utilities stay out of the production build.** Helpers, fixtures, and fake fds used only by tests must not live on production types (e.g. not nested in `Tty` / public app APIs) and must not ship real implementation into `zig build` artifacts. Prefer file-scope helpers gated with `if (builtin.is_test)` (or equivalent), or code that exists only inside `test` blocks. Production builds may expose an empty stub type at most — never pipe/PTY open helpers, injectable globals meant only for tests, or other harness code.
 
 ## Session start
 

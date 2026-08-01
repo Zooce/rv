@@ -49,6 +49,8 @@ pub const PollError = Tty.ReadError || error{Unexpected};
 /// - `timeout_ms == 0`: non-blocking
 /// - `timeout_ms > 0`: wait at most that many milliseconds
 /// - returns `null` on timeout with no event
+/// - hangup/EOF on the tty (`error.EndOfStream` from read) → `.quit` so apps exit
+///   cleanly instead of busy-spinning the wait loop
 pub fn poll(t: *Tty, timeout_ms: i32) PollError!?Event {
     // Signal handlers only set flags. Check those *before* we might block on read.
 
@@ -68,7 +70,11 @@ pub fn poll(t: *Tty, timeout_ms: i32) PollError!?Event {
 
     // 3) Try to read one byte of keyboard input.
     var byte: [1]u8 = undefined; // single-byte scratch buffer
-    const n = try readWithTimeout(t, &byte, timeout_ms);
+    const n = readWithTimeout(t, &byte, timeout_ms) catch |err| switch (err) {
+        // Terminal gone (PTY torn down, peer closed): soft quit, not a hard error.
+        error.EndOfStream => return .quit,
+        else => |e| return e,
+    };
     if (n == 0) {
         // Timeout, or wait returned early because a flag is set. Check again.
         if (t.takeWinch()) {
@@ -82,7 +88,11 @@ pub fn poll(t: *Tty, timeout_ms: i32) PollError!?Event {
     }
 
     // 4) We have a byte — turn it into a Key (may read more bytes for escapes).
-    return try decodeKey(t, byte[0]);
+    // EOF mid-sequence (rare) also maps to quit: the input stream is gone.
+    return decodeKey(t, byte[0]) catch |err| switch (err) {
+        error.EndOfStream => return .quit,
+        else => |e| return e,
+    };
 }
 
 /// Block until an event is available (never returns null).
@@ -98,6 +108,9 @@ pub fn next(t: *Tty) PollError!Event {
 /// Read into `buf` honoring `timeout_ms`. For infinite wait, slice into 200ms
 /// chunks so SIGWINCH / quit flags can be observed (a bare blocking read would
 /// not return until a key arrives).
+///
+/// `error.EndOfStream` from `readTimeout` (poll-ready + read 0) is returned
+/// immediately — must not treat it as a soft timeout or this loop busy-spins.
 fn readWithTimeout(t: *Tty, buf: []u8, timeout_ms: i32) Tty.ReadError!usize {
     if (timeout_ms < 0) {
         // Indefinite wait, implemented as a loop of short timed polls.
@@ -106,7 +119,7 @@ fn readWithTimeout(t: *Tty, buf: []u8, timeout_ms: i32) Tty.ReadError!usize {
             if (t.peekWinch() or t.peekQuit()) return 0;
             const n = t.readTimeout(buf, 200) catch |err| switch (err) {
                 error.WouldBlock => continue, // shouldn't happen often; keep waiting
-                else => |e| return e, // real I/O error
+                else => |e| return e, // EndOfStream / I/O — poll maps EOF → .quit
             };
             if (n > 0) return n; // got data
             // else: 200ms elapsed, loop and check flags again
@@ -212,6 +225,27 @@ comptime {
 test "Key tags" {
     const k: Key = .{ .char = 'a' };
     try std.testing.expect(k == .char);
+}
+
+// Contract: hangup/EOF on the input fd must surface as .quit (not spin / null forever).
+// Pipe with closed write end → poll ready + read 0 → EndOfStream from readTimeout.
+test "poll maps EOF to quit" {
+    if (@import("builtin").os.tag != .linux) return error.SkipZigTest;
+
+    // TestingPipe: .read = input side for Tty, .write = peer (close → EOF on read).
+    const pipe = try tty_mod.TestingPipe.open();
+    defer pipe.closeRead();
+    pipe.closeWrite(); // EOF on the read end
+
+    var t: Tty = .{
+        .fd = pipe.read,
+        .original = undefined,
+    };
+    // Finite timeout so a regression that treats EOF as soft-timeout fails cleanly
+    // (returns null) instead of hanging the test runner.
+    const ev = try poll(&t, 100);
+    try std.testing.expect(ev != null);
+    try std.testing.expect(ev.? == .quit);
 }
 
 // Contract: infinite-wait may wake because SIGWINCH is pending, but must not

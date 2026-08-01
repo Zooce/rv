@@ -97,6 +97,9 @@ pub const Tty = struct {
     pub const ReadError = error{
         InputOutput,
         NotOpenForReading,
+        /// poll reported ready (or HUP/ERR) but `read` returned 0 — peer closed / hangup.
+        /// Not a soft timeout (timeout is success with `0` bytes from `readTimeout`).
+        EndOfStream,
         Unexpected,
     } || error{WouldBlock}; // non-blocking path had no data yet
 
@@ -210,7 +213,12 @@ pub const Tty = struct {
 
     /// Wait up to `timeout_ms` for input, then `read`.
     /// - timeout 0: poll once, don't block
-    /// - returns 0 if the timer expired with no data
+    /// - returns 0 if the timer expired with no data (soft timeout)
+    /// - returns `error.EndOfStream` if poll says ready/HUP/ERR and `read` yields 0
+    ///   (hangup/EOF — must not be treated like a timeout or wait loops busy-spin)
+    ///
+    /// Callers must not treat only `n == 0` as "keep waiting": hangup is an error.
+    /// Prefer `event.poll` / `event.next`, which map `EndOfStream` → `.quit`.
     pub fn readTimeout(self: *Tty, buf: []u8, timeout_ms: i32) ReadError!usize {
         // poll() watches fds for readiness without consuming data.
         var pfd = [_]posix.pollfd{.{
@@ -225,7 +233,11 @@ pub const Tty = struct {
         if (pfd[0].revents & (posix.POLL.IN | posix.POLL.HUP | posix.POLL.ERR) == 0) {
             return 0;
         }
-        return self.read(buf); // data is ready — actually pull it
+        // Kernel says the fd is readable (or hung up). read(0) means EOF, not
+        // "try again" — a soft timeout is only when poll itself returned 0 above.
+        const nread = try self.read(buf);
+        if (nread == 0 and buf.len > 0) return error.EndOfStream;
+        return nread;
     }
 
     /// true once per **SIGWINCH** (signal: window change); clears the flag.
@@ -488,9 +500,72 @@ comptime {
     _ = linux;
 }
 
+// Test-only pipe pair for controllable input (EOF / timeout tests).
+// Gated on `builtin.is_test` so production builds do not include the helper.
+// - `read`:  pipe **read** end — attach to a `Tty.fd` as keyboard input
+// - `write`: pipe **write** end — peer; close it to force EOF on `read`
+pub const TestingPipe = if (builtin.is_test) struct {
+    read: posix.fd_t,
+    write: posix.fd_t,
+
+    pub fn open() !@This() {
+        var fds: [2]posix.fd_t = undefined;
+        // pipe2: fds[0] = read end, fds[1] = write end (POSIX).
+        switch (posix.errno(posix.system.pipe2(&fds, .{ .CLOEXEC = true }))) {
+            .SUCCESS => return .{ .read = fds[0], .write = fds[1] },
+            else => return error.Unexpected,
+        }
+    }
+
+    pub fn closeRead(self: @This()) void {
+        _ = posix.system.close(self.read);
+    }
+
+    pub fn closeWrite(self: @This()) void {
+        _ = posix.system.close(self.write);
+    }
+} else struct {};
+
 test "Size layout" {
     const s = Size{ .cols = 80, .rows = 24 };
     try std.testing.expect(s.cols == 80);
+}
+
+// Contract: poll-ready + read(0) is hangup/EOF, not a soft timeout.
+// A closed write end is always "readable" with zero bytes; treating that as
+// soft timeout 0 makes wait loops busy-spin (regression guard).
+test "readTimeout EOF after poll-ready is EndOfStream not timeout" {
+    if (builtin.os.tag != .linux) return error.SkipZigTest;
+
+    const pipe = try TestingPipe.open();
+    defer pipe.closeRead();
+    // Close write end so the read end reports ready + EOF.
+    pipe.closeWrite();
+
+    var t: Tty = .{
+        .fd = pipe.read,
+        .original = undefined,
+    };
+    var buf: [1]u8 = undefined;
+    // Must not look like a timeout (0). Must be distinguishable as hangup/EOF.
+    try std.testing.expectError(error.EndOfStream, t.readTimeout(&buf, 100));
+}
+
+// Timeout path still returns 0 when the peer is open but silent.
+test "readTimeout returns 0 on real timeout with open peer" {
+    if (builtin.os.tag != .linux) return error.SkipZigTest;
+
+    const pipe = try TestingPipe.open();
+    defer pipe.closeRead();
+    defer pipe.closeWrite();
+
+    var t: Tty = .{
+        .fd = pipe.read,
+        .original = undefined,
+    };
+    var buf: [1]u8 = undefined;
+    const n = try t.readTimeout(&buf, 30);
+    try std.testing.expectEqual(@as(usize, 0), n);
 }
 
 // Contract: emergencyRestore puts termios back and clears g.active.
