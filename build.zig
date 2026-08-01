@@ -35,6 +35,13 @@ pub fn build(b: *std.Build) void {
     const run_demo_step = b.step("run-demo", "Run the minimal TUI demo (interactive)");
     run_demo_step.dependOn(&run_demo.step);
 
+    // Diff model + unified parser (MVP-0.1).
+    const diff_mod = b.addModule("diff", .{
+        .root_source_file = b.path("src/diff.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+
     // Placeholder main package binary for `rv` itself (not yet implemented).
     const rv = b.addExecutable(.{
         .name = "rv",
@@ -44,6 +51,7 @@ pub fn build(b: *std.Build) void {
             .optimize = optimize,
             .imports = &.{
                 .{ .name = "tui", .module = tui_mod },
+                .{ .name = "diff", .module = diff_mod },
             },
         }),
     });
@@ -66,6 +74,14 @@ pub fn build(b: *std.Build) void {
         }),
     });
     const run_tui_tests = b.addRunArtifact(tui_tests);
-    const test_step = b.step("test", "Run TUI unit tests");
+
+    // Reuse the same module graph as the library import (not a second root).
+    const diff_tests = b.addTest(.{
+        .root_module = diff_mod,
+    });
+    const run_diff_tests = b.addRunArtifact(diff_tests);
+
+    const test_step = b.step("test", "Run unit tests (TUI + diff)");
     test_step.dependOn(&run_tui_tests.step);
+    test_step.dependOn(&run_diff_tests.step);
 }
