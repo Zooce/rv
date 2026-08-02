@@ -36,6 +36,19 @@ For command details, load the `goal` skill / playbook when available.
 - **Avoid `@as` when a typed value or peer resolution is enough.** Prefer `try testing.expectEqual(2, d.files.len)` over `try testing.expectEqual(@as(usize, 2), …)`, and typed locals/constants over casting at the call. Use `@as` only when Zig cannot infer the type and the cast is the clearest fix.
 - **Test utilities stay out of the production build.** Helpers, fixtures, and fake fds used only by tests must not live on production types (e.g. not nested in `Tty` / public app APIs) and must not ship real implementation into `zig build` artifacts. Prefer file-scope helpers gated with `if (builtin.is_test)` (or equivalent), or code that exists only inside `test` blocks. Production builds may expose an empty stub type at most — never pipe/PTY open helpers, injectable globals meant only for tests, or other harness code.
 
+## Change size (review batches)
+
+- **Never make more than about 250 lines of change at a time** (insertions + deletions across the batch). That is roughly the most that can be reviewed in one pass.
+- **Even if the task needs more work, stop at ~250 lines.** Do not continue implementing the next slice until the user has reviewed and approved the current batch.
+- **Ask for review before continuing.** When you hit the limit (or would exceed it with the next edit), stop, summarize what changed, and wait for explicit approval. Only then proceed with the next part of the change.
+- Count net diff size for the unapproved batch (not the whole goal). Prefer smaller, coherent batches over packing to the limit.
+- **Each batch must be a complete, buildable change.** Stopping mid-edit is not allowed if it leaves the tree broken. The task must be broken into slices that each leave the project building and tests runnable (for example: introduce types/stubs/boilerplate first, wire call sites, then fill in behavior in later approved batches).
+- **Exceptions** (these may exceed ~250 lines in one go when splitting would be worse or impossible):
+  - Deleting a whole file (or a few whole files) as one intentional removal
+  - Mechanical mass renames / bulk renames that are the same edit repeated
+  - Generated or vendored content the agent did not hand-author (still prefer not dumping huge generated blobs without need)
+  When an exception applies, still stop for review after that batch before unrelated follow-up work.
+
 ## Session start (project)
 
 Always-on rules above apply first. Project extras:

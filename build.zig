@@ -52,7 +52,17 @@ pub fn build(b: *std.Build) void {
         },
     });
 
-    // `rv` binary: load smart-default diff and print a summary (no TUI yet).
+    // Flatten Diff → display rows + viewport helpers (MVP-0.3).
+    const view_mod = b.addModule("view", .{
+        .root_source_file = b.path("src/view.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{
+            .{ .name = "diff", .module = diff_mod },
+        },
+    });
+
+    // `rv` binary: full-screen read-only diff review TUI.
     const rv = b.addExecutable(.{
         .name = "rv",
         .root_module = b.createModule(.{
@@ -63,6 +73,7 @@ pub fn build(b: *std.Build) void {
                 .{ .name = "tui", .module = tui_mod },
                 .{ .name = "diff", .module = diff_mod },
                 .{ .name = "git", .module = git_mod },
+                .{ .name = "view", .module = view_mod },
             },
         }),
     });
@@ -73,7 +84,7 @@ pub fn build(b: *std.Build) void {
     if (b.args) |args| {
         run_rv.addArgs(args);
     }
-    const run_step = b.step("run", "Run rv (load smart-default git diff, print summary)");
+    const run_step = b.step("run", "Run rv (full-screen diff review TUI)");
     run_step.dependOn(&run_rv.step);
 
     // Unit tests for the TUI module.
@@ -97,8 +108,14 @@ pub fn build(b: *std.Build) void {
     });
     const run_git_tests = b.addRunArtifact(git_tests);
 
-    const test_step = b.step("test", "Run unit tests (TUI + diff + git)");
+    const view_tests = b.addTest(.{
+        .root_module = view_mod,
+    });
+    const run_view_tests = b.addRunArtifact(view_tests);
+
+    const test_step = b.step("test", "Run unit tests (TUI + diff + git + view)");
     test_step.dependOn(&run_tui_tests.step);
     test_step.dependOn(&run_diff_tests.step);
     test_step.dependOn(&run_git_tests.step);
+    test_step.dependOn(&run_view_tests.step);
 }

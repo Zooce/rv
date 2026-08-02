@@ -10,7 +10,7 @@ run = "zig build"
 run = "zig build test --summary all --test-timeout 5s"
 
 [tasks.rv]
-description = "Build and run rv (load smart-default git diff, print summary)"
+description = "Build and run rv (full-screen diff review TUI)"
 run = "zig build run --"
 
 [tasks.demo]
