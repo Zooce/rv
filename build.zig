@@ -42,7 +42,17 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
 
-    // Placeholder main package binary for `rv` itself (not yet implemented).
+    // Git subprocess loader + smart default (MVP-0.2).
+    const git_mod = b.addModule("git", .{
+        .root_source_file = b.path("src/git.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{
+            .{ .name = "diff", .module = diff_mod },
+        },
+    });
+
+    // `rv` binary: load smart-default diff and print a summary (no TUI yet).
     const rv = b.addExecutable(.{
         .name = "rv",
         .root_module = b.createModule(.{
@@ -52,6 +62,7 @@ pub fn build(b: *std.Build) void {
             .imports = &.{
                 .{ .name = "tui", .module = tui_mod },
                 .{ .name = "diff", .module = diff_mod },
+                .{ .name = "git", .module = git_mod },
             },
         }),
     });
@@ -62,7 +73,7 @@ pub fn build(b: *std.Build) void {
     if (b.args) |args| {
         run_rv.addArgs(args);
     }
-    const run_step = b.step("run", "Run the rv binary (stub until the review TUI lands)");
+    const run_step = b.step("run", "Run rv (load smart-default git diff, print summary)");
     run_step.dependOn(&run_rv.step);
 
     // Unit tests for the TUI module.
@@ -81,7 +92,13 @@ pub fn build(b: *std.Build) void {
     });
     const run_diff_tests = b.addRunArtifact(diff_tests);
 
-    const test_step = b.step("test", "Run unit tests (TUI + diff)");
+    const git_tests = b.addTest(.{
+        .root_module = git_mod,
+    });
+    const run_git_tests = b.addRunArtifact(git_tests);
+
+    const test_step = b.step("test", "Run unit tests (TUI + diff + git)");
     test_step.dependOn(&run_tui_tests.step);
     test_step.dependOn(&run_diff_tests.step);
+    test_step.dependOn(&run_git_tests.step);
 }

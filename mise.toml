@@ -2,11 +2,16 @@
 zig = "0.16.0"
 
 [tasks.build]
-description = "Build all artifacts (rv stub + tui_demo)"
+description = "Build all artifacts (rv + tui_demo)"
 run = "zig build"
 
 [tasks.test]
-run = "zig build test --summary all --test-timeout 500ms"
+# Git loader tests shell out to real `git` (init/commit); keep a modest timeout.
+run = "zig build test --summary all --test-timeout 5s"
+
+[tasks.rv]
+description = "Build and run rv (load smart-default git diff, print summary)"
+run = "zig build run --"
 
 [tasks.demo]
 description = "Build and run the interactive TUI demo"
