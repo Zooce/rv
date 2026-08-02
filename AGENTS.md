@@ -49,6 +49,10 @@ For command details, load the `goal` skill / playbook when available.
   - Generated or vendored content the agent did not hand-author (still prefer not dumping huge generated blobs without need)
   When an exception applies, still stop for review after that batch before unrelated follow-up work.
 
+## Language (project)
+
+- Do **not** call goals “epics,” “stories,” or other agile jargon. A larger goal that is split for implementation is a **parent** goal; the pieces are **slices** (or just goals / sub-goals). Say “MVP-2 parent #4” or “slices #38–#42,” not “the MVP-2 epic.”
+
 ## Session start (project)
 
 Always-on rules above apply first. Project extras:
