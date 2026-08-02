@@ -22,7 +22,21 @@ pub const Row = union(enum) {
     line: struct {
         kind: diff.LineKind,
         text: []const u8,
+        /// Display path of the owning file (borrowed from `Diff`).
+        path: []const u8,
+        /// 1-based old-file line when this line exists on the old side.
+        old_no: ?u32 = null,
+        /// 1-based new-file line when this line exists on the new side.
+        new_no: ?u32 = null,
     },
+};
+
+/// Line-comment target at the cursor (path + line numbers). `null` on headers
+/// and meta lines (not commentable in MVP-1).
+pub const Anchor = struct {
+    path: []const u8,
+    old_line: ?u32,
+    new_line: ?u32,
 };
 
 /// Build an owned list of rows from `d`. Caller's `alloc` owns the slice;
@@ -48,6 +62,9 @@ pub fn flatten(alloc: Allocator, d: *const diff.Diff) Allocator.Error![]Row {
                 try rows.append(alloc, .{ .line = .{
                     .kind = ln.kind,
                     .text = ln.text,
+                    .path = f.displayPath(),
+                    .old_no = ln.old_no,
+                    .new_no = ln.new_no,
                 } });
             }
         }
@@ -145,6 +162,24 @@ pub fn prevHunk(rows: []const Row, cursor: usize) usize {
     return clampCursor(cursor, rows.len);
 }
 
+/// Anchor for a line comment at `cursor`, or `null` if the row is not a
+/// normal diff body line (file/hunk header or meta).
+pub fn anchorAt(rows: []const Row, cursor: usize) ?Anchor {
+    if (rows.len == 0) return null;
+    const cur = clampCursor(cursor, rows.len);
+    return switch (rows[cur]) {
+        .line => |ln| switch (ln.kind) {
+            .meta => null,
+            .context, .add, .delete => .{
+                .path = ln.path,
+                .old_line = ln.old_no,
+                .new_line = ln.new_no,
+            },
+        },
+        .file_header, .hunk_header => null,
+    };
+}
+
 /// Status footer fields for `cursor` within `rows`.
 pub fn statusAt(rows: []const Row, cursor: usize) Status {
     if (rows.len == 0) {
@@ -209,9 +244,21 @@ test "flatten file hunk and lines" {
     try testing.expect(rows[2] == .line);
     try testing.expectEqual(diff.LineKind.delete, rows[2].line.kind);
     try testing.expectEqualStrings("old", rows[2].line.text);
+    try testing.expectEqualStrings("f", rows[2].line.path);
+    try testing.expectEqual(1, rows[2].line.old_no.?);
+    try testing.expect(rows[2].line.new_no == null);
     try testing.expect(rows[3] == .line);
     try testing.expectEqual(diff.LineKind.add, rows[3].line.kind);
     try testing.expectEqualStrings("new", rows[3].line.text);
+    try testing.expectEqual(1, rows[3].line.new_no.?);
+    try testing.expect(rows[3].line.old_no == null);
+
+    try testing.expect(anchorAt(rows, 0) == null);
+    try testing.expect(anchorAt(rows, 1) == null);
+    const a = anchorAt(rows, 2).?;
+    try testing.expectEqualStrings("f", a.path);
+    try testing.expectEqual(1, a.old_line.?);
+    try testing.expect(a.new_line == null);
 }
 
 test "flatten binary file has header only" {

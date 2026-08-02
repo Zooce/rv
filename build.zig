@@ -62,6 +62,13 @@ pub fn build(b: *std.Build) void {
         },
     });
 
+    // Comment model + `.rv/reviews/` JSON store (MVP-1).
+    const store_mod = b.addModule("store", .{
+        .root_source_file = b.path("src/store.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+
     // `rv` binary: full-screen read-only diff review TUI.
     const rv = b.addExecutable(.{
         .name = "rv",
@@ -74,6 +81,7 @@ pub fn build(b: *std.Build) void {
                 .{ .name = "diff", .module = diff_mod },
                 .{ .name = "git", .module = git_mod },
                 .{ .name = "view", .module = view_mod },
+                .{ .name = "store", .module = store_mod },
             },
         }),
     });
@@ -113,9 +121,15 @@ pub fn build(b: *std.Build) void {
     });
     const run_view_tests = b.addRunArtifact(view_tests);
 
-    const test_step = b.step("test", "Run unit tests (TUI + diff + git + view)");
+    const store_tests = b.addTest(.{
+        .root_module = store_mod,
+    });
+    const run_store_tests = b.addRunArtifact(store_tests);
+
+    const test_step = b.step("test", "Run unit tests (TUI + diff + git + view + store)");
     test_step.dependOn(&run_tui_tests.step);
     test_step.dependOn(&run_diff_tests.step);
     test_step.dependOn(&run_git_tests.step);
     test_step.dependOn(&run_view_tests.step);
+    test_step.dependOn(&run_store_tests.step);
 }

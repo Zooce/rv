@@ -1,14 +1,18 @@
-//! `rv` entry point — full-screen read-only diff review (MVP-0.4).
+//! `rv` entry point — full-screen diff review with line comments (MVP-1).
 //!
-//! Load smart-default git diff → flatten rows → immediate-mode TUI:
-//! highlight current line, `j`/`k` move, `[`/`]` hunks, footer, `q` quit.
-//! Failures and empty diffs print a message and exit without entering the TUI
-//! (so the terminal is never left in raw / alt-screen mode).
+//! Load smart-default git diff → flatten rows → load `.rv` comments → TUI:
+//! `j`/`k` move, `[`/`]` hunks, `i`/`c`/`a`/`Enter` comment (footer prompt),
+//! `q` quit. Empty/error paths never enter raw / alt-screen mode.
+//!
+//! Comment UX (v1): single-line footer prompt (not an inline box). Esc cancels;
+//! Enter saves. Markers: `*` gutter on lines with open comments. Reload on next
+//! `rv` via `.rv/reviews/current.json`.
 
 const std = @import("std");
 const git = @import("git");
 const tui = @import("tui");
 const view = @import("view");
+const store = @import("store");
 
 pub fn main() !void {
     var gpa_state: std.heap.DebugAllocator(.{}) = .init;
@@ -34,13 +38,25 @@ pub fn main() !void {
     defer d.deinit();
 
     if (d.files.len == 0) {
-        // Smart default found nothing: clean worktree and nothing ahead of base.
         std.debug.print("rv: no changes to review\n", .{});
         return;
     }
 
     const rows = try view.flatten(alloc, &d);
     defer alloc.free(rows);
+
+    var review = store.load(alloc, io, .cwd(), store.default_review_id) catch |err| {
+        const msg: []const u8 = switch (err) {
+            error.InvalidJson => "invalid .rv review JSON",
+            error.InvalidState => "invalid comment state in .rv store",
+            error.InvalidSide => "invalid comment side in .rv store",
+            error.OutOfMemory => "out of memory",
+            else => "failed to load .rv comment store",
+        };
+        std.debug.print("rv: {s}\n", .{msg});
+        std.process.exit(1);
+    };
+    defer review.deinit();
 
     var term = try tui.Tty.open();
     defer term.deinit();
@@ -52,8 +68,13 @@ pub fn main() !void {
     var cursor: usize = 0;
     var scroll: usize = 0;
     var running = true;
+    var commenting = false;
+    var draft: std.ArrayList(u8) = .empty;
+    defer draft.deinit(alloc);
+    // Anchor captured when entering comment mode (cursor does not move then).
+    var draft_anchor: view.Anchor = undefined;
 
-    paint(&scr, size, rows, cursor, &scroll);
+    paint(&scr, size, rows, cursor, &scroll, &review, commenting, draft.items);
     try scr.present(&term);
 
     while (running) {
@@ -63,17 +84,47 @@ pub fn main() !void {
             .resize => |new_size| {
                 size = new_size;
                 try scr.resize(size);
-                paint(&scr, size, rows, cursor, &scroll);
-                try scr.present(&term);
             },
             .key => |key| {
-                switch (key) {
+                if (commenting) {
+                    switch (key) {
+                        .esc => {
+                            commenting = false;
+                            draft.clearRetainingCapacity();
+                        },
+                        .enter => {
+                            if (draft.items.len > 0) {
+                                const side = sideForAnchor(draft_anchor);
+                                _ = try review.addOpen(
+                                    draft_anchor.path,
+                                    draft_anchor.old_line,
+                                    draft_anchor.new_line,
+                                    side,
+                                    draft.items,
+                                );
+                                store.save(&review, alloc, io, .cwd()) catch {
+                                    // Stay in review; next save can retry. Marker is in-memory.
+                                };
+                            }
+                            commenting = false;
+                            draft.clearRetainingCapacity();
+                        },
+                        .backspace => {
+                            if (draft.items.len > 0) _ = draft.pop();
+                        },
+                        .char => |c| {
+                            if (c >= 0x20 and c < 0x7f) {
+                                try draft.append(alloc, @intCast(c));
+                            }
+                        },
+                        .ctrl_c => running = false,
+                        else => {},
+                    }
+                } else switch (key) {
                     .char => |c| {
                         if (c == 'q' or c == 'Q') {
                             running = false;
-                            break;
-                        }
-                        if (c == 'j') {
+                        } else if (c == 'j') {
                             if (cursor + 1 < rows.len) cursor += 1;
                         } else if (c == 'k') {
                             if (cursor > 0) cursor -= 1;
@@ -81,6 +132,19 @@ pub fn main() !void {
                             cursor = view.nextHunk(rows, cursor);
                         } else if (c == '[') {
                             cursor = view.prevHunk(rows, cursor);
+                        } else if (c == 'i' or c == 'c' or c == 'a') {
+                            if (view.anchorAt(rows, cursor)) |a| {
+                                draft_anchor = a;
+                                draft.clearRetainingCapacity();
+                                commenting = true;
+                            }
+                        }
+                    },
+                    .enter => {
+                        if (view.anchorAt(rows, cursor)) |a| {
+                            draft_anchor = a;
+                            draft.clearRetainingCapacity();
+                            commenting = true;
                         }
                     },
                     .down => {
@@ -89,30 +153,34 @@ pub fn main() !void {
                     .up => {
                         if (cursor > 0) cursor -= 1;
                     },
-                    .ctrl_c => {
-                        running = false;
-                        break;
-                    },
+                    .ctrl_c => running = false,
                     else => {},
                 }
-                paint(&scr, size, rows, cursor, &scroll);
-                try scr.present(&term);
             },
+        }
+        if (running) {
+            paint(&scr, size, rows, cursor, &scroll, &review, commenting, draft.items);
+            try scr.present(&term);
         }
     }
 }
 
-/// Rebuild front buffer from rows + cursor; update `scroll` to keep cursor visible.
-/// Layout: title (row 0) | content | footer (last row when height ≥ 2).
+fn sideForAnchor(a: view.Anchor) store.Side {
+    if (a.old_line != null and a.new_line != null) return .context;
+    if (a.new_line != null) return .new;
+    return .old;
+}
+
 fn paint(
     scr: *tui.Screen,
     size: tui.Size,
     rows: []const view.Row,
     cursor: usize,
     scroll: *usize,
+    review: *const store.Review,
+    commenting: bool,
+    draft: []const u8,
 ) void {
-    // Forced dark palette (truecolor) so a light terminal theme cannot wash
-    // out the review surface via ANSI index remapping.
     const bg = tui.Color{ .rgb = .{ .r = 0x12, .g = 0x12, .b = 0x14 } };
     const fg = tui.Color{ .rgb = .{ .r = 0xd0, .g = 0xd0, .b = 0xd0 } };
     const body = tui.Style{ .fg = fg, .bg = bg };
@@ -156,13 +224,15 @@ fn paint(
 
     scr.clearStyle(body);
 
-    // Title row.
     if (size.rows > 0) {
         fillRow(scr, 0, title_style);
-        scr.putStr(1, 0, "rv  j/k move  [/] hunk  q quit", title_style);
+        const help = if (commenting)
+            "rv  comment  Enter save  Esc cancel"
+        else
+            "rv  j/k move  [/] hunk  i comment  q quit";
+        scr.putStr(1, 0, help, title_style);
     }
 
-    // Footer on the last row when there is room (title + footer + optional body).
     const has_footer = size.rows >= 2;
     const footer_y: u16 = if (has_footer) size.rows - 1 else 0;
     const content_top: u16 = 1;
@@ -180,7 +250,8 @@ fn paint(
     var i: usize = scroll.*;
     while (i < rows.len and screen_y < content_bottom) : (i += 1) {
         const is_cur = i == cur;
-        const text = formatRow(&line_buf, rows[i]);
+        const marked = rowMarked(rows[i], review);
+        const text = formatRow(&line_buf, rows[i], marked);
         const base = baseStyle(rows[i], body, file_style, hunk_style, add_style, del_style, meta_style);
         const st = if (is_cur) cur_style else base;
         fillRow(scr, screen_y, st);
@@ -190,30 +261,45 @@ fn paint(
 
     if (has_footer) {
         fillRow(scr, footer_y, footer_style);
-        const st = view.statusAt(rows, cur);
-        const footer_text = formatFooter(&line_buf, st);
+        const footer_text = if (commenting)
+            bufPrintTrunc(&line_buf, "> {s}", .{draft})
+        else blk: {
+            const st = view.statusAt(rows, cur);
+            break :blk formatFooter(&line_buf, st, review.openCount());
+        };
         scr.putStr(1, footer_y, footer_text, footer_style);
     }
 
     scr.hideCursor();
 }
 
-/// `path  hunk i/n  row i/n` (omits hunk segment when there are no hunks).
-fn formatFooter(buf: []u8, st: view.Status) []const u8 {
+fn rowMarked(row: view.Row, review: *const store.Review) bool {
+    return switch (row) {
+        .line => |ln| switch (ln.kind) {
+            .meta => false,
+            else => review.hasOpenAt(ln.path, ln.old_no, ln.new_no),
+        },
+        else => false,
+    };
+}
+
+fn formatFooter(buf: []u8, st: view.Status, open_n: usize) []const u8 {
     if (st.row_n == 0) return "no changes";
     if (st.hunk_n == 0) {
-        return bufPrintTrunc(buf, "{s}  {d}/{d}", .{
+        return bufPrintTrunc(buf, "{s}  {d}/{d}  {d} open", .{
             if (st.path.len > 0) st.path else "?",
             st.row_i,
             st.row_n,
+            open_n,
         });
     }
-    return bufPrintTrunc(buf, "{s}  hunk {d}/{d}  {d}/{d}", .{
+    return bufPrintTrunc(buf, "{s}  hunk {d}/{d}  {d}/{d}  {d} open", .{
         if (st.path.len > 0) st.path else "?",
         st.hunk_i,
         st.hunk_n,
         st.row_i,
         st.row_n,
+        open_n,
     });
 }
 
@@ -238,8 +324,9 @@ fn baseStyle(
     };
 }
 
-/// Format one row into `buf`. Oversized content is truncated (never errors).
-fn formatRow(buf: []u8, row: view.Row) []const u8 {
+/// Format one row. Line rows use a 2-char gutter: `*` when marked, else space,
+/// then ` ` / `+` / `-` / `\`.
+fn formatRow(buf: []u8, row: view.Row, marked: bool) []const u8 {
     return switch (row) {
         .file_header => |fh| if (fh.is_binary)
             bufPrintTrunc(buf, " {s}  (binary)", .{fh.path})
@@ -258,17 +345,17 @@ fn formatRow(buf: []u8, row: view.Row) []const u8 {
             });
         },
         .line => |ln| blk: {
-            if (buf.len == 0) break :blk buf[0..0];
-            const marker: u8 = switch (ln.kind) {
+            if (buf.len < 2) break :blk buf[0..0];
+            buf[0] = if (marked) '*' else ' ';
+            buf[1] = switch (ln.kind) {
                 .context => ' ',
                 .add => '+',
                 .delete => '-',
                 .meta => '\\',
             };
-            buf[0] = marker;
-            const n = @min(ln.text.len, buf.len - 1);
-            @memcpy(buf[1..][0..n], ln.text[0..n]);
-            break :blk buf[0 .. n + 1];
+            const n = @min(ln.text.len, buf.len - 2);
+            @memcpy(buf[2..][0..n], ln.text[0..n]);
+            break :blk buf[0 .. n + 2];
         },
     };
 }
