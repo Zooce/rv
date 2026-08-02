@@ -1,7 +1,9 @@
-//! `rv` entry point — full-screen read-only diff review (MVP-0.3).
+//! `rv` entry point — full-screen read-only diff review (MVP-0.4).
 //!
 //! Load smart-default git diff → flatten rows → immediate-mode TUI:
-//! highlight current line, `j`/`k` move, viewport follows, resize, `q` quit.
+//! highlight current line, `j`/`k` move, `[`/`]` hunks, footer, `q` quit.
+//! Failures and empty diffs print a message and exit without entering the TUI
+//! (so the terminal is never left in raw / alt-screen mode).
 
 const std = @import("std");
 const git = @import("git");
@@ -17,10 +19,11 @@ pub fn main() !void {
     defer threaded.deinit();
     const io = threaded.io();
 
+    // Load before any TTY setup so error/empty paths never touch the terminal.
     var d = git.loadDefaultDiff(alloc, io) catch |err| {
         const msg: []const u8 = switch (err) {
-            error.NotARepository => "not a git repository",
-            error.GitNotFound => "git executable not found",
+            error.NotARepository => "not a git repository (run from a work tree)",
+            error.GitNotFound => "git executable not found in PATH",
             error.GitFailed => "git command failed",
             error.OutOfMemory => "out of memory",
             error.BadHunkHeader => "failed to parse unified diff (bad hunk header)",
@@ -31,6 +34,7 @@ pub fn main() !void {
     defer d.deinit();
 
     if (d.files.len == 0) {
+        // Smart default found nothing: clean worktree and nothing ahead of base.
         std.debug.print("rv: no changes to review\n", .{});
         return;
     }
@@ -73,6 +77,10 @@ pub fn main() !void {
                             if (cursor + 1 < rows.len) cursor += 1;
                         } else if (c == 'k') {
                             if (cursor > 0) cursor -= 1;
+                        } else if (c == ']') {
+                            cursor = view.nextHunk(rows, cursor);
+                        } else if (c == '[') {
+                            cursor = view.prevHunk(rows, cursor);
                         }
                     },
                     .down => {
@@ -95,6 +103,7 @@ pub fn main() !void {
 }
 
 /// Rebuild front buffer from rows + cursor; update `scroll` to keep cursor visible.
+/// Layout: title (row 0) | content | footer (last row when height ≥ 2).
 fn paint(
     scr: *tui.Screen,
     size: tui.Size,
@@ -102,41 +111,46 @@ fn paint(
     cursor: usize,
     scroll: *usize,
 ) void {
-    const body = tui.Style{
-        .fg = .{ .indexed = 7 },
-        .bg = .{ .indexed = 0 },
-    };
+    // Forced dark palette (truecolor) so a light terminal theme cannot wash
+    // out the review surface via ANSI index remapping.
+    const bg = tui.Color{ .rgb = .{ .r = 0x12, .g = 0x12, .b = 0x14 } };
+    const fg = tui.Color{ .rgb = .{ .r = 0xd0, .g = 0xd0, .b = 0xd0 } };
+    const body = tui.Style{ .fg = fg, .bg = bg };
     const title_style = tui.Style{
-        .fg = .{ .indexed = 15 },
-        .bg = .{ .indexed = 4 },
+        .fg = .{ .rgb = .{ .r = 0xee, .g = 0xee, .b = 0xee } },
+        .bg = .{ .rgb = .{ .r = 0x2a, .g = 0x3f, .b = 0x5f } },
         .bold = true,
     };
+    const footer_style = tui.Style{
+        .fg = .{ .rgb = .{ .r = 0xee, .g = 0xee, .b = 0xee } },
+        .bg = .{ .rgb = .{ .r = 0x2a, .g = 0x3f, .b = 0x5f } },
+    };
     const file_style = tui.Style{
-        .fg = .{ .indexed = 15 },
-        .bg = .{ .indexed = 0 },
+        .fg = .{ .rgb = .{ .r = 0xff, .g = 0xff, .b = 0xff } },
+        .bg = bg,
         .bold = true,
     };
     const hunk_style = tui.Style{
-        .fg = .{ .indexed = 6 },
-        .bg = .{ .indexed = 0 },
+        .fg = .{ .rgb = .{ .r = 0x6a, .g = 0xb8, .b = 0xc8 } },
+        .bg = bg,
         .dim = true,
     };
     const add_style = tui.Style{
-        .fg = .{ .indexed = 10 },
-        .bg = .{ .indexed = 0 },
+        .fg = .{ .rgb = .{ .r = 0x6a, .g = 0xc4, .b = 0x6a } },
+        .bg = bg,
     };
     const del_style = tui.Style{
-        .fg = .{ .indexed = 9 },
-        .bg = .{ .indexed = 0 },
+        .fg = .{ .rgb = .{ .r = 0xe0, .g = 0x6c, .b = 0x75 } },
+        .bg = bg,
     };
     const meta_style = tui.Style{
-        .fg = .{ .indexed = 8 },
-        .bg = .{ .indexed = 0 },
+        .fg = .{ .rgb = .{ .r = 0x80, .g = 0x80, .b = 0x80 } },
+        .bg = bg,
         .dim = true,
     };
     const cur_style = tui.Style{
-        .fg = .{ .indexed = 0 },
-        .bg = .{ .indexed = 7 },
+        .fg = .{ .rgb = .{ .r = 0x12, .g = 0x12, .b = 0x14 } },
+        .bg = .{ .rgb = .{ .r = 0xc8, .g = 0xc8, .b = 0xc8 } },
         .bold = true,
     };
 
@@ -145,18 +159,26 @@ fn paint(
     // Title row.
     if (size.rows > 0) {
         fillRow(scr, 0, title_style);
-        scr.putStr(1, 0, "rv  j/k move  q quit", title_style);
+        scr.putStr(1, 0, "rv  j/k move  [/] hunk  q quit", title_style);
     }
 
-    // Content area is everything below the title.
-    const content_rows: usize = if (size.rows > 1) size.rows - 1 else 0;
+    // Footer on the last row when there is room (title + footer + optional body).
+    const has_footer = size.rows >= 2;
+    const footer_y: u16 = if (has_footer) size.rows - 1 else 0;
+    const content_top: u16 = 1;
+    const content_bottom: u16 = if (has_footer) footer_y else size.rows;
+    const content_rows: usize = if (content_bottom > content_top)
+        content_bottom - content_top
+    else
+        0;
+
     const cur = view.clampCursor(cursor, rows.len);
     scroll.* = view.ensureVisible(scroll.*, cur, content_rows, rows.len);
 
     var line_buf: [512]u8 = undefined;
-    var screen_y: u16 = 1;
+    var screen_y: u16 = content_top;
     var i: usize = scroll.*;
-    while (i < rows.len and screen_y < size.rows) : (i += 1) {
+    while (i < rows.len and screen_y < content_bottom) : (i += 1) {
         const is_cur = i == cur;
         const text = formatRow(&line_buf, rows[i]);
         const base = baseStyle(rows[i], body, file_style, hunk_style, add_style, del_style, meta_style);
@@ -166,7 +188,33 @@ fn paint(
         screen_y += 1;
     }
 
+    if (has_footer) {
+        fillRow(scr, footer_y, footer_style);
+        const st = view.statusAt(rows, cur);
+        const footer_text = formatFooter(&line_buf, st);
+        scr.putStr(1, footer_y, footer_text, footer_style);
+    }
+
     scr.hideCursor();
+}
+
+/// `path  hunk i/n  row i/n` (omits hunk segment when there are no hunks).
+fn formatFooter(buf: []u8, st: view.Status) []const u8 {
+    if (st.row_n == 0) return "no changes";
+    if (st.hunk_n == 0) {
+        return bufPrintTrunc(buf, "{s}  {d}/{d}", .{
+            if (st.path.len > 0) st.path else "?",
+            st.row_i,
+            st.row_n,
+        });
+    }
+    return bufPrintTrunc(buf, "{s}  hunk {d}/{d}  {d}/{d}", .{
+        if (st.path.len > 0) st.path else "?",
+        st.hunk_i,
+        st.hunk_n,
+        st.row_i,
+        st.row_n,
+    });
 }
 
 fn baseStyle(

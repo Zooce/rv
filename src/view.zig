@@ -74,6 +74,108 @@ pub fn ensureVisible(scroll: usize, cursor: usize, height: usize, row_count: usi
     return s;
 }
 
+// --- hunk jump + status (MVP-0.4) ----------------------------------------
+
+/// Location context for the status footer. Slices borrow from `rows`.
+pub const Status = struct {
+    /// Display path of the file containing the cursor (`""` if none).
+    path: []const u8,
+    /// 1-based index of the current hunk among all hunks; `0` when not in a hunk.
+    hunk_i: usize,
+    /// Total number of hunk headers in `rows`.
+    hunk_n: usize,
+    /// 1-based cursor row among all display rows; `0` when empty.
+    row_i: usize,
+    /// Total display rows.
+    row_n: usize,
+};
+
+/// Row index of the last `.hunk_header` at or before `cursor`, or `null`.
+pub fn currentHunkStart(rows: []const Row, cursor: usize) ?usize {
+    if (rows.len == 0) return null;
+    var i = clampCursor(cursor, rows.len);
+    while (true) {
+        if (rows[i] == .hunk_header) return i;
+        if (i == 0) return null;
+        i -= 1;
+    }
+}
+
+/// Land on the first add/delete line of the hunk starting at `hunk_start`,
+/// or on the hunk header itself when the hunk has no changed lines.
+pub fn landOnHunk(rows: []const Row, hunk_start: usize) usize {
+    if (hunk_start >= rows.len or rows[hunk_start] != .hunk_header) {
+        return clampCursor(hunk_start, rows.len);
+    }
+    var i = hunk_start + 1;
+    while (i < rows.len) : (i += 1) {
+        switch (rows[i]) {
+            .line => |ln| switch (ln.kind) {
+                .add, .delete => return i,
+                .context, .meta => {},
+            },
+            .hunk_header, .file_header => break,
+        }
+    }
+    return hunk_start;
+}
+
+/// Jump to the next hunk after the one containing `cursor` (or the first hunk
+/// if none). Unchanged when there is no later hunk.
+pub fn nextHunk(rows: []const Row, cursor: usize) usize {
+    if (rows.len == 0) return 0;
+    const search_from: usize = if (currentHunkStart(rows, cursor)) |s| s + 1 else 0;
+    var i = search_from;
+    while (i < rows.len) : (i += 1) {
+        if (rows[i] == .hunk_header) return landOnHunk(rows, i);
+    }
+    return clampCursor(cursor, rows.len);
+}
+
+/// Jump to the previous hunk before the one containing `cursor`. Unchanged
+/// when already on the first hunk (or before any hunk).
+pub fn prevHunk(rows: []const Row, cursor: usize) usize {
+    if (rows.len == 0) return 0;
+    const cur = currentHunkStart(rows, cursor) orelse return clampCursor(cursor, rows.len);
+    var i = cur;
+    while (i > 0) {
+        i -= 1;
+        if (rows[i] == .hunk_header) return landOnHunk(rows, i);
+    }
+    return clampCursor(cursor, rows.len);
+}
+
+/// Status footer fields for `cursor` within `rows`.
+pub fn statusAt(rows: []const Row, cursor: usize) Status {
+    if (rows.len == 0) {
+        return .{ .path = "", .hunk_i = 0, .hunk_n = 0, .row_i = 0, .row_n = 0 };
+    }
+    const cur = clampCursor(cursor, rows.len);
+    var path: []const u8 = "";
+    var hunk_n: usize = 0;
+    var hunk_i: usize = 0;
+    var i: usize = 0;
+    while (i < rows.len) : (i += 1) {
+        switch (rows[i]) {
+            .file_header => |fh| {
+                if (i <= cur) path = fh.path;
+            },
+            .hunk_header => {
+                hunk_n += 1;
+                if (i <= cur) hunk_i = hunk_n;
+            },
+            .line => {},
+        }
+    }
+    return .{
+        .path = path,
+        .hunk_i = hunk_i,
+        .hunk_n = hunk_n,
+        .row_i = cur + 1,
+        .row_n = rows.len,
+    };
+}
+
 // --- tests ---------------------------------------------------------------
 
 const testing = std.testing;
@@ -147,4 +249,75 @@ test "ensureVisible scrolls with cursor" {
     try testing.expectEqual(7, ensureVisible(0, 9, 3, 10));
     try testing.expectEqual(0, ensureVisible(0, 0, 3, 2));
     try testing.expectEqual(0, ensureVisible(0, 0, 0, 10));
+}
+
+/// Two-hunk fixture: file, h0, del, add, h1, del, add → indices 0..6.
+/// Caller owns `d` and `rows` (strings borrow from `d`).
+fn twoHunkFixture(alloc: Allocator) !struct { d: diff.Diff, rows: []Row } {
+    const fixture =
+        \\diff --git a/f b/f
+        \\--- a/f
+        \\+++ b/f
+        \\@@ -1 +1 @@
+        \\-old1
+        \\+new1
+        \\@@ -10 +10 @@ section
+        \\-old2
+        \\+new2
+    ;
+    var d = try diff.parse(alloc, fixture);
+    errdefer d.deinit();
+    const rows = try flatten(alloc, &d);
+    return .{ .d = d, .rows = rows };
+}
+
+test "nextHunk and prevHunk land on first changed line" {
+    var fix = try twoHunkFixture(testing.allocator);
+    defer fix.d.deinit();
+    defer testing.allocator.free(fix.rows);
+    const rows = fix.rows;
+    try testing.expectEqual(7, rows.len);
+
+    // From file header → first hunk's first delete.
+    try testing.expectEqual(2, nextHunk(rows, 0));
+    // From first hunk body → second hunk's first delete.
+    try testing.expectEqual(5, nextHunk(rows, 2));
+    try testing.expectEqual(5, nextHunk(rows, 3));
+    // No later hunk.
+    try testing.expectEqual(5, nextHunk(rows, 5));
+    try testing.expectEqual(6, nextHunk(rows, 6));
+
+    // From second hunk → first hunk land.
+    try testing.expectEqual(2, prevHunk(rows, 5));
+    try testing.expectEqual(2, prevHunk(rows, 6));
+    // Already on first hunk: stay.
+    try testing.expectEqual(2, prevHunk(rows, 2));
+    try testing.expectEqual(0, prevHunk(rows, 0));
+}
+
+test "statusAt path and hunk index" {
+    var fix = try twoHunkFixture(testing.allocator);
+    defer fix.d.deinit();
+    defer testing.allocator.free(fix.rows);
+    const rows = fix.rows;
+
+    const s0 = statusAt(rows, 0);
+    try testing.expectEqualStrings("f", s0.path);
+    try testing.expectEqual(0, s0.hunk_i);
+    try testing.expectEqual(2, s0.hunk_n);
+    try testing.expectEqual(1, s0.row_i);
+    try testing.expectEqual(7, s0.row_n);
+
+    const s2 = statusAt(rows, 2);
+    try testing.expectEqualStrings("f", s2.path);
+    try testing.expectEqual(1, s2.hunk_i);
+    try testing.expectEqual(2, s2.hunk_n);
+
+    const s5 = statusAt(rows, 5);
+    try testing.expectEqual(2, s5.hunk_i);
+    try testing.expectEqual(2, s5.hunk_n);
+
+    const empty = statusAt(&.{}, 0);
+    try testing.expectEqual(0, empty.hunk_n);
+    try testing.expectEqual(0, empty.row_i);
 }
