@@ -1,7 +1,8 @@
-//! Headless CLI for the comment store (MVP-2.2).
+//! Headless CLI for the comment store (MVP-2.2 / 2.3).
 //!
-//! Subcommands: `status`, `list`, `show`, help. No git load and no raw TTY
-//! modes. Bare `rv` (no args) still launches the review TUI from `main`.
+//! Subcommands: `status`, `list`, `show`, `resolve`, `reopen`, help. No git
+//! load and no raw TTY modes. Bare `rv` (no args) still launches the review
+//! TUI from `main`.
 
 const std = @import("std");
 const store = @import("store");
@@ -19,6 +20,8 @@ pub const Command = union(enum) {
     status,
     list: ListFilter,
     show: []const u8,
+    resolve: []const []const u8,
+    reopen: []const []const u8,
 };
 
 /// Parse argv after the program name.
@@ -39,6 +42,14 @@ pub fn parse(args: []const []const u8) error{Usage}!Command {
     if (std.mem.eql(u8, cmd, "show")) {
         if (args.len != 2) return error.Usage;
         return .{ .show = args[1] };
+    }
+    if (std.mem.eql(u8, cmd, "resolve")) {
+        if (args.len < 2) return error.Usage;
+        return .{ .resolve = args[1..] };
+    }
+    if (std.mem.eql(u8, cmd, "reopen")) {
+        if (args.len < 2) return error.Usage;
+        return .{ .reopen = args[1..] };
     }
     return error.Usage;
 }
@@ -67,6 +78,8 @@ const usage_text =
     \\  status                         open/resolved counts for the current review
     \\  list [--open|--all|--resolved] list comments (default: open only)
     \\  show <id>                      print one comment
+    \\  resolve <id> [id…]             mark comments resolved
+    \\  reopen <id> [id…]              mark comments open again
     \\  help, -h, --help               show this help
     \\
     \\Exit codes: 0 success, 1 error, 2 usage
@@ -84,6 +97,8 @@ pub fn run(alloc: Allocator, io: Io, args: []const []const u8) u8 {
         .status => return cmdStatus(alloc, io),
         .list => |filter| return cmdList(alloc, io, filter),
         .show => |id| return cmdShow(alloc, io, id),
+        .resolve => |ids| return cmdSetState(alloc, io, ids, .resolved, "resolved"),
+        .reopen => |ids| return cmdSetState(alloc, io, ids, .open, "reopened"),
     }
 }
 
@@ -208,6 +223,41 @@ fn cmdShow(alloc: Allocator, io: Io, id: []const u8) u8 {
     return exit_success;
 }
 
+/// Load → setState (all-or-nothing) → save → one confirmation line per id.
+fn cmdSetState(
+    alloc: Allocator,
+    io: Io,
+    ids: []const []const u8,
+    state: store.State,
+    verb: []const u8,
+) u8 {
+    var review = loadReview(alloc, io) catch |err| return loadFail(err);
+    defer review.deinit();
+
+    review.setState(ids, state) catch {
+        for (ids) |id| {
+            if (review.find(id) == null) {
+                std.debug.print("rv: comment not found: {s}\n", .{id});
+            }
+        }
+        return exit_operational;
+    };
+
+    store.save(&review, alloc, io, .cwd()) catch {
+        std.debug.print("rv: failed to save .rv comment store\n", .{});
+        return exit_operational;
+    };
+
+    var buf: [1024]u8 = undefined;
+    var w = std.Io.File.stdout().writer(io, &buf);
+    const out = &w.interface;
+    for (ids) |id| {
+        out.print("{s} {s}\n", .{ id, verb }) catch return writeFail();
+    }
+    out.flush() catch return writeFail();
+    return exit_success;
+}
+
 fn loadReview(alloc: Allocator, io: Io) store.LoadError!store.Review {
     return store.load(alloc, io, .cwd(), store.default_review_id);
 }
@@ -274,7 +324,7 @@ fn bufPrintTrunc(buf: []u8, comptime fmt: []const u8, args: anytype) []const u8 
 
 const testing = std.testing;
 
-test "parse help status list show" {
+test "parse help status list show resolve reopen" {
     try testing.expectEqual(Command.help, try parse(&.{"help"}));
     try testing.expectEqual(Command.help, try parse(&.{"--help"}));
     try testing.expectEqual(Command.help, try parse(&.{"-h"}));
@@ -287,6 +337,22 @@ test "parse help status list show" {
 
     const show = try parse(&.{ "show", "3" });
     try testing.expectEqualStrings("3", show.show);
+
+    const resolve_one = try parse(&.{ "resolve", "1" });
+    try testing.expectEqual(1, resolve_one.resolve.len);
+    try testing.expectEqualStrings("1", resolve_one.resolve[0]);
+
+    const resolve_multi = try parse(&.{ "resolve", "1", "2", "3" });
+    try testing.expectEqual(3, resolve_multi.resolve.len);
+    try testing.expectEqualStrings("2", resolve_multi.resolve[1]);
+
+    const reopen_one = try parse(&.{ "reopen", "7" });
+    try testing.expectEqual(1, reopen_one.reopen.len);
+    try testing.expectEqualStrings("7", reopen_one.reopen[0]);
+
+    const reopen_multi = try parse(&.{ "reopen", "a", "b" });
+    try testing.expectEqual(2, reopen_multi.reopen.len);
+    try testing.expectEqualStrings("b", reopen_multi.reopen[1]);
 }
 
 test "parse usage errors" {
@@ -298,6 +364,8 @@ test "parse usage errors" {
     try testing.expectError(error.Usage, parse(&.{ "list", "--all", "--open" }));
     try testing.expectError(error.Usage, parse(&.{ "list", "--bogus" }));
     try testing.expectError(error.Usage, parse(&.{ "help", "extra" }));
+    try testing.expectError(error.Usage, parse(&.{"resolve"}));
+    try testing.expectError(error.Usage, parse(&.{"reopen"}));
 }
 
 test "formatAnchor" {

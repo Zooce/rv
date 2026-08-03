@@ -4,8 +4,8 @@
 //! comments → TUI (`j`/`k`, `[`/`]`, `i`/`c`/`a`/`Enter` comment, `q` quit).
 //! Empty/error paths never enter raw / alt-screen mode.
 //!
-//! With a subcommand: headless CLI (`status`, `list`, `show`, help) — no git
-//! load and no raw TTY modes.
+//! With a subcommand: headless CLI (`status`, `list`, `show`, `resolve`,
+//! `reopen`, help) — no git load and no raw TTY modes.
 //!
 //! Comment UX (v1): single-line footer prompt (not an inline box). Esc cancels;
 //! Enter saves. Markers: `*` gutter on lines with open comments. Reload on next
