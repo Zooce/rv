@@ -76,6 +76,37 @@ pub const Review = struct {
         });
         return id;
     }
+
+    /// Comment with `id`, or null if none.
+    pub fn find(self: *const Review, id: []const u8) ?*const Comment {
+        return if (self.findIndex(id)) |i| &self.comments.items[i] else null;
+    }
+
+    fn findIndex(self: *const Review, id: []const u8) ?usize {
+        for (self.comments.items, 0..) |c, i| {
+            if (std.mem.eql(u8, c.id, id)) return i;
+        }
+        return null;
+    }
+
+    /// Set state for every id. All must exist before any write (all-or-nothing).
+    /// Idempotent when a comment is already in `state`.
+    pub fn setState(self: *Review, ids: []const []const u8, state: State) error{NotFound}!void {
+        for (ids) |id| {
+            if (self.findIndex(id) == null) return error.NotFound;
+        }
+        for (ids) |id| {
+            self.comments.items[self.findIndex(id).?].state = state;
+        }
+    }
+
+    pub fn resolve(self: *Review, ids: []const []const u8) error{NotFound}!void {
+        try self.setState(ids, .resolved);
+    }
+
+    pub fn reopen(self: *Review, ids: []const []const u8) error{NotFound}!void {
+        try self.setState(ids, .open);
+    }
 };
 
 fn lineMatch(a: ?u32, b: ?u32) bool {
@@ -202,6 +233,7 @@ fn stringify(self: *const Review, gpa: Allocator) Allocator.Error![]u8 {
 
 const testing = std.testing;
 const builtin = @import("builtin");
+const IsolatedTmp = if (builtin.is_test) @import("isolated_tmp").IsolatedTmp else void;
 
 test "addOpen hasOpenAt and roundtrip" {
     var r = try initEmpty(testing.allocator, default_review_id);
@@ -218,25 +250,76 @@ test "addOpen hasOpenAt and roundtrip" {
     if (builtin.os.tag == .wasi) return;
     const io = testing.io;
     const alloc = testing.allocator;
-    var rnd: [8]u8 = undefined;
-    io.random(&rnd);
-    var name_buf: [12]u8 = undefined;
-    const name = std.base64.url_safe.Encoder.encode(&name_buf, &rnd);
-    const path = try std.fmt.allocPrint(alloc, "/tmp/rv-store-{s}", .{name});
-    defer alloc.free(path);
-    try Io.Dir.createDirAbsolute(io, path, .default_dir);
-    defer Io.Dir.cwd().deleteTree(io, path) catch {};
-    var dir = try Io.Dir.openDirAbsolute(io, path, .{});
-    defer dir.close(io);
+    var tmp = try IsolatedTmp.create(alloc, io);
+    defer tmp.cleanup(alloc, io);
 
-    var empty = try load(alloc, io, dir, default_review_id);
+    var empty = try load(alloc, io, tmp.dir, default_review_id);
     defer empty.deinit();
     try testing.expectEqual(0, empty.comments.items.len);
-    try save(&r, alloc, io, dir);
-    var loaded = try load(alloc, io, dir, default_review_id);
+    try save(&r, alloc, io, tmp.dir);
+    var loaded = try load(alloc, io, tmp.dir, default_review_id);
     defer loaded.deinit();
     try testing.expectEqualStrings("a.zig", loaded.comments.items[0].path);
     try testing.expectEqual(10, loaded.comments.items[0].new_line.?);
     try testing.expectEqualStrings("fix", loaded.comments.items[0].body);
     try testing.expectEqualStrings("2", try loaded.addOpen("b.zig", 1, null, .old, "x"));
+}
+
+test "find resolve reopen and multi-id all-or-nothing" {
+    var review = try initEmpty(testing.allocator, default_review_id);
+    defer review.deinit();
+    const id1 = try review.addOpen("a.zig", null, 1, .new, "one");
+    const id2 = try review.addOpen("b.zig", null, 2, .new, "two");
+
+    try testing.expect(review.find("nope") == null);
+    try testing.expectEqualStrings("one", review.find(id1).?.body);
+    try testing.expectEqual(State.open, review.find(id1).?.state);
+
+    try review.resolve(&.{id1});
+    try testing.expectEqual(State.resolved, review.find(id1).?.state);
+    try testing.expectEqual(1, review.openCount());
+    try testing.expectEqual(State.open, review.find(id2).?.state);
+    // Idempotent when already resolved.
+    try review.resolve(&.{id1});
+    try testing.expectEqual(State.resolved, review.find(id1).?.state);
+
+    try review.reopen(&.{id1});
+    try testing.expectEqual(State.open, review.find(id1).?.state);
+    try testing.expectEqual(2, review.openCount());
+
+    // Unknown id: no writes (multi-id all-or-nothing).
+    try testing.expectError(error.NotFound, review.resolve(&.{ id1, "999" }));
+    try testing.expectEqual(State.open, review.find(id1).?.state);
+    try testing.expectEqual(State.open, review.find(id2).?.state);
+
+    try review.resolve(&.{ id1, id2 });
+    try testing.expectEqual(State.resolved, review.find(id1).?.state);
+    try testing.expectEqual(State.resolved, review.find(id2).?.state);
+    try testing.expectEqual(0, review.openCount());
+    try testing.expectError(error.NotFound, review.reopen(&.{"ghost"}));
+}
+
+test "resolve save load preserves state" {
+    if (builtin.os.tag == .wasi) return;
+    var review = try initEmpty(testing.allocator, default_review_id);
+    defer review.deinit();
+    const id = try review.addOpen("c.zig", 3, null, .old, "keep");
+    try review.resolve(&.{id});
+
+    const io = testing.io;
+    const alloc = testing.allocator;
+    var tmp = try IsolatedTmp.create(alloc, io);
+    defer tmp.cleanup(alloc, io);
+
+    try save(&review, alloc, io, tmp.dir);
+    var loaded = try load(alloc, io, tmp.dir, default_review_id);
+    defer loaded.deinit();
+    try testing.expectEqual(State.resolved, loaded.find(id).?.state);
+    try testing.expectEqual(0, loaded.openCount());
+    try loaded.reopen(&.{id});
+    try testing.expectEqual(State.open, loaded.find(id).?.state);
+    try save(&loaded, alloc, io, tmp.dir);
+    var again = try load(alloc, io, tmp.dir, default_review_id);
+    defer again.deinit();
+    try testing.expectEqual(State.open, again.find(id).?.state);
 }

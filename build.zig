@@ -42,6 +42,14 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
 
+    // Shared test temp dirs under `/tmp` (IsolatedTmp). Imported by modules
+    // that run fixtures; unused on production paths (see `builtin.is_test`).
+    const isolated_tmp_mod = b.addModule("isolated_tmp", .{
+        .root_source_file = b.path("src/isolated_tmp.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+
     // Git subprocess loader + smart default (MVP-0.2).
     const git_mod = b.addModule("git", .{
         .root_source_file = b.path("src/git.zig"),
@@ -49,6 +57,7 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
         .imports = &.{
             .{ .name = "diff", .module = diff_mod },
+            .{ .name = "isolated_tmp", .module = isolated_tmp_mod },
         },
     });
 
@@ -67,6 +76,9 @@ pub fn build(b: *std.Build) void {
         .root_source_file = b.path("src/store.zig"),
         .target = target,
         .optimize = optimize,
+        .imports = &.{
+            .{ .name = "isolated_tmp", .module = isolated_tmp_mod },
+        },
     });
 
     // `rv` binary: full-screen read-only diff review TUI.

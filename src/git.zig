@@ -132,49 +132,13 @@ fn git(alloc: Allocator, io: Io, cwd: std.process.Child.Cwd, argv: []const []con
 
 // --- tests ---------------------------------------------------------------
 //
-// Fixtures live under `/tmp`, not `.zig-cache/tmp`. Nested dirs inside this
-// project still belong to the rv work tree, so `git rev-parse` would walk up
-// and succeed even without a local `.git`.
+// Fixtures use IsolatedTmp under `/tmp` (not `.zig-cache/tmp`). Nested dirs
+// inside this project still belong to the rv work tree, so `git rev-parse`
+// would walk up and succeed even without a local `.git`.
 
 const testing = std.testing;
 const builtin = @import("builtin");
-
-/// Temp dir outside any project work tree (`/tmp/rv-git-…`).
-const IsolatedTmp = struct {
-    path: []u8,
-    dir: Io.Dir,
-
-    fn create(alloc: Allocator, io: Io) !IsolatedTmp {
-        var random_bytes: [12]u8 = undefined;
-        io.random(&random_bytes);
-        var name_buf: [16]u8 = undefined;
-        const name = std.base64.url_safe.Encoder.encode(&name_buf, &random_bytes);
-        const path = try std.fmt.allocPrint(alloc, "/tmp/rv-git-{s}", .{name});
-        errdefer alloc.free(path);
-
-        try Io.Dir.createDirAbsolute(io, path, .default_dir);
-        errdefer Io.Dir.cwd().deleteTree(io, path) catch {};
-
-        const dir = try Io.Dir.openDirAbsolute(io, path, .{});
-        return .{ .path = path, .dir = dir };
-    }
-
-    fn cleanup(self: *IsolatedTmp, alloc: Allocator, io: Io) void {
-        self.dir.close(io);
-        // Best-effort remove; tests should not leave junk on success.
-        Io.Dir.cwd().deleteTree(io, self.path) catch {};
-        alloc.free(self.path);
-        self.* = undefined;
-    }
-
-    fn cwd(self: IsolatedTmp) std.process.Child.Cwd {
-        return .{ .path = self.path };
-    }
-
-    fn write(self: IsolatedTmp, io: Io, sub_path: []const u8, data: []const u8) !void {
-        try self.dir.writeFile(io, .{ .sub_path = sub_path, .data = data });
-    }
-};
+const IsolatedTmp = if (builtin.is_test) @import("isolated_tmp").IsolatedTmp else void;
 
 /// `git init -b main` plus local user.name / user.email (required for commits).
 fn initTestRepo(alloc: Allocator, io: Io, cwd: std.process.Child.Cwd) !void {
