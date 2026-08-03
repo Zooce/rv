@@ -1,8 +1,11 @@
-//! `rv` entry point — full-screen diff review with line comments (MVP-1).
+//! `rv` entry point — CLI dispatch + full-screen diff review (MVP-1 / MVP-2.2).
 //!
-//! Load smart-default git diff → flatten rows → load `.rv` comments → TUI:
-//! `j`/`k` move, `[`/`]` hunks, `i`/`c`/`a`/`Enter` comment (footer prompt),
-//! `q` quit. Empty/error paths never enter raw / alt-screen mode.
+//! With no args: load smart-default git diff → flatten rows → load `.rv`
+//! comments → TUI (`j`/`k`, `[`/`]`, `i`/`c`/`a`/`Enter` comment, `q` quit).
+//! Empty/error paths never enter raw / alt-screen mode.
+//!
+//! With a subcommand: headless CLI (`status`, `list`, `show`, help) — no git
+//! load and no raw TTY modes.
 //!
 //! Comment UX (v1): single-line footer prompt (not an inline box). Esc cancels;
 //! Enter saves. Markers: `*` gutter on lines with open comments. Reload on next
@@ -13,16 +16,20 @@ const git = @import("git");
 const tui = @import("tui");
 const view = @import("view");
 const store = @import("store");
+const cli = @import("cli");
 
-pub fn main() !void {
-    var gpa_state: std.heap.DebugAllocator(.{}) = .init;
-    defer _ = gpa_state.deinit();
-    const alloc = gpa_state.allocator();
+pub fn main(init: std.process.Init) !u8 {
+    const alloc = init.gpa;
+    const io = init.io;
 
-    var threaded: std.Io.Threaded = .init(alloc, .{});
-    defer threaded.deinit();
-    const io = threaded.io();
+    const argv = try init.minimal.args.toSlice(init.arena.allocator());
+    if (argv.len > 1) {
+        return cli.run(alloc, io, argv[1..]);
+    }
+    return try runTui(alloc, io);
+}
 
+fn runTui(alloc: std.mem.Allocator, io: std.Io) !u8 {
     // Load before any TTY setup so error/empty paths never touch the terminal.
     var d = git.loadDefaultDiff(alloc, io) catch |err| {
         const msg: []const u8 = switch (err) {
@@ -33,13 +40,13 @@ pub fn main() !void {
             error.BadHunkHeader => "failed to parse unified diff (bad hunk header)",
         };
         std.debug.print("rv: {s}\n", .{msg});
-        std.process.exit(1);
+        return 1;
     };
     defer d.deinit();
 
     if (d.files.len == 0) {
         std.debug.print("rv: no changes to review\n", .{});
-        return;
+        return 0;
     }
 
     const rows = try view.flatten(alloc, &d);
@@ -54,7 +61,7 @@ pub fn main() !void {
             else => "failed to load .rv comment store",
         };
         std.debug.print("rv: {s}\n", .{msg});
-        std.process.exit(1);
+        return 1;
     };
     defer review.deinit();
 
@@ -163,6 +170,7 @@ pub fn main() !void {
             try scr.present(&term);
         }
     }
+    return 0;
 }
 
 fn sideForAnchor(a: view.Anchor) store.Side {

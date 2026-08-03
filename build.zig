@@ -81,6 +81,16 @@ pub fn build(b: *std.Build) void {
         },
     });
 
+    // Headless CLI: status / list / show (MVP-2.2+).
+    const cli_mod = b.addModule("cli", .{
+        .root_source_file = b.path("src/cli.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{
+            .{ .name = "store", .module = store_mod },
+        },
+    });
+
     // `rv` binary: full-screen read-only diff review TUI.
     const rv = b.addExecutable(.{
         .name = "rv",
@@ -94,6 +104,7 @@ pub fn build(b: *std.Build) void {
                 .{ .name = "git", .module = git_mod },
                 .{ .name = "view", .module = view_mod },
                 .{ .name = "store", .module = store_mod },
+                .{ .name = "cli", .module = cli_mod },
             },
         }),
     });
@@ -138,10 +149,16 @@ pub fn build(b: *std.Build) void {
     });
     const run_store_tests = b.addRunArtifact(store_tests);
 
-    const test_step = b.step("test", "Run unit tests (TUI + diff + git + view + store)");
+    const cli_tests = b.addTest(.{
+        .root_module = cli_mod,
+    });
+    const run_cli_tests = b.addRunArtifact(cli_tests);
+
+    const test_step = b.step("test", "Run unit tests (TUI + diff + git + view + store + cli)");
     test_step.dependOn(&run_tui_tests.step);
     test_step.dependOn(&run_diff_tests.step);
     test_step.dependOn(&run_git_tests.step);
     test_step.dependOn(&run_view_tests.step);
     test_step.dependOn(&run_store_tests.step);
+    test_step.dependOn(&run_cli_tests.step);
 }
