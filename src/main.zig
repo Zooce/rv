@@ -5,7 +5,7 @@
 //! Empty/error paths never enter raw / alt-screen mode.
 //!
 //! With a subcommand: headless CLI (`status`, `list`, `show`, `resolve`,
-//! `reopen`, help) — no git load and no raw TTY modes.
+//! `reopen`, `export`, help) — no git load and no raw TTY modes.
 //!
 //! Comment UX (v1): single-line footer prompt (not an inline box). Esc cancels;
 //! Enter saves. Markers: `*` gutter on lines with open comments. Reload on next
