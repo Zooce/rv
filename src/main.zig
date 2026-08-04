@@ -5,7 +5,7 @@
 //! Empty/error paths never enter raw / alt-screen mode.
 //!
 //! With a subcommand: headless CLI (`status`, `list`, `show`, `resolve`,
-//! `reopen`, `export`, help) — no git load and no raw TTY modes.
+//! `reopen`, `export`, `install-skill`, help) — no git load and no raw TTY modes.
 //!
 //! Comment UX (v1): single-line footer prompt (not an inline box). Esc cancels;
 //! Enter saves. Markers: `*` gutter on lines with open comments. Reload on next
@@ -24,7 +24,11 @@ pub fn main(init: std.process.Init) !u8 {
 
     const argv = try init.minimal.args.toSlice(init.arena.allocator());
     if (argv.len > 1) {
-        return cli.run(alloc, io, argv[1..]);
+        const env: cli.Env = .{
+            .home = init.environ_map.get("HOME"),
+            .skill_dir = init.environ_map.get("RV_SKILL_DIR"),
+        };
+        return cli.run(alloc, io, argv[1..], env);
     }
     return try runTui(alloc, io);
 }

@@ -1,13 +1,20 @@
-//! Headless CLI for the comment store (MVP-2.2–2.4).
+//! Headless CLI for the comment store (MVP-2.2–2.5).
 //!
-//! Subcommands: `status`, `list`, `show`, `resolve`, `reopen`, `export`, help.
-//! No git load and no raw TTY modes. Bare `rv` (no args) still launches the
-//! review TUI from `main`.
+//! Subcommands: `status`, `list`, `show`, `resolve`, `reopen`, `export`,
+//! `install-skill`, help. No git load and no raw TTY modes. Bare `rv` (no
+//! args) still launches the review TUI from `main`.
 
 const std = @import("std");
 const store = @import("store");
+const install_skill = @import("install_skill");
 const Allocator = std.mem.Allocator;
 const Io = std.Io;
+
+/// Process env needed by install-skill (and future commands).
+pub const Env = struct {
+    home: ?[]const u8 = null,
+    skill_dir: ?[]const u8 = null,
+};
 
 pub const exit_success: u8 = 0;
 pub const exit_operational: u8 = 1;
@@ -30,6 +37,7 @@ pub const Command = union(enum) {
     resolve: []const []const u8,
     reopen: []const []const u8,
     @"export": ExportOpts,
+    install_skill: install_skill.Opts,
 };
 
 /// Parse argv after the program name.
@@ -61,6 +69,9 @@ pub fn parse(args: []const []const u8) error{Usage}!Command {
     }
     if (std.mem.eql(u8, cmd, "export")) {
         return .{ .@"export" = try parseExport(args[1..]) };
+    }
+    if (std.mem.eql(u8, cmd, "install-skill")) {
+        return .{ .install_skill = try parseInstallSkill(args[1..]) };
     }
     return error.Usage;
 }
@@ -110,6 +121,28 @@ fn parseExport(args: []const []const u8) error{Usage}!ExportOpts {
     return opts;
 }
 
+fn parseInstallSkill(args: []const []const u8) error{Usage}!install_skill.Opts {
+    var opts: install_skill.Opts = .{};
+    var i: usize = 0;
+    while (i < args.len) : (i += 1) {
+        const a = args[i];
+        if (std.mem.eql(u8, a, "--list")) {
+            if (opts.list) return error.Usage;
+            opts.list = true;
+        } else if (std.mem.eql(u8, a, "--uninstall")) {
+            if (opts.uninstall) return error.Usage;
+            opts.uninstall = true;
+        } else if (std.mem.eql(u8, a, "--agent")) {
+            i += 1;
+            if (i >= args.len or args[i].len == 0) return error.Usage;
+            if (opts.agent != null) return error.Usage;
+            opts.agent = args[i];
+        } else return error.Usage;
+    }
+    if (opts.list and opts.uninstall) return error.Usage;
+    return opts;
+}
+
 const usage_text =
     \\usage: rv [<command>] [args]
     \\
@@ -125,6 +158,10 @@ const usage_text =
     \\    --format md|json             output format (default: md)
     \\    --open|--all|--resolved      filter (default: open)
     \\    -o <path>                    write file instead of stdout
+    \\  install-skill [options]        install bundled agent skill
+    \\    --list                       show source, canonical, and agent links
+    \\    --uninstall                  remove skill symlinks
+    \\    --agent <name>               only grok|claude|codex|cursor
     \\  help, -h, --help               show this help
     \\
     \\Exit codes: 0 success, 1 error, 2 usage
@@ -132,7 +169,7 @@ const usage_text =
 ;
 
 /// Run a CLI command. `args` is argv after the program name.
-pub fn run(alloc: Allocator, io: Io, args: []const []const u8) u8 {
+pub fn run(alloc: Allocator, io: Io, args: []const []const u8, env: Env) u8 {
     const cmd = parse(args) catch {
         std.debug.print("{s}", .{usage_text});
         return exit_usage;
@@ -145,6 +182,19 @@ pub fn run(alloc: Allocator, io: Io, args: []const []const u8) u8 {
         .resolve => |ids| return cmdSetState(alloc, io, ids, .resolved, "resolved"),
         .reopen => |ids| return cmdSetState(alloc, io, ids, .open, "reopened"),
         .@"export" => |opts| return cmdExport(alloc, io, opts),
+        .install_skill => |opts| {
+            var out_buf: [4096]u8 = undefined;
+            var err_buf: [1024]u8 = undefined;
+            var out_w = std.Io.File.stdout().writer(io, &out_buf);
+            var err_w = std.Io.File.stderr().writer(io, &err_buf);
+            const rc = install_skill.run(alloc, io, opts, env.home, env.skill_dir, .{
+                .out = &out_w.interface,
+                .err = &err_w.interface,
+            });
+            out_w.interface.flush() catch {};
+            err_w.interface.flush() catch {};
+            return rc;
+        },
     }
 }
 
@@ -470,7 +520,7 @@ fn bufPrintTrunc(buf: []u8, comptime fmt: []const u8, args: anytype) []const u8 
 
 const testing = std.testing;
 
-test "parse help status list show resolve reopen export" {
+test "parse help status list show resolve reopen export install-skill" {
     try testing.expectEqual(Command.help, try parse(&.{"help"}));
     try testing.expectEqual(Command.help, try parse(&.{"--help"}));
     try testing.expectEqual(Command.help, try parse(&.{"-h"}));
@@ -514,6 +564,14 @@ test "parse help status list show resolve reopen export" {
     try testing.expectEqual(ExportFormat.md, exp_order.format);
     try testing.expectEqual(ListFilter.resolved, exp_order.filter);
     try testing.expectEqualStrings("/tmp/r.md", exp_order.out_path.?);
+
+    const inst = (try parse(&.{"install-skill"})).install_skill;
+    try testing.expect(!inst.list and !inst.uninstall and inst.agent == null);
+    const inst_list = (try parse(&.{ "install-skill", "--list" })).install_skill;
+    try testing.expect(inst_list.list);
+    const inst_agent = (try parse(&.{ "install-skill", "--agent", "grok", "--uninstall" })).install_skill;
+    try testing.expect(inst_agent.uninstall);
+    try testing.expectEqualStrings("grok", inst_agent.agent.?);
 }
 
 test "parse usage errors" {
@@ -532,6 +590,9 @@ test "parse usage errors" {
     try testing.expectError(error.Usage, parse(&.{ "export", "-o" }));
     try testing.expectError(error.Usage, parse(&.{ "export", "-o", "a", "-o", "b" }));
     try testing.expectError(error.Usage, parse(&.{ "export", "--bogus" }));
+    try testing.expectError(error.Usage, parse(&.{ "install-skill", "--list", "--uninstall" }));
+    try testing.expectError(error.Usage, parse(&.{ "install-skill", "--agent" }));
+    try testing.expectError(error.Usage, parse(&.{ "install-skill", "--bogus" }));
 }
 
 test "formatMarkdown and formatJson filter and envelope" {

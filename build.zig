@@ -81,13 +81,24 @@ pub fn build(b: *std.Build) void {
         },
     });
 
-    // Headless CLI: status / list / show (MVP-2.2+).
+    // Bundled agent skill install (MVP-2.5).
+    const install_skill_mod = b.addModule("install_skill", .{
+        .root_source_file = b.path("src/install_skill.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{
+            .{ .name = "isolated_tmp", .module = isolated_tmp_mod },
+        },
+    });
+
+    // Headless CLI: status / list / show / export / install-skill (MVP-2.2+).
     const cli_mod = b.addModule("cli", .{
         .root_source_file = b.path("src/cli.zig"),
         .target = target,
         .optimize = optimize,
         .imports = &.{
             .{ .name = "store", .module = store_mod },
+            .{ .name = "install_skill", .module = install_skill_mod },
         },
     });
 
@@ -109,6 +120,12 @@ pub fn build(b: *std.Build) void {
         }),
     });
     b.installArtifact(rv);
+    // Bundled skill for `rv install-skill` (prefix/share/rv/skills/rv).
+    b.installDirectory(.{
+        .source_dir = b.path("skills/rv"),
+        .install_dir = .prefix,
+        .install_subdir = "share/rv/skills/rv",
+    });
 
     const run_rv = b.addRunArtifact(rv);
     run_rv.step.dependOn(b.getInstallStep());
@@ -154,11 +171,17 @@ pub fn build(b: *std.Build) void {
     });
     const run_cli_tests = b.addRunArtifact(cli_tests);
 
-    const test_step = b.step("test", "Run unit tests (TUI + diff + git + view + store + cli)");
+    const install_skill_tests = b.addTest(.{
+        .root_module = install_skill_mod,
+    });
+    const run_install_skill_tests = b.addRunArtifact(install_skill_tests);
+
+    const test_step = b.step("test", "Run unit tests (TUI + diff + git + view + store + cli + install_skill)");
     test_step.dependOn(&run_tui_tests.step);
     test_step.dependOn(&run_diff_tests.step);
     test_step.dependOn(&run_git_tests.step);
     test_step.dependOn(&run_view_tests.step);
     test_step.dependOn(&run_store_tests.step);
     test_step.dependOn(&run_cli_tests.step);
+    test_step.dependOn(&run_install_skill_tests.step);
 }
