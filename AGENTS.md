@@ -38,12 +38,20 @@ For command details, load the `goal` skill / playbook when available.
 
 ## Change size (review batches)
 
-- **Never make more than about 250 lines of change at a time** (insertions + deletions across the batch). That is roughly the most that can be reviewed in one pass.
-- **Even if the task needs more work, stop at ~250 lines.** Do not continue implementing the next slice until the user has reviewed and approved the current batch.
-- **Ask for review before continuing.** When you hit the limit (or would exceed it with the next edit), stop, summarize what changed, and wait for explicit approval. Only then proceed with the next part of the change.
-- Count net diff size for the unapproved batch (not the whole goal). Prefer smaller, coherent batches over packing to the limit.
-- **Each batch must be a complete, buildable change.** Stopping mid-edit is not allowed if it leaves the tree broken. The task must be broken into slices that each leave the project building and tests runnable (for example: introduce types/stubs/boilerplate first, wire call sites, then fill in behavior in later approved batches).
-- **Exceptions** (these may exceed ~250 lines in one go when splitting would be worse or impossible):
+**Purpose:** keep each unapproved diff small so the user can review it easily. Fewer changes per batch means easier review. Prefer small, coherent batches. If you reach about 250 lines changed, treat that as a signal to consider reworking your approach into smaller slices — not as a target to aim for.
+
+**Plan first, then implement one batch.** Break the work down *before* coding. Do not implement everything and then try to split or undo it into “batches.” A little planning up front is required.
+
+**How to keep batches small** (examples, not a fixed recipe):
+- **Tests as their own batch** — implement behavior first and add tests later, or write tests first as a separate batch when that fits (e.g. bug/test-first goals). Either way, tests need not ship in the same review as the implementation.
+- **Stub, then implement** — one batch introduces types, signatures, stubs/boilerplate and wires call sites so the project still builds; a later batch fills in real behavior; tests can be a third batch.
+- Prefer the smallest slice that is still a complete, reviewable unit over packing toward any line limit.
+
+**Rules:**
+- **Stop and ask for review** after each batch. Do not start the next slice until the user has reviewed and approved the current one.
+- **Each batch must be a complete, buildable change.** Stopping mid-edit is not allowed if it leaves the project broken. Every batch should leave the project building and tests runnable.
+- Count net diff size for the unapproved batch only (not the whole goal). Prefer smaller, coherent batches over packing to a limit.
+- **Exceptions** (a larger single batch is OK when splitting would be worse or impossible):
   - Deleting a whole file (or a few whole files) as one intentional removal
   - Mechanical mass renames / bulk renames that are the same edit repeated
   - Generated or vendored content the agent did not hand-author (still prefer not dumping huge generated blobs without need)
