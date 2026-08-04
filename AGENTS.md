@@ -65,7 +65,7 @@ For command details, load the `goal` skill / playbook when available.
 
 Always-on rules above apply first. Project extras:
 
-1. After `goal status --full`, if the user wants work and there is no active goal, pick from the recommended order in [`GOAL_ORDER.md`](GOAL_ORDER.md) (or `goal list`) and `goal start <id>` only when they ask to start work (or name a goal).
+1. After `goal status --full`, if the user wants work and there is no active goal, pick from **`goal list` Next order** (top first). That queue is kept aligned with [`GOAL_ORDER.md`](GOAL_ORDER.md). Start with `goal start <id>` only when they ask to start work (or name a goal).
 2. Read the full brief with `goal show <id>` (or rely on `status --full` once active) before coding.
 
 ## Using `goal`
@@ -77,7 +77,7 @@ Always-on rules above apply first. Project extras:
 | Command | When to use |
 |---------|-------------|
 | `goal status --full` | Session start; see active goal + body |
-| `goal list` / `goal list --all` | See Next / Later / everything |
+| `goal list` / `goal list --all` | See Next / Later / everything (see **List order** below) |
 | `goal show <id>` | Full text of a goal (brief for implementers) |
 | `goal start <id>` | Begin a session on that goal (makes it active) |
 | `goal note "…"` | Append progress, decisions, or blockers to the **active** goal |
@@ -86,11 +86,28 @@ Always-on rules above apply first. Project extras:
 | `goal complete` | Finish the active goal |
 | `goal new --file path.md` | Create a goal from a markdown file (first line = title) |
 | `goal new "title"` | Create a goal with only a title |
-| `goal next <id>` | Promote Later → Next |
+| `goal next <id>` | Promote Later → Next, **or** move an already-Next goal to the **top** of Next |
 | `goal later <id>` | Demote Next → Later |
 | `goal edit <id>` | Edit goal body in `$EDITOR` |
 
 Use `goal help <command>` for full flags (`-q` / `--quiet` prints only an id, useful in scripts).
+
+### List order (live queue)
+
+`goal list` order is the operational queue — use it instead of inventing a second ranking.
+
+| List | Sort key | Meaning |
+|------|----------|---------|
+| **Next** | Most recently `goal next`’d first | Top of Next = do next. Calling `goal next <id>` on an already-Next goal re-pins it to the top. |
+| **Later** | Most recently **created** first | Creation-time backlog order only; not a priority queue. Demote with `goal later`; do not expect `next`/`later` to re-rank Later. |
+
+**Keeping Next aligned with [`GOAL_ORDER.md`](GOAL_ORDER.md):**
+
+1. Put the ordered critical path in **Next**; leave park / anytime hygiene in **Later**.
+2. To set Next order, call `goal next <id>` from **last → first** (bottom of desired order first, then work up). The last `next` becomes the top of the list.
+3. To bump one goal without reshuffling the rest of the plan, `goal next <id>` that id alone (it jumps to top).
+4. When adding a new goal to the middle of the plan: `goal new` (Later) → `goal next` it, then re-`next` everything that should stay above it (or re-run last→first for the whole Next stack).
+5. [`GOAL_ORDER.md`](GOAL_ORDER.md) remains the written rationale and done history; **Next list order** is what agents follow day to day. If they drift, re-sync with `goal next` as above.
 
 ### Workflow for agents
 
@@ -99,13 +116,13 @@ Use `goal help <command>` for full flags (`-q` / `--quiet` prints only an id, us
 3. **Stay in scope.** Do not implement a different goal “while you are here” unless the user asks. Out-of-scope discoveries → `goal note` or a new goal via `goal new`.
 4. **Record decisions** with `goal note` (API choices, deferred follow-ups, test harness notes).
 5. **Finish cleanly:** leave the tree buildable; run the goal's verify steps; use `goal note` for leftover work. Run `goal complete` / `goal stop` only when the user asks.
-6. **Order of work:** follow [`GOAL_ORDER.md`](GOAL_ORDER.md) unless the user overrides. Foundation bugs before product MVP slices that depend on them.
+6. **Order of work:** follow **`goal list` Next** (top first), which should match [`GOAL_ORDER.md`](GOAL_ORDER.md). Prefer re-ordering with `goal next` over ignoring the live list.
 
 ### Placement defaults
 
-- `goal new` adds goals to **Later** by default.
-- Promote with `goal next <id>` when something should enter the upcoming queue.
-- Demote with `goal later <id>` when it should not compete with current Next work.
+- `goal new` adds goals to **Later** by default (newest Later first in `goal list`).
+- Promote with `goal next <id>` when something should enter (or jump to the top of) the upcoming queue.
+- Demote with `goal later <id>` when it should not compete with current Next work (park / filler).
 
 ### Bug goals (test-first)
 
