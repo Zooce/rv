@@ -69,11 +69,32 @@ fn runTui(alloc: std.mem.Allocator, io: std.Io) !u8 {
     };
     defer review.deinit();
 
-    var term = try tui.Tty.open();
+    // TTY/screen setup after load: map failures to short messages (same as load
+    // errors). `Tty.open` restores on partial failure; `defer deinit` covers
+    // success-then-later-setup-fail so raw/alt-screen never sticks.
+    var term = tui.Tty.open() catch |err| {
+        const msg: []const u8 = switch (err) {
+            error.NotATty => "no controlling terminal (need an interactive TTY)",
+            error.AccessDenied => "cannot open terminal: access denied",
+            error.ProcessFdQuotaExceeded, error.SystemFdQuotaExceeded => "cannot open terminal: too many open files",
+            error.SystemResources => "cannot open terminal: system resources exhausted",
+            error.BrokenPipe, error.InputOutput => "failed to initialize terminal (I/O error)",
+            else => "failed to open terminal",
+        };
+        std.debug.print("rv: {s}\n", .{msg});
+        return 1;
+    };
     defer term.deinit();
 
-    var size = try term.getSize();
-    var scr = try tui.Screen.init(alloc, size);
+    var size = term.getSize() catch {
+        std.debug.print("rv: failed to read terminal size\n", .{});
+        return 1;
+    };
+    var scr = tui.Screen.init(alloc, size) catch {
+        // `Screen.init` only allocates; failure is OOM.
+        std.debug.print("rv: out of memory\n", .{});
+        return 1;
+    };
     defer scr.deinit();
 
     var cursor: usize = 0;
