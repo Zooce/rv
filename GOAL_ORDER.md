@@ -23,6 +23,7 @@ See also: [`AGENTS.md`](AGENTS.md) (how to use `goal`).
 | **29** | Enrich display rows (path / line nos / anchors) — shipped with MVP-1 |
 | **38–42** | MVP-2.1–2.5 (store resolve, CLI, export, install-skill) |
 | **4** | MVP-2 parent (agent handoff CLI) — verified closed |
+| **28** | TUI setup failures: clear message when Tty/Screen open fails after load |
 
 MVP-2 design locks (history): `list` open-only by default; `reopen` in CLI; export stdout/`-o` only (no auto-write); JSON export envelope; skill canonical `~/.agents/skills/rv` + agent symlinks; no project-local skill in MVP-2.
 
@@ -34,12 +35,11 @@ Cheap, independent, high clarity for daily use. Start here after MVP-2.
 
 | Order | ID | Title |
 |------:|----|-------|
-| 1 | **28** | TUI setup failures: clear message when Tty/Screen open fails after load |
-| 2 | **35** | Diff line styling: light/dark green-red backgrounds, drop +/- markers |
-| 3 | **37** | Stronger file and hunk header styling |
-| 4 | **36** | Sticky file and hunk headers in the review viewport |
+| 1 | **35** | Diff line styling: light/dark green-red backgrounds, drop +/- markers |
+| 2 | **37** | Stronger file and hunk header styling |
+| 3 | **36** | Sticky file and hunk headers in the review viewport |
 
-**Why this sequence:** #28 is a tiny post-load error path. #35 then #37 share the paint style table; #36 pins headers using those styles.
+**Why this sequence:** #35 then #37 share the paint style table; #36 pins headers using those styles. (#28 TUI setup failures is done.)
 
 ---
 
@@ -47,9 +47,10 @@ Cheap, independent, high clarity for daily use. Start here after MVP-2.
 
 | Order | ID | Title |
 |------:|----|-------|
+| 4 | **46** | Include untracked files in the smart-default diff |
 | 5 | **43** | Non-git diff input (file / stdin / patch path) |
 
-**Why here:** after handoff CLI so agents can review a saved patch and still `list` / `export` / `resolve`. Same TUI + `.rv/` board; git smart-default remains bare `rv`. Can pull earlier if offline patch review is blocking.
+**Why here:** #46 completes live worktree review (new files without a forced `git add`); #43 is offline/saved patches. Same TUI + `.rv/` board; bare `rv` stays git smart-default. Pull either earlier if blocked on new-file or patch review.
 
 ---
 
@@ -106,9 +107,10 @@ Not on the critical path. Do when touching related files or as filler.
 
 ```text
 #4 MVP-2 (done): #38–#42 slices + parent closed
+#28 TUI setup failures (done)
 
-  → #28 (tiny error UX)
   → #35 → #37 → #36   (review readability pack)
+  → #46 untracked in smart-default
   → #43 non-git diff input
   → #34 horizontal scroll
   → #5  MVP-3
@@ -117,4 +119,4 @@ Not on the critical path. Do when touching related files or as filler.
   → #10–17, #11, #23, #24, #30   (filler)
 ```
 
-Immediate Next (top of `goal list`): **#28**, then **#35** → **#37** → **#36** → … Start with `goal start 28`.
+Immediate Next (top of `goal list`): **#35** → **#37** → **#36** → **#46** → … Start with `goal start 35`.
