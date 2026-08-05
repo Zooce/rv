@@ -27,21 +27,20 @@ See also: [`AGENTS.md`](AGENTS.md) (how to use `goal`).
 | **35** | Diff line styling: light/dark green-red backgrounds, drop +/- markers |
 | **37** | Stronger file and hunk header styling |
 | **36** | Sticky file headers in the review viewport (file-only pin; hunks scroll) |
+| **48** | Jump cursor to next/previous hunk header row |
+| **49** | Jump cursor to next/previous file header row |
 
 MVP-2 design locks (history): `list` open-only by default; `reopen` in CLI; export stdout/`-o` only (no auto-write); JSON export envelope; skill canonical `~/.agents/skills/rv` + agent symlinks; no project-local skill in MVP-2.
 
 ---
 
-## 1. Header navigation (Next)
+## 1. Change-line navigation (Next)
 
-Land the cursor on hunk/file **header rows** (for later stage/unstage/discard). After sticky file pin (#36).
+Walk only **add/delete** lines (`J`/`K`), skipping context and headers. Complements header jumps (#48/#49) and one-row `j`/`k`.
 
 | Order | ID | Title |
 |------:|----|-------|
-| 1 | **48** | Jump cursor to next/previous hunk header row |
-| 2 | **49** | Jump cursor to next/previous file header row |
-
-**Why this sequence:** Hunk jump first (denser, replaces/adjusts `[`/`]` feel); then file jump. Both keep headers cursor-reachable.
+| 1 | **50** | Jump `J`/`K` to next/previous changed line |
 
 ---
 
@@ -49,8 +48,8 @@ Land the cursor on hunk/file **header rows** (for later stage/unstage/discard). 
 
 | Order | ID | Title |
 |------:|----|-------|
-| 3 | **46** | Include untracked files in the smart-default diff |
-| 4 | **43** | Non-git diff input (file / stdin / patch path) |
+| 2 | **46** | Include untracked files in the smart-default diff |
+| 3 | **43** | Non-git diff input (file / stdin / patch path) |
 
 **Why here:** #46 completes live worktree review (new files without a forced `git add`); #43 is offline/saved patches. Same TUI + `.rv/` board; bare `rv` stays git smart-default. Pull either earlier if blocked on new-file or patch review.
 
@@ -60,8 +59,8 @@ Land the cursor on hunk/file **header rows** (for later stage/unstage/discard). 
 
 | Order | ID | Title |
 |------:|----|-------|
-| 5 | **34** | Horizontal scroll / long-line visibility |
-| 6 | **5** | MVP-3: Navigation depth (search, files, ranges) |
+| 4 | **34** | Horizontal scroll / long-line visibility |
+| 5 | **5** | MVP-3: Navigation depth (search, files, ranges) |
 
 **Why:** #34 before #5 so column cursor / range selection can share horizontal viewport state. MVP-3 prefers MVP-2 so export grows range fields once.
 
@@ -71,10 +70,10 @@ Land the cursor on hunk/file **header rows** (for later stage/unstage/discard). 
 
 | Order | ID | Title |
 |------:|----|-------|
-| 7 | **33** | [perf] Reproducible bench/profile harness |
-| 8 | **32** | [perf] Event loop: no-op keys must not repaint |
-| 9 | **31** | Performance program (parent) |
-| 10 | **22** | Large diffs: stream / bound / abbreviate |
+| 6 | **33** | [perf] Reproducible bench/profile harness |
+| 7 | **32** | [perf] Event loop: no-op keys must not repaint |
+| 8 | **31** | Performance program (parent) |
+| 9 | **22** | Large diffs: stream / bound / abbreviate |
 
 **Why:** harness (#33) before concrete wins (#32) and the program (#31). Large-diff strategy (#22) after profiles or real pain.
 
@@ -84,8 +83,8 @@ Land the cursor on hunk/file **header rows** (for later stage/unstage/discard). 
 
 | Order | ID | Title |
 |------:|----|-------|
-| 11 | **26** | Design: changesets (comment-scoped reviews → one commit) |
-| 12 | **25** | Design: stage / unstage / discard hunks and files |
+| 10 | **26** | Design: changesets (comment-scoped reviews → one commit) |
+| 11 | **25** | Design: stage / unstage / discard hunks and files |
 
 Design after MVP-2 is real. #26 is the multi-round agent loop; #25 is useful but secondary to comment → resolve.
 
@@ -112,7 +111,8 @@ Not on the critical path. Do when touching related files or as filler.
 #28 TUI setup failures (done)
 #35 → #37 → #36   (review readability pack; sticky = file-only)
 
-  → #48 hunk-header jump → #49 file-header jump
+  → #48 hunk-header jump → #49 file-header jump (done)
+  → #50 J/K next/previous changed line
   → #46 untracked in smart-default
   → #43 non-git diff input
   → #34 horizontal scroll
@@ -122,4 +122,4 @@ Not on the critical path. Do when touching related files or as filler.
   → #10–17, #11, #23, #24, #30   (filler)
 ```
 
-Immediate Next (top of `goal list`): **#48** → **#49** → **#46** → … Start with `goal start 48`.
+Immediate Next (top of `goal list`): **#50** → **#46** → **#43** → … Start with `goal start 50`.
