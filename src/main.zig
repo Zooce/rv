@@ -8,8 +8,9 @@
 //! `reopen`, `export`, `install-skill`, help) — no git load and no raw TTY modes.
 //!
 //! Comment UX (v1): single-line footer prompt (not an inline box). Esc cancels;
-//! Enter saves. Markers: `*` gutter on lines with open comments. Reload on next
-//! `rv` via `.rv/reviews/current.json`.
+//! Enter saves. Open-comment marker: `*` in the gutter. Add/delete lines use
+//! green/red backgrounds (no `+/-`). Reload on next `rv` via
+//! `.rv/reviews/current.json`.
 
 const std = @import("std");
 const git = @import("git");
@@ -214,6 +215,10 @@ fn paint(
     commenting: bool,
     draft: []const u8,
 ) void {
+    // Diff line palette (truecolor). Add/delete meaning is background, not `+/-`.
+    // Unfocused: light green/red fill. Cursor on add/delete/context: lighter
+    // lift of that row's fill (keeps kind). Cursor on meta/headers: neutral
+    // reverse gray. No color → bg may not show; markers are not restored.
     const bg = tui.Color{ .rgb = .{ .r = 0x12, .g = 0x12, .b = 0x14 } };
     const fg = tui.Color{ .rgb = .{ .r = 0xd0, .g = 0xd0, .b = 0xd0 } };
     const body = tui.Style{ .fg = fg, .bg = bg };
@@ -237,12 +242,28 @@ fn paint(
         .dim = true,
     };
     const add_style = tui.Style{
-        .fg = .{ .rgb = .{ .r = 0x6a, .g = 0xc4, .b = 0x6a } },
-        .bg = bg,
+        .fg = .{ .rgb = .{ .r = 0xb8, .g = 0xe0, .b = 0xb8 } },
+        .bg = .{ .rgb = .{ .r = 0x1a, .g = 0x2e, .b = 0x1f } },
     };
     const del_style = tui.Style{
-        .fg = .{ .rgb = .{ .r = 0xe0, .g = 0x6c, .b = 0x75 } },
-        .bg = bg,
+        .fg = .{ .rgb = .{ .r = 0xe8, .g = 0xc0, .b = 0xc4 } },
+        .bg = .{ .rgb = .{ .r = 0x3a, .g = 0x1c, .b = 0x20 } },
+    };
+    const add_cur_style = tui.Style{
+        .fg = .{ .rgb = .{ .r = 0xe8, .g = 0xff, .b = 0xe8 } },
+        .bg = .{ .rgb = .{ .r = 0x24, .g = 0x52, .b = 0x30 } },
+        .bold = true,
+    };
+    const del_cur_style = tui.Style{
+        .fg = .{ .rgb = .{ .r = 0xff, .g = 0xe8, .b = 0xea } },
+        .bg = .{ .rgb = .{ .r = 0x6b, .g = 0x2a, .b = 0x32 } },
+        .bold = true,
+    };
+    // Context cursor: lighter lift of body bg (same idea as add/delete cursor).
+    const ctx_cur_style = tui.Style{
+        .fg = fg,
+        .bg = .{ .rgb = .{ .r = 0x2a, .g = 0x2a, .b = 0x30 } },
+        .bold = true,
     };
     const meta_style = tui.Style{
         .fg = .{ .rgb = .{ .r = 0x80, .g = 0x80, .b = 0x80 } },
@@ -285,8 +306,20 @@ fn paint(
         const is_cur = i == cur;
         const marked = rowMarked(rows[i], review);
         const text = formatRow(&line_buf, rows[i], marked);
-        const base = baseStyle(rows[i], body, file_style, hunk_style, add_style, del_style, meta_style);
-        const st = if (is_cur) cur_style else base;
+        const st = rowStyle(
+            rows[i],
+            is_cur,
+            body,
+            file_style,
+            hunk_style,
+            add_style,
+            del_style,
+            add_cur_style,
+            del_cur_style,
+            ctx_cur_style,
+            meta_style,
+            cur_style,
+        );
         fillRow(scr, screen_y, st);
         scr.putStr(0, screen_y, text, st);
         screen_y += 1;
@@ -336,15 +369,33 @@ fn formatFooter(buf: []u8, st: view.Status, open_n: usize) []const u8 {
     });
 }
 
-fn baseStyle(
+/// Style for one content row. Cursor on add/delete/context keeps kind via a
+/// lighter fill; cursor on meta/headers uses neutral reverse.
+fn rowStyle(
     row: view.Row,
+    is_cur: bool,
     body: tui.Style,
     file_style: tui.Style,
     hunk_style: tui.Style,
     add_style: tui.Style,
     del_style: tui.Style,
+    add_cur_style: tui.Style,
+    del_cur_style: tui.Style,
+    ctx_cur_style: tui.Style,
     meta_style: tui.Style,
+    cur_style: tui.Style,
 ) tui.Style {
+    if (is_cur) {
+        return switch (row) {
+            .line => |ln| switch (ln.kind) {
+                .add => add_cur_style,
+                .delete => del_cur_style,
+                .context => ctx_cur_style,
+                .meta => cur_style,
+            },
+            .file_header, .hunk_header => cur_style,
+        };
+    }
     return switch (row) {
         .file_header => file_style,
         .hunk_header => hunk_style,
@@ -357,8 +408,8 @@ fn baseStyle(
     };
 }
 
-/// Format one row. Line rows use a 2-char gutter: `*` when marked, else space,
-/// then ` ` / `+` / `-` / `\`.
+/// Format one row. Line rows: 2-char gutter (`*` if marked else space, then
+/// pad/`\` for meta). Add/delete use background color, not `+/-` markers.
 fn formatRow(buf: []u8, row: view.Row, marked: bool) []const u8 {
     return switch (row) {
         .file_header => |fh| if (fh.is_binary)
@@ -381,10 +432,8 @@ fn formatRow(buf: []u8, row: view.Row, marked: bool) []const u8 {
             if (buf.len < 2) break :blk buf[0..0];
             buf[0] = if (marked) '*' else ' ';
             buf[1] = switch (ln.kind) {
-                .context => ' ',
-                .add => '+',
-                .delete => '-',
                 .meta => '\\',
+                .context, .add, .delete => ' ',
             };
             const n = @min(ln.text.len, buf.len - 2);
             @memcpy(buf[2..][0..n], ln.text[0..n]);
