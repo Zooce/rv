@@ -313,6 +313,69 @@ pub fn prevFileHeader(rows: []const Row, cursor: usize) usize {
     return cur;
 }
 
+/// True when `row` is an add or delete body line (not context/meta/headers).
+fn isChangedLine(row: Row) bool {
+    return switch (row) {
+        .line => |ln| switch (ln.kind) {
+            .add, .delete => true,
+            .context, .meta => false,
+        },
+        .file_header, .hunk_header => false,
+    };
+}
+
+/// First row of the contiguous add/delete run containing `idx`, or `null`
+/// when `rows[idx]` is not a changed line. A group is maximal: broken only by
+/// context, meta, or headers (same-hunk groups with context between count
+/// as separate groups).
+fn changeGroupStart(rows: []const Row, idx: usize) ?usize {
+    if (idx >= rows.len or !isChangedLine(rows[idx])) return null;
+    var i = idx;
+    while (i > 0 and isChangedLine(rows[i - 1])) : (i -= 1) {}
+    return i;
+}
+
+/// Jump to the first line of the next change *group* after `cursor`. A group
+/// is a contiguous run of add/delete rows; consecutive changed lines are one
+/// group (unlike one-row `j`). Skips context, meta, and headers. Unchanged
+/// when no later group exists.
+pub fn nextChange(rows: []const Row, cursor: usize) usize {
+    if (rows.len == 0) return 0;
+    const cur = clampCursor(cursor, rows.len);
+    var i = cur + 1;
+    // Leave the rest of the current group so J ≠ j on multi-line edits.
+    if (isChangedLine(rows[cur])) {
+        while (i < rows.len and isChangedLine(rows[i])) : (i += 1) {}
+    }
+    while (i < rows.len) : (i += 1) {
+        if (isChangedLine(rows[i])) return i;
+    }
+    return cur;
+}
+
+/// Jump to the first line of the previous change group (or the start of the
+/// current group when mid-group). Unchanged when none precedes.
+pub fn prevChange(rows: []const Row, cursor: usize) usize {
+    if (rows.len == 0) return 0;
+    const cur = clampCursor(cursor, rows.len);
+    if (changeGroupStart(rows, cur)) |start| {
+        if (start < cur) return start;
+        // On the first line of this group: step to the previous group.
+        var i = start;
+        while (i > 0) {
+            i -= 1;
+            if (isChangedLine(rows[i])) return changeGroupStart(rows, i).?;
+        }
+        return cur;
+    }
+    var i = cur;
+    while (i > 0) {
+        i -= 1;
+        if (isChangedLine(rows[i])) return changeGroupStart(rows, i).?;
+    }
+    return cur;
+}
+
 /// Anchor for a line comment at `cursor`, or `null` if the row is not a
 /// normal diff body line (file/hunk header or meta).
 pub fn anchorAt(rows: []const Row, cursor: usize) ?Anchor {
@@ -637,6 +700,96 @@ test "nextFileHeader and prevFileHeader land on file rows" {
 
     try testing.expectEqual(0, nextFileHeader(&.{}, 0));
     try testing.expectEqual(0, prevFileHeader(&.{}, 0));
+}
+
+/// Multi-group fixture (groups can share a hunk when context sits between):
+/// 0 file, 1 h0, 2 ctx, 3–5 group0 (del,del,add), 6 ctx, 7–8 group1 (del,add),
+/// 9 ctx, 10 h1, 11–12 group2 (del,add).
+fn changeNavFixture(alloc: Allocator) !struct { d: diff.Diff, rows: []Row } {
+    const fixture =
+        \\diff --git a/f b/f
+        \\--- a/f
+        \\+++ b/f
+        \\@@ -1,6 +1,6 @@
+        \\ keep
+        \\-old1a
+        \\-old1b
+        \\+new1
+        \\ mid
+        \\-old2
+        \\+new2
+        \\ tail
+        \\@@ -20 +20 @@
+        \\-old3
+        \\+new3
+    ;
+    var d = try diff.parse(alloc, fixture);
+    errdefer d.deinit();
+    const rows = try flatten(alloc, &d);
+    return .{ .d = d, .rows = rows };
+}
+
+test "nextChange and prevChange jump change groups not single lines" {
+    var fix = try changeNavFixture(testing.allocator);
+    defer fix.d.deinit();
+    defer testing.allocator.free(fix.rows);
+    const rows = fix.rows;
+    try testing.expectEqual(13, rows.len);
+    try testing.expect(rows[2] == .line and rows[2].line.kind == .context);
+    try testing.expect(rows[3] == .line and rows[3].line.kind == .delete);
+    try testing.expect(rows[4] == .line and rows[4].line.kind == .delete);
+    try testing.expect(rows[5] == .line and rows[5].line.kind == .add);
+    try testing.expect(rows[6] == .line and rows[6].line.kind == .context);
+    try testing.expect(rows[7] == .line and rows[7].line.kind == .delete);
+    try testing.expect(rows[8] == .line and rows[8].line.kind == .add);
+    try testing.expect(rows[9] == .line and rows[9].line.kind == .context);
+    try testing.expect(rows[10] == .hunk_header);
+    try testing.expect(rows[11] == .line and rows[11].line.kind == .delete);
+    try testing.expect(rows[12] == .line and rows[12].line.kind == .add);
+
+    // From file/hunk/context → first group start.
+    try testing.expectEqual(3, nextChange(rows, 0));
+    try testing.expectEqual(3, nextChange(rows, 1));
+    try testing.expectEqual(3, nextChange(rows, 2));
+    // Mid multi-line group: J skips the whole run (not j-like line steps).
+    try testing.expectEqual(7, nextChange(rows, 3));
+    try testing.expectEqual(7, nextChange(rows, 4));
+    try testing.expectEqual(7, nextChange(rows, 5));
+    // Context between same-hunk groups → next group.
+    try testing.expectEqual(7, nextChange(rows, 6));
+    // Across hunk header → next group.
+    try testing.expectEqual(11, nextChange(rows, 7));
+    try testing.expectEqual(11, nextChange(rows, 8));
+    try testing.expectEqual(11, nextChange(rows, 9));
+    try testing.expectEqual(11, nextChange(rows, 10));
+    // No later group: stay (including mid last group).
+    try testing.expectEqual(11, nextChange(rows, 11));
+    try testing.expectEqual(12, nextChange(rows, 12));
+
+    // Mid group → current group start; on start → previous group start.
+    try testing.expectEqual(11, prevChange(rows, 12));
+    try testing.expectEqual(7, prevChange(rows, 11));
+    try testing.expectEqual(7, prevChange(rows, 10));
+    try testing.expectEqual(7, prevChange(rows, 9));
+    try testing.expectEqual(7, prevChange(rows, 8));
+    try testing.expectEqual(3, prevChange(rows, 7));
+    try testing.expectEqual(3, prevChange(rows, 6));
+    try testing.expectEqual(3, prevChange(rows, 5));
+    try testing.expectEqual(3, prevChange(rows, 4));
+    // No earlier group: stay.
+    try testing.expectEqual(3, prevChange(rows, 3));
+    try testing.expectEqual(2, prevChange(rows, 2));
+    try testing.expectEqual(1, prevChange(rows, 1));
+    try testing.expectEqual(0, prevChange(rows, 0));
+
+    // Coexists with header jumps (different landings from mid group0).
+    try testing.expectEqual(7, nextChange(rows, 4)); // J → next group
+    try testing.expectEqual(10, nextHunkHeader(rows, 4)); // ] → next @@
+    try testing.expectEqual(3, prevChange(rows, 4)); // K → group start
+    try testing.expectEqual(1, prevHunkHeader(rows, 4)); // [ → @@
+
+    try testing.expectEqual(0, nextChange(&.{}, 0));
+    try testing.expectEqual(0, prevChange(&.{}, 0));
 }
 
 test "stickyHeaders pins last file above scroll only" {

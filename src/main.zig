@@ -161,6 +161,10 @@ fn runTui(alloc: std.mem.Allocator, io: std.Io) !u8 {
                             if (cursor + 1 < rows.len) cursor += 1;
                         } else if (c == 'k') {
                             if (cursor > 0) cursor -= 1;
+                        } else if (c == 'J') {
+                            cursor = view.nextChange(rows, cursor);
+                        } else if (c == 'K') {
+                            cursor = view.prevChange(rows, cursor);
                         } else if (c == ']') {
                             cursor = view.nextHunkHeader(rows, cursor);
                         } else if (c == '[') {
@@ -304,7 +308,7 @@ fn paint(
         const help = if (commenting)
             "rv  comment  Enter save  Esc cancel"
         else
-            "rv  j/k  [/] hunk  {/} file  i comment  q quit";
+            "rv  j/k line  J/K change  [/] hunk  {/} file  i comment  q quit";
         scr.putStr(1, 0, help, title_style);
     }
 
