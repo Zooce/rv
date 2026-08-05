@@ -287,6 +287,32 @@ pub fn prevHunkHeader(rows: []const Row, cursor: usize) usize {
     return cur;
 }
 
+/// Jump to the next `.file_header` row after `cursor`. Lands on the file
+/// header itself. Unchanged when none follows.
+pub fn nextFileHeader(rows: []const Row, cursor: usize) usize {
+    if (rows.len == 0) return 0;
+    const cur = clampCursor(cursor, rows.len);
+    var i = cur + 1;
+    while (i < rows.len) : (i += 1) {
+        if (rows[i] == .file_header) return i;
+    }
+    return cur;
+}
+
+/// Jump to the previous `.file_header` row before `cursor`. Lands on the
+/// file header itself. From a file body this is the current file's header.
+/// Unchanged when none precedes.
+pub fn prevFileHeader(rows: []const Row, cursor: usize) usize {
+    if (rows.len == 0) return 0;
+    const cur = clampCursor(cursor, rows.len);
+    var i = cur;
+    while (i > 0) {
+        i -= 1;
+        if (rows[i] == .file_header) return i;
+    }
+    return cur;
+}
+
 /// Anchor for a line comment at `cursor`, or `null` if the row is not a
 /// normal diff body line (file/hunk header or meta).
 pub fn anchorAt(rows: []const Row, cursor: usize) ?Anchor {
@@ -574,6 +600,43 @@ test "currentFileStart and currentHunkInFile" {
     // On next file header: no hunk in this file yet.
     try testing.expect(currentHunkInFile(rows, 7) == null);
     try testing.expectEqual(8, currentHunkInFile(rows, 9).?);
+}
+
+// twoFileFixture: 0 fileA … 6, 7 fileB, 8 h2, 9 del, 10 add.
+test "nextFileHeader and prevFileHeader land on file rows" {
+    var fix = try twoFileFixture(testing.allocator);
+    defer fix.d.deinit();
+    defer testing.allocator.free(fix.rows);
+    const rows = fix.rows;
+    try testing.expectEqual(11, rows.len);
+    try testing.expect(rows[0] == .file_header);
+    try testing.expect(rows[7] == .file_header);
+
+    // Next file after A body / A header.
+    try testing.expectEqual(7, nextFileHeader(rows, 0));
+    try testing.expectEqual(7, nextFileHeader(rows, 3));
+    try testing.expectEqual(7, nextFileHeader(rows, 6));
+    // No later file: stay.
+    try testing.expectEqual(7, nextFileHeader(rows, 7));
+    try testing.expectEqual(9, nextFileHeader(rows, 9));
+    try testing.expectEqual(10, nextFileHeader(rows, 10));
+
+    // From B body → B header; from B header → A header.
+    try testing.expectEqual(7, prevFileHeader(rows, 9));
+    try testing.expectEqual(7, prevFileHeader(rows, 10));
+    try testing.expectEqual(0, prevFileHeader(rows, 7));
+    try testing.expectEqual(0, prevFileHeader(rows, 3));
+    // No earlier file: stay.
+    try testing.expectEqual(0, prevFileHeader(rows, 0));
+
+    // Coexists with hunk-header jump (different landings from same cursor).
+    try testing.expectEqual(4, nextHunkHeader(rows, 3));
+    try testing.expectEqual(7, nextFileHeader(rows, 3));
+    try testing.expectEqual(1, prevHunkHeader(rows, 3));
+    try testing.expectEqual(0, prevFileHeader(rows, 3));
+
+    try testing.expectEqual(0, nextFileHeader(&.{}, 0));
+    try testing.expectEqual(0, prevFileHeader(&.{}, 0));
 }
 
 test "stickyHeaders pins last file above scroll only" {
