@@ -1,7 +1,7 @@
 //! `rv` entry point — CLI dispatch + full-screen diff review (MVP-1 / MVP-2.2).
 //!
 //! With no args: load smart-default git diff → flatten rows → load `.rv`
-//! comments → TUI (`j`/`k`, `[`/`]`, `i`/`c`/`a`/`Enter` comment, `q` quit).
+//! comments → TUI (`j`/`k`, `[`/`]` hunk header, `i`/`c`/`a`/`Enter` comment, `q` quit).
 //! Empty/error paths never enter raw / alt-screen mode.
 //!
 //! With a subcommand: headless CLI (`status`, `list`, `show`, `resolve`,
@@ -162,9 +162,9 @@ fn runTui(alloc: std.mem.Allocator, io: std.Io) !u8 {
                         } else if (c == 'k') {
                             if (cursor > 0) cursor -= 1;
                         } else if (c == ']') {
-                            cursor = view.nextHunk(rows, cursor);
+                            cursor = view.nextHunkHeader(rows, cursor);
                         } else if (c == '[') {
-                            cursor = view.prevHunk(rows, cursor);
+                            cursor = view.prevHunkHeader(rows, cursor);
                         } else if (c == 'i' or c == 'c' or c == 'a') {
                             if (view.anchorAt(rows, cursor)) |a| {
                                 draft_anchor = a;
@@ -300,7 +300,7 @@ fn paint(
         const help = if (commenting)
             "rv  comment  Enter save  Esc cancel"
         else
-            "rv  j/k move  [/] hunk  i comment  q quit";
+            "rv  j/k move  [/] hunk hdr  i comment  q quit";
         scr.putStr(1, 0, help, title_style);
     }
 

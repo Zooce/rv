@@ -235,7 +235,8 @@ pub fn landOnHunk(rows: []const Row, hunk_start: usize) usize {
 }
 
 /// Jump to the next hunk after the one containing `cursor` (or the first hunk
-/// if none). Unchanged when there is no later hunk.
+/// if none). Lands on the first add/delete line. Unchanged when there is no
+/// later hunk.
 pub fn nextHunk(rows: []const Row, cursor: usize) usize {
     if (rows.len == 0) return 0;
     const search_from: usize = if (currentHunkStart(rows, cursor)) |s| s + 1 else 0;
@@ -246,8 +247,9 @@ pub fn nextHunk(rows: []const Row, cursor: usize) usize {
     return clampCursor(cursor, rows.len);
 }
 
-/// Jump to the previous hunk before the one containing `cursor`. Unchanged
-/// when already on the first hunk (or before any hunk).
+/// Jump to the previous hunk before the one containing `cursor`. Lands on the
+/// first add/delete line. Unchanged when already on the first hunk (or before
+/// any hunk).
 pub fn prevHunk(rows: []const Row, cursor: usize) usize {
     if (rows.len == 0) return 0;
     const cur = currentHunkStart(rows, cursor) orelse return clampCursor(cursor, rows.len);
@@ -257,6 +259,32 @@ pub fn prevHunk(rows: []const Row, cursor: usize) usize {
         if (rows[i] == .hunk_header) return landOnHunk(rows, i);
     }
     return clampCursor(cursor, rows.len);
+}
+
+/// Jump to the next `.hunk_header` row after `cursor`. Lands on the header
+/// itself (not the first add/delete). Unchanged when none follows.
+pub fn nextHunkHeader(rows: []const Row, cursor: usize) usize {
+    if (rows.len == 0) return 0;
+    const cur = clampCursor(cursor, rows.len);
+    var i = cur + 1;
+    while (i < rows.len) : (i += 1) {
+        if (rows[i] == .hunk_header) return i;
+    }
+    return cur;
+}
+
+/// Jump to the previous `.hunk_header` row before `cursor`. Lands on the
+/// header itself. From a hunk body this is the current hunk's `@@` row.
+/// Unchanged when none precedes.
+pub fn prevHunkHeader(rows: []const Row, cursor: usize) usize {
+    if (rows.len == 0) return 0;
+    const cur = clampCursor(cursor, rows.len);
+    var i = cur;
+    while (i > 0) {
+        i -= 1;
+        if (rows[i] == .hunk_header) return i;
+    }
+    return cur;
 }
 
 /// Anchor for a line comment at `cursor`, or `null` if the row is not a
@@ -437,6 +465,40 @@ test "nextHunk and prevHunk land on first changed line" {
     // Already on first hunk: stay.
     try testing.expectEqual(2, prevHunk(rows, 2));
     try testing.expectEqual(0, prevHunk(rows, 0));
+}
+
+// twoHunkFixture layout: 0 file, 1 h0, 2 del, 3 add, 4 h1, 5 del, 6 add.
+test "nextHunkHeader and prevHunkHeader land on @@ rows" {
+    var fix = try twoHunkFixture(testing.allocator);
+    defer fix.d.deinit();
+    defer testing.allocator.free(fix.rows);
+    const rows = fix.rows;
+    try testing.expectEqual(7, rows.len);
+    try testing.expect(rows[1] == .hunk_header);
+    try testing.expect(rows[4] == .hunk_header);
+
+    // From file header / first body → next is first then second header.
+    try testing.expectEqual(1, nextHunkHeader(rows, 0));
+    try testing.expectEqual(4, nextHunkHeader(rows, 1));
+    try testing.expectEqual(4, nextHunkHeader(rows, 2));
+    try testing.expectEqual(4, nextHunkHeader(rows, 3));
+    // No later header: stay.
+    try testing.expectEqual(4, nextHunkHeader(rows, 4));
+    try testing.expectEqual(5, nextHunkHeader(rows, 5));
+    try testing.expectEqual(6, nextHunkHeader(rows, 6));
+
+    // From body → current hunk header; from header → previous header.
+    try testing.expectEqual(4, prevHunkHeader(rows, 5));
+    try testing.expectEqual(4, prevHunkHeader(rows, 6));
+    try testing.expectEqual(1, prevHunkHeader(rows, 4));
+    try testing.expectEqual(1, prevHunkHeader(rows, 2));
+    try testing.expectEqual(1, prevHunkHeader(rows, 3));
+    // No earlier header: stay.
+    try testing.expectEqual(1, prevHunkHeader(rows, 1));
+    try testing.expectEqual(0, prevHunkHeader(rows, 0));
+
+    try testing.expectEqual(0, nextHunkHeader(&.{}, 0));
+    try testing.expectEqual(0, prevHunkHeader(&.{}, 0));
 }
 
 test "statusAt path and hunk index" {
