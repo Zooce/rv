@@ -65,7 +65,7 @@ For command details, load the `goal` skill / playbook when available.
 
 Always-on rules above apply first. Project extras:
 
-1. After `goal status --full`, if the user wants work and there is no active goal, pick from **`goal list` Next order** (top first). That queue is kept aligned with [`GOAL_ORDER.md`](GOAL_ORDER.md). Start with `goal start <id>` only when they ask to start work (or name a goal).
+1. After `goal status --full`, if the user wants work and there is no active goal, pick from **`goal list` Next order** (top first). Start with `goal start <id>` only when they ask to start work (or name a goal).
 2. Read the full brief with `goal show <id>` (or rely on `status --full` once active) before coding.
 
 ## Using `goal`
@@ -94,20 +94,19 @@ Use `goal help <command>` for full flags (`-q` / `--quiet` prints only an id, us
 
 ### List order (live queue)
 
-`goal list` order is the operational queue — use it instead of inventing a second ranking.
+`goal list` is the only work queue — do not invent a second ranking doc.
 
 | List | Sort key | Meaning |
 |------|----------|---------|
 | **Next** | Most recently `goal next`’d first | Top of Next = do next. Calling `goal next <id>` on an already-Next goal re-pins it to the top. |
 | **Later** | Most recently **created** first | Creation-time backlog order only; not a priority queue. Demote with `goal later`; do not expect `next`/`later` to re-rank Later. |
 
-**Keeping Next aligned with [`GOAL_ORDER.md`](GOAL_ORDER.md):**
+**Shaping Next:**
 
 1. Put the ordered critical path in **Next**; leave park / anytime hygiene in **Later**.
 2. To set Next order, call `goal next <id>` from **last → first** (bottom of desired order first, then work up). The last `next` becomes the top of the list.
-3. To bump one goal without reshuffling the rest of the plan, `goal next <id>` that id alone (it jumps to top).
-4. When adding a new goal to the middle of the plan: `goal new` (Later) → `goal next` it, then re-`next` everything that should stay above it (or re-run last→first for the whole Next stack).
-5. [`GOAL_ORDER.md`](GOAL_ORDER.md) remains the written rationale and done history; **Next list order** is what agents follow day to day. If they drift, re-sync with `goal next` as above.
+3. To bump one goal without reshuffling the rest, `goal next <id>` that id alone (it jumps to top).
+4. When adding a goal into the middle of the plan: `goal new` (Later) → `goal next` it, then re-`next` everything that should stay above it (or re-run last→first for the whole Next stack).
 
 ### Workflow for agents
 
@@ -116,7 +115,7 @@ Use `goal help <command>` for full flags (`-q` / `--quiet` prints only an id, us
 3. **Stay in scope.** Do not implement a different goal “while you are here” unless the user asks. Out-of-scope discoveries → `goal note` or a new goal via `goal new`.
 4. **Record decisions** with `goal note` (API choices, deferred follow-ups, test harness notes).
 5. **Finish cleanly:** leave the tree buildable; run the goal's verify steps; use `goal note` for leftover work. Run `goal complete` / `goal stop` only when the user asks.
-6. **Order of work:** follow **`goal list` Next** (top first), which should match [`GOAL_ORDER.md`](GOAL_ORDER.md). Prefer re-ordering with `goal next` over ignoring the live list.
+6. **Order of work:** follow **`goal list` Next** (top first). Prefer re-ordering with `goal next` over inventing a side plan.
 
 ### Placement defaults
 
@@ -134,6 +133,6 @@ When a goal is marked **`[bug]`** and requires tests:
 
 ### What not to do
 
-- Do not replace `goal` with ad-hoc TODO files, scratch notes as the only plan, or untracked checklist markdown (except project docs like `GOAL_ORDER.md` / design notes).
+- Do not replace `goal` with ad-hoc TODO files, scratch notes as the only plan, or a second ranking/checklist doc.
 - Do not complete a goal that still fails its stated acceptance criteria or verify commands.
 - Do not start multiple goals at once; stop or complete the active one first.
