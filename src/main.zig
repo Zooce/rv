@@ -215,10 +215,15 @@ fn paint(
     commenting: bool,
     draft: []const u8,
 ) void {
-    // Diff line palette (truecolor). Add/delete meaning is background, not `+/-`.
-    // Unfocused: light green/red fill. Cursor on add/delete/context: lighter
-    // lift of that row's fill (keeps kind). Cursor on meta/headers: neutral
-    // reverse gray. No color → bg may not show; markers are not restored.
+    // Diff line palette (truecolor). Documented together so sticky headers
+    // (#36) and body paints share one table. Hierarchy:
+    //   body          — near-black bg, neutral fg
+    //   file header   — full-row dark grey bar, bold light path
+    //   hunk header   — full-row deeper grey bar, light `@@`
+    //   add / delete  — green/red fills (#35); markers are not restored
+    //   *@_cur        — lighter lift of the same kind (keeps identity)
+    //   meta / meta@cur — dim / reverse gray only
+    // No color → bg may not show; structure still relies on bold/dim when set.
     const bg = tui.Color{ .rgb = .{ .r = 0x12, .g = 0x12, .b = 0x14 } };
     const fg = tui.Color{ .rgb = .{ .r = 0xd0, .g = 0xd0, .b = 0xd0 } };
     const body = tui.Style{ .fg = fg, .bg = bg };
@@ -231,15 +236,26 @@ fn paint(
         .fg = .{ .rgb = .{ .r = 0xee, .g = 0xee, .b = 0xee } },
         .bg = .{ .rgb = .{ .r = 0x2a, .g = 0x3f, .b = 0x5f } },
     };
+    // File header: dark grey bar + light bold path (clear vs body; not green/red).
     const file_style = tui.Style{
-        .fg = .{ .rgb = .{ .r = 0xff, .g = 0xff, .b = 0xff } },
-        .bg = bg,
+        .fg = .{ .rgb = .{ .r = 0xee, .g = 0xee, .b = 0xf0 } },
+        .bg = .{ .rgb = .{ .r = 0x48, .g = 0x48, .b = 0x4c } },
         .bold = true,
     };
+    const file_cur_style = tui.Style{
+        .fg = .{ .rgb = .{ .r = 0xff, .g = 0xff, .b = 0xff } },
+        .bg = .{ .rgb = .{ .r = 0x60, .g = 0x60, .b = 0x64 } },
+        .bold = true,
+    };
+    // Hunk header: deeper grey bar (dimmer than file; light `@@`).
     const hunk_style = tui.Style{
-        .fg = .{ .rgb = .{ .r = 0x6a, .g = 0xb8, .b = 0xc8 } },
-        .bg = bg,
-        .dim = true,
+        .fg = .{ .rgb = .{ .r = 0xc8, .g = 0xc8, .b = 0xcc } },
+        .bg = .{ .rgb = .{ .r = 0x30, .g = 0x30, .b = 0x34 } },
+    };
+    const hunk_cur_style = tui.Style{
+        .fg = .{ .rgb = .{ .r = 0xee, .g = 0xee, .b = 0xf0 } },
+        .bg = .{ .rgb = .{ .r = 0x44, .g = 0x44, .b = 0x48 } },
+        .bold = true,
     };
     const add_style = tui.Style{
         .fg = .{ .rgb = .{ .r = 0xb8, .g = 0xe0, .b = 0xb8 } },
@@ -270,6 +286,7 @@ fn paint(
         .bg = bg,
         .dim = true,
     };
+    // Meta cursor only (headers use file_cur / hunk_cur).
     const cur_style = tui.Style{
         .fg = .{ .rgb = .{ .r = 0x12, .g = 0x12, .b = 0x14 } },
         .bg = .{ .rgb = .{ .r = 0xc8, .g = 0xc8, .b = 0xc8 } },
@@ -311,7 +328,9 @@ fn paint(
             is_cur,
             body,
             file_style,
+            file_cur_style,
             hunk_style,
+            hunk_cur_style,
             add_style,
             del_style,
             add_cur_style,
@@ -369,14 +388,16 @@ fn formatFooter(buf: []u8, st: view.Status, open_n: usize) []const u8 {
     });
 }
 
-/// Style for one content row. Cursor on add/delete/context keeps kind via a
-/// lighter fill; cursor on meta/headers uses neutral reverse.
+/// Style for one content row. Cursor keeps row kind: add/delete/context and
+/// file/hunk headers use a lighter lift of their bar; meta uses reverse gray.
 fn rowStyle(
     row: view.Row,
     is_cur: bool,
     body: tui.Style,
     file_style: tui.Style,
+    file_cur_style: tui.Style,
     hunk_style: tui.Style,
+    hunk_cur_style: tui.Style,
     add_style: tui.Style,
     del_style: tui.Style,
     add_cur_style: tui.Style,
@@ -393,7 +414,8 @@ fn rowStyle(
                 .context => ctx_cur_style,
                 .meta => cur_style,
             },
-            .file_header, .hunk_header => cur_style,
+            .file_header => file_cur_style,
+            .hunk_header => hunk_cur_style,
         };
     }
     return switch (row) {
