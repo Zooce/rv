@@ -215,8 +215,8 @@ fn paint(
     commenting: bool,
     draft: []const u8,
 ) void {
-    // Diff line palette (truecolor). Documented together so sticky headers
-    // (#36) and body paints share one table. Hierarchy:
+    // Diff line palette (truecolor). Documented together so sticky file
+    // headers (#36) and body paints share one table. Hierarchy:
     //   body          — near-black bg, neutral fg
     //   file header   — full-row dark grey bar, bold light path
     //   hunk header   — full-row deeper grey bar, light `@@`
@@ -314,10 +314,26 @@ fn paint(
         0;
 
     const cur = view.clampCursor(cursor, rows.len);
-    scroll.* = view.ensureVisible(scroll.*, cur, content_rows, rows.len);
+    const settled = view.ensureVisibleSticky(scroll.*, cur, content_rows, rows);
+    scroll.* = settled.scroll;
+    const sticky = settled.sticky;
 
     var line_buf: [512]u8 = undefined;
     var screen_y: u16 = content_top;
+
+    // Sticky file path under the title bar (hunk headers scroll with the body).
+    // Last file header strictly above scroll stays pinned; the next file header
+    // enters as a normal body row. Cursor lift if cursor is on that source row.
+    if (sticky.file_idx) |fi| {
+        if (screen_y < content_bottom) {
+            const text = formatRow(&line_buf, rows[fi], false);
+            const st = if (fi == cur) file_cur_style else file_style;
+            fillRow(scr, screen_y, st);
+            scr.putStr(0, screen_y, text, st);
+            screen_y += 1;
+        }
+    }
+
     var i: usize = scroll.*;
     while (i < rows.len and screen_y < content_bottom) : (i += 1) {
         const is_cur = i == cur;
