@@ -376,10 +376,24 @@ fn paint(
             const st = view.statusAt(rows, cur);
             break :blk formatFooter(&line_buf, st, review.openCount());
         };
+        // Prompt/status starts at column 1 (one-cell left gutter).
         scr.putStr(1, footer_y, footer_text, footer_style);
+        if (commenting) {
+            // Caret is end-only today (append / pop). Hardware cursor after the
+            // drawn text; clamp to the last column when the draft fills the row.
+            // Draft input is ASCII printable, so display width equals byte length.
+            const after: usize = 1 + footer_text.len;
+            const cx: u16 = if (size.cols == 0)
+                0
+            else
+                @intCast(@min(after, @as(usize, size.cols) - 1));
+            scr.setCursor(cx, footer_y);
+        } else {
+            scr.hideCursor();
+        }
+    } else {
+        scr.hideCursor();
     }
-
-    scr.hideCursor();
 }
 
 fn rowMarked(row: view.Row, review: *const store.Review) bool {
