@@ -323,3 +323,76 @@ test "clean main with nothing ahead of base: empty model" {
     try testing.expectEqual(0, d.files.len);
     try testing.expectEqual(0, d.hunk_count);
 }
+
+test "dirty tracked plus untracked file: both in local stream" {
+    if (builtin.os.tag == .wasi) return error.SkipZigTest;
+
+    const io = testing.io;
+    const alloc = testing.allocator;
+    var tmp = try IsolatedTmp.create(alloc, io);
+    defer tmp.cleanup(alloc, io);
+    const cwd = tmp.cwd();
+
+    try initTestRepo(alloc, io, cwd);
+    try tmp.write(io, "tracked.txt", "line1\n");
+    try expectGitOk(alloc, io, cwd, &.{ "git", "add", "tracked.txt" });
+    try expectGitOk(alloc, io, cwd, &.{ "git", "commit", "-m", "init" });
+
+    try tmp.write(io, "tracked.txt", "line1\nedited\n");
+    try tmp.write(io, "new.zig", "pub fn main() void {}\n");
+
+    var d = try loadDefaultDiffCwd(alloc, io, cwd);
+    defer d.deinit();
+
+    try testing.expectEqual(2, d.files.len);
+    try expectHasDisplayPath(d, "tracked.txt");
+    try expectHasDisplayPath(d, "new.zig");
+}
+
+test "ignored untracked path is not included" {
+    if (builtin.os.tag == .wasi) return error.SkipZigTest;
+
+    const io = testing.io;
+    const alloc = testing.allocator;
+    var tmp = try IsolatedTmp.create(alloc, io);
+    defer tmp.cleanup(alloc, io);
+    const cwd = tmp.cwd();
+
+    try initTestRepo(alloc, io, cwd);
+    try tmp.write(io, "only.txt", "x\n");
+    try tmp.write(io, ".gitignore", "ignored.txt\n");
+    try expectGitOk(alloc, io, cwd, &.{ "git", "add", "only.txt", ".gitignore" });
+    try expectGitOk(alloc, io, cwd, &.{ "git", "commit", "-m", "init" });
+
+    // Matches .gitignore → exclude-standard must omit it from the local stream.
+    try tmp.write(io, "ignored.txt", "should not appear\n");
+
+    var d = try loadDefaultDiffCwd(alloc, io, cwd);
+    defer d.deinit();
+    try testing.expectEqual(0, d.files.len);
+}
+
+test "untracked-only worktree: non-empty local stream" {
+    if (builtin.os.tag == .wasi) return error.SkipZigTest;
+
+    const io = testing.io;
+    const alloc = testing.allocator;
+    var tmp = try IsolatedTmp.create(alloc, io);
+    defer tmp.cleanup(alloc, io);
+    const cwd = tmp.cwd();
+
+    try initTestRepo(alloc, io, cwd);
+    try tmp.write(io, "only.txt", "x\n");
+    try expectGitOk(alloc, io, cwd, &.{ "git", "add", "only.txt" });
+    try expectGitOk(alloc, io, cwd, &.{ "git", "commit", "-m", "init" });
+
+    // Tracked tree is clean; only an untracked source file.
+    try tmp.write(io, "brand_new.zig", "const x = 1;\n");
+
+    var d = try loadDefaultDiffCwd(alloc, io, cwd);
+    defer d.deinit();
+
+    try testing.expectEqual(1, d.files.len);
+    try expectHasDisplayPath(d, "brand_new.zig");
+    try testing.expect(d.hunk_count >= 1);
+}
