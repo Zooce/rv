@@ -2,10 +2,18 @@
 //!
 //! ## Smart default
 //!
-//! 1. **Local changes** — if `git diff HEAD` is non-empty, review that stream.
-//!    This is staged **and** unstaged changes to tracked files in one unified
-//!    diff (equivalent to combining `git diff` and `git diff --cached`).
-//!    Untracked files are **not** included (v1).
+//! 1. **Local changes** — if there is anything local to review, use that stream:
+//!    - Staged **and** unstaged changes to tracked files (`git diff HEAD`),
+//!      equivalent to combining `git diff` and `git diff --cached`.
+//!    - Plus **untracked** files listed by
+//!      `git ls-files --others --exclude-standard` (same ignore rules as
+//!      `git status` untracked). Each path is turned into a new-file unified
+//!      diff via `git diff --no-index -- /dev/null <path>`.
+//!    Untracked sections are appended **after** tracked paths. Empty untracked
+//!    files appear as new-file headers (often zero hunks). Binary untracked
+//!    files follow the same binary placeholder rules as tracked binary adds.
+//!    Local untracked alone (no tracked changes) still takes this path and skips
+//!    branch-vs-base. With no `HEAD` yet, only untracked content is considered.
 //! 2. **Branch vs base** — otherwise compare the current branch to a base:
 //!    - Prefer the configured upstream (`@{upstream}`) when it resolves.
 //!    - Else `main`, then `master`, when that ref exists.
@@ -14,8 +22,8 @@
 //! ## Empty diffs
 //!
 //! No matching changes yields an empty `Diff` (zero files), **not** an error.
-//! That covers a clean worktree with nothing ahead of base, and a repo with
-//! no commits yet (no `HEAD`).
+//! That covers a clean worktree with no untracked files and nothing ahead of
+//! base, and a repo with no commits and no untracked files.
 //!
 //! ## Errors
 //!
@@ -43,26 +51,38 @@ pub fn loadDefaultDiff(alloc: Allocator, io: Io) Error!diff.Diff {
 pub fn loadDefaultDiffCwd(alloc: Allocator, io: Io, cwd: std.process.Child.Cwd) Error!diff.Diff {
     try ensureInsideWorkTree(alloc, io, cwd);
 
-    // No commits yet → nothing to compare.
-    if (!try revExists(alloc, io, cwd, "HEAD")) {
+    // 1. Local: tracked changes vs HEAD (if any) + untracked (exclude-standard).
+    const untracked = try untrackedDiff(alloc, io, cwd);
+    defer if (untracked) |u| alloc.free(u);
+
+    if (try revExists(alloc, io, cwd, "HEAD")) {
+        const local = try git(alloc, io, cwd, .{ .argv = &.{ "git", "diff", "HEAD" } });
+        defer alloc.free(local);
+
+        if (local.len > 0 or untracked != null) {
+            if (untracked) |u| {
+                if (local.len == 0) return try diff.parse(alloc, u);
+                const combined = try std.mem.concat(alloc, u8, &.{ local, u });
+                defer alloc.free(combined);
+                return try diff.parse(alloc, combined);
+            }
+            return try diff.parse(alloc, local);
+        }
+    } else if (untracked) |u| {
+        // No commits yet: still review untracked new files.
+        return try diff.parse(alloc, u);
+    } else {
         return try diff.parse(alloc, "");
     }
 
-    // 1. Local staged + unstaged vs HEAD.
-    const local = try git(alloc, io, cwd, &.{ "git", "diff", "HEAD" });
-    defer alloc.free(local);
-    if (local.len > 0) {
-        return try diff.parse(alloc, local);
-    }
-
-    // 2. Branch vs base (three-dot).
+    // 2. Branch vs base (three-dot). Requires HEAD (already verified above).
     const base = try resolveBase(alloc, io, cwd) orelse {
         return try diff.parse(alloc, "");
     };
     const range = try std.fmt.allocPrint(alloc, "{s}...HEAD", .{base});
     defer alloc.free(range);
 
-    const branch = try git(alloc, io, cwd, &.{ "git", "diff", range });
+    const branch = try git(alloc, io, cwd, .{ .argv = &.{ "git", "diff", range } });
     defer alloc.free(branch);
     return try diff.parse(alloc, branch);
 }
@@ -70,7 +90,7 @@ pub fn loadDefaultDiffCwd(alloc: Allocator, io: Io, cwd: std.process.Child.Cwd) 
 // --- internals -----------------------------------------------------------
 
 fn ensureInsideWorkTree(alloc: Allocator, io: Io, cwd: std.process.Child.Cwd) Error!void {
-    const out = git(alloc, io, cwd, &.{ "git", "rev-parse", "--is-inside-work-tree" }) catch |err| switch (err) {
+    const out = git(alloc, io, cwd, .{ .argv = &.{ "git", "rev-parse", "--is-inside-work-tree" } }) catch |err| switch (err) {
         error.GitFailed => return error.NotARepository,
         else => return err,
     };
@@ -93,7 +113,9 @@ fn revExists(alloc: Allocator, io: Io, cwd: std.process.Child.Cwd, rev: []const 
     const as_commit = try std.fmt.allocPrint(alloc, "{s}^{{commit}}", .{rev});
     defer alloc.free(as_commit);
 
-    const out = git(alloc, io, cwd, &.{ "git", "rev-parse", "--verify", "--quiet", as_commit }) catch |err| switch (err) {
+    const out = git(alloc, io, cwd, .{
+        .argv = &.{ "git", "rev-parse", "--verify", "--quiet", as_commit },
+    }) catch |err| switch (err) {
         error.GitFailed => return false,
         else => return err,
     };
@@ -101,12 +123,51 @@ fn revExists(alloc: Allocator, io: Io, cwd: std.process.Child.Cwd, rev: []const 
     return true;
 }
 
-/// Run `argv` (typically a `git …` command). On exit 0, returns owned stdout
-/// (caller frees). Non-zero exit / crash → `GitFailed`; missing binary →
-/// `GitNotFound`. Pattern matches a small `proc.exec`-style helper.
-fn git(alloc: Allocator, io: Io, cwd: std.process.Child.Cwd, argv: []const []const u8) Error![]u8 {
+/// Unified-diff text for untracked, non-ignored paths (exclude-standard).
+/// `null` when there are none. Caller frees a non-null result.
+fn untrackedDiff(alloc: Allocator, io: Io, cwd: std.process.Child.Cwd) Error!?[]u8 {
+    const listing = try git(alloc, io, cwd, .{
+        .argv = &.{ "git", "ls-files", "--others", "--exclude-standard", "-z" },
+    });
+    defer alloc.free(listing);
+    if (listing.len == 0) return null;
+
+    var out: std.ArrayList(u8) = .empty;
+    errdefer out.deinit(alloc);
+
+    var it = std.mem.splitScalar(u8, listing, 0);
+    while (it.next()) |path| {
+        if (path.len == 0) continue;
+        // Exit 1 is normal when files differ (always for a real new file).
+        const piece = try git(alloc, io, cwd, .{
+            .argv = &.{ "git", "diff", "--no-index", "--", "/dev/null", path },
+            .allowed_error_code = 1,
+        });
+        defer alloc.free(piece);
+        try out.appendSlice(alloc, piece);
+    }
+    if (out.items.len == 0) {
+        out.deinit(alloc);
+        return null;
+    }
+    return try out.toOwnedSlice(alloc);
+}
+
+/// Options for `git`. Field defaults match a strict exit-0 success.
+const GitOpts = struct {
+    argv: []const []const u8,
+    /// One additional non-zero exit code treated as success (alongside 0).
+    /// Example: `1` for `git diff --no-index`, which exits 1 when the sides
+    /// differ. `null` = only exit 0. Not a range — only this exact code.
+    allowed_error_code: ?u8 = null,
+};
+
+/// Run a `git …` command. On exit 0 (or `allowed_error_code` when set), returns
+/// owned stdout (caller frees). Any other exit / crash → `GitFailed`; missing
+/// binary → `GitNotFound`.
+fn git(alloc: Allocator, io: Io, cwd: std.process.Child.Cwd, opts: GitOpts) Error![]u8 {
     const result = std.process.run(alloc, io, .{
-        .argv = argv,
+        .argv = opts.argv,
         .cwd = cwd,
         // Diffs can be large in real repos; keep a high but finite cap.
         // Follow-up: stream / bound very large refactors (see goal backlog).
@@ -123,7 +184,12 @@ fn git(alloc: Allocator, io: Io, cwd: std.process.Child.Cwd, argv: []const []con
     }
 
     switch (result.term) {
-        .exited => |code| if (code != 0) return error.GitFailed,
+        .exited => |code| {
+            if (code != 0) {
+                const allowed = opts.allowed_error_code orelse return error.GitFailed;
+                if (code != allowed) return error.GitFailed;
+            }
+        },
         else => return error.GitFailed,
     }
 
@@ -148,7 +214,7 @@ fn initTestRepo(alloc: Allocator, io: Io, cwd: std.process.Child.Cwd) !void {
 }
 
 fn expectGitOk(alloc: Allocator, io: Io, cwd: std.process.Child.Cwd, argv: []const []const u8) !void {
-    const out = git(alloc, io, cwd, argv) catch |err| {
+    const out = git(alloc, io, cwd, .{ .argv = argv }) catch |err| {
         std.debug.print("git failed: {s} ({t})\n", .{ argv[1], err });
         return error.TestUnexpectedResult;
     };
@@ -231,7 +297,7 @@ test "clean feature branch: diff is commits ahead of main only" {
     var d = try loadDefaultDiffCwd(alloc, io, cwd);
     defer d.deinit();
 
-    // Branch-vs-base: exactly the two files changed since main, no local dirt.
+    // Branch-vs-base: exactly the two files changed since main, no local changes.
     try testing.expectEqual(2, d.files.len);
     try testing.expectEqual(2, d.hunk_count);
     try expectHasDisplayPath(d, "feature-only.txt");
