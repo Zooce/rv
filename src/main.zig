@@ -1,7 +1,8 @@
 //! `rv` entry point — CLI dispatch + full-screen diff review (MVP-1 / MVP-2.2).
 //!
 //! With no args: load smart-default git diff → flatten rows → load `.rv`
-//! comments → TUI (`j`/`k`, `[`/`]` hunk, `{`/`}` file header, `i`/`c`/`a`/`Enter` comment, `q` quit).
+//! comments → TUI (`j`/`k`, `h`/`l` pan, `0`/`$` col home/end, `[`/`]` hunk,
+//! `{`/`}` file header, `i`/`c`/`a`/`Enter` comment, `q` quit).
 //! Empty/error paths never enter raw / alt-screen mode.
 //!
 //! With a subcommand: headless CLI (`status`, `list`, `show`, `resolve`,
@@ -101,6 +102,8 @@ fn runTui(alloc: std.mem.Allocator, io: std.Io) !u8 {
 
     var cursor: usize = 0;
     var scroll: usize = 0;
+    // First visible display column for lines in the cursor's hunk only.
+    var col_scroll: usize = 0;
     var running = true;
     var commenting = false;
     var draft: std.ArrayList(u8) = .empty;
@@ -110,7 +113,7 @@ fn runTui(alloc: std.mem.Allocator, io: std.Io) !u8 {
     // Anchor captured when entering comment mode (cursor does not move then).
     var draft_anchor: view.Anchor = undefined;
 
-    paint(&scr, size, rows, cursor, &scroll, &review, commenting, draft.items, &draft_scroll);
+    paint(&scr, size, rows, cursor, &scroll, &col_scroll, &review, commenting, draft.items, &draft_scroll);
     try scr.present(&term);
 
     while (running) {
@@ -179,6 +182,16 @@ fn runTui(alloc: std.mem.Allocator, io: std.Io) !u8 {
                             if (cursor + 1 < rows.len) cursor += 1;
                         } else if (c == 'k') {
                             if (cursor > 0) cursor -= 1;
+                        } else if (c == 'h') {
+                            const step = panStep(size.cols);
+                            col_scroll = if (col_scroll > step) col_scroll - step else 0;
+                        } else if (c == 'l') {
+                            col_scroll +%= panStep(size.cols);
+                        } else if (c == '0') {
+                            col_scroll = 0;
+                        } else if (c == '$') {
+                            const span = view.hunkSpanAt(rows, cursor);
+                            col_scroll = view.colScrollToEnd(hunkMaxLineWidth(rows, span), size.cols);
                         } else if (c == 'J') {
                             cursor = view.nextChange(rows, cursor);
                         } else if (c == 'K') {
@@ -214,17 +227,41 @@ fn runTui(alloc: std.mem.Allocator, io: std.Io) !u8 {
                     .up => {
                         if (cursor > 0) cursor -= 1;
                     },
+                    .left => {
+                        const step = panStep(size.cols);
+                        col_scroll = if (col_scroll > step) col_scroll - step else 0;
+                    },
+                    .right => {
+                        col_scroll +%= panStep(size.cols);
+                    },
                     .ctrl_c => running = false,
                     else => {},
                 }
             },
         }
         if (running) {
-            paint(&scr, size, rows, cursor, &scroll, &review, commenting, draft.items, &draft_scroll);
+            paint(&scr, size, rows, cursor, &scroll, &col_scroll, &review, commenting, draft.items, &draft_scroll);
             try scr.present(&term);
         }
     }
     return 0;
+}
+
+/// Horizontal pan step: about a quarter of the terminal width (at least 1).
+fn panStep(cols: u16) usize {
+    return @max(@as(usize, 1), @as(usize, cols) / 4);
+}
+
+/// Widest formatted **line** in the hunk body (headers excluded). 0 if empty.
+fn hunkMaxLineWidth(rows: []const view.Row, span: view.HunkSpan) usize {
+    var max_w: usize = 0;
+    var line_buf: [512]u8 = undefined;
+    var i = span.body_start;
+    while (i < span.body_end) : (i += 1) {
+        const text = formatRow(&line_buf, rows[i], false);
+        max_w = @max(max_w, tui.screen.displayWidth(text));
+    }
+    return max_w;
 }
 
 /// Visible comment-box row budget: keep the title row; cap at `max_rows`.
@@ -255,6 +292,7 @@ fn paint(
     rows: []const view.Row,
     cursor: usize,
     scroll: *usize,
+    col_scroll: *usize,
     review: *const store.Review,
     commenting: bool,
     draft: []const u8,
@@ -355,7 +393,7 @@ fn paint(
         const help = if (commenting)
             "rv  comment  Enter save  Esc cancel  ↑↓ scroll"
         else
-            "rv  j/k line  J/K change  [/] hunk  {/} file  i comment  q quit";
+            "rv  j/k line  h/l pan  0/$  J/K change  [/] hunk  {/} file  i  q";
         scr.putStr(1, 0, help, title_style);
     }
 
@@ -380,11 +418,18 @@ fn paint(
     const sticky = settled.sticky;
 
     var line_buf: [512]u8 = undefined;
+    // Only lines in the cursor's hunk pan; file/hunk headers never pan.
+    // Range = widest line in that hunk vs viewport (0 if none overflow).
+    const pan_span = view.hunkSpanAt(rows, cur);
+    const hunk_w = hunkMaxLineWidth(rows, pan_span);
+    col_scroll.* = view.clampColScroll(col_scroll.*, hunk_w, size.cols);
+    const cs = col_scroll.*;
     var screen_y: u16 = content_top;
 
     // Sticky file path under the title bar (hunk headers scroll with the body).
     // Last file header strictly above scroll stays pinned; the next file header
     // enters as a normal body row. Cursor lift if cursor is on that source row.
+    // Sticky path is not panned (header bar stays full-width from column 0).
     if (sticky.file_idx) |fi| {
         if (screen_y < content_bottom) {
             const text = formatRow(&line_buf, rows[fi], false);
@@ -417,7 +462,9 @@ fn paint(
             cur_style,
         );
         fillRow(scr, screen_y, st);
-        scr.putStr(0, screen_y, text, st);
+        const pan = pan_span.containsBody(i);
+        const visible = if (pan) text[tui.screen.byteAtCol(text, cs)..] else text;
+        scr.putStr(0, screen_y, visible, st);
         screen_y += 1;
     }
 

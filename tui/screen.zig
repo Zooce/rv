@@ -317,6 +317,53 @@ pub fn codepointWidth(cp: u21) u8 {
     return 1; // everything else: one column
 }
 
+/// Display columns of UTF-8 `text` (same width rules as `putStr` / `codepointWidth`).
+pub fn displayWidth(text: []const u8) usize {
+    var cols: usize = 0;
+    var i: usize = 0;
+    while (i < text.len) {
+        const len = std.unicode.utf8ByteSequenceLength(text[i]) catch {
+            i += 1;
+            continue;
+        };
+        if (i + len > text.len) break;
+        const cp = std.unicode.utf8Decode(text[i .. i + len]) catch {
+            i += 1;
+            continue;
+        };
+        i += len;
+        cols += codepointWidth(cp);
+    }
+    return cols;
+}
+
+/// Byte index into UTF-8 `text` at the start of display column `col` (0-based).
+/// Past the end → `text.len`. If `col` lands inside a wide glyph, skips past it
+/// so callers do not start a slice mid-cell.
+pub fn byteAtCol(text: []const u8, col: usize) usize {
+    if (col == 0) return 0;
+    var c: usize = 0;
+    var i: usize = 0;
+    while (i < text.len) {
+        if (c >= col) return i;
+        const len = std.unicode.utf8ByteSequenceLength(text[i]) catch {
+            i += 1;
+            continue;
+        };
+        if (i + len > text.len) break;
+        const cp = std.unicode.utf8Decode(text[i .. i + len]) catch {
+            i += 1;
+            continue;
+        };
+        const w = codepointWidth(cp);
+        i += len;
+        if (w == 0) continue;
+        if (c + w > col) return i; // mid-wide glyph: start after it
+        c += w;
+    }
+    return text.len;
+}
+
 /// **CUP** = Cursor Position. Emit `CSI row ; col H` with 1-based coordinates.
 fn writeCup(t: *Tty, x: u16, y: u16) !void {
     var buf: [32]u8 = undefined; // stack buffer for the formatted sequence
@@ -392,6 +439,26 @@ test "cell eql" {
     const a = Cell.blank();
     const b = Cell.blank();
     try std.testing.expect(a.eql(b));
+}
+
+test "displayWidth and byteAtCol ASCII" {
+    try std.testing.expectEqual(@as(usize, 0), displayWidth(""));
+    try std.testing.expectEqual(@as(usize, 5), displayWidth("hello"));
+    try std.testing.expectEqual(@as(usize, 0), byteAtCol("hello", 0));
+    try std.testing.expectEqual(@as(usize, 2), byteAtCol("hello", 2));
+    try std.testing.expectEqual(@as(usize, 5), byteAtCol("hello", 5));
+    try std.testing.expectEqual(@as(usize, 5), byteAtCol("hello", 99));
+    try std.testing.expectEqualStrings("llo", "hello"[byteAtCol("hello", 2)..]);
+}
+
+test "displayWidth wide glyph" {
+    // U+4E00 CJK ideograph → 2 columns under codepointWidth.
+    const wide = "\u{4e00}";
+    try std.testing.expectEqual(@as(usize, 2), displayWidth(wide));
+    try std.testing.expectEqual(@as(usize, 0), byteAtCol(wide, 0));
+    // Column 1 is the second half of the wide cell → skip past the glyph.
+    try std.testing.expectEqual(wide.len, byteAtCol(wide, 1));
+    try std.testing.expectEqual(wide.len, byteAtCol(wide, 2));
 }
 
 // Contract: failed present must be safe to retry.

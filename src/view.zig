@@ -91,6 +91,60 @@ pub fn ensureVisible(scroll: usize, cursor: usize, height: usize, row_count: usi
     return s;
 }
 
+// --- horizontal scroll -------------------------------------------------
+
+/// Largest first-visible display column for content of `content_w` columns
+/// in a viewport of `viewport_w` columns. Zero when everything fits.
+pub fn maxColScroll(content_w: usize, viewport_w: usize) usize {
+    if (viewport_w == 0 or content_w <= viewport_w) return 0;
+    return content_w - viewport_w;
+}
+
+/// Clamp `col_scroll` into a valid range for the given content and viewport.
+pub fn clampColScroll(col_scroll: usize, content_w: usize, viewport_w: usize) usize {
+    return @min(col_scroll, maxColScroll(content_w, viewport_w));
+}
+
+/// First-visible column so the end of a `content_w`-wide row is on screen
+/// (or 0 when the row fits). Same as `maxColScroll`.
+pub fn colScrollToEnd(content_w: usize, viewport_w: usize) usize {
+    return maxColScroll(content_w, viewport_w);
+}
+
+/// Body of the hunk that owns `cursor` (half-open `[body_start, body_end)`).
+/// File/hunk headers are never in the body. Empty when not inside a hunk
+/// (e.g. cursor on a file header before any `@@` in that file).
+pub const HunkSpan = struct {
+    /// Index of the owning `.hunk_header`, or `null` when not in a hunk.
+    header: ?usize = null,
+    /// First `.line` row after the header (equals `body_end` if the hunk is empty).
+    body_start: usize = 0,
+    /// Exclusive end: next file/hunk header, or `rows.len`.
+    body_end: usize = 0,
+
+    pub fn containsBody(self: HunkSpan, i: usize) bool {
+        return i >= self.body_start and i < self.body_end;
+    }
+};
+
+/// Hunk body span for horizontal pan: only lines in this range should scroll.
+/// Uses `currentHunkInFile` so a file header does not inherit the previous file's hunk.
+pub fn hunkSpanAt(rows: []const Row, cursor: usize) HunkSpan {
+    const header = currentHunkInFile(rows, cursor) orelse return .{};
+    var end = header + 1;
+    while (end < rows.len) : (end += 1) {
+        switch (rows[end]) {
+            .line => {},
+            .hunk_header, .file_header => break,
+        }
+    }
+    return .{
+        .header = header,
+        .body_start = header + 1,
+        .body_end = end,
+    };
+}
+
 // --- sticky file headers -----------------------------------------------
 
 /// Display-row index to pin above the scrollable content area.
@@ -510,6 +564,55 @@ test "ensureVisible scrolls with cursor" {
     try testing.expectEqual(7, ensureVisible(0, 9, 3, 10));
     try testing.expectEqual(0, ensureVisible(0, 0, 3, 2));
     try testing.expectEqual(0, ensureVisible(0, 0, 0, 10));
+}
+
+test "maxColScroll and clampColScroll" {
+    try testing.expectEqual(0, maxColScroll(10, 20));
+    try testing.expectEqual(0, maxColScroll(10, 10));
+    try testing.expectEqual(5, maxColScroll(15, 10));
+    try testing.expectEqual(0, maxColScroll(15, 0));
+    try testing.expectEqual(0, clampColScroll(0, 15, 10));
+    try testing.expectEqual(3, clampColScroll(3, 15, 10));
+    try testing.expectEqual(5, clampColScroll(99, 15, 10));
+    try testing.expectEqual(0, clampColScroll(3, 5, 10));
+    try testing.expectEqual(5, colScrollToEnd(15, 10));
+    try testing.expectEqual(0, colScrollToEnd(5, 10));
+}
+
+test "hunkSpanAt body excludes headers and stops at next hunk/file" {
+    // twoHunkFixture: 0 file, 1 h0, 2 del, 3 add, 4 h1, 5 del, 6 add
+    var fix = try twoHunkFixture(testing.allocator);
+    defer fix.d.deinit();
+    defer testing.allocator.free(fix.rows);
+    const rows = fix.rows;
+
+    // On file header: not in a hunk.
+    const none = hunkSpanAt(rows, 0);
+    try testing.expect(none.header == null);
+    try testing.expectEqual(0, none.body_start);
+    try testing.expectEqual(0, none.body_end);
+    try testing.expect(!none.containsBody(2));
+
+    // On first @@ or its lines: body is 2..4
+    const h0 = hunkSpanAt(rows, 1);
+    try testing.expectEqual(1, h0.header.?);
+    try testing.expectEqual(2, h0.body_start);
+    try testing.expectEqual(4, h0.body_end);
+    try testing.expect(h0.containsBody(2));
+    try testing.expect(h0.containsBody(3));
+    try testing.expect(!h0.containsBody(1));
+    try testing.expect(!h0.containsBody(4));
+
+    const h0_line = hunkSpanAt(rows, 3);
+    try testing.expectEqual(1, h0_line.header.?);
+    try testing.expectEqual(2, h0_line.body_start);
+    try testing.expectEqual(4, h0_line.body_end);
+
+    // Second hunk
+    const h1 = hunkSpanAt(rows, 5);
+    try testing.expectEqual(4, h1.header.?);
+    try testing.expectEqual(5, h1.body_start);
+    try testing.expectEqual(7, h1.body_end);
 }
 
 /// Two-hunk fixture: file, h0, del, add, h1, del, add → indices 0..6.
