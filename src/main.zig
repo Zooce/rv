@@ -7,10 +7,10 @@
 //! With a subcommand: headless CLI (`status`, `list`, `show`, `resolve`,
 //! `reopen`, `export`, `install-skill`, help) — no git load and no raw TTY modes.
 //!
-//! Comment UX (v1): single-line footer prompt (not an inline box). Esc cancels;
-//! Enter saves. Open-comment marker: `*` in the gutter. Add/delete lines use
-//! green/red backgrounds (no `+/-`). Reload on next `rv` via
-//! `.rv/reviews/current.json`.
+//! Comment UX: soft-wrapped multi-line footer prompt (grows up to 4 rows, then
+//! scrolls with a right-edge scrollbar). Esc cancels; Enter saves. Open-comment
+//! marker: `*` in the gutter. Add/delete lines use green/red backgrounds (no
+//! `+/-`). Reload on next `rv` via `.rv/reviews/current.json`.
 
 const std = @import("std");
 const git = @import("git");
@@ -18,6 +18,7 @@ const tui = @import("tui");
 const view = @import("view");
 const store = @import("store");
 const cli = @import("cli");
+const comment_input = @import("comment_input");
 
 pub fn main(init: std.process.Init) !u8 {
     const alloc = init.gpa;
@@ -104,10 +105,12 @@ fn runTui(alloc: std.mem.Allocator, io: std.Io) !u8 {
     var commenting = false;
     var draft: std.ArrayList(u8) = .empty;
     defer draft.deinit(alloc);
+    // First visible soft-wrapped line of the comment box (when scrolled).
+    var draft_scroll: usize = 0;
     // Anchor captured when entering comment mode (cursor does not move then).
     var draft_anchor: view.Anchor = undefined;
 
-    paint(&scr, size, rows, cursor, &scroll, &review, commenting, draft.items);
+    paint(&scr, size, rows, cursor, &scroll, &review, commenting, draft.items, &draft_scroll);
     try scr.present(&term);
 
     while (running) {
@@ -124,6 +127,7 @@ fn runTui(alloc: std.mem.Allocator, io: std.Io) !u8 {
                         .esc => {
                             commenting = false;
                             draft.clearRetainingCapacity();
+                            draft_scroll = 0;
                         },
                         .enter => {
                             if (draft.items.len > 0) {
@@ -141,14 +145,28 @@ fn runTui(alloc: std.mem.Allocator, io: std.Io) !u8 {
                             }
                             commenting = false;
                             draft.clearRetainingCapacity();
+                            draft_scroll = 0;
                         },
                         .backspace => {
                             if (draft.items.len > 0) _ = draft.pop();
+                            followDraftEnd(size.cols, size.rows, draft.items, &draft_scroll);
                         },
                         .char => |c| {
                             if (c >= 0x20 and c < 0x7f) {
                                 try draft.append(alloc, @intCast(c));
+                                followDraftEnd(size.cols, size.rows, draft.items, &draft_scroll);
                             }
+                        },
+                        .up => {
+                            if (draft_scroll > 0) draft_scroll -= 1;
+                        },
+                        .down => {
+                            const m = commentMetrics(size.cols, size.rows, draft.items);
+                            draft_scroll = comment_input.clampScroll(
+                                draft_scroll + 1,
+                                m.line_count,
+                                m.height,
+                            );
                         },
                         .ctrl_c => running = false,
                         else => {},
@@ -177,6 +195,7 @@ fn runTui(alloc: std.mem.Allocator, io: std.Io) !u8 {
                             if (view.anchorAt(rows, cursor)) |a| {
                                 draft_anchor = a;
                                 draft.clearRetainingCapacity();
+                                draft_scroll = 0;
                                 commenting = true;
                             }
                         }
@@ -185,6 +204,7 @@ fn runTui(alloc: std.mem.Allocator, io: std.Io) !u8 {
                         if (view.anchorAt(rows, cursor)) |a| {
                             draft_anchor = a;
                             draft.clearRetainingCapacity();
+                            draft_scroll = 0;
                             commenting = true;
                         }
                     },
@@ -200,11 +220,27 @@ fn runTui(alloc: std.mem.Allocator, io: std.Io) !u8 {
             },
         }
         if (running) {
-            paint(&scr, size, rows, cursor, &scroll, &review, commenting, draft.items);
+            paint(&scr, size, rows, cursor, &scroll, &review, commenting, draft.items, &draft_scroll);
             try scr.present(&term);
         }
     }
     return 0;
+}
+
+/// Visible comment-box row budget: keep the title row; cap at `max_rows`.
+fn commentMaxVisible(term_rows: u16) usize {
+    if (term_rows <= 1) return 1;
+    return @min(comment_input.max_rows, @as(usize, term_rows - 1));
+}
+
+fn commentMetrics(cols: u16, term_rows: u16, draft: []const u8) comment_input.Metrics {
+    return comment_input.metricsLimited(cols, draft, commentMaxVisible(term_rows));
+}
+
+/// After append/backspace, keep the end of the draft in view.
+fn followDraftEnd(cols: u16, term_rows: u16, draft: []const u8, draft_scroll: *usize) void {
+    const m = commentMetrics(cols, term_rows, draft);
+    draft_scroll.* = comment_input.scrollToEnd(m.line_count, m.height);
 }
 
 fn sideForAnchor(a: view.Anchor) store.Side {
@@ -222,6 +258,7 @@ fn paint(
     review: *const store.Review,
     commenting: bool,
     draft: []const u8,
+    draft_scroll: *usize,
 ) void {
     // Diff line palette (truecolor). Documented together so sticky file
     // headers (#36) and body paints share one table. Hierarchy:
@@ -243,6 +280,16 @@ fn paint(
     const footer_style = tui.Style{
         .fg = .{ .rgb = .{ .r = 0xee, .g = 0xee, .b = 0xee } },
         .bg = .{ .rgb = .{ .r = 0x2a, .g = 0x3f, .b = 0x5f } },
+    };
+    const footer_bar_track = tui.Style{
+        .fg = .{ .rgb = .{ .r = 0x6a, .g = 0x7a, .b = 0x9a } },
+        .bg = .{ .rgb = .{ .r = 0x2a, .g = 0x3f, .b = 0x5f } },
+        .dim = true,
+    };
+    const footer_bar_thumb = tui.Style{
+        .fg = .{ .rgb = .{ .r = 0xee, .g = 0xee, .b = 0xee } },
+        .bg = .{ .rgb = .{ .r = 0x4a, .g = 0x6a, .b = 0x9a } },
+        .bold = true,
     };
     // File header: dark grey bar + light bold path (clear vs body; not green/red).
     const file_style = tui.Style{
@@ -306,16 +353,22 @@ fn paint(
     if (size.rows > 0) {
         fillRow(scr, 0, title_style);
         const help = if (commenting)
-            "rv  comment  Enter save  Esc cancel"
+            "rv  comment  Enter save  Esc cancel  ↑↓ scroll"
         else
             "rv  j/k line  J/K change  [/] hunk  {/} file  i comment  q quit";
         scr.putStr(1, 0, help, title_style);
     }
 
+    // Footer: 1 status row, or soft-wrapped comment box (grows to max_rows).
     const has_footer = size.rows >= 2;
-    const footer_y: u16 = if (has_footer) size.rows - 1 else 0;
+    const cm: ?comment_input.Metrics = if (commenting and has_footer)
+        commentMetrics(size.cols, size.rows, draft)
+    else
+        null;
+    const footer_h: u16 = if (!has_footer) 0 else if (cm) |m| m.height else 1;
+    const footer_top: u16 = if (has_footer) size.rows - footer_h else 0;
     const content_top: u16 = 1;
-    const content_bottom: u16 = if (has_footer) footer_y else size.rows;
+    const content_bottom: u16 = if (has_footer) footer_top else size.rows;
     const content_rows: usize = if (content_bottom > content_top)
         content_bottom - content_top
     else
@@ -369,26 +422,55 @@ fn paint(
     }
 
     if (has_footer) {
-        fillRow(scr, footer_y, footer_style);
-        const footer_text = if (commenting)
-            bufPrintTrunc(&line_buf, "> {s}", .{draft})
-        else blk: {
-            const st = view.statusAt(rows, cur);
-            break :blk formatFooter(&line_buf, st, review.openCount());
-        };
-        // Prompt/status starts at column 1 (one-cell left gutter).
-        scr.putStr(1, footer_y, footer_text, footer_style);
-        if (commenting) {
-            // Caret is end-only today (append / pop). Hardware cursor after the
-            // drawn text; clamp to the last column when the draft fills the row.
-            // Draft input is ASCII printable, so display width equals byte length.
-            const after: usize = 1 + footer_text.len;
+        if (cm) |m| {
+            draft_scroll.* = comment_input.clampScroll(draft_scroll.*, m.line_count, m.height);
+            const ds = draft_scroll.*;
+
+            var row: u16 = 0;
+            while (row < footer_h) : (row += 1) {
+                const y: u16 = footer_top + row;
+                fillRow(scr, y, footer_style);
+                const vline = ds + row;
+                const piece = comment_input.writeVisualLine(&line_buf, draft, m.text_w, vline);
+                // Prefix + text start at column 1 (one-cell left gutter).
+                scr.putStr(1, y, piece, footer_style);
+            }
+
+            // Right pad is always reserved (text_w stable). Scrollbar uses the
+            // rightmost column of that pad when needed; the pad column left of
+            // it stays empty so wrap does not reflow when the bar appears.
+            if (m.show_scrollbar and size.cols > 0) {
+                const bar_x: u16 = size.cols - 1;
+                const thumb = comment_input.scrollbarThumb(
+                    m.line_count,
+                    m.height,
+                    ds,
+                    m.height,
+                );
+                var br: u16 = 0;
+                while (br < footer_h) : (br += 1) {
+                    const y: u16 = footer_top + br;
+                    const in_thumb = br >= thumb.start and br < thumb.start + thumb.len;
+                    const st = if (in_thumb) footer_bar_thumb else footer_bar_track;
+                    const ch: u21 = if (in_thumb) '█' else '│';
+                    scr.setCell(bar_x, y, .{ .char = ch, .width = 1, .style = st });
+                }
+            }
+
+            // Caret is end-only (append / pop). Clamp to last column when full.
+            const caret = comment_input.cursorAtEnd(draft, m.text_w, ds, m.height);
             const cx: u16 = if (size.cols == 0)
                 0
             else
-                @intCast(@min(after, @as(usize, size.cols) - 1));
-            scr.setCursor(cx, footer_y);
+                @intCast(@min(@as(usize, caret.x), @as(usize, size.cols) - 1));
+            const cy: u16 = footer_top + caret.y_off;
+            scr.setCursor(cx, cy);
         } else {
+            const footer_y = footer_top;
+            fillRow(scr, footer_y, footer_style);
+            const st = view.statusAt(rows, cur);
+            const footer_text = formatFooter(&line_buf, st, review.openCount());
+            scr.putStr(1, footer_y, footer_text, footer_style);
             scr.hideCursor();
         }
     } else {

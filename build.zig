@@ -71,6 +71,13 @@ pub fn build(b: *std.Build) void {
         },
     });
 
+    // Soft-wrapped multi-line comment footer layout (goal #53).
+    const comment_input_mod = b.addModule("comment_input", .{
+        .root_source_file = b.path("src/comment_input.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+
     // Comment model + `.rv/reviews/` JSON store (MVP-1).
     const store_mod = b.addModule("store", .{
         .root_source_file = b.path("src/store.zig"),
@@ -116,6 +123,7 @@ pub fn build(b: *std.Build) void {
                 .{ .name = "view", .module = view_mod },
                 .{ .name = "store", .module = store_mod },
                 .{ .name = "cli", .module = cli_mod },
+                .{ .name = "comment_input", .module = comment_input_mod },
             },
         }),
     });
@@ -161,6 +169,11 @@ pub fn build(b: *std.Build) void {
     });
     const run_view_tests = b.addRunArtifact(view_tests);
 
+    const comment_input_tests = b.addTest(.{
+        .root_module = comment_input_mod,
+    });
+    const run_comment_input_tests = b.addRunArtifact(comment_input_tests);
+
     const store_tests = b.addTest(.{
         .root_module = store_mod,
     });
@@ -176,11 +189,12 @@ pub fn build(b: *std.Build) void {
     });
     const run_install_skill_tests = b.addRunArtifact(install_skill_tests);
 
-    const test_step = b.step("test", "Run unit tests (TUI + diff + git + view + store + cli + install_skill)");
+    const test_step = b.step("test", "Run unit tests (TUI + diff + git + view + comment_input + store + cli + install_skill)");
     test_step.dependOn(&run_tui_tests.step);
     test_step.dependOn(&run_diff_tests.step);
     test_step.dependOn(&run_git_tests.step);
     test_step.dependOn(&run_view_tests.step);
+    test_step.dependOn(&run_comment_input_tests.step);
     test_step.dependOn(&run_store_tests.step);
     test_step.dependOn(&run_cli_tests.step);
     test_step.dependOn(&run_install_skill_tests.step);
