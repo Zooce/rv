@@ -3,6 +3,9 @@
 //! With no args: load smart-default git diff → flatten rows → load `.rv`
 //! comments → TUI (`j`/`k`, `h`/`l` pan, `0`/`$` col home/end, `[`/`]` hunk,
 //! `{`/`}` file header, `i`/`c`/`a`/`Enter` comment, `q` quit).
+//! Diff layout defaults to side-by-side when the terminal is wide enough;
+//! falls back to unified when narrow. `t` toggles session preference
+//! (explicit unified stays unified even when wide).
 //! Empty/error paths never enter raw / alt-screen mode.
 //!
 //! With a subcommand: headless CLI (`status`, `list`, `show`, `resolve`,
@@ -59,6 +62,8 @@ fn runTui(alloc: std.mem.Allocator, io: std.Io) !u8 {
 
     const rows = try view.flatten(alloc, &d);
     defer alloc.free(rows);
+    const sbs_slots = try view.pairSideBySide(alloc, rows);
+    defer alloc.free(sbs_slots);
 
     var review = store.load(alloc, io, .cwd(), store.default_review_id) catch |err| {
         const msg: []const u8 = switch (err) {
@@ -105,6 +110,8 @@ fn runTui(alloc: std.mem.Allocator, io: std.Io) !u8 {
     var scroll: usize = 0;
     // First visible display column for lines in the cursor's hunk only.
     var col_scroll: usize = 0;
+    // Prefer side-by-side; auto-unified when narrow. `t` flips session preference.
+    var layout_pref: view.LayoutPref = .side_by_side;
     var running = true;
     var commenting = false;
     var draft: std.ArrayList(u8) = .empty;
@@ -116,7 +123,7 @@ fn runTui(alloc: std.mem.Allocator, io: std.Io) !u8 {
     // Anchor captured when entering comment mode (cursor does not move then).
     var draft_anchor: view.Anchor = undefined;
 
-    paint(&scr, size, rows, cursor, &scroll, &col_scroll, &review, commenting, draft.items, draft_caret, &draft_scroll);
+    paint(&scr, size, rows, sbs_slots, layout_pref, cursor, &scroll, &col_scroll, &review, commenting, draft.items, draft_caret, &draft_scroll);
     try scr.present(&term);
 
     while (running) {
@@ -202,19 +209,20 @@ fn runTui(alloc: std.mem.Allocator, io: std.Io) !u8 {
                         if (c == 'q' or c == 'Q') {
                             running = false;
                         } else if (c == 'j') {
-                            if (cursor + 1 < rows.len) cursor += 1;
+                            cursor = moveLineDown(layout_pref, size.cols, rows, sbs_slots, cursor);
                         } else if (c == 'k') {
-                            if (cursor > 0) cursor -= 1;
+                            cursor = moveLineUp(layout_pref, size.cols, rows, sbs_slots, cursor);
                         } else if (c == 'h') {
-                            const step = panStep(size.cols);
+                            const step = panStep(panViewportCols(layout_pref, size.cols));
                             col_scroll = if (col_scroll > step) col_scroll - step else 0;
                         } else if (c == 'l') {
-                            col_scroll +%= panStep(size.cols);
+                            col_scroll +%= panStep(panViewportCols(layout_pref, size.cols));
                         } else if (c == '0') {
                             col_scroll = 0;
                         } else if (c == '$') {
                             const span = view.hunkSpanAt(rows, cursor);
-                            col_scroll = view.colScrollToEnd(hunkMaxLineWidth(rows, span), size.cols);
+                            const vp = panViewportCols(layout_pref, size.cols);
+                            col_scroll = view.colScrollToEnd(hunkMaxLineWidth(rows, span), vp);
                         } else if (c == 'J') {
                             cursor = view.nextChange(rows, cursor);
                         } else if (c == 'K') {
@@ -227,6 +235,8 @@ fn runTui(alloc: std.mem.Allocator, io: std.Io) !u8 {
                             cursor = view.nextFileHeader(rows, cursor);
                         } else if (c == '{') {
                             cursor = view.prevFileHeader(rows, cursor);
+                        } else if (c == 't') {
+                            layout_pref = view.toggleLayoutPref(layout_pref);
                         } else if (c == 'i' or c == 'c' or c == 'a') {
                             if (view.anchorAt(rows, cursor)) |a| {
                                 draft_anchor = a;
@@ -247,17 +257,17 @@ fn runTui(alloc: std.mem.Allocator, io: std.Io) !u8 {
                         }
                     },
                     .down => {
-                        if (cursor + 1 < rows.len) cursor += 1;
+                        cursor = moveLineDown(layout_pref, size.cols, rows, sbs_slots, cursor);
                     },
                     .up => {
-                        if (cursor > 0) cursor -= 1;
+                        cursor = moveLineUp(layout_pref, size.cols, rows, sbs_slots, cursor);
                     },
                     .left => {
-                        const step = panStep(size.cols);
+                        const step = panStep(panViewportCols(layout_pref, size.cols));
                         col_scroll = if (col_scroll > step) col_scroll - step else 0;
                     },
                     .right => {
-                        col_scroll +%= panStep(size.cols);
+                        col_scroll +%= panStep(panViewportCols(layout_pref, size.cols));
                     },
                     .ctrl_c => running = false,
                     else => {},
@@ -265,16 +275,53 @@ fn runTui(alloc: std.mem.Allocator, io: std.Io) !u8 {
             },
         }
         if (running) {
-            paint(&scr, size, rows, cursor, &scroll, &col_scroll, &review, commenting, draft.items, draft_caret, &draft_scroll);
+            paint(&scr, size, rows, sbs_slots, layout_pref, cursor, &scroll, &col_scroll, &review, commenting, draft.items, draft_caret, &draft_scroll);
             try scr.present(&term);
         }
     }
     return 0;
 }
 
-/// Horizontal pan step: about a quarter of the terminal width (at least 1).
+/// Columns available for horizontal pan: full width (unified) or one pane (SBS).
+fn panViewportCols(pref: view.LayoutPref, cols: u16) u16 {
+    return switch (view.effectiveLayout(pref, cols)) {
+        .unified => cols,
+        .side_by_side => view.sbsPaneWidths(cols).left_w,
+    };
+}
+
+/// One step down: unified row in unified layout; next SBS slot in side-by-side.
+fn moveLineDown(
+    pref: view.LayoutPref,
+    cols: u16,
+    rows: []const view.Row,
+    slots: []const view.SbsSlot,
+    cursor: usize,
+) usize {
+    return switch (view.effectiveLayout(pref, cols)) {
+        .unified => if (cursor + 1 < rows.len) cursor + 1 else cursor,
+        .side_by_side => view.nextSbsCursor(slots, rows, cursor),
+    };
+}
+
+/// One step up: unified row in unified layout; previous SBS slot in side-by-side.
+fn moveLineUp(
+    pref: view.LayoutPref,
+    cols: u16,
+    rows: []const view.Row,
+    slots: []const view.SbsSlot,
+    cursor: usize,
+) usize {
+    return switch (view.effectiveLayout(pref, cols)) {
+        .unified => if (cursor > 0) cursor - 1 else cursor,
+        .side_by_side => view.prevSbsCursor(slots, rows, cursor),
+    };
+}
+
+/// Horizontal pan step: about a quarter of the pan viewport (at least 1).
 fn panStep(cols: u16) usize {
-    return @max(@as(usize, 1), @as(usize, cols) / 4);
+    if (cols == 0) return 1;
+    return @max(1, cols / 4);
 }
 
 /// Widest formatted **line** in the hunk body (headers excluded). 0 if empty.
@@ -323,6 +370,8 @@ fn paint(
     scr: *tui.Screen,
     size: tui.Size,
     rows: []const view.Row,
+    sbs_slots: []const view.SbsSlot,
+    layout_pref: view.LayoutPref,
     cursor: usize,
     scroll: *usize,
     col_scroll: *usize,
@@ -427,7 +476,7 @@ fn paint(
         const help = if (commenting)
             "rv  comment  Enter save  Esc cancel  ↑↓ scroll"
         else
-            "rv  j/k line  h/l pan  0/$  J/K change  [/] hunk  {/} file  i  q";
+            "rv  j/k line  h/l pan  0/$  J/K change  [/] hunk  {/} file  t layout  i  q";
         scr.putStr(1, 0, help, title_style);
     }
 
@@ -447,59 +496,182 @@ fn paint(
         0;
 
     const cur = view.clampCursor(cursor, rows.len);
-    const settled = view.ensureVisibleSticky(scroll.*, cur, content_rows, rows);
-    scroll.* = settled.scroll;
-    const sticky = settled.sticky;
+    const layout = view.effectiveLayout(layout_pref, size.cols);
+    const gutter_style = tui.Style{
+        .fg = .{ .rgb = .{ .r = 0x50, .g = 0x50, .b = 0x58 } },
+        .bg = bg,
+    };
 
     var line_buf: [512]u8 = undefined;
     // Only lines in the cursor's hunk pan; file/hunk headers never pan.
-    // Range = widest line in that hunk vs viewport (0 if none overflow).
     const pan_span = view.hunkSpanAt(rows, cur);
     const hunk_w = hunkMaxLineWidth(rows, pan_span);
-    col_scroll.* = view.clampColScroll(col_scroll.*, hunk_w, size.cols);
+    const pan_vp: usize = panViewportCols(layout_pref, size.cols);
+    col_scroll.* = view.clampColScroll(col_scroll.*, hunk_w, pan_vp);
     const cs = col_scroll.*;
-    var screen_y: u16 = content_top;
 
-    // Sticky file path under the title bar (hunk headers scroll with the body).
-    // Last file header strictly above scroll stays pinned; the next file header
-    // enters as a normal body row. Cursor lift if cursor is on that source row.
-    // Sticky path is not panned (header bar stays full-width from column 0).
-    if (sticky.file_idx) |fi| {
-        if (screen_y < content_bottom) {
-            const text = formatRow(&line_buf, rows[fi], false);
-            const st = if (fi == cur) file_cur_style else file_style;
-            fillRow(scr, screen_y, st);
-            scr.putStr(0, screen_y, text, st);
-            screen_y += 1;
-        }
-    }
+    switch (layout) {
+        .unified => {
+            const settled = view.ensureVisibleSticky(scroll.*, cur, content_rows, rows);
+            scroll.* = settled.scroll;
+            const sticky = settled.sticky;
+            var screen_y: u16 = content_top;
 
-    var i: usize = scroll.*;
-    while (i < rows.len and screen_y < content_bottom) : (i += 1) {
-        const is_cur = i == cur;
-        const marked = rowMarked(rows[i], review);
-        const text = formatRow(&line_buf, rows[i], marked);
-        const st = rowStyle(
-            rows[i],
-            is_cur,
-            body,
-            file_style,
-            file_cur_style,
-            hunk_style,
-            hunk_cur_style,
-            add_style,
-            del_style,
-            add_cur_style,
-            del_cur_style,
-            ctx_cur_style,
-            meta_style,
-            cur_style,
-        );
-        fillRow(scr, screen_y, st);
-        const pan = pan_span.containsBody(i);
-        const visible = if (pan) text[tui.screen.byteAtCol(text, cs)..] else text;
-        scr.putStr(0, screen_y, visible, st);
-        screen_y += 1;
+            // Sticky file path under the title bar (hunk headers scroll with body).
+            if (sticky.file_idx) |fi| {
+                if (screen_y < content_bottom) {
+                    const text = formatRow(&line_buf, rows[fi], false);
+                    const st = if (fi == cur) file_cur_style else file_style;
+                    fillRow(scr, screen_y, st);
+                    scr.putStr(0, screen_y, text, st);
+                    screen_y += 1;
+                }
+            }
+
+            var i: usize = scroll.*;
+            while (i < rows.len and screen_y < content_bottom) : (i += 1) {
+                const is_cur = i == cur;
+                const marked = rowMarked(rows[i], review);
+                const text = formatRow(&line_buf, rows[i], marked);
+                const st = rowStyle(
+                    rows[i],
+                    is_cur,
+                    body,
+                    file_style,
+                    file_cur_style,
+                    hunk_style,
+                    hunk_cur_style,
+                    add_style,
+                    del_style,
+                    add_cur_style,
+                    del_cur_style,
+                    ctx_cur_style,
+                    meta_style,
+                    cur_style,
+                );
+                fillRow(scr, screen_y, st);
+                const pan = pan_span.containsBody(i);
+                const visible = if (pan) text[tui.screen.byteAtCol(text, cs)..] else text;
+                scr.putStr(0, screen_y, visible, st);
+                screen_y += 1;
+            }
+        },
+        .side_by_side => {
+            const settled = view.ensureVisibleStickySbs(scroll.*, cur, content_rows, sbs_slots, rows);
+            scroll.* = settled.scroll;
+            const sticky = settled.sticky;
+            const panes = view.sbsPaneWidths(size.cols);
+            var screen_y: u16 = content_top;
+
+            if (sticky.file_idx) |fi| {
+                if (screen_y < content_bottom) {
+                    const text = formatRow(&line_buf, rows[fi], false);
+                    const st = if (fi == cur) file_cur_style else file_style;
+                    fillRow(scr, screen_y, st);
+                    scr.putStr(0, screen_y, text, st);
+                    screen_y += 1;
+                }
+            }
+
+            var si: usize = scroll.*;
+            while (si < sbs_slots.len and screen_y < content_bottom) : (si += 1) {
+                switch (sbs_slots[si]) {
+                    .header => |ri| {
+                        const is_cur = ri == cur;
+                        const text = formatRow(&line_buf, rows[ri], false);
+                        const st = rowStyle(
+                            rows[ri],
+                            is_cur,
+                            body,
+                            file_style,
+                            file_cur_style,
+                            hunk_style,
+                            hunk_cur_style,
+                            add_style,
+                            del_style,
+                            add_cur_style,
+                            del_cur_style,
+                            ctx_cur_style,
+                            meta_style,
+                            cur_style,
+                        );
+                        fillRow(scr, screen_y, st);
+                        scr.putStr(0, screen_y, text, st);
+                    },
+                    .pair => |p| {
+                        // Whole slot is current when the cursor sits on either pane
+                        // (paired del|add highlight together as one split row).
+                        const slot_cur = sbs_slots[si].containsRow(cur);
+                        const left_st = if (p.left) |ri|
+                            rowStyle(
+                                rows[ri],
+                                slot_cur,
+                                body,
+                                file_style,
+                                file_cur_style,
+                                hunk_style,
+                                hunk_cur_style,
+                                add_style,
+                                del_style,
+                                add_cur_style,
+                                del_cur_style,
+                                ctx_cur_style,
+                                meta_style,
+                                cur_style,
+                            )
+                        else if (slot_cur) ctx_cur_style else body;
+                        const right_st = if (p.right) |ri|
+                            rowStyle(
+                                rows[ri],
+                                slot_cur,
+                                body,
+                                file_style,
+                                file_cur_style,
+                                hunk_style,
+                                hunk_cur_style,
+                                add_style,
+                                del_style,
+                                add_cur_style,
+                                del_cur_style,
+                                ctx_cur_style,
+                                meta_style,
+                                cur_style,
+                            )
+                        else if (slot_cur) ctx_cur_style else body;
+
+                        fillSpan(scr, 0, panes.gutter_x, screen_y, left_st);
+                        if (panes.right_w > 0 or panes.gutter_x < size.cols) {
+                            fillSpan(scr, panes.gutter_x, panes.gutter_x + 1, screen_y, gutter_style);
+                            if (panes.gutter_x < size.cols) {
+                                scr.setCell(panes.gutter_x, screen_y, .{
+                                    .char = '│',
+                                    .width = 1,
+                                    .style = gutter_style,
+                                });
+                            }
+                        }
+                        const right_x: u16 = panes.gutter_x + 1;
+                        fillSpan(scr, right_x, size.cols, screen_y, right_st);
+
+                        if (p.left) |ri| {
+                            const marked = rowMarked(rows[ri], review);
+                            const text = formatRow(&line_buf, rows[ri], marked);
+                            const pan = pan_span.containsBody(ri);
+                            const visible = if (pan) text[tui.screen.byteAtCol(text, cs)..] else text;
+                            putPaneStr(scr, 0, screen_y, panes.left_w, visible, left_st);
+                        }
+                        if (p.right) |ri| {
+                            const marked = rowMarked(rows[ri], review);
+                            const text = formatRow(&line_buf, rows[ri], marked);
+                            const pan = pan_span.containsBody(ri);
+                            const visible = if (pan) text[tui.screen.byteAtCol(text, cs)..] else text;
+                            putPaneStr(scr, right_x, screen_y, panes.right_w, visible, right_st);
+                        }
+                    },
+                }
+                screen_y += 1;
+            }
+        },
     }
 
     if (has_footer) {
@@ -551,7 +723,7 @@ fn paint(
             const footer_y = footer_top;
             fillRow(scr, footer_y, footer_style);
             const st = view.statusAt(rows, cur);
-            const footer_text = formatFooter(&line_buf, st, review.openCount());
+            const footer_text = formatFooter(&line_buf, st, review.openCount(), layout_pref, size.cols);
             scr.putStr(1, footer_y, footer_text, footer_style);
             scr.hideCursor();
         }
@@ -570,23 +742,44 @@ fn rowMarked(row: view.Row, review: *const store.Review) bool {
     };
 }
 
-fn formatFooter(buf: []u8, st: view.Status, open_n: usize) []const u8 {
+/// Short layout label for the status footer.
+fn layoutFooterLabel(pref: view.LayoutPref, cols: u16) []const u8 {
+    return switch (view.effectiveLayout(pref, cols)) {
+        .side_by_side => "sbs",
+        .unified => switch (pref) {
+            .unified => "uni",
+            // Prefer SBS but terminal too narrow for two panes.
+            .side_by_side => "uni~",
+        },
+    };
+}
+
+fn formatFooter(
+    buf: []u8,
+    st: view.Status,
+    open_n: usize,
+    layout_pref: view.LayoutPref,
+    cols: u16,
+) []const u8 {
+    const mode = layoutFooterLabel(layout_pref, cols);
     if (st.row_n == 0) return "no changes";
     if (st.hunk_n == 0) {
-        return bufPrintTrunc(buf, "{s}  {d}/{d}  {d} open", .{
+        return bufPrintTrunc(buf, "{s}  {d}/{d}  {d} open  {s}", .{
             if (st.path.len > 0) st.path else "?",
             st.row_i,
             st.row_n,
             open_n,
+            mode,
         });
     }
-    return bufPrintTrunc(buf, "{s}  hunk {d}/{d}  {d}/{d}  {d} open", .{
+    return bufPrintTrunc(buf, "{s}  hunk {d}/{d}  {d}/{d}  {d} open  {s}", .{
         if (st.path.len > 0) st.path else "?",
         st.hunk_i,
         st.hunk_n,
         st.row_i,
         st.row_n,
         open_n,
+        mode,
     });
 }
 
@@ -676,8 +869,20 @@ fn bufPrintTrunc(buf: []u8, comptime fmt: []const u8, args: anytype) []const u8 
 }
 
 fn fillRow(scr: *tui.Screen, y: u16, style: tui.Style) void {
-    var x: u16 = 0;
-    while (x < scr.cols) : (x += 1) {
+    fillSpan(scr, 0, scr.cols, y, style);
+}
+
+/// Fill columns `[x0, x1)` on row `y` (clamped to the screen).
+fn fillSpan(scr: *tui.Screen, x0: u16, x1: u16, y: u16, style: tui.Style) void {
+    var x = x0;
+    while (x < x1 and x < scr.cols) : (x += 1) {
         scr.setCell(x, y, .{ .char = ' ', .width = 1, .style = style });
     }
+}
+
+/// Write `text` into a pane starting at `x`, at most `pane_w` display columns.
+fn putPaneStr(scr: *tui.Screen, x: u16, y: u16, pane_w: u16, text: []const u8, style: tui.Style) void {
+    if (pane_w == 0) return;
+    const end = tui.screen.byteAtCol(text, pane_w);
+    scr.putStr(x, y, text[0..end], style);
 }
