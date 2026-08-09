@@ -112,7 +112,7 @@ fn nextLineStart(draft: []const u8, end: usize) usize {
 
 /// Byte range of draft text on visual line `line` (0-based), or null if past end.
 /// Empty draft yields one empty line at index 0.
-pub fn lineAt(draft: []const u8, text_w: u16, line: usize) ?LineRange {
+pub fn lineRange(draft: []const u8, text_w: u16, line: usize) ?LineRange {
     const tw: usize = if (text_w == 0) 1 else text_w;
     if (draft.len == 0) {
         return if (line == 0) .{ .start = 0, .end = 0 } else null;
@@ -139,7 +139,7 @@ pub fn lineAt(draft: []const u8, text_w: u16, line: usize) ?LineRange {
 pub fn lineCount(draft: []const u8, text_w: u16) usize {
     if (draft.len == 0) return 1;
     var n: usize = 0;
-    while (lineAt(draft, text_w, n)) |_| : (n += 1) {}
+    while (lineRange(draft, text_w, n)) |_| : (n += 1) {}
     return if (n == 0) 1 else n;
 }
 
@@ -182,7 +182,7 @@ pub fn scrollToEnd(line_count: usize, height: u16) usize {
 /// Write `prefix + draft-slice` for visual line `line` into `buf`.
 pub fn writeVisualLine(buf: []u8, draft: []const u8, text_w: u16, line: usize) []const u8 {
     if (buf.len == 0) return buf[0..0];
-    const range = lineAt(draft, text_w, line) orelse return buf[0..0];
+    const range = lineRange(draft, text_w, line) orelse return buf[0..0];
     const pref: []const u8 = if (line == 0) prefix_first else prefix_cont;
     const text = draft[range.start..range.end];
     const need = pref.len + text.len;
@@ -202,21 +202,95 @@ pub fn writeVisualLine(buf: []u8, draft: []const u8, text_w: u16, line: usize) [
     return buf[0..need];
 }
 
-/// End-of-draft caret: absolute screen column and row offset in the footer.
+/// Visual line index and column within that line's draft text.
+pub const VisualPos = struct {
+    line: usize,
+    col: usize,
+
+    /// Map a caret byte index into `draft` to a visual line and column-in-text.
+    /// `caret` is clamped to `[0, draft.len]`. Skipped wrap spaces (between a
+    /// line's `end` and the next line's `start`) map to the end of the preceding
+    /// visual line.
+    pub fn init(draft: []const u8, text_w: u16, caret: usize) VisualPos {
+        const c = @min(caret, draft.len);
+        if (draft.len == 0) return .{ .line = 0, .col = 0 };
+
+        var line: usize = 0;
+        while (lineRange(draft, text_w, line)) |range| : (line += 1) {
+            if (c <= range.end) {
+                return .{ .line = line, .col = c - range.start };
+            }
+            // Past this line's text: either in skipped spaces before the next
+            // line, or on a later line. Peek at next start without allocating.
+            const next_start = blk: {
+                if (range.end >= draft.len) break :blk draft.len;
+                var n = nextLineStart(draft, range.end);
+                if (n <= range.start) n = range.end;
+                break :blk n;
+            };
+            if (c < next_start or next_start >= draft.len) {
+                // Skipped spaces, or caret past last line content → end of this line.
+                return .{ .line = line, .col = range.end - range.start };
+            }
+            // else: c >= next_start → continue to next visual line
+        }
+        // Should not reach: empty handled above; last line always covers draft.len.
+        return .{ .line = 0, .col = 0 };
+    }
+};
+
+/// Footer screen position for the hardware caret.
+pub const CursorPos = struct {
+    x: u16,
+    y_off: u16,
+};
+
+/// Byte index in `draft` for visual `line` and column-in-text `col`.
+/// `col` is clamped to the line's text length (end-of-line). Past-last line → `draft.len`.
+pub fn byteAtVisual(draft: []const u8, text_w: u16, line: usize, col: usize) usize {
+    const range = lineRange(draft, text_w, line) orelse return draft.len;
+    const len = range.end - range.start;
+    return range.start + @min(col, len);
+}
+
+/// Screen column and footer row offset for a caret byte index.
+/// If the caret's visual line is above `scroll`, `y_off` is 0; if below the
+/// window, `y_off` is `height - 1`. Callers should scroll with `ensureVisible`
+/// first so the caret is on-screen.
+pub fn cursorAt(
+    draft: []const u8,
+    text_w: u16,
+    scroll: usize,
+    height: u16,
+    caret: usize,
+) CursorPos {
+    const pos = VisualPos.init(draft, text_w, caret);
+    const y_off_usize: usize = if (pos.line < scroll) 0 else pos.line - scroll;
+    const h: usize = height;
+    const y_off: u16 = @intCast(@min(y_off_usize, h -| 1));
+    const col: u16 = @intCast(pos.col);
+    const x: u16 = left_gutter + prefix_w + col;
+    return .{ .x = x, .y_off = y_off };
+}
+
+/// End-of-draft caret (append position).
 pub fn cursorAtEnd(
     draft: []const u8,
     text_w: u16,
     scroll: usize,
     height: u16,
-) struct { x: u16, y_off: u16 } {
-    const lines = lineCount(draft, text_w);
-    const last: usize = lines - 1;
-    const range = lineAt(draft, text_w, last) orelse LineRange{ .start = 0, .end = 0 };
-    const col_in_text = range.end - range.start;
-    const y_off_usize: usize = if (last < scroll) 0 else last - scroll;
-    const y_off: u16 = @intCast(@min(y_off_usize, @as(usize, height) -| 1));
-    const x: u16 = left_gutter + prefix_w + @as(u16, @intCast(col_in_text));
-    return .{ .x = x, .y_off = y_off };
+) CursorPos {
+    return cursorAt(draft, text_w, scroll, height, draft.len);
+}
+
+/// Move `scroll` so visual line `caret_line` is visible in a window of `height`.
+pub fn ensureVisible(scroll: usize, caret_line: usize, height: u16, line_count: usize) usize {
+    if (height == 0 or line_count == 0) return 0;
+    const h: usize = height;
+    var s = scroll;
+    if (caret_line < s) s = caret_line;
+    if (caret_line >= s + h) s = caret_line + 1 - h;
+    return clampScroll(s, line_count, height);
 }
 
 /// Vertical scrollbar thumb in a track of `track` rows.
@@ -251,8 +325,8 @@ test "word wrap breaks on spaces" {
     // text_w=10: "hello world" → "hello" / "world"
     const d = "hello world";
     try testing.expectEqual(@as(usize, 2), lineCount(d, 10));
-    const a = lineAt(d, 10, 0).?;
-    const b = lineAt(d, 10, 1).?;
+    const a = lineRange(d, 10, 0).?;
+    const b = lineRange(d, 10, 1).?;
     try testing.expectEqualStrings("hello", d[a.start..a.end]);
     try testing.expectEqualStrings("world", d[b.start..b.end]);
 }
@@ -260,16 +334,16 @@ test "word wrap breaks on spaces" {
 test "word wrap breaks after hyphen and comma" {
     // text_w=8 forces boundaries: "pre-" | "flight," | "okay"
     const d = "pre-flight,okay";
-    try testing.expectEqualStrings("pre-", d[lineAt(d, 8, 0).?.start..lineAt(d, 8, 0).?.end]);
-    try testing.expectEqualStrings("flight,", d[lineAt(d, 8, 1).?.start..lineAt(d, 8, 1).?.end]);
-    try testing.expectEqualStrings("okay", d[lineAt(d, 8, 2).?.start..lineAt(d, 8, 2).?.end]);
+    try testing.expectEqualStrings("pre-", d[lineRange(d, 8, 0).?.start..lineRange(d, 8, 0).?.end]);
+    try testing.expectEqualStrings("flight,", d[lineRange(d, 8, 1).?.start..lineRange(d, 8, 1).?.end]);
+    try testing.expectEqualStrings("okay", d[lineRange(d, 8, 2).?.start..lineRange(d, 8, 2).?.end]);
 }
 
 test "hard split long token" {
     const d = "abcdefghijXYZ"; // 13 chars, text_w=10 → abcd...ij / XYZ
     try testing.expectEqual(@as(usize, 2), lineCount(d, 10));
-    try testing.expectEqualStrings("abcdefghij", d[lineAt(d, 10, 0).?.start..lineAt(d, 10, 0).?.end]);
-    try testing.expectEqualStrings("XYZ", d[lineAt(d, 10, 1).?.start..lineAt(d, 10, 1).?.end]);
+    try testing.expectEqualStrings("abcdefghij", d[lineRange(d, 10, 0).?.start..lineRange(d, 10, 0).?.end]);
+    try testing.expectEqualStrings("XYZ", d[lineRange(d, 10, 1).?.start..lineRange(d, 10, 1).?.end]);
 }
 
 test "writeVisualLine hanging indent" {
@@ -320,6 +394,71 @@ test "cursorAtEnd empty and wrapped" {
     const c = cursorAtEnd(d, 10, 0, 2);
     try testing.expectEqual(@as(u16, 1), c.y_off);
     try testing.expectEqual(@as(u16, left_gutter + prefix_w + 5), c.x); // "world"
+}
+
+test "VisualPos.init empty mid and end" {
+    try testing.expectEqual(0, VisualPos.init("", 10, 0).line);
+    try testing.expectEqual(0, VisualPos.init("", 10, 0).col);
+
+    const d = "hello world"; // line0 "hello", line1 "world"
+    const p0 = VisualPos.init(d, 10, 0);
+    try testing.expectEqual(0, p0.line);
+    try testing.expectEqual(0, p0.col);
+
+    const mid = VisualPos.init(d, 10, 2); // 'l' of hello
+    try testing.expectEqual(0, mid.line);
+    try testing.expectEqual(2, mid.col);
+
+    // After "hello" (byte 5 = space, skipped) → end of line 0
+    const after_hello = VisualPos.init(d, 10, 5);
+    try testing.expectEqual(0, after_hello.line);
+    try testing.expectEqual(5, after_hello.col);
+
+    const world = VisualPos.init(d, 10, 6);
+    try testing.expectEqual(1, world.line);
+    try testing.expectEqual(0, world.col);
+
+    const end = VisualPos.init(d, 10, d.len);
+    try testing.expectEqual(1, end.line);
+    try testing.expectEqual(5, end.col);
+}
+
+test "byteAtVisual roundtrip and clamp" {
+    const d = "hello world";
+    try testing.expectEqual(0, byteAtVisual(d, 10, 0, 0));
+    try testing.expectEqual(2, byteAtVisual(d, 10, 0, 2));
+    try testing.expectEqual(5, byteAtVisual(d, 10, 0, 5)); // end of "hello"
+    try testing.expectEqual(5, byteAtVisual(d, 10, 0, 99)); // clamp
+    try testing.expectEqual(6, byteAtVisual(d, 10, 1, 0));
+    try testing.expectEqual(11, byteAtVisual(d, 10, 1, 5));
+    try testing.expectEqual(11, byteAtVisual(d, 10, 9, 0)); // past last
+
+    // Round-trip displayed positions (not the skipped space byte).
+    for ([_]usize{ 0, 2, 5, 6, 8, 11 }) |b| {
+        const p = VisualPos.init(d, 10, b);
+        try testing.expectEqual(b, byteAtVisual(d, 10, p.line, p.col));
+    }
+}
+
+test "cursorAt mid-line matches VisualPos" {
+    const d = "hello world";
+    const c = cursorAt(d, 10, 0, 2, 2);
+    try testing.expectEqual(0, c.y_off);
+    try testing.expectEqual(left_gutter + prefix_w + 2, c.x);
+
+    // End caret matches cursorAtEnd.
+    const end = cursorAt(d, 10, 0, 2, d.len);
+    const end2 = cursorAtEnd(d, 10, 0, 2);
+    try testing.expectEqual(end2.x, end.x);
+    try testing.expectEqual(end2.y_off, end.y_off);
+}
+
+test "ensureVisible keeps caret line in window" {
+    try testing.expectEqual(0, ensureVisible(0, 0, 4, 10));
+    try testing.expectEqual(0, ensureVisible(0, 3, 4, 10));
+    try testing.expectEqual(2, ensureVisible(0, 5, 4, 10)); // 5 at bottom of [2,6)
+    try testing.expectEqual(3, ensureVisible(5, 3, 4, 10)); // pull up
+    try testing.expectEqual(6, ensureVisible(0, 9, 4, 10)); // last page
 }
 
 test "scrollbarThumb extremes" {

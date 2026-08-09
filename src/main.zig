@@ -9,9 +9,10 @@
 //! `reopen`, `export`, `install-skill`, help) — no git load and no raw TTY modes.
 //!
 //! Comment UX: soft-wrapped multi-line footer prompt (grows up to 4 rows, then
-//! scrolls with a right-edge scrollbar). Esc cancels; Enter saves. Open-comment
-//! marker: `*` in the gutter. Add/delete lines use green/red backgrounds (no
-//! `+/-`). Reload on next `rv` via `.rv/reviews/current.json`.
+//! scrolls with a right-edge scrollbar). Arrow keys move the caret; insert and
+//! backspace edit at the caret. Esc cancels; Enter saves. Open-comment marker:
+//! `*` in the gutter. Add/delete lines use green/red backgrounds (no `+/-`).
+//! Reload on next `rv` via `.rv/reviews/current.json`.
 
 const std = @import("std");
 const git = @import("git");
@@ -110,10 +111,12 @@ fn runTui(alloc: std.mem.Allocator, io: std.Io) !u8 {
     defer draft.deinit(alloc);
     // First visible soft-wrapped line of the comment box (when scrolled).
     var draft_scroll: usize = 0;
+    // Byte index of the comment caret into `draft` (0…len).
+    var draft_caret: usize = 0;
     // Anchor captured when entering comment mode (cursor does not move then).
     var draft_anchor: view.Anchor = undefined;
 
-    paint(&scr, size, rows, cursor, &scroll, &col_scroll, &review, commenting, draft.items, &draft_scroll);
+    paint(&scr, size, rows, cursor, &scroll, &col_scroll, &review, commenting, draft.items, draft_caret, &draft_scroll);
     try scr.present(&term);
 
     while (running) {
@@ -131,6 +134,7 @@ fn runTui(alloc: std.mem.Allocator, io: std.Io) !u8 {
                             commenting = false;
                             draft.clearRetainingCapacity();
                             draft_scroll = 0;
+                            draft_caret = 0;
                         },
                         .enter => {
                             if (draft.items.len > 0) {
@@ -149,27 +153,46 @@ fn runTui(alloc: std.mem.Allocator, io: std.Io) !u8 {
                             commenting = false;
                             draft.clearRetainingCapacity();
                             draft_scroll = 0;
+                            draft_caret = 0;
                         },
                         .backspace => {
-                            if (draft.items.len > 0) _ = draft.pop();
-                            followDraftEnd(size.cols, size.rows, draft.items, &draft_scroll);
+                            if (draft_caret > 0) {
+                                draft_caret -= 1;
+                                _ = draft.orderedRemove(draft_caret);
+                                ensureDraftCaretVisible(size.cols, size.rows, draft.items, &draft_scroll, draft_caret);
+                            }
                         },
                         .char => |c| {
                             if (c >= 0x20 and c < 0x7f) {
-                                try draft.append(alloc, @intCast(c));
-                                followDraftEnd(size.cols, size.rows, draft.items, &draft_scroll);
+                                try draft.insert(alloc, draft_caret, @intCast(c));
+                                draft_caret += 1;
+                                ensureDraftCaretVisible(size.cols, size.rows, draft.items, &draft_scroll, draft_caret);
                             }
                         },
+                        .left => {
+                            if (draft_caret > 0) draft_caret -= 1;
+                            ensureDraftCaretVisible(size.cols, size.rows, draft.items, &draft_scroll, draft_caret);
+                        },
+                        .right => {
+                            if (draft_caret < draft.items.len) draft_caret += 1;
+                            ensureDraftCaretVisible(size.cols, size.rows, draft.items, &draft_scroll, draft_caret);
+                        },
                         .up => {
-                            if (draft_scroll > 0) draft_scroll -= 1;
+                            const m = commentMetrics(size.cols, size.rows, draft.items);
+                            const pos = comment_input.VisualPos.init(draft.items, m.text_w, draft_caret);
+                            // On the first visual line, stay put (keep column).
+                            if (pos.line > 0) {
+                                draft_caret = comment_input.byteAtVisual(draft.items, m.text_w, pos.line - 1, pos.col);
+                                ensureDraftCaretVisible(size.cols, size.rows, draft.items, &draft_scroll, draft_caret);
+                            }
                         },
                         .down => {
                             const m = commentMetrics(size.cols, size.rows, draft.items);
-                            draft_scroll = comment_input.clampScroll(
-                                draft_scroll + 1,
-                                m.line_count,
-                                m.height,
-                            );
+                            const pos = comment_input.VisualPos.init(draft.items, m.text_w, draft_caret);
+                            if (pos.line + 1 < m.line_count) {
+                                draft_caret = comment_input.byteAtVisual(draft.items, m.text_w, pos.line + 1, pos.col);
+                            }
+                            ensureDraftCaretVisible(size.cols, size.rows, draft.items, &draft_scroll, draft_caret);
                         },
                         .ctrl_c => running = false,
                         else => {},
@@ -209,6 +232,7 @@ fn runTui(alloc: std.mem.Allocator, io: std.Io) !u8 {
                                 draft_anchor = a;
                                 draft.clearRetainingCapacity();
                                 draft_scroll = 0;
+                                draft_caret = 0;
                                 commenting = true;
                             }
                         }
@@ -218,6 +242,7 @@ fn runTui(alloc: std.mem.Allocator, io: std.Io) !u8 {
                             draft_anchor = a;
                             draft.clearRetainingCapacity();
                             draft_scroll = 0;
+                            draft_caret = 0;
                             commenting = true;
                         }
                     },
@@ -240,7 +265,7 @@ fn runTui(alloc: std.mem.Allocator, io: std.Io) !u8 {
             },
         }
         if (running) {
-            paint(&scr, size, rows, cursor, &scroll, &col_scroll, &review, commenting, draft.items, &draft_scroll);
+            paint(&scr, size, rows, cursor, &scroll, &col_scroll, &review, commenting, draft.items, draft_caret, &draft_scroll);
             try scr.present(&term);
         }
     }
@@ -274,10 +299,18 @@ fn commentMetrics(cols: u16, term_rows: u16, draft: []const u8) comment_input.Me
     return comment_input.metricsLimited(cols, draft, commentMaxVisible(term_rows));
 }
 
-/// After append/backspace, keep the end of the draft in view.
-fn followDraftEnd(cols: u16, term_rows: u16, draft: []const u8, draft_scroll: *usize) void {
+/// Keep the visual line under `caret` inside the comment footer window.
+/// Typing at the end still end-follows (last line is the caret line).
+fn ensureDraftCaretVisible(
+    cols: u16,
+    term_rows: u16,
+    draft: []const u8,
+    draft_scroll: *usize,
+    caret: usize,
+) void {
     const m = commentMetrics(cols, term_rows, draft);
-    draft_scroll.* = comment_input.scrollToEnd(m.line_count, m.height);
+    const pos = comment_input.VisualPos.init(draft, m.text_w, caret);
+    draft_scroll.* = comment_input.ensureVisible(draft_scroll.*, pos.line, m.height, m.line_count);
 }
 
 fn sideForAnchor(a: view.Anchor) store.Side {
@@ -296,6 +329,7 @@ fn paint(
     review: *const store.Review,
     commenting: bool,
     draft: []const u8,
+    draft_caret: usize,
     draft_scroll: *usize,
 ) void {
     // Diff line palette (truecolor). Documented together so sticky file
@@ -470,7 +504,10 @@ fn paint(
 
     if (has_footer) {
         if (cm) |m| {
-            draft_scroll.* = comment_input.clampScroll(draft_scroll.*, m.line_count, m.height);
+            // Reflow (e.g. resize) can move the caret line; keep it on-screen.
+            const caret_byte = @min(draft_caret, draft.len);
+            const pos = comment_input.VisualPos.init(draft, m.text_w, caret_byte);
+            draft_scroll.* = comment_input.ensureVisible(draft_scroll.*, pos.line, m.height, m.line_count);
             const ds = draft_scroll.*;
 
             var row: u16 = 0;
@@ -504,12 +541,10 @@ fn paint(
                 }
             }
 
-            // Caret is end-only (append / pop). Clamp to last column when full.
-            const caret = comment_input.cursorAtEnd(draft, m.text_w, ds, m.height);
-            const cx: u16 = if (size.cols == 0)
-                0
-            else
-                @intCast(@min(@as(usize, caret.x), @as(usize, size.cols) - 1));
+            // Hardware caret at draft_caret (insert position). Clamp x to cols.
+            const caret = comment_input.cursorAt(draft, m.text_w, ds, m.height, caret_byte);
+            const max_x: u16 = if (size.cols == 0) 0 else size.cols - 1;
+            const cx: u16 = @min(caret.x, max_x);
             const cy: u16 = footer_top + caret.y_off;
             scr.setCursor(cx, cy);
         } else {

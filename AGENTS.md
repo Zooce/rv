@@ -36,6 +36,7 @@ For command details, load the `goal` skill / playbook when available.
 - **Allocator parameters and locals are named `alloc`.** Not `gpa`, `allocator`, or single-letter `a` for an `Allocator` value (struct fields that own a longer-lived pool may still use a descriptive name such as `arena` when that is clearer). Prefer `const alloc = …` at the use site.
 - **Avoid `@as` when a typed value or peer resolution is enough.** Prefer `try testing.expectEqual(2, d.files.len)` over `try testing.expectEqual(@as(usize, 2), …)`, and typed locals/constants over casting at the call. Use `@as` only when Zig cannot infer the type and the cast is the clearest fix.
 - **Test utilities stay out of the production build.** Helpers, fixtures, and fake fds used only by tests must not live on production types (e.g. not nested in `Tty` / public app APIs) and must not ship real implementation into `zig build` artifacts. Prefer file-scope helpers gated with `if (builtin.is_test)` (or equivalent), or code that exists only inside `test` blocks. Production builds may expose an empty stub type at most — never pipe/PTY open helpers, injectable globals meant only for tests, or other harness code.
+- **Self-check AGENTS.md before review.** Before asking the user to review a batch, re-read the relevant rules in this file and scan your own diff for violations (needless `@as`, trivial wrappers, wrong allocator names, oversized batch, banned terms, and the rest). Fix them first; do not hand the user a batch that still breaks project rules.
 
 ## Change size (review batches)
 
