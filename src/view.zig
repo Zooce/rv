@@ -742,6 +742,87 @@ pub fn statusAt(rows: []const Row, cursor: usize) Status {
     };
 }
 
+// --- diff text search (MVP-3a) -------------------------------------------
+
+/// Result of a text search step. `wrapped` is true when the walk crossed
+/// the end (or start) of the row list to find the hit.
+pub const SearchHit = struct {
+    index: usize,
+    wrapped: bool,
+};
+
+/// Searchable text for one display row, or `null` if `/` does not search it.
+///
+/// In scope (v1): add / delete / context **body** line text only. File headers,
+/// hunk headers, and meta lines are excluded (path find is MVP-3b).
+pub fn searchText(row: Row) ?[]const u8 {
+    return switch (row) {
+        .line => |ln| switch (ln.kind) {
+            .add, .delete, .context => ln.text,
+            .meta => null,
+        },
+        .file_header, .hunk_header => null,
+    };
+}
+
+/// Case-sensitive substring match against `searchText` for this row.
+pub fn rowMatches(row: Row, query: []const u8) bool {
+    if (query.len == 0) return false;
+    const t = searchText(row) orelse return false;
+    return std.mem.indexOf(u8, t, query) != null;
+}
+
+/// First match at or after `cursor`, wrapping from the top if needed.
+/// Empty query or no hits → `null`. Used when Enter commits a `/` query.
+pub fn firstMatch(rows: []const Row, query: []const u8, cursor: usize) ?SearchHit {
+    if (query.len == 0 or rows.len == 0) return null;
+    const cur = clampCursor(cursor, rows.len);
+    var i = cur;
+    while (i < rows.len) : (i += 1) {
+        if (rowMatches(rows[i], query)) return .{ .index = i, .wrapped = false };
+    }
+    i = 0;
+    while (i < cur) : (i += 1) {
+        if (rowMatches(rows[i], query)) return .{ .index = i, .wrapped = true };
+    }
+    return null;
+}
+
+/// Next match strictly after `cursor`, wrapping around to the start.
+/// Unchanged semantics for the caller when `null` (no query / no hits).
+pub fn nextMatch(rows: []const Row, query: []const u8, cursor: usize) ?SearchHit {
+    if (query.len == 0 or rows.len == 0) return null;
+    const cur = clampCursor(cursor, rows.len);
+    var i = cur + 1;
+    while (i < rows.len) : (i += 1) {
+        if (rowMatches(rows[i], query)) return .{ .index = i, .wrapped = false };
+    }
+    i = 0;
+    while (i <= cur) : (i += 1) {
+        if (rowMatches(rows[i], query)) return .{ .index = i, .wrapped = true };
+    }
+    return null;
+}
+
+/// Previous match strictly before `cursor`, wrapping around to the end.
+/// A sole match on `cursor` returns that index with `wrapped = true`.
+pub fn prevMatch(rows: []const Row, query: []const u8, cursor: usize) ?SearchHit {
+    if (query.len == 0 or rows.len == 0) return null;
+    const cur = clampCursor(cursor, rows.len);
+    var i = cur;
+    while (i > 0) {
+        i -= 1;
+        if (rowMatches(rows[i], query)) return .{ .index = i, .wrapped = false };
+    }
+    // Wrap: scan from the last row down through `cur` (inclusive).
+    i = rows.len;
+    while (i > cur) {
+        i -= 1;
+        if (rowMatches(rows[i], query)) return .{ .index = i, .wrapped = true };
+    }
+    return null;
+}
+
 // --- tests ---------------------------------------------------------------
 
 const testing = std.testing;
@@ -1093,6 +1174,80 @@ fn changeNavFixture(alloc: Allocator) !struct { d: diff.Diff, rows: []Row } {
     errdefer d.deinit();
     const rows = try flatten(alloc, &d);
     return .{ .d = d, .rows = rows };
+}
+
+test "searchText is body lines only" {
+    const fixture =
+        \\diff --git a/f b/f
+        \\--- a/f
+        \\+++ b/f
+        \\@@ -1,3 +1,3 @@ section
+        \\ keep
+        \\-old
+        \\+new
+    ;
+    var d = try diff.parse(testing.allocator, fixture);
+    defer d.deinit();
+    const rows = try flatten(testing.allocator, &d);
+    defer testing.allocator.free(rows);
+    // file, hunk, context, delete, add
+    try testing.expect(searchText(rows[0]) == null);
+    try testing.expect(searchText(rows[1]) == null);
+    try testing.expectEqualStrings("keep", searchText(rows[2]).?);
+    try testing.expectEqualStrings("old", searchText(rows[3]).?);
+    try testing.expectEqualStrings("new", searchText(rows[4]).?);
+    try testing.expect(rowMatches(rows[3], "old"));
+    try testing.expect(!rowMatches(rows[3], "OLD"));
+    try testing.expect(!rowMatches(rows[0], "f"));
+}
+
+test "firstMatch nextMatch prevMatch wrap" {
+    const fixture =
+        \\diff --git a/f b/f
+        \\--- a/f
+        \\+++ b/f
+        \\@@ -1,4 +1,4 @@
+        \\ alpha
+        \\-beta
+        \\+beta2
+        \\ gamma alpha
+        \\ tail
+    ;
+    var d = try diff.parse(testing.allocator, fixture);
+    defer d.deinit();
+    const rows = try flatten(testing.allocator, &d);
+    defer testing.allocator.free(rows);
+    // 0 file, 1 hunk, 2 "alpha", 3 "beta", 4 "beta2", 5 "gamma alpha", 6 "tail"
+
+    const first = firstMatch(rows, "alpha", 0).?;
+    try testing.expectEqual(2, first.index);
+    try testing.expect(!first.wrapped);
+
+    // Inclusive of cursor when already on a match.
+    try testing.expectEqual(2, firstMatch(rows, "alpha", 2).?.index);
+
+    // From after first alpha → second (gamma alpha).
+    const n1 = nextMatch(rows, "alpha", 2).?;
+    try testing.expectEqual(5, n1.index);
+    try testing.expect(!n1.wrapped);
+
+    // Wrap from last alpha back to first.
+    const n2 = nextMatch(rows, "alpha", 5).?;
+    try testing.expectEqual(2, n2.index);
+    try testing.expect(n2.wrapped);
+
+    const p1 = prevMatch(rows, "alpha", 5).?;
+    try testing.expectEqual(2, p1.index);
+    try testing.expect(!p1.wrapped);
+
+    const p2 = prevMatch(rows, "alpha", 2).?;
+    try testing.expectEqual(5, p2.index);
+    try testing.expect(p2.wrapped);
+
+    try testing.expect(firstMatch(rows, "nope", 0) == null);
+    try testing.expect(firstMatch(rows, "", 0) == null);
+    // Headers not searchable.
+    try testing.expect(firstMatch(rows, "@@", 0) == null);
 }
 
 test "nextChange and prevChange jump change groups not single lines" {
