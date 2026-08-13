@@ -2,8 +2,8 @@
 //!
 //! With no args: load smart-default git diff → flatten rows → load `.rv`
 //! comments → TUI (`j`/`k`, `h`/`l` pan, `0`/`$` col home/end, `[`/`]` hunk,
-//! `{`/`}` file header, `/` text search, `n`/`N` next/prev match, `i`/`c`/`a`/
-//! `Enter` comment, `q` quit).
+//! `{`/`}` file header, `/` text search, `n`/`N` next/prev match, `Space` `f`
+//! file-path find, `i`/`c`/`a`/`Enter` comment, `q` quit).
 //! Diff layout defaults to side-by-side when the terminal is wide enough;
 //! falls back to unified when narrow. `t` toggles session preference
 //! (explicit unified stays unified even when wide).
@@ -21,7 +21,14 @@
 //! Diff text search (MVP-3a): `/` opens a single-line footer prompt. Enter
 //! commits a case-sensitive substring query over add/delete/context body text
 //! (not headers/meta); Esc cancels without moving the cursor. `n`/`N` walk
-//! matches with wrap. No match leaves the cursor put and shows a footer note.
+//! those text matches with wrap. No match leaves the cursor put and shows a
+//! footer note.
+//!
+//! File-path find (MVP-3b): `Space` then `f` opens the same footer prompt
+//! (prefix `/`, same keys). Enter jumps to the first matching **file header**
+//! from the cursor (wrap). Multi-match: that first hit only — `n`/`N` stay
+//! text-search. An unmatched `Space` leader is dropped; the next key is
+//! handled as normal. Esc cancels without moving the cursor.
 
 const std = @import("std");
 const git = @import("git");
@@ -121,9 +128,13 @@ fn runTui(alloc: std.mem.Allocator, io: std.Io) !u8 {
     var running = true;
     // Exactly one footer focus; cannot comment and search at once.
     var focus: FooterFocus = .normal;
+    // Scope for the open `/` prompt (text vs file path). Ignored otherwise.
+    var search_kind: SearchKind = .text;
+    // `Space` leader: next key may be `f` (file find). Cleared on that next key.
+    var leader_pending: bool = false;
     var draft: std.ArrayList(u8) = .empty;
     defer draft.deinit(alloc);
-    // Committed `/` query for `n`/`N` (empty means no active search).
+    // Committed `/` text query for `n`/`N` (empty means no active text search).
     var last_query: std.ArrayList(u8) = .empty;
     defer last_query.deinit(alloc);
     // One-shot footer note (owned bytes; len 0 = none). Cleared on next key.
@@ -135,7 +146,7 @@ fn runTui(alloc: std.mem.Allocator, io: std.Io) !u8 {
     // Anchor captured when entering comment mode (cursor does not move then).
     var draft_anchor: view.Anchor = undefined;
 
-    paint(&scr, size, rows, sbs_slots, layout_pref, cursor, &scroll, &col_scroll, &review, focus, draft.items, draft_caret, &draft_scroll, note.slice());
+    paint(&scr, size, rows, sbs_slots, layout_pref, cursor, &scroll, &col_scroll, &review, focus, search_kind, draft.items, draft_caret, &draft_scroll, note.slice());
     try scr.present(&term);
 
     while (running) {
@@ -229,6 +240,16 @@ fn runTui(alloc: std.mem.Allocator, io: std.Io) !u8 {
                             focus = .normal;
                             if (draft.items.len == 0) {
                                 draft_caret = 0;
+                            } else if (search_kind == .file) {
+                                // Single jump; do not replace the `/` n/N query.
+                                if (view.firstPathMatch(rows, draft.items, cursor)) |hit| {
+                                    cursor = hit.index;
+                                    if (hit.wrapped) note.set("search wrapped");
+                                } else {
+                                    note.setFmt("Pattern not found: {s}", .{draft.items});
+                                }
+                                draft.clearRetainingCapacity();
+                                draft_caret = 0;
                             } else {
                                 last_query.clearRetainingCapacity();
                                 try last_query.appendSlice(alloc, draft.items);
@@ -263,12 +284,23 @@ fn runTui(alloc: std.mem.Allocator, io: std.Io) !u8 {
                         .ctrl_c => running = false,
                         else => {},
                     },
-                    .normal => switch (key) {
+                    .normal => {
+                        const after_leader = leader_pending;
+                        leader_pending = false;
+                        switch (key) {
                         .char => |c| {
-                            if (c == 'q' or c == 'Q') {
+                            if (after_leader and c == 'f') {
+                                focus = .searching;
+                                search_kind = .file;
+                                draft.clearRetainingCapacity();
+                                draft_caret = 0;
+                            } else if (c == 'q' or c == 'Q') {
                                 running = false;
+                            } else if (c == ' ') {
+                                leader_pending = true;
                             } else if (c == '/') {
                                 focus = .searching;
+                                search_kind = .text;
                                 draft.clearRetainingCapacity();
                                 draft_caret = 0;
                             } else if (c == 'n') {
@@ -352,12 +384,13 @@ fn runTui(alloc: std.mem.Allocator, io: std.Io) !u8 {
                         },
                         .ctrl_c => running = false,
                         else => {},
+                        }
                     },
                 }
             },
         }
         if (running) {
-            paint(&scr, size, rows, sbs_slots, layout_pref, cursor, &scroll, &col_scroll, &review, focus, draft.items, draft_caret, &draft_scroll, note.slice());
+            paint(&scr, size, rows, sbs_slots, layout_pref, cursor, &scroll, &col_scroll, &review, focus, search_kind, draft.items, draft_caret, &draft_scroll, note.slice());
             try scr.present(&term);
         }
     }
@@ -366,6 +399,9 @@ fn runTui(alloc: std.mem.Allocator, io: std.Io) !u8 {
 
 /// Footer key ownership: normal nav, comment draft, or `/` search prompt.
 const FooterFocus = enum { normal, commenting, searching };
+
+/// What the open `/` prompt matches. `n`/`N` always use `.text` (`last_query`).
+const SearchKind = enum { text, file };
 
 /// One-shot footer message. Bytes always live in `buf`; `len == 0` means none.
 /// Avoids optional slices that sometimes point at static strings and sometimes
@@ -492,6 +528,7 @@ fn paint(
     col_scroll: *usize,
     review: *const store.Review,
     focus: FooterFocus,
+    search_kind: SearchKind,
     draft: []const u8,
     draft_caret: usize,
     draft_scroll: *usize,
@@ -591,8 +628,11 @@ fn paint(
         fillRow(scr, 0, title_style);
         const help = switch (focus) {
             .commenting => "rv  comment  Enter save  Esc cancel  ↑↓ scroll",
-            .searching => "rv  search  Enter jump  Esc cancel",
-            .normal => "rv  j/k line  h/l pan  0/$  J/K change  [/] hunk  {/} file  / n/N  t  i  q",
+            .searching => switch (search_kind) {
+                .text => "rv  search  Enter jump  Esc cancel",
+                .file => "rv  file  Enter jump  Esc cancel",
+            },
+            .normal => "rv  j/k line  h/l pan  0/$  J/K change  [/] hunk  {/} file  / n/N  Space f  t  i  q",
         };
         scr.putStr(1, 0, help, title_style);
     }
@@ -837,8 +877,8 @@ fn paint(
             const cy: u16 = footer_top + caret.y_off;
             scr.setCursor(cx, cy);
         } else if (focus == .searching) {
-            // Single-line `/` prompt: gutter col 0, `/` at 1, query at 2+.
-            // Caret 0 sits after `/` (column 2).
+            // Single-line prompt (`/` text or `Space` `f` paths): gutter col 0,
+            // `/` at 1, query at 2+. Caret 0 sits after `/` (column 2).
             const footer_y = footer_top;
             fillRow(scr, footer_y, footer_style);
             const caret_byte = @min(draft_caret, draft.len);

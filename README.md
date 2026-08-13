@@ -96,7 +96,7 @@ Not a multi-user code-review platform. Not a GitHub replacement. A **personal re
 | `h` / `l` | Move **left / right** on the current line (column cursor for char-range comments). |
 | `[` / `]` | Jump to the **previous / next hunk**. |
 | `/` | **Search the diff text** — incremental find across the loaded changeset (like vim `/`). `n` / `N` next / previous match. |
-| `Space` `f` | **Search changed files** — same interaction as `/`, but scoped to **paths in the review** (not a floating file picker). Type a fragment; matches jump the cursor to that file's first relevant line. |
+| `Space` `f` | **Search changed files** — same prompt as `/`, scoped to **paths in the review** (not a floating file picker). Type a fragment; Enter jumps to the matching **file header** (first hit from the cursor, wrapping). `n`/`N` stay text-search. |
 | `i` / `c` / `a` / `Enter` | Enter **comment mode** — open a comment box **below the cursor** (same action; pick the muscle memory you prefer). |
 | (later) | Page/half-page scroll, jump to next comment, more `Space` leader maps — same vocabulary |
 
@@ -107,7 +107,7 @@ Contrast with tools where `j`/`k` only pan the view and comment placement needs 
 Both searches use one pattern: a **prompt on the status/command line** (vim-style), not a centered modal list.
 
 - **`/`** — query against **diff content** (added/removed/context lines as shown). Landing on a match moves the **current-line cursor** there.
-- **`Space` `f`** — query against **changed file paths** only. Same prompt UX as `/` (a specialized `/` for the file set), then jump into that file in the review stream.
+- **`Space` `f`** — query against **changed file paths** only. Same prompt UX as `/` (a specialized `/` for the file set). Enter lands on the **file header** of the first match at or after the cursor (wraps). File find is a single jump; `n`/`N` still walk the last `/` text query.
 - Prefer **filter-as-you-type + jump** over browsing a separate UI. Optional match count / next-hit hints in the footer are fine; a discrete “picker widget” is not required for v1.
 
 #### Comment mode

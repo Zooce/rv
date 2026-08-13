@@ -754,7 +754,7 @@ pub const SearchHit = struct {
 /// Searchable text for one display row, or `null` if `/` does not search it.
 ///
 /// In scope (v1): add / delete / context **body** line text only. File headers,
-/// hunk headers, and meta lines are excluded (path find is MVP-3b).
+/// hunk headers, and meta lines are excluded (`Space` `f` uses `searchPath`).
 pub fn searchText(row: Row) ?[]const u8 {
     return switch (row) {
         .line => |ln| switch (ln.kind) {
@@ -765,10 +765,26 @@ pub fn searchText(row: Row) ?[]const u8 {
     };
 }
 
+/// Path string for file-find (`Space` `f`), or `null` on non-header rows.
+/// Lands on the file header itself (not the first body/change line).
+pub fn searchPath(row: Row) ?[]const u8 {
+    return switch (row) {
+        .file_header => |fh| fh.path,
+        .hunk_header, .line => null,
+    };
+}
+
 /// Case-sensitive substring match against `searchText` for this row.
 pub fn rowMatches(row: Row, query: []const u8) bool {
     if (query.len == 0) return false;
     const t = searchText(row) orelse return false;
+    return std.mem.indexOf(u8, t, query) != null;
+}
+
+/// Case-sensitive substring match against `searchPath` for this row.
+pub fn rowPathMatches(row: Row, query: []const u8) bool {
+    if (query.len == 0) return false;
+    const t = searchPath(row) orelse return false;
     return std.mem.indexOf(u8, t, query) != null;
 }
 
@@ -819,6 +835,23 @@ pub fn prevMatch(rows: []const Row, query: []const u8, cursor: usize) ?SearchHit
     while (i > cur) {
         i -= 1;
         if (rowMatches(rows[i], query)) return .{ .index = i, .wrapped = true };
+    }
+    return null;
+}
+
+/// First file-header path match at or after `cursor`, wrapping from the top.
+/// Empty query or no hits → `null`. Used when Enter commits a `Space` `f` query.
+/// Multi-match: first hit from the cursor (same walk as `firstMatch`).
+pub fn firstPathMatch(rows: []const Row, query: []const u8, cursor: usize) ?SearchHit {
+    if (query.len == 0 or rows.len == 0) return null;
+    const cur = clampCursor(cursor, rows.len);
+    var i = cur;
+    while (i < rows.len) : (i += 1) {
+        if (rowPathMatches(rows[i], query)) return .{ .index = i, .wrapped = false };
+    }
+    i = 0;
+    while (i < cur) : (i += 1) {
+        if (rowPathMatches(rows[i], query)) return .{ .index = i, .wrapped = true };
     }
     return null;
 }
@@ -1248,6 +1281,72 @@ test "firstMatch nextMatch prevMatch wrap" {
     try testing.expect(firstMatch(rows, "", 0) == null);
     // Headers not searchable.
     try testing.expect(firstMatch(rows, "@@", 0) == null);
+}
+
+test "searchPath and firstPathMatch are file headers only" {
+    const fixture =
+        \\diff --git a/src/app/main.zig b/src/app/main.zig
+        \\--- a/src/app/main.zig
+        \\+++ b/src/app/main.zig
+        \\@@ -1 +1 @@
+        \\-oldMain
+        \\+newMain
+        \\diff --git a/src/view.zig b/src/view.zig
+        \\--- a/src/view.zig
+        \\+++ b/src/view.zig
+        \\@@ -1 +1 @@
+        \\-oldView
+        \\+newView
+        \\diff --git a/lib/util.zig b/lib/util.zig
+        \\--- a/lib/util.zig
+        \\+++ b/lib/util.zig
+        \\@@ -1 +1 @@
+        \\-oldUtil
+        \\+newUtil
+    ;
+    var d = try diff.parse(testing.allocator, fixture);
+    defer d.deinit();
+    const rows = try flatten(testing.allocator, &d);
+    defer testing.allocator.free(rows);
+    // 0 main hdr, 1 hunk, 2 del, 3 add,
+    // 4 view hdr, 5 hunk, 6 del, 7 add,
+    // 8 util hdr, 9 hunk, 10 del, 11 add
+
+    try testing.expectEqualStrings("src/app/main.zig", searchPath(rows[0]).?);
+    try testing.expectEqualStrings("src/view.zig", searchPath(rows[4]).?);
+    try testing.expectEqualStrings("lib/util.zig", searchPath(rows[8]).?);
+    try testing.expect(searchPath(rows[1]) == null);
+    try testing.expect(searchPath(rows[2]) == null);
+    try testing.expect(searchPath(rows[3]) == null);
+
+    try testing.expect(rowPathMatches(rows[0], "app/main"));
+    try testing.expect(rowPathMatches(rows[4], "view"));
+    try testing.expect(!rowPathMatches(rows[0], "APP"));
+    try testing.expect(!rowPathMatches(rows[2], "app/main"));
+    try testing.expect(!rowPathMatches(rows[2], "oldMain"));
+    try testing.expect(!rowPathMatches(rows[0], ""));
+
+    const unique = firstPathMatch(rows, "util", 0).?;
+    try testing.expectEqual(8, unique.index);
+    try testing.expect(!unique.wrapped);
+
+    // Inclusive of cursor when already on a matching header.
+    try testing.expectEqual(0, firstPathMatch(rows, "src/", 0).?.index);
+
+    // From after first src file → next src file (not wrap).
+    const next_src = firstPathMatch(rows, "src/", 1).?;
+    try testing.expectEqual(4, next_src.index);
+    try testing.expect(!next_src.wrapped);
+
+    // From past the last src file → wrap to the first.
+    const wrap = firstPathMatch(rows, "src/", 5).?;
+    try testing.expectEqual(0, wrap.index);
+    try testing.expect(wrap.wrapped);
+
+    try testing.expect(firstPathMatch(rows, "nope", 0) == null);
+    try testing.expect(firstPathMatch(rows, "", 0) == null);
+    // Body text is not a path hit.
+    try testing.expect(firstPathMatch(rows, "oldMain", 0) == null);
 }
 
 test "nextChange and prevChange jump change groups not single lines" {
