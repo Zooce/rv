@@ -2,9 +2,9 @@
 //!
 //! With no args: load smart-default git diff → flatten rows → load `.rv`
 //! comments → TUI (`j`/`k`, `h`/`l` pan, `0`/`$` col home/end, `[`/`]` hunk,
-//! `{`/`}` file header, `/` text search, `n`/`N` next/prev match, `Space` `f`
-//! file-path find, `i`/`c`/`a`/`Enter` create or edit new, `I`/`C`/`A` old,
-//! `d` dismiss new, `D` dismiss old, `q` quit).
+//! `{`/`}` file header, `(`/`)` prev/next comment, `/` text search, `n`/`N`
+//! next/prev match, `Space` `f` file-path find, `i`/`c`/`a`/`Enter` create or
+//! edit new, `I`/`C`/`A` old, `d` dismiss new, `D` dismiss old, `q` quit).
 //! Diff layout defaults to side-by-side when the terminal is wide enough;
 //! falls back to unified when narrow. `t` toggles session preference
 //! (explicit unified stays unified even when wide).
@@ -350,6 +350,10 @@ fn runTui(alloc: std.mem.Allocator, io: std.Io) !u8 {
                                 cursor = view.nextFileHeader(rows, cursor);
                             } else if (c == '{') {
                                 cursor = view.prevFileHeader(rows, cursor);
+                            } else if (c == ')') {
+                                try jumpLiveComment(&review, alloc, rows, &cursor, &note, .next);
+                            } else if (c == '(') {
+                                try jumpLiveComment(&review, alloc, rows, &cursor, &note, .prev);
                             } else if (c == 't') {
                                 layout_pref = view.toggleLayoutPref(layout_pref);
                             } else if (c == 'i' or c == 'c' or c == 'a') {
@@ -560,6 +564,50 @@ fn beginComment(
     return true;
 }
 
+/// Live comment as a display target, or null if it has no usable side/line.
+fn commentLoc(c: store.Comment) ?view.CommentLoc {
+    if (c.state != .open) return null;
+    if (c.side) |s| {
+        switch (s) {
+            .old => if (c.old_line) |n| return .{ .path = c.path, .side = .old, .line = n },
+            .new => if (c.new_line) |n| return .{ .path = c.path, .side = .new, .line = n },
+            .context => {
+                if (c.new_line) |n| return .{ .path = c.path, .side = .new, .line = n };
+                if (c.old_line) |n| return .{ .path = c.path, .side = .old, .line = n };
+            },
+        }
+        return null;
+    }
+    if (c.new_line) |n| return .{ .path = c.path, .side = .new, .line = n };
+    if (c.old_line) |n| return .{ .path = c.path, .side = .old, .line = n };
+    return null;
+}
+
+fn jumpLiveComment(
+    review: *const store.Review,
+    alloc: std.mem.Allocator,
+    rows: []const view.Row,
+    cursor: *usize,
+    note: *StatusNote,
+    comptime toward: enum { next, prev },
+) std.mem.Allocator.Error!void {
+    var locs: std.ArrayList(view.CommentLoc) = .empty;
+    defer locs.deinit(alloc);
+    for (review.comments.items) |c| {
+        if (commentLoc(c)) |loc| try locs.append(alloc, loc);
+    }
+    const hit = switch (toward) {
+        .next => view.nextComment(rows, locs.items, cursor.*),
+        .prev => view.prevComment(rows, locs.items, cursor.*),
+    };
+    if (hit) |h| {
+        cursor.* = h.index;
+        if (h.wrapped) note.set("comment wrapped");
+    } else {
+        note.set("no comments");
+    }
+}
+
 /// Dismiss the first live comment on `want` at `cursor`. Missing side or no
 /// comment: footer note, store unchanged. Save failure puts the comment back.
 fn dismissAt(
@@ -712,7 +760,7 @@ fn paint(
                 .text => "rv  search  Enter jump  Esc cancel",
                 .file => "rv  file  Enter jump  Esc cancel",
             },
-            .normal => "rv  j/k line  h/l pan  0/$  J/K change  [/] hunk  {/} file  / n/N search  Space f files  t layout  i/I create/edit  d/D dismiss  q quit",
+            .normal => "rv  j/k line  h/l pan  0/$  J/K change  [/] hunk  {/} file  (/) comment  / n/N search  Space f files  t layout  i/I create/edit  d/D dismiss  q quit",
         };
         scr.putStr(1, 0, help, title_style);
     }

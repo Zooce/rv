@@ -95,13 +95,14 @@ Not a multi-user code-review platform. Not a GitHub replacement. A **personal re
 | `j` / `k` | Move the **current line** down / up (highlighted). Viewport follows so the cursor stays visible. |
 | `h` / `l` | Move **left / right** on the current line (column cursor for char-range comments). |
 | `[` / `]` | Jump to the **previous / next hunk**. |
+| `(` / `)` | Jump to the **previous / next live comment**. Cursor goes to that comment’s side (old line or new line). Wraps; no comments stays put with a footer note. |
 | `/` | **Search the diff text** — incremental find across the loaded changeset (like vim `/`). `n` / `N` next / previous match. |
 | `Space` `f` | **Search changed files** — same prompt as `/`, scoped to **paths in the review** (not a floating file picker). Type a fragment; Enter jumps to the matching **file header** (first hit from the cursor, wrapping). `n`/`N` stay text-search. |
 | `i` / `c` / `a` / `Enter` | Create or edit the comment on **new** (right pane in side-by-side, or the current `+` / context line in unified). Open a box **below the cursor**. Same action; pick the muscle memory you prefer. |
 | `I` / `C` / `A` | Create or edit the comment on **old** (left pane in side-by-side, or the current `-` / context line in unified). Missing side does nothing. |
 | `d` | Dismiss the comment on **new** (right) at the cursor. Gone from the board; no confirm. |
 | `D` | Dismiss the comment on **old** (left). Missing side or no comment there: footer note; does not take the other pane. |
-| (later) | Page/half-page scroll, jump to next comment, more `Space` leader maps — same vocabulary |
+| (later) | Page/half-page scroll, more `Space` leader maps — same vocabulary |
 
 Contrast with tools where `j`/`k` only pan the view and comment placement needs a mouse: in `rv`, **where the cursor is is where the comment goes.**
 
@@ -194,7 +195,7 @@ $ rv install-skill             # once per machine (or after upgrade)
 $ grok   # or claude - agent implements a feature
 
 $ rv     # smart default: dirty tree, else branch vs base
-         # j/k line; h/l col; [/] hunks; / text; Space f files
+         # j/k line; h/l col; [/] hunks; (/) comments; / text; Space f files
          # i/c/a/Enter -> create or edit new; I/C/A -> old
          # d dismiss new; D dismiss old
 
@@ -212,7 +213,7 @@ $ rv                         # confirm, leave more, continue
 
 1. **Clean and simple** - enjoyable to use every day; no cluttered "IDE in the terminal."
 2. **Performance** - no slop. Instant open on large diffs is a requirement, not a nice-to-have.
-3. **Vim / Helix-like keybindings** - `j`/`k` move a **highlighted current line** (not merely scroll); `h`/`l` move by column; `[`/`]` jump hunks; `/` search diff text; `Space` `f` search changed files (specialized `/`, not a floating picker); `i`/`c`/`a`/`Enter` create or edit on new, `I`/`C`/`A` on old (box below the cursor); `d`/`D` dismiss new/old.
+3. **Vim / Helix-like keybindings** - `j`/`k` move a **highlighted current line** (not merely scroll); `h`/`l` move by column; `[`/`]` jump hunks; `(`/`)` jump comments; `/` search diff text; `Space` `f` search changed files (specialized `/`, not a floating picker); `i`/`c`/`a`/`Enter` create or edit on new, `I`/`C`/`A` on old (box below the cursor); `d`/`D` dismiss new/old.
 4. **Diff-first layout** - files and hunks from the *change set*, not a full project tree.
 5. **Precise selection** - comments must attach to the exact span you care about, including overlapping ranges.
 6. **Mouse optional** - never required to place or target a comment.

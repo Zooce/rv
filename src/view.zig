@@ -756,6 +756,31 @@ pub fn commentAnchor(
     };
 }
 
+/// Path + side + line of a live comment. `line` is that side's 1-based number.
+pub const CommentLoc = struct {
+    path: []const u8,
+    side: CommentSide,
+    line: u32,
+};
+
+/// Unified row that holds `loc`, or null if that path/side/line is not in `rows`.
+pub fn rowForComment(rows: []const Row, loc: CommentLoc) ?usize {
+    for (rows, 0..) |row, i| {
+        switch (row) {
+            .line => |ln| {
+                if (!std.mem.eql(u8, ln.path, loc.path)) continue;
+                const no = switch (loc.side) {
+                    .old => ln.old_no,
+                    .new => ln.new_no,
+                };
+                if (no == loc.line) return i;
+            },
+            .file_header, .hunk_header => {},
+        }
+    }
+    return null;
+}
+
 /// Status footer fields for `cursor` within `rows`.
 pub fn statusAt(rows: []const Row, cursor: usize) Status {
     if (rows.len == 0) {
@@ -795,6 +820,75 @@ pub const SearchHit = struct {
     index: usize,
     wrapped: bool,
 };
+
+/// Display order: row, then old before new, then `locs` order.
+const CommentRank = struct {
+    row: usize,
+    side: u1,
+    i: usize,
+
+    fn less(a: CommentRank, b: CommentRank) bool {
+        if (a.row != b.row) return a.row < b.row;
+        if (a.side != b.side) return a.side < b.side;
+        return a.i < b.i;
+    }
+};
+
+/// Next live comment strictly after `cursor` in display order. Wraps to the
+/// first comment when none follow. Null when no `locs` resolve to a row.
+pub fn nextComment(rows: []const Row, locs: []const CommentLoc, cursor: usize) ?SearchHit {
+    if (rows.len == 0 or locs.len == 0) return null;
+    const cur = clampCursor(cursor, rows.len);
+    var best_after: ?CommentRank = null;
+    var best_wrap: ?CommentRank = null;
+    for (locs, 0..) |loc, i| {
+        const row = rowForComment(rows, loc) orelse continue;
+        const rank: CommentRank = .{
+            .row = row,
+            .side = switch (loc.side) {
+                .old => 0,
+                .new => 1,
+            },
+            .i = i,
+        };
+        if (row > cur) {
+            if (best_after == null or rank.less(best_after.?)) best_after = rank;
+        } else {
+            if (best_wrap == null or rank.less(best_wrap.?)) best_wrap = rank;
+        }
+    }
+    if (best_after) |r| return .{ .index = r.row, .wrapped = false };
+    if (best_wrap) |r| return .{ .index = r.row, .wrapped = true };
+    return null;
+}
+
+/// Previous live comment strictly before `cursor` in display order. Wraps to
+/// the last comment when none precede. Null when no `locs` resolve to a row.
+pub fn prevComment(rows: []const Row, locs: []const CommentLoc, cursor: usize) ?SearchHit {
+    if (rows.len == 0 or locs.len == 0) return null;
+    const cur = clampCursor(cursor, rows.len);
+    var best_before: ?CommentRank = null;
+    var best_wrap: ?CommentRank = null;
+    for (locs, 0..) |loc, i| {
+        const row = rowForComment(rows, loc) orelse continue;
+        const rank: CommentRank = .{
+            .row = row,
+            .side = switch (loc.side) {
+                .old => 0,
+                .new => 1,
+            },
+            .i = i,
+        };
+        if (row < cur) {
+            if (best_before == null or best_before.?.less(rank)) best_before = rank;
+        } else {
+            if (best_wrap == null or best_wrap.?.less(rank)) best_wrap = rank;
+        }
+    }
+    if (best_before) |r| return .{ .index = r.row, .wrapped = false };
+    if (best_wrap) |r| return .{ .index = r.row, .wrapped = true };
+    return null;
+}
 
 /// Searchable text for one display row, or `null` if `/` does not search it.
 ///
@@ -1972,4 +2066,134 @@ test "commentAnchor side-by-side pair empty pane header" {
     try testing.expect(commentAnchor(rows3, slots3, .side_by_side, 4, .old) == null);
 
     try testing.expect(commentAnchor(&.{}, &.{}, .side_by_side, 0, .new) == null);
+}
+
+test "rowForComment add delete context missing" {
+    const fixture =
+        \\diff --git a/f b/f
+        \\--- a/f
+        \\+++ b/f
+        \\@@ -1,3 +1,3 @@
+        \\ keep
+        \\-old
+        \\+new
+        \\ tail
+    ;
+    var d = try diff.parse(testing.allocator, fixture);
+    defer d.deinit();
+    const rows = try flatten(testing.allocator, &d);
+    defer testing.allocator.free(rows);
+    // 0 file, 1 hunk, 2 keep, 3 del, 4 add, 5 tail
+
+    try testing.expectEqual(3, rowForComment(rows, .{ .path = "f", .side = .old, .line = 2 }).?);
+    try testing.expectEqual(4, rowForComment(rows, .{ .path = "f", .side = .new, .line = 2 }).?);
+    try testing.expectEqual(2, rowForComment(rows, .{ .path = "f", .side = .old, .line = 1 }).?);
+    try testing.expectEqual(2, rowForComment(rows, .{ .path = "f", .side = .new, .line = 1 }).?);
+    try testing.expect(rowForComment(rows, .{ .path = "f", .side = .new, .line = 99 }) == null);
+    try testing.expect(rowForComment(rows, .{ .path = "gone", .side = .old, .line = 2 }) == null);
+    try testing.expect(rowForComment(&.{}, .{ .path = "f", .side = .new, .line = 1 }) == null);
+}
+
+test "rowForComment new side is not the pair's primary row" {
+    const fixture =
+        \\diff --git a/f b/f
+        \\--- a/f
+        \\+++ b/f
+        \\@@ -1 +1 @@
+        \\-old
+        \\+new
+    ;
+    var d = try diff.parse(testing.allocator, fixture);
+    defer d.deinit();
+    const rows = try flatten(testing.allocator, &d);
+    defer testing.allocator.free(rows);
+    const slots = try pairSideBySide(testing.allocator, rows);
+    defer testing.allocator.free(slots);
+    // 0 file, 1 hunk, 2 del, 3 add — one pair slot, primary is the delete.
+    const pair_i = sbsSlotForRow(slots, 2).?;
+    try testing.expectEqual(2, sbsPrimaryRow(slots[pair_i]));
+    try testing.expectEqual(2, rowForComment(rows, .{ .path = "f", .side = .old, .line = 1 }).?);
+    try testing.expectEqual(3, rowForComment(rows, .{ .path = "f", .side = .new, .line = 1 }).?);
+}
+
+test "nextComment prevComment display order wrap skip missing" {
+    const fixture =
+        \\diff --git a/f b/f
+        \\--- a/f
+        \\+++ b/f
+        \\@@ -1,3 +1,3 @@
+        \\ keep
+        \\-old
+        \\+new
+        \\ tail
+    ;
+    var d = try diff.parse(testing.allocator, fixture);
+    defer d.deinit();
+    const rows = try flatten(testing.allocator, &d);
+    defer testing.allocator.free(rows);
+    // Store order is add then delete; display order is delete (3) then add (4).
+    const locs = [_]CommentLoc{
+        .{ .path = "f", .side = .new, .line = 2 },
+        .{ .path = "f", .side = .old, .line = 2 },
+        .{ .path = "gone", .side = .new, .line = 1 },
+    };
+
+    try testing.expect(nextComment(rows, &.{}, 0) == null);
+    try testing.expect(prevComment(rows, &.{}, 0) == null);
+    try testing.expect(nextComment(&.{}, &locs, 0) == null);
+
+    const n0 = nextComment(rows, &locs, 0).?;
+    try testing.expectEqual(3, n0.index);
+    try testing.expect(!n0.wrapped);
+
+    const n1 = nextComment(rows, &locs, 3).?;
+    try testing.expectEqual(4, n1.index);
+    try testing.expect(!n1.wrapped);
+
+    const n2 = nextComment(rows, &locs, 4).?;
+    try testing.expectEqual(3, n2.index);
+    try testing.expect(n2.wrapped);
+
+    const p0 = prevComment(rows, &locs, 5).?;
+    try testing.expectEqual(4, p0.index);
+    try testing.expect(!p0.wrapped);
+
+    const p1 = prevComment(rows, &locs, 4).?;
+    try testing.expectEqual(3, p1.index);
+    try testing.expect(!p1.wrapped);
+
+    const p2 = prevComment(rows, &locs, 3).?;
+    try testing.expectEqual(4, p2.index);
+    try testing.expect(p2.wrapped);
+}
+
+test "nextComment same row is one stop then later row" {
+    const fixture =
+        \\diff --git a/f b/f
+        \\--- a/f
+        \\+++ b/f
+        \\@@ -1,3 +1,3 @@
+        \\ keep
+        \\-old
+        \\+new
+        \\ tail
+    ;
+    var d = try diff.parse(testing.allocator, fixture);
+    defer d.deinit();
+    const rows = try flatten(testing.allocator, &d);
+    defer testing.allocator.free(rows);
+    // Both sides of context row 2, plus add at 4.
+    const locs = [_]CommentLoc{
+        .{ .path = "f", .side = .new, .line = 1 },
+        .{ .path = "f", .side = .old, .line = 1 },
+        .{ .path = "f", .side = .new, .line = 2 },
+    };
+
+    const n0 = nextComment(rows, &locs, 1).?;
+    try testing.expectEqual(2, n0.index);
+    try testing.expect(!n0.wrapped);
+
+    const n1 = nextComment(rows, &locs, 2).?;
+    try testing.expectEqual(4, n1.index);
+    try testing.expect(!n1.wrapped);
 }
