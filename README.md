@@ -33,8 +33,8 @@ On small diffs this is annoying. On large diffs it is exhausting and error-prone
 ```
 agent makes changes
     -> rv (terminal, vim keys, comments on real ranges)
-    -> agent reads open comments (export / CLI / later MCP)
-    -> agent addresses them; comments get resolved
+    -> agent reads comments (export / CLI / later MCP)
+    -> agent addresses them; `rv resolve` deletes those ids
 ```
 
 ---
@@ -51,7 +51,7 @@ agent makes changes
 | **local-pr-reviewer** | Local PR-ish idea | Buggy in practice; comments didn't produce a useful handoff |
 | **revdiff** | Closer - local review focus | Output path unreliable (stdout paste or broken file write); handoff format not agent-friendly |
 | **Local web UIs** | Familiar PR-style layout | Forces a browser; leaves the terminal workflow |
-| **hunk** (modem-dev) | Strong terminal review UI; live session CLI; human notes agents can read | Agent skill is **not auto-installed** — only `hunk skill path` + manual symlink/copy (or Nix home-manager). Session-bound notes, not a durable open/resolved board; coarser anchors than file/hunk/line/char + overlaps. **`j`/`k` only scroll the viewport one line** — no moveable current-line cursor; leaving a note often requires the **mouse** |
+| **hunk** (modem-dev) | Strong terminal review UI; live session CLI; human notes agents can read | Agent skill is **not auto-installed** — only `hunk skill path` + manual symlink/copy (or Nix home-manager). Session-bound notes, not a durable comment board; coarser anchors than file/hunk/line/char + overlaps. **`j`/`k` only scroll the viewport one line** — no moveable current-line cursor; leaving a note often requires the **mouse** |
 
 Design reactions baked into `rv`:
 
@@ -99,6 +99,8 @@ Not a multi-user code-review platform. Not a GitHub replacement. A **personal re
 | `Space` `f` | **Search changed files** — same prompt as `/`, scoped to **paths in the review** (not a floating file picker). Type a fragment; Enter jumps to the matching **file header** (first hit from the cursor, wrapping). `n`/`N` stay text-search. |
 | `i` / `c` / `a` / `Enter` | Comment **new** code (right pane in side-by-side, or the current `+` / context line in unified). Open a box **below the cursor**. Same action; pick the muscle memory you prefer. |
 | `I` / `C` / `A` | Comment **old** code (left pane in side-by-side, or the current `-` / context line in unified). Missing side does nothing. |
+| `d` | Dismiss the comment on **new** (right) at the cursor. Gone from the board; no confirm. |
+| `D` | Dismiss the comment on **old** (left). Missing side or no comment there: footer note; does not take the other pane. |
 | (later) | Page/half-page scroll, jump to next comment, more `Space` leader maps — same vocabulary |
 
 Contrast with tools where `j`/`k` only pan the view and comment placement needs a mouse: in `rv`, **where the cursor is is where the comment goes.**
@@ -148,15 +150,15 @@ Anchoring:
 - **Display anchors:** path + line/column (and optional old/new side) for human readability
 - **Stability anchors:** hunk/context identity so comments survive small surrounding edits better than bare line numbers alone
 
-Lifecycle (v1): **`open` | `resolved`**. Humans resolve in the TUI; agents resolve via CLI. Same store.
+Lifecycle (v1): **present | gone**. Humans dismiss in the TUI (`d` / `D`); agents call `rv resolve`, which deletes the same ids. No reopen and no resolved list.
 
 ### Agent handoff (hybrid)
 
 Built for any agent (Grok, Claude, Codex, Cursor, ...):
 
-1. **Export** - `rv export` (and friends) emit a stable, agent-readable document of open comments (paths, ranges, bodies, ids). Paste, pipe, or `@`-include into a session.
-2. **CLI** - list / show / resolve comments programmatically so an agent in the repo can close the loop without GUI.
-3. **Skill install** - `rv install-skill` wires a bundled agent skill into the agent's discovery paths so "address open `rv` comments" works without re-pasting docs or hand-symlinking after every upgrade.
+1. **Export** - `rv export` (and friends) emit a stable, agent-readable document of comments (paths, ranges, bodies, ids). Paste, pipe, or `@`-include into a session.
+2. **CLI** - list / show / resolve (delete) comments programmatically so an agent in the repo can close the loop without GUI.
+3. **Skill install** - `rv install-skill` wires a bundled agent skill into the agent's discovery paths so "address `rv` comments" works without re-pasting docs or hand-symlinking after every upgrade.
 4. **MCP (later)** - same operations as tools the agent can call directly.
 
 `rv` does **not** apply fixes itself. It is the comment board; the agent does the work.
@@ -194,12 +196,13 @@ $ grok   # or claude - agent implements a feature
 $ rv     # smart default: dirty tree, else branch vs base
          # j/k line; h/l col; [/] hunks; / text; Space f files
          # i/c/a/Enter -> comment new; I/C/A -> comment old
+         # d dismiss new; D dismiss old
 
 $ rv export -o .rv/review.md   # or stdout / JSON
-# agent already knows the skill: address open rv comments
+# agent already knows the skill: address rv comments
 
-$ rv list --open
-$ rv resolve <id>              # agent or human
+$ rv list
+$ rv resolve <id>              # deletes the id
 $ rv                         # confirm, leave more, continue
 ```
 
@@ -209,7 +212,7 @@ $ rv                         # confirm, leave more, continue
 
 1. **Clean and simple** - enjoyable to use every day; no cluttered "IDE in the terminal."
 2. **Performance** - no slop. Instant open on large diffs is a requirement, not a nice-to-have.
-3. **Vim / Helix-like keybindings** - `j`/`k` move a **highlighted current line** (not merely scroll); `h`/`l` move by column; `[`/`]` jump hunks; `/` search diff text; `Space` `f` search changed files (specialized `/`, not a floating picker); `i`/`c`/`a`/`Enter` comment new code, `I`/`C`/`A` comment old (box below the cursor).
+3. **Vim / Helix-like keybindings** - `j`/`k` move a **highlighted current line** (not merely scroll); `h`/`l` move by column; `[`/`]` jump hunks; `/` search diff text; `Space` `f` search changed files (specialized `/`, not a floating picker); `i`/`c`/`a`/`Enter` comment new code, `I`/`C`/`A` comment old (box below the cursor); `d`/`D` dismiss new/old.
 4. **Diff-first layout** - files and hunks from the *change set*, not a full project tree.
 5. **Precise selection** - comments must attach to the exact span you care about, including overlapping ranges.
 6. **Mouse optional** - never required to place or target a comment.
@@ -236,7 +239,7 @@ $ rv                         # confirm, leave more, continue
 | Git data | Prefer **shelling out to `git`** for diffs/status | Correctness and zero vendored git complexity; revisit libgit2 only if needed |
 | TUI | Lean Zig TUI stack (evaluate **ZigZag**, **libvaxis**-style, or minimal custom) | Prefer small deps; measure latency on big diffs early |
 | Comment store | **Repo-local `.rv/`** (gitignored) | Agents already work in the project root; discoverable default. Optional XDG later for global prefs |
-| Export formats | Markdown (human/agent paste) + JSON (tooling) | Stable schema with comment ids, anchors, state |
+| Export formats | Markdown (human/agent paste) + JSON (tooling) | Stable schema with comment ids and anchors |
 | Agent integration | CLI first -> `install-skill` -> export ergonomics -> MCP | Works with Grok, Claude, and anything that can read a file or run a command; skill discovery is installed, not documented-only |
 
 ### Suggested on-disk layout
@@ -245,24 +248,23 @@ $ rv                         # confirm, leave more, continue
 .rv/
   config.toml          # optional local overrides
   reviews/
-    <review-id>.json   # comments + anchors + state for a review session
+    <review-id>.json   # comments + anchors for a review session
   export/
     latest.md          # optional last export convenience path
 ```
 
-Exact schema is implementation detail; the README-level contract is: **stable ids, precise anchors, open/resolved, exportable.**
+Exact schema is implementation detail; the README-level contract is: **stable ids, precise anchors, exportable.**
 
 ### CLI surface (indicative)
 
 ```text
 rv                  # TUI, smart default range
 rv review [range]   # TUI on an explicit git range
-rv list [--open]    # list comments
+rv list             # list comments
 rv show <id>
-rv resolve <id> ...
-rv reopen <id> ...
+rv resolve <id> ... # delete comments
 rv export [--format md|json] [-o path]
-rv status           # open counts / current review summary
+rv status           # live count and store path
 rv install-skill [--agent <name>] [--list] [--uninstall]
                     # install/update the bundled agent skill into
                     # known discovery paths (symlink preferred)
@@ -277,7 +279,7 @@ rv install-skill [--agent <name>] [--list] [--uninstall]
 - Reviewing agent output no longer requires a GUI *and* a prose re-description of every issue
 - Leaving a comment on a multi-line, even overlapping, span is faster than typing the location into chat — and possible without taking hands off the keyboard
 - `j`/`k` feel like moving a cursor through the change, not nudging a scrollbar
-- Export/CLI handoff is reliable enough that "address open `rv` comments" is a normal agent instruction
+- Export/CLI handoff is reliable enough that "address `rv` comments" is a normal agent instruction
 - `rv install-skill` is enough to make that instruction work in Grok/Claude (and peers) without manual path plumbing
 - The TUI is something you *want* to open mid-session, not a chore
 

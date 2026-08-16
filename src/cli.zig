@@ -1,8 +1,9 @@
 //! Headless CLI for the comment store (MVP-2.2–2.5).
 //!
-//! Subcommands: `status`, `list`, `show`, `resolve`, `reopen`, `export`,
+//! Subcommands: `status`, `list`, `show`, `resolve`, `export`,
 //! `install-skill`, help. No git load and no raw TTY modes. Bare `rv` (no
 //! args) still launches the review TUI from `main`.
+//! `resolve` deletes ids. There is no reopen and no list/export filter.
 
 const std = @import("std");
 const store = @import("store");
@@ -20,22 +21,19 @@ pub const exit_success: u8 = 0;
 pub const exit_operational: u8 = 1;
 pub const exit_usage: u8 = 2;
 
-pub const ListFilter = enum { open, resolved, all };
 pub const ExportFormat = enum { md, json };
 
 pub const ExportOpts = struct {
     format: ExportFormat = .md,
-    filter: ListFilter = .open,
     out_path: ?[]const u8 = null,
 };
 
 pub const Command = union(enum) {
     help,
     status,
-    list: ListFilter,
+    list,
     show: []const u8,
     resolve: []const []const u8,
-    reopen: []const []const u8,
     @"export": ExportOpts,
     install_skill: install_skill.Opts,
 };
@@ -53,7 +51,8 @@ pub fn parse(args: []const []const u8) error{Usage}!Command {
         return .status;
     }
     if (std.mem.eql(u8, cmd, "list")) {
-        return .{ .list = try parseListFilter(args[1..]) };
+        if (args.len != 1) return error.Usage;
+        return .list;
     }
     if (std.mem.eql(u8, cmd, "show")) {
         if (args.len != 2) return error.Usage;
@@ -62,10 +61,6 @@ pub fn parse(args: []const []const u8) error{Usage}!Command {
     if (std.mem.eql(u8, cmd, "resolve")) {
         if (args.len < 2) return error.Usage;
         return .{ .resolve = args[1..] };
-    }
-    if (std.mem.eql(u8, cmd, "reopen")) {
-        if (args.len < 2) return error.Usage;
-        return .{ .reopen = args[1..] };
     }
     if (std.mem.eql(u8, cmd, "export")) {
         return .{ .@"export" = try parseExport(args[1..]) };
@@ -82,16 +77,7 @@ fn isHelp(s: []const u8) bool {
         std.mem.eql(u8, s, "-h");
 }
 
-fn parseListFilter(args: []const []const u8) error{Usage}!ListFilter {
-    if (args.len == 0) return .open;
-    if (args.len != 1) return error.Usage;
-    if (std.mem.eql(u8, args[0], "--open")) return .open;
-    if (std.mem.eql(u8, args[0], "--all")) return .all;
-    if (std.mem.eql(u8, args[0], "--resolved")) return .resolved;
-    return error.Usage;
-}
-
-/// Flags may appear in any order. Default: md, open-only, stdout.
+/// Flags may appear in any order. Default: md, stdout.
 fn parseExport(args: []const []const u8) error{Usage}!ExportOpts {
     var opts: ExportOpts = .{};
     var i: usize = 0;
@@ -110,12 +96,6 @@ fn parseExport(args: []const []const u8) error{Usage}!ExportOpts {
             if (i >= args.len or args[i].len == 0) return error.Usage;
             if (opts.out_path != null) return error.Usage;
             opts.out_path = args[i];
-        } else if (std.mem.eql(u8, a, "--open")) {
-            opts.filter = .open;
-        } else if (std.mem.eql(u8, a, "--all")) {
-            opts.filter = .all;
-        } else if (std.mem.eql(u8, a, "--resolved")) {
-            opts.filter = .resolved;
         } else return error.Usage;
     }
     return opts;
@@ -149,14 +129,12 @@ const usage_text =
     \\With no command, opens the full-screen review TUI.
     \\
     \\Commands:
-    \\  status                         open/resolved counts for the current review
-    \\  list [--open|--all|--resolved] list comments (default: open only)
+    \\  status                         live comment count and store path
+    \\  list                           list comments
     \\  show <id>                      print one comment
-    \\  resolve <id> [id…]             mark comments resolved
-    \\  reopen <id> [id…]              mark comments open again
-    \\  export [options]               dump comments (default: open, markdown, stdout)
+    \\  resolve <id> [id…]             delete comments
+    \\  export [options]               dump comments (default: markdown, stdout)
     \\    --format md|json             output format (default: md)
-    \\    --open|--all|--resolved      filter (default: open)
     \\    -o <path>                    write file instead of stdout
     \\  install-skill [options]        install bundled agent skill
     \\    --list                       show source, canonical, and agent links
@@ -177,10 +155,9 @@ pub fn run(alloc: Allocator, io: Io, args: []const []const u8, env: Env) u8 {
     switch (cmd) {
         .help => return cmdHelp(io),
         .status => return cmdStatus(alloc, io),
-        .list => |filter| return cmdList(alloc, io, filter),
+        .list => return cmdList(alloc, io),
         .show => |id| return cmdShow(alloc, io, id),
-        .resolve => |ids| return cmdSetState(alloc, io, ids, .resolved, "resolved"),
-        .reopen => |ids| return cmdSetState(alloc, io, ids, .open, "reopened"),
+        .resolve => |ids| return cmdResolve(alloc, io, ids),
         .@"export" => |opts| return cmdExport(alloc, io, opts),
         .install_skill => |opts| {
             var out_buf: [4096]u8 = undefined;
@@ -211,15 +188,6 @@ fn cmdStatus(alloc: Allocator, io: Io) u8 {
     var review = loadReview(alloc, io) catch |err| return loadFail(err);
     defer review.deinit();
 
-    var open_n: usize = 0;
-    var resolved_n: usize = 0;
-    for (review.comments.items) |c| {
-        switch (c.state) {
-            .open => open_n += 1,
-            .resolved => resolved_n += 1,
-        }
-    }
-    const total = review.comments.items.len;
     const rel = store.reviewRelPath(alloc, review.id) catch {
         std.debug.print("rv: out of memory\n", .{});
         return exit_operational;
@@ -232,11 +200,9 @@ fn cmdStatus(alloc: Allocator, io: Io) u8 {
     out.print(
         \\review: {s}
         \\store: {s}
-        \\open: {d}
-        \\resolved: {d}
-        \\total: {d}
+        \\comments: {d}
         \\
-    , .{ review.id, rel, open_n, resolved_n, total }) catch {
+    , .{ review.id, rel, review.comments.items.len }) catch {
         std.debug.print("rv: write failed\n", .{});
         return exit_operational;
     };
@@ -247,7 +213,7 @@ fn cmdStatus(alloc: Allocator, io: Io) u8 {
     return exit_success;
 }
 
-fn cmdList(alloc: Allocator, io: Io, filter: ListFilter) u8 {
+fn cmdList(alloc: Allocator, io: Io) u8 {
     var review = loadReview(alloc, io) catch |err| return loadFail(err);
     defer review.deinit();
 
@@ -257,10 +223,9 @@ fn cmdList(alloc: Allocator, io: Io, filter: ListFilter) u8 {
 
     var anchor_buf: [256]u8 = undefined;
     for (review.comments.items) |c| {
-        if (!matchesFilter(c.state, filter)) continue;
         const anchor = formatAnchor(&anchor_buf, c);
-        // One line: id state anchor body (newlines in body → spaces).
-        out.print("{s}  {s}  {s}  ", .{ c.id, @tagName(c.state), anchor }) catch {
+        // One line: id anchor body (newlines in body → spaces).
+        out.print("{s}  {s}  ", .{ c.id, anchor }) catch {
             std.debug.print("rv: write failed\n", .{});
             return exit_operational;
         };
@@ -293,7 +258,6 @@ fn cmdShow(alloc: Allocator, io: Io, id: []const u8) u8 {
     var w = std.Io.File.stdout().writer(io, &buf);
     const out = &w.interface;
     out.print("id: {s}\n", .{c.id}) catch return writeFail();
-    out.print("state: {s}\n", .{@tagName(c.state)}) catch return writeFail();
     out.print("path: {s}\n", .{c.path}) catch return writeFail();
     if (c.old_line) |n| {
         out.print("old_line: {d}\n", .{n}) catch return writeFail();
@@ -319,18 +283,12 @@ fn cmdShow(alloc: Allocator, io: Io, id: []const u8) u8 {
     return exit_success;
 }
 
-/// Load → setState (all-or-nothing) → save → one confirmation line per id.
-fn cmdSetState(
-    alloc: Allocator,
-    io: Io,
-    ids: []const []const u8,
-    state: store.State,
-    verb: []const u8,
-) u8 {
+/// Load → remove (all-or-nothing) → save → one confirmation line per id.
+fn cmdResolve(alloc: Allocator, io: Io, ids: []const []const u8) u8 {
     var review = loadReview(alloc, io) catch |err| return loadFail(err);
     defer review.deinit();
 
-    review.setState(ids, state) catch {
+    review.remove(ids) catch {
         for (ids) |id| {
             if (review.find(id) == null) {
                 std.debug.print("rv: comment not found: {s}\n", .{id});
@@ -348,7 +306,7 @@ fn cmdSetState(
     var w = std.Io.File.stdout().writer(io, &buf);
     const out = &w.interface;
     for (ids) |id| {
-        out.print("{s} {s}\n", .{ id, verb }) catch return writeFail();
+        out.print("{s} deleted\n", .{id}) catch return writeFail();
     }
     out.flush() catch return writeFail();
     return exit_success;
@@ -359,8 +317,8 @@ fn cmdExport(alloc: Allocator, io: Io, opts: ExportOpts) u8 {
     defer review.deinit();
 
     const bytes = switch (opts.format) {
-        .md => formatMarkdown(alloc, &review, opts.filter),
-        .json => formatJson(alloc, &review, opts.filter),
+        .md => formatMarkdown(alloc, &review),
+        .json => formatJson(alloc, &review),
     } catch {
         std.debug.print("rv: out of memory\n", .{});
         return exit_operational;
@@ -383,28 +341,27 @@ fn cmdExport(alloc: Allocator, io: Io, opts: ExportOpts) u8 {
     return exit_success;
 }
 
-/// Paste-ready markdown: header + one section per matching comment.
-fn formatMarkdown(alloc: Allocator, review: *const store.Review, filter: ListFilter) Allocator.Error![]u8 {
+/// Paste-ready markdown: header + one section per comment.
+fn formatMarkdown(alloc: Allocator, review: *const store.Review) Allocator.Error![]u8 {
     var out: std.Io.Writer.Allocating = .init(alloc);
     errdefer out.deinit();
     const w = &out.writer;
 
-    w.print("# rv export — review `{s}` (filter: {s})\n\n", .{ review.id, @tagName(filter) }) catch return error.OutOfMemory;
+    w.print("# rv export — review `{s}`\n\n", .{review.id}) catch return error.OutOfMemory;
 
     var any = false;
     var anchor_buf: [256]u8 = undefined;
     for (review.comments.items) |c| {
-        if (!matchesFilter(c.state, filter)) continue;
         any = true;
         const anchor = formatAnchor(&anchor_buf, c);
-        w.print("## [{s}] {s} — {s}", .{ c.id, @tagName(c.state), anchor }) catch return error.OutOfMemory;
+        w.print("## [{s}] — {s}", .{ c.id, anchor }) catch return error.OutOfMemory;
         if (c.side) |s| w.print(" ({s})", .{@tagName(s)}) catch return error.OutOfMemory;
         w.writeAll("\n\n") catch return error.OutOfMemory;
         w.writeAll(c.body) catch return error.OutOfMemory;
         if (c.body.len == 0 or c.body[c.body.len - 1] != '\n') w.writeAll("\n") catch return error.OutOfMemory;
         w.writeAll("\n") catch return error.OutOfMemory;
     }
-    if (!any) w.writeAll("_No comments match this filter._\n") catch return error.OutOfMemory;
+    if (!any) w.writeAll("_No comments._\n") catch return error.OutOfMemory;
     return try out.toOwnedSlice();
 }
 
@@ -415,22 +372,19 @@ const ExportComment = struct {
     new_line: ?u32 = null,
     side: ?[]const u8 = null,
     body: []const u8,
-    state: []const u8,
 };
 
 const ExportEnvelope = struct {
     version: u32,
     review_id: []const u8,
-    filter: []const u8,
     comments: []const ExportComment,
 };
 
-/// Export envelope (not a raw store dump): version, review_id, filter, comments[].
-fn formatJson(alloc: Allocator, review: *const store.Review, filter: ListFilter) Allocator.Error![]u8 {
+/// Export envelope (not a raw store dump): version, review_id, comments[].
+fn formatJson(alloc: Allocator, review: *const store.Review) Allocator.Error![]u8 {
     var wire: std.ArrayList(ExportComment) = .empty;
     defer wire.deinit(alloc);
     for (review.comments.items) |c| {
-        if (!matchesFilter(c.state, filter)) continue;
         try wire.append(alloc, .{
             .id = c.id,
             .path = c.path,
@@ -438,13 +392,11 @@ fn formatJson(alloc: Allocator, review: *const store.Review, filter: ListFilter)
             .new_line = c.new_line,
             .side = if (c.side) |s| @tagName(s) else null,
             .body = c.body,
-            .state = @tagName(c.state),
         });
     }
     const envelope: ExportEnvelope = .{
         .version = store.schema_version,
         .review_id = review.id,
-        .filter = @tagName(filter),
         .comments = wire.items,
     };
     var out: std.Io.Writer.Allocating = .init(alloc);
@@ -468,14 +420,6 @@ fn loadFail(err: store.LoadError) u8 {
     };
     std.debug.print("rv: {s}\n", .{msg});
     return exit_operational;
-}
-
-fn matchesFilter(state: store.State, filter: ListFilter) bool {
-    return switch (filter) {
-        .all => true,
-        .open => state == .open,
-        .resolved => state == .resolved,
-    };
 }
 
 fn writeFail() u8 {
@@ -520,16 +464,12 @@ fn bufPrintTrunc(buf: []u8, comptime fmt: []const u8, args: anytype) []const u8 
 
 const testing = std.testing;
 
-test "parse help status list show resolve reopen export install-skill" {
+test "parse help status list show resolve export install-skill" {
     try testing.expectEqual(Command.help, try parse(&.{"help"}));
     try testing.expectEqual(Command.help, try parse(&.{"--help"}));
     try testing.expectEqual(Command.help, try parse(&.{"-h"}));
     try testing.expectEqual(Command.status, try parse(&.{"status"}));
-
-    try testing.expectEqual(ListFilter.open, (try parse(&.{"list"})).list);
-    try testing.expectEqual(ListFilter.open, (try parse(&.{ "list", "--open" })).list);
-    try testing.expectEqual(ListFilter.all, (try parse(&.{ "list", "--all" })).list);
-    try testing.expectEqual(ListFilter.resolved, (try parse(&.{ "list", "--resolved" })).list);
+    try testing.expectEqual(Command.list, try parse(&.{"list"}));
 
     const show = try parse(&.{ "show", "3" });
     try testing.expectEqualStrings("3", show.show);
@@ -542,27 +482,16 @@ test "parse help status list show resolve reopen export install-skill" {
     try testing.expectEqual(3, resolve_multi.resolve.len);
     try testing.expectEqualStrings("2", resolve_multi.resolve[1]);
 
-    const reopen_one = try parse(&.{ "reopen", "7" });
-    try testing.expectEqual(1, reopen_one.reopen.len);
-    try testing.expectEqualStrings("7", reopen_one.reopen[0]);
-
-    const reopen_multi = try parse(&.{ "reopen", "a", "b" });
-    try testing.expectEqual(2, reopen_multi.reopen.len);
-    try testing.expectEqualStrings("b", reopen_multi.reopen[1]);
-
     const exp_default = (try parse(&.{"export"})).@"export";
     try testing.expectEqual(ExportFormat.md, exp_default.format);
-    try testing.expectEqual(ListFilter.open, exp_default.filter);
     try testing.expect(exp_default.out_path == null);
 
-    const exp_json = (try parse(&.{ "export", "--format", "json", "--all", "-o", "out.json" })).@"export";
+    const exp_json = (try parse(&.{ "export", "--format", "json", "-o", "out.json" })).@"export";
     try testing.expectEqual(ExportFormat.json, exp_json.format);
-    try testing.expectEqual(ListFilter.all, exp_json.filter);
     try testing.expectEqualStrings("out.json", exp_json.out_path.?);
 
-    const exp_order = (try parse(&.{ "export", "-o", "/tmp/r.md", "--format", "md", "--resolved" })).@"export";
+    const exp_order = (try parse(&.{ "export", "-o", "/tmp/r.md", "--format", "md" })).@"export";
     try testing.expectEqual(ExportFormat.md, exp_order.format);
-    try testing.expectEqual(ListFilter.resolved, exp_order.filter);
     try testing.expectEqualStrings("/tmp/r.md", exp_order.out_path.?);
 
     const inst = (try parse(&.{"install-skill"})).install_skill;
@@ -580,11 +509,17 @@ test "parse usage errors" {
     try testing.expectError(error.Usage, parse(&.{ "status", "x" }));
     try testing.expectError(error.Usage, parse(&.{"show"}));
     try testing.expectError(error.Usage, parse(&.{ "show", "1", "2" }));
-    try testing.expectError(error.Usage, parse(&.{ "list", "--all", "--open" }));
+    try testing.expectError(error.Usage, parse(&.{ "list", "--open" }));
+    try testing.expectError(error.Usage, parse(&.{ "list", "--all" }));
+    try testing.expectError(error.Usage, parse(&.{ "list", "--resolved" }));
     try testing.expectError(error.Usage, parse(&.{ "list", "--bogus" }));
     try testing.expectError(error.Usage, parse(&.{ "help", "extra" }));
     try testing.expectError(error.Usage, parse(&.{"resolve"}));
     try testing.expectError(error.Usage, parse(&.{"reopen"}));
+    try testing.expectError(error.Usage, parse(&.{ "reopen", "7" }));
+    try testing.expectError(error.Usage, parse(&.{ "export", "--open" }));
+    try testing.expectError(error.Usage, parse(&.{ "export", "--all" }));
+    try testing.expectError(error.Usage, parse(&.{ "export", "--resolved" }));
     try testing.expectError(error.Usage, parse(&.{ "export", "--format" }));
     try testing.expectError(error.Usage, parse(&.{ "export", "--format", "xml" }));
     try testing.expectError(error.Usage, parse(&.{ "export", "-o" }));
@@ -595,38 +530,33 @@ test "parse usage errors" {
     try testing.expectError(error.Usage, parse(&.{ "install-skill", "--bogus" }));
 }
 
-test "formatMarkdown and formatJson filter and envelope" {
+test "formatMarkdown and formatJson envelope" {
     var review = try store.initEmpty(testing.allocator, "current");
     defer review.deinit();
     _ = try review.addOpen("a.zig", null, 10, .new, "fix me");
     _ = try review.addOpen("b.zig", 2, null, .old, "also");
-    try review.resolve(&.{"2"});
 
-    const md = try formatMarkdown(testing.allocator, &review, .open);
+    const md = try formatMarkdown(testing.allocator, &review);
     defer testing.allocator.free(md);
-    try testing.expect(std.mem.indexOf(u8, md, "filter: open") != null);
-    try testing.expect(std.mem.indexOf(u8, md, "## [1] open — a.zig:+10 (new)") != null);
+    try testing.expect(std.mem.indexOf(u8, md, "# rv export — review `current`") != null);
+    try testing.expect(std.mem.indexOf(u8, md, "## [1] — a.zig:+10 (new)") != null);
     try testing.expect(std.mem.indexOf(u8, md, "fix me") != null);
-    try testing.expect(std.mem.indexOf(u8, md, "## [2]") == null);
+    try testing.expect(std.mem.indexOf(u8, md, "## [2] — b.zig:-2 (old)") != null);
+    try testing.expect(std.mem.indexOf(u8, md, "also") != null);
 
-    const md_all = try formatMarkdown(testing.allocator, &review, .all);
-    defer testing.allocator.free(md_all);
-    try testing.expect(std.mem.indexOf(u8, md_all, "## [2] resolved — b.zig:-2 (old)") != null);
-
-    const js = try formatJson(testing.allocator, &review, .open);
+    const js = try formatJson(testing.allocator, &review);
     defer testing.allocator.free(js);
     var parsed = try std.json.parseFromSlice(ExportEnvelope, testing.allocator, js, .{
         .allocate = .alloc_always,
         .ignore_unknown_fields = true,
     });
     defer parsed.deinit();
-    try testing.expectEqual(@as(u32, 1), parsed.value.version);
+    try testing.expectEqual(1, parsed.value.version);
     try testing.expectEqualStrings("current", parsed.value.review_id);
-    try testing.expectEqualStrings("open", parsed.value.filter);
-    try testing.expectEqual(1, parsed.value.comments.len);
+    try testing.expectEqual(2, parsed.value.comments.len);
     try testing.expectEqualStrings("1", parsed.value.comments[0].id);
     try testing.expectEqualStrings("a.zig", parsed.value.comments[0].path);
-    try testing.expectEqual(@as(u32, 10), parsed.value.comments[0].new_line.?);
+    try testing.expectEqual(10, parsed.value.comments[0].new_line.?);
     try testing.expectEqualStrings("new", parsed.value.comments[0].side.?);
     try testing.expectEqualStrings("fix me", parsed.value.comments[0].body);
 }

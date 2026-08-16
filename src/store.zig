@@ -45,13 +45,14 @@ pub const Review = struct {
         return n;
     }
 
-    pub fn hasOpenAt(self: *const Review, path: []const u8, old_line: ?u32, new_line: ?u32) bool {
-        for (self.comments.items) |c| {
+    /// First live comment in store order at this path matching the given line(s).
+    pub fn firstAt(self: *const Review, path: []const u8, old_line: ?u32, new_line: ?u32) ?usize {
+        for (self.comments.items, 0..) |c, i| {
             if (c.state != .open) continue;
             if (!std.mem.eql(u8, c.path, path)) continue;
-            if (lineMatch(c.old_line, old_line) or lineMatch(c.new_line, new_line)) return true;
+            if (lineMatch(c.old_line, old_line) or lineMatch(c.new_line, new_line)) return i;
         }
-        return false;
+        return null;
     }
 
     pub fn addOpen(
@@ -89,23 +90,23 @@ pub const Review = struct {
         return null;
     }
 
-    /// Set state for every id. All must exist before any write (all-or-nothing).
-    /// Idempotent when a comment is already in `state`.
-    pub fn setState(self: *Review, ids: []const []const u8, state: State) error{NotFound}!void {
+    /// Delete every id. All must exist before any write (all-or-nothing).
+    /// Remaining comments keep store order. Duplicate ids delete once.
+    pub fn remove(self: *Review, ids: []const []const u8) error{NotFound}!void {
         for (ids) |id| {
             if (self.findIndex(id) == null) return error.NotFound;
         }
-        for (ids) |id| {
-            self.comments.items[self.findIndex(id).?].state = state;
+        var i = self.comments.items.len;
+        while (i > 0) {
+            i -= 1;
+            const cid = self.comments.items[i].id;
+            for (ids) |id| {
+                if (std.mem.eql(u8, cid, id)) {
+                    _ = self.comments.orderedRemove(i);
+                    break;
+                }
+            }
         }
-    }
-
-    pub fn resolve(self: *Review, ids: []const []const u8) error{NotFound}!void {
-        try self.setState(ids, .resolved);
-    }
-
-    pub fn reopen(self: *Review, ids: []const []const u8) error{NotFound}!void {
-        try self.setState(ids, .open);
     }
 };
 
@@ -183,13 +184,15 @@ fn parseJson(gpa: Allocator, raw: []const u8, fallback_id: []const u8) LoadError
     var max_seq: u64 = 0;
     for (wire.comments) |wc| {
         const state = std.meta.stringToEnum(State, wc.state) orelse return error.InvalidState;
+        if (std.fmt.parseInt(u64, wc.id, 10) catch null) |n| {
+            if (n > max_seq) max_seq = n;
+        }
+        // Do not migrate resolved rows back to open.
+        if (state == .resolved) continue;
         const side: ?Side = if (wc.side) |s|
             (std.meta.stringToEnum(Side, s) orelse return error.InvalidSide)
         else
             null;
-        if (std.fmt.parseInt(u64, wc.id, 10) catch null) |n| {
-            if (n > max_seq) max_seq = n;
-        }
         try review.comments.append(a, .{
             .id = try a.dupe(u8, wc.id),
             .path = try a.dupe(u8, wc.path),
@@ -235,12 +238,12 @@ const testing = std.testing;
 const builtin = @import("builtin");
 const IsolatedTmp = if (builtin.is_test) @import("isolated_tmp").IsolatedTmp else void;
 
-test "addOpen hasOpenAt and roundtrip" {
+test "addOpen firstAt and roundtrip" {
     var r = try initEmpty(testing.allocator, default_review_id);
     defer r.deinit();
     try testing.expectEqualStrings("1", try r.addOpen("a.zig", null, 10, .new, "fix"));
-    try testing.expect(r.hasOpenAt("a.zig", null, 10));
-    try testing.expect(!r.hasOpenAt("a.zig", null, 11));
+    try testing.expect(r.firstAt("a.zig", null, 10) != null);
+    try testing.expect(r.firstAt("a.zig", null, 11) == null);
     try testing.expectEqual(1, r.openCount());
     const bad =
         \\{"version":1,"id":"current","comments":[{"id":"1","path":"f","body":"x","state":"nope"}]}
@@ -265,61 +268,69 @@ test "addOpen hasOpenAt and roundtrip" {
     try testing.expectEqualStrings("2", try loaded.addOpen("b.zig", 1, null, .old, "x"));
 }
 
-test "find resolve reopen and multi-id all-or-nothing" {
+test "find" {
     var review = try initEmpty(testing.allocator, default_review_id);
     defer review.deinit();
     const id1 = try review.addOpen("a.zig", null, 1, .new, "one");
-    const id2 = try review.addOpen("b.zig", null, 2, .new, "two");
+    _ = try review.addOpen("b.zig", null, 2, .new, "two");
 
     try testing.expect(review.find("nope") == null);
     try testing.expectEqualStrings("one", review.find(id1).?.body);
     try testing.expectEqual(State.open, review.find(id1).?.state);
-
-    try review.resolve(&.{id1});
-    try testing.expectEqual(State.resolved, review.find(id1).?.state);
-    try testing.expectEqual(1, review.openCount());
-    try testing.expectEqual(State.open, review.find(id2).?.state);
-    // Idempotent when already resolved.
-    try review.resolve(&.{id1});
-    try testing.expectEqual(State.resolved, review.find(id1).?.state);
-
-    try review.reopen(&.{id1});
-    try testing.expectEqual(State.open, review.find(id1).?.state);
-    try testing.expectEqual(2, review.openCount());
-
-    // Unknown id: no writes (multi-id all-or-nothing).
-    try testing.expectError(error.NotFound, review.resolve(&.{ id1, "999" }));
-    try testing.expectEqual(State.open, review.find(id1).?.state);
-    try testing.expectEqual(State.open, review.find(id2).?.state);
-
-    try review.resolve(&.{ id1, id2 });
-    try testing.expectEqual(State.resolved, review.find(id1).?.state);
-    try testing.expectEqual(State.resolved, review.find(id2).?.state);
-    try testing.expectEqual(0, review.openCount());
-    try testing.expectError(error.NotFound, review.reopen(&.{"ghost"}));
 }
 
-test "resolve save load preserves state" {
-    if (builtin.os.tag == .wasi) return;
+test "remove all-or-nothing preserves remaining order" {
     var review = try initEmpty(testing.allocator, default_review_id);
     defer review.deinit();
-    const id = try review.addOpen("c.zig", 3, null, .old, "keep");
-    try review.resolve(&.{id});
+    const id1 = try review.addOpen("a.zig", null, 1, .new, "one");
+    const id2 = try review.addOpen("b.zig", null, 2, .new, "two");
+    const id3 = try review.addOpen("c.zig", null, 3, .new, "three");
 
-    const io = testing.io;
-    const alloc = testing.allocator;
-    var tmp = try IsolatedTmp.create(alloc, io);
-    defer tmp.cleanup(alloc, io);
+    try testing.expectError(error.NotFound, review.remove(&.{ id2, "ghost" }));
+    try testing.expectEqual(3, review.comments.items.len);
+    try testing.expectEqualStrings("two", review.find(id2).?.body);
 
-    try save(&review, alloc, io, tmp.dir);
-    var loaded = try load(alloc, io, tmp.dir, default_review_id);
-    defer loaded.deinit();
-    try testing.expectEqual(State.resolved, loaded.find(id).?.state);
-    try testing.expectEqual(0, loaded.openCount());
-    try loaded.reopen(&.{id});
-    try testing.expectEqual(State.open, loaded.find(id).?.state);
-    try save(&loaded, alloc, io, tmp.dir);
-    var again = try load(alloc, io, tmp.dir, default_review_id);
-    defer again.deinit();
-    try testing.expectEqual(State.open, again.find(id).?.state);
+    try review.remove(&.{id2});
+    try testing.expect(review.find(id2) == null);
+    try testing.expectEqual(2, review.comments.items.len);
+    try testing.expectEqualStrings(id1, review.comments.items[0].id);
+    try testing.expectEqualStrings(id3, review.comments.items[1].id);
+
+    try review.remove(&.{ id1, id1 });
+    try testing.expect(review.find(id1) == null);
+    try testing.expectEqual(1, review.comments.items.len);
+    try testing.expectEqualStrings(id3, review.comments.items[0].id);
+
+    try review.remove(&.{id3});
+    try testing.expectEqual(0, review.comments.items.len);
+    try testing.expectError(error.NotFound, review.remove(&.{"ghost"}));
+}
+
+test "load drops resolved comments and keeps next_seq" {
+    const raw =
+        \\{"version":1,"id":"current","comments":[{"id":"1","path":"a.zig","body":"keep","state":"open"},{"id":"5","path":"b.zig","body":"gone","state":"resolved"}]}
+    ;
+    var review = try parseJson(testing.allocator, raw, default_review_id);
+    defer review.deinit();
+    try testing.expectEqual(1, review.comments.items.len);
+    try testing.expectEqualStrings("keep", review.find("1").?.body);
+    try testing.expect(review.find("5") == null);
+    try testing.expectEqual(6, review.next_seq);
+    try testing.expectEqual(1, review.openCount());
+}
+
+test "firstAt store order and opposite side" {
+    var review = try initEmpty(testing.allocator, default_review_id);
+    defer review.deinit();
+    _ = try review.addOpen("f.zig", null, 10, .new, "new first");
+    _ = try review.addOpen("f.zig", 10, null, .old, "old");
+    _ = try review.addOpen("f.zig", null, 10, .new, "new second");
+
+    try testing.expectEqual(0, review.firstAt("f.zig", null, 10).?);
+    try testing.expectEqual(1, review.firstAt("f.zig", 10, null).?);
+    try testing.expect(review.firstAt("f.zig", null, 11) == null);
+    try testing.expect(review.firstAt("g.zig", null, 10) == null);
+
+    try review.remove(&.{"1"});
+    try testing.expectEqual(1, review.firstAt("f.zig", null, 10).?);
 }

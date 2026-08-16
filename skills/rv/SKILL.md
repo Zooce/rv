@@ -1,16 +1,16 @@
 ---
 name: rv
 description: >
-  Address open rv code-review comments. Use when the user asks to fix rv
-  comments, address review feedback from rv, or work through open items from
+  Address rv code-review comments. Use when the user asks to fix rv
+  comments, address review feedback from rv, or work through items from
   `rv list` / `rv export` / `.rv/reviews/`.
 ---
 
 # rv review comments
 
 `rv` is a terminal code-review **comment board**. Humans leave comments on a
-diff; agents fix the code and mark comments resolved. `rv` does **not** apply
-patches.
+diff; agents fix the code and `rv resolve` deletes those ids. `rv` does **not**
+apply patches. There is no reopen and no resolved list.
 
 Store: `.rv/reviews/current.json` in the **repo root**. Run commands there.
 
@@ -18,21 +18,20 @@ Store: `.rv/reviews/current.json` in the **repo root**. Run commands there.
 
 | Command | Purpose |
 |---------|---------|
-| `rv status` | Open / resolved / total counts |
-| `rv list` | Open comments (default); `--all` / `--resolved` / `--open` |
+| `rv status` | Live comment count and store path |
+| `rv list` | Comments on the board |
 | `rv show <id>` | One comment: path, lines, side, body |
 | `rv export` | Markdown (default) or `--format json`; `-o path` writes a file |
-| `rv resolve <id> [id…]` | Mark resolved after you fixed them |
-| `rv reopen <id> [id…]` | Mark open again |
+| `rv resolve <id> [id…]` | Delete comments after you fixed them |
 
 Bare `rv` opens the TUI; agents should use the headless commands above.
 
 ## Workflow
 
-1. `rv list` or `rv export --format md` — read open comments and anchors.
+1. `rv list` or `rv export --format md` — read comments and anchors.
 2. Edit only the paths/lines given; do not invent anchors.
-3. `rv resolve <id>` for each fully addressed comment.
-4. `rv list` again until open is empty (or only deferred items remain).
+3. `rv resolve <id>` for each fully addressed comment (deletes the id).
+4. `rv list` again until the board is empty (or only deferred items remain).
 
 ## Rules
 

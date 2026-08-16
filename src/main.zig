@@ -4,14 +4,14 @@
 //! comments → TUI (`j`/`k`, `h`/`l` pan, `0`/`$` col home/end, `[`/`]` hunk,
 //! `{`/`}` file header, `/` text search, `n`/`N` next/prev match, `Space` `f`
 //! file-path find, `i`/`c`/`a`/`Enter` comment new, `I`/`C`/`A` comment old,
-//! `q` quit).
+//! `d` dismiss new, `D` dismiss old, `q` quit).
 //! Diff layout defaults to side-by-side when the terminal is wide enough;
 //! falls back to unified when narrow. `t` toggles session preference
 //! (explicit unified stays unified even when wide).
 //! Empty/error paths never enter raw / alt-screen mode.
 //!
 //! With a subcommand: headless CLI (`status`, `list`, `show`, `resolve`,
-//! `reopen`, `export`, `install-skill`, help) — no git load and no raw TTY modes.
+//! `export`, `install-skill`, help) — no git load and no raw TTY modes.
 //!
 //! Comment UX: soft-wrapped multi-line footer prompt (grows up to 4 rows, then
 //! scrolls with a right-edge scrollbar). Arrow keys move the caret; insert and
@@ -368,6 +368,10 @@ fn runTui(alloc: std.mem.Allocator, io: std.Io) !u8 {
                                     draft_caret = 0;
                                     focus = .commenting;
                                 }
+                            } else if (c == 'd') {
+                                dismissAt(&review, alloc, io, rows, sbs_slots, layout, cursor, .new, &note);
+                            } else if (c == 'D') {
+                                dismissAt(&review, alloc, io, rows, sbs_slots, layout, cursor, .old, &note);
                             }
                         },
                         .enter => {
@@ -527,6 +531,38 @@ fn sideForAnchor(a: view.Anchor) store.Side {
     return .old;
 }
 
+/// Dismiss the first live comment on `want` at `cursor`. Missing side or no
+/// comment: footer note, store unchanged. Save failure puts the comment back.
+fn dismissAt(
+    review: *store.Review,
+    alloc: std.mem.Allocator,
+    io: std.Io,
+    rows: []const view.Row,
+    slots: []const view.SbsSlot,
+    layout: view.EffectiveLayout,
+    cursor: usize,
+    want: view.CommentSide,
+    note: *StatusNote,
+) void {
+    const a = view.commentAnchor(rows, slots, layout, cursor, want) orelse {
+        note.set("no comment on this side");
+        return;
+    };
+    const idx = review.firstAt(a.path, a.old_line, a.new_line) orelse {
+        note.set("no comment on this side");
+        return;
+    };
+    const saved = review.comments.items[idx];
+    const id = saved.id;
+    review.remove(&.{id}) catch return;
+    store.save(review, alloc, io, .cwd()) catch {
+        review.comments.insert(review.arena.allocator(), idx, saved) catch {};
+        note.set("failed to save .rv comment store");
+        return;
+    };
+    note.setFmt("deleted {s}", .{id});
+}
+
 fn paint(
     scr: *tui.Screen,
     size: tui.Size,
@@ -647,7 +683,7 @@ fn paint(
                 .text => "rv  search  Enter jump  Esc cancel",
                 .file => "rv  file  Enter jump  Esc cancel",
             },
-            .normal => "rv  j/k line  h/l pan  0/$  J/K change  [/] hunk  {/} file  / n/N  Space f  t  i/I  q",
+            .normal => "rv  j/k line  h/l pan  0/$  J/K change  [/] hunk  {/} file  / n/N search  Space f files  t layout  i/I comment  d/D dismiss  q quit",
         };
         scr.putStr(1, 0, help, title_style);
     }
@@ -924,7 +960,7 @@ fn rowMarked(row: view.Row, review: *const store.Review) bool {
     return switch (row) {
         .line => |ln| switch (ln.kind) {
             .meta => false,
-            else => review.hasOpenAt(ln.path, ln.old_no, ln.new_no),
+            else => review.firstAt(ln.path, ln.old_no, ln.new_no) != null,
         },
         else => false,
     };
