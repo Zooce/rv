@@ -78,6 +78,12 @@ pub const Review = struct {
         return id;
     }
 
+    /// Overwrite `body` only. Path, lines, side, id, and state stay put.
+    pub fn setBody(self: *Review, id: []const u8, body: []const u8) (error{NotFound} || Allocator.Error)!void {
+        const i = self.findIndex(id) orelse return error.NotFound;
+        self.comments.items[i].body = try self.alloc().dupe(u8, body);
+    }
+
     /// Comment with `id`, or null if none.
     pub fn find(self: *const Review, id: []const u8) ?*const Comment {
         return if (self.findIndex(id)) |i| &self.comments.items[i] else null;
@@ -333,4 +339,37 @@ test "firstAt store order and opposite side" {
 
     try review.remove(&.{"1"});
     try testing.expectEqual(1, review.firstAt("f.zig", null, 10).?);
+}
+
+test "setBody overwrites body only" {
+    var review = try initEmpty(testing.allocator, default_review_id);
+    defer review.deinit();
+    const id1 = try review.addOpen("a.zig", null, 10, .new, "one");
+    const id2 = try review.addOpen("b.zig", 2, null, .old, "other");
+
+    try testing.expectError(error.NotFound, review.setBody("ghost", "x"));
+    try review.setBody(id1, "two");
+
+    const c = review.find(id1).?;
+    try testing.expectEqualStrings(id1, c.id);
+    try testing.expectEqualStrings("a.zig", c.path);
+    try testing.expect(c.old_line == null);
+    try testing.expectEqual(10, c.new_line.?);
+    try testing.expectEqual(Side.new, c.side.?);
+    try testing.expectEqual(State.open, c.state);
+    try testing.expectEqualStrings("two", c.body);
+    try testing.expectEqualStrings("other", review.find(id2).?.body);
+
+    if (builtin.os.tag == .wasi) return;
+    const io = testing.io;
+    const alloc = testing.allocator;
+    var tmp = try IsolatedTmp.create(alloc, io);
+    defer tmp.cleanup(alloc, io);
+    try save(&review, alloc, io, tmp.dir);
+    var loaded = try load(alloc, io, tmp.dir, default_review_id);
+    defer loaded.deinit();
+    try testing.expectEqualStrings("two", loaded.find(id1).?.body);
+    try testing.expectEqualStrings(id1, loaded.find(id1).?.id);
+    try testing.expectEqual(10, loaded.find(id1).?.new_line.?);
+    try testing.expectEqual(Side.new, loaded.find(id1).?.side.?);
 }

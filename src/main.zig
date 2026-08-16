@@ -3,7 +3,7 @@
 //! With no args: load smart-default git diff → flatten rows → load `.rv`
 //! comments → TUI (`j`/`k`, `h`/`l` pan, `0`/`$` col home/end, `[`/`]` hunk,
 //! `{`/`}` file header, `/` text search, `n`/`N` next/prev match, `Space` `f`
-//! file-path find, `i`/`c`/`a`/`Enter` comment new, `I`/`C`/`A` comment old,
+//! file-path find, `i`/`c`/`a`/`Enter` create or edit new, `I`/`C`/`A` old,
 //! `d` dismiss new, `D` dismiss old, `q` quit).
 //! Diff layout defaults to side-by-side when the terminal is wide enough;
 //! falls back to unified when narrow. `t` toggles session preference
@@ -133,21 +133,15 @@ fn runTui(alloc: std.mem.Allocator, io: std.Io) !u8 {
     var search_kind: SearchKind = .text;
     // `Space` leader: next key may be `f` (file find). Cleared on that next key.
     var leader_pending: bool = false;
-    var draft: std.ArrayList(u8) = .empty;
-    defer draft.deinit(alloc);
+    var draft: Draft = .{};
+    defer draft.buf.deinit(alloc);
     // Committed `/` text query for `n`/`N` (empty means no active text search).
     var last_query: std.ArrayList(u8) = .empty;
     defer last_query.deinit(alloc);
     // One-shot footer note (owned bytes; len 0 = none). Cleared on next key.
     var note: StatusNote = .{};
-    // First visible soft-wrapped line of the comment box (when scrolled).
-    var draft_scroll: usize = 0;
-    // Byte index of the comment / search caret into `draft` (0…len).
-    var draft_caret: usize = 0;
-    // Anchor captured when entering comment mode (cursor does not move then).
-    var draft_anchor: view.Anchor = .{ .path = "", .old_line = null, .new_line = null };
 
-    paint(&scr, size, rows, sbs_slots, layout_pref, cursor, &scroll, &col_scroll, &review, focus, search_kind, draft.items, draft_caret, &draft_scroll, draft_anchor, note.slice());
+    paint(&scr, size, rows, sbs_slots, layout_pref, cursor, &scroll, &col_scroll, &review, focus, search_kind, draft.buf.items, draft.caret, &draft.scroll, draft.anchor, note.slice());
     try scr.present(&term);
 
     while (running) {
@@ -165,67 +159,78 @@ fn runTui(alloc: std.mem.Allocator, io: std.Io) !u8 {
                     .commenting => switch (key) {
                         .esc => {
                             focus = .normal;
-                            draft.clearRetainingCapacity();
-                            draft_scroll = 0;
-                            draft_caret = 0;
+                            draft.clear();
                         },
                         .enter => {
-                            if (draft.items.len > 0) {
-                                const side = sideForAnchor(draft_anchor);
-                                _ = try review.addOpen(
-                                    draft_anchor.path,
-                                    draft_anchor.old_line,
-                                    draft_anchor.new_line,
-                                    side,
-                                    draft.items,
-                                );
-                                store.save(&review, alloc, io, .cwd()) catch {
-                                    // Stay in review; next save can retry. Marker is in-memory.
-                                };
+                            if (draft.buf.items.len > 0) {
+                                if (draft.edit_id) |id| {
+                                    if (review.find(id)) |c| {
+                                        const prior = c.body;
+                                        if (review.setBody(id, draft.buf.items)) |_| {
+                                            store.save(&review, alloc, io, .cwd()) catch {
+                                                review.setBody(id, prior) catch {};
+                                                note.set("failed to save .rv comment store");
+                                            };
+                                        } else |err| switch (err) {
+                                            error.NotFound => {},
+                                            error.OutOfMemory => return error.OutOfMemory,
+                                        }
+                                    }
+                                } else {
+                                    const side = sideForAnchor(draft.anchor);
+                                    _ = try review.addOpen(
+                                        draft.anchor.path,
+                                        draft.anchor.old_line,
+                                        draft.anchor.new_line,
+                                        side,
+                                        draft.buf.items,
+                                    );
+                                    store.save(&review, alloc, io, .cwd()) catch {
+                                        // Stay in review; next save can retry. Marker is in-memory.
+                                    };
+                                }
                             }
                             focus = .normal;
-                            draft.clearRetainingCapacity();
-                            draft_scroll = 0;
-                            draft_caret = 0;
+                            draft.clear();
                         },
                         .backspace => {
-                            if (draft_caret > 0) {
-                                draft_caret -= 1;
-                                _ = draft.orderedRemove(draft_caret);
-                                ensureDraftCaretVisible(size.cols, size.rows, draft.items, &draft_scroll, draft_caret);
+                            if (draft.caret > 0) {
+                                draft.caret -= 1;
+                                _ = draft.buf.orderedRemove(draft.caret);
+                                ensureDraftCaretVisible(size.cols, size.rows, draft.buf.items, &draft.scroll, draft.caret);
                             }
                         },
                         .char => |c| {
                             if (c >= 0x20 and c < 0x7f) {
-                                try draft.insert(alloc, draft_caret, @intCast(c));
-                                draft_caret += 1;
-                                ensureDraftCaretVisible(size.cols, size.rows, draft.items, &draft_scroll, draft_caret);
+                                try draft.buf.insert(alloc, draft.caret, @intCast(c));
+                                draft.caret += 1;
+                                ensureDraftCaretVisible(size.cols, size.rows, draft.buf.items, &draft.scroll, draft.caret);
                             }
                         },
                         .left => {
-                            if (draft_caret > 0) draft_caret -= 1;
-                            ensureDraftCaretVisible(size.cols, size.rows, draft.items, &draft_scroll, draft_caret);
+                            if (draft.caret > 0) draft.caret -= 1;
+                            ensureDraftCaretVisible(size.cols, size.rows, draft.buf.items, &draft.scroll, draft.caret);
                         },
                         .right => {
-                            if (draft_caret < draft.items.len) draft_caret += 1;
-                            ensureDraftCaretVisible(size.cols, size.rows, draft.items, &draft_scroll, draft_caret);
+                            if (draft.caret < draft.buf.items.len) draft.caret += 1;
+                            ensureDraftCaretVisible(size.cols, size.rows, draft.buf.items, &draft.scroll, draft.caret);
                         },
                         .up => {
-                            const m = commentMetrics(size.cols, size.rows, draft.items);
-                            const pos = comment_input.VisualPos.init(draft.items, m.text_w, draft_caret);
+                            const m = commentMetrics(size.cols, size.rows, draft.buf.items);
+                            const pos = comment_input.VisualPos.init(draft.buf.items, m.text_w, draft.caret);
                             // On the first visual line, stay put (keep column).
                             if (pos.line > 0) {
-                                draft_caret = comment_input.byteAtVisual(draft.items, m.text_w, pos.line - 1, pos.col);
-                                ensureDraftCaretVisible(size.cols, size.rows, draft.items, &draft_scroll, draft_caret);
+                                draft.caret = comment_input.byteAtVisual(draft.buf.items, m.text_w, pos.line - 1, pos.col);
+                                ensureDraftCaretVisible(size.cols, size.rows, draft.buf.items, &draft.scroll, draft.caret);
                             }
                         },
                         .down => {
-                            const m = commentMetrics(size.cols, size.rows, draft.items);
-                            const pos = comment_input.VisualPos.init(draft.items, m.text_w, draft_caret);
+                            const m = commentMetrics(size.cols, size.rows, draft.buf.items);
+                            const pos = comment_input.VisualPos.init(draft.buf.items, m.text_w, draft.caret);
                             if (pos.line + 1 < m.line_count) {
-                                draft_caret = comment_input.byteAtVisual(draft.items, m.text_w, pos.line + 1, pos.col);
+                                draft.caret = comment_input.byteAtVisual(draft.buf.items, m.text_w, pos.line + 1, pos.col);
                             }
-                            ensureDraftCaretVisible(size.cols, size.rows, draft.items, &draft_scroll, draft_caret);
+                            ensureDraftCaretVisible(size.cols, size.rows, draft.buf.items, &draft.scroll, draft.caret);
                         },
                         .ctrl_c => running = false,
                         else => {},
@@ -234,28 +239,25 @@ fn runTui(alloc: std.mem.Allocator, io: std.Io) !u8 {
                         .esc => {
                             // Cancel: leave cursor where it was; discard draft only.
                             focus = .normal;
-                            draft.clearRetainingCapacity();
-                            draft_caret = 0;
+                            draft.clear();
                         },
                         .enter => {
                             focus = .normal;
-                            if (draft.items.len == 0) {
-                                draft_caret = 0;
+                            if (draft.buf.items.len == 0) {
+                                draft.caret = 0;
                             } else if (search_kind == .file) {
                                 // Single jump; do not replace the `/` n/N query.
-                                if (view.firstPathMatch(rows, draft.items, cursor)) |hit| {
+                                if (view.firstPathMatch(rows, draft.buf.items, cursor)) |hit| {
                                     cursor = hit.index;
                                     if (hit.wrapped) note.set("search wrapped");
                                 } else {
-                                    note.setFmt("Pattern not found: {s}", .{draft.items});
+                                    note.setFmt("Pattern not found: {s}", .{draft.buf.items});
                                 }
-                                draft.clearRetainingCapacity();
-                                draft_caret = 0;
+                                draft.clear();
                             } else {
                                 last_query.clearRetainingCapacity();
-                                try last_query.appendSlice(alloc, draft.items);
-                                draft.clearRetainingCapacity();
-                                draft_caret = 0;
+                                try last_query.appendSlice(alloc, draft.buf.items);
+                                draft.clear();
                                 if (view.firstMatch(rows, last_query.items, cursor)) |hit| {
                                     cursor = hit.index;
                                     if (hit.wrapped) note.set("search wrapped");
@@ -265,22 +267,22 @@ fn runTui(alloc: std.mem.Allocator, io: std.Io) !u8 {
                             }
                         },
                         .backspace => {
-                            if (draft_caret > 0) {
-                                draft_caret -= 1;
-                                _ = draft.orderedRemove(draft_caret);
+                            if (draft.caret > 0) {
+                                draft.caret -= 1;
+                                _ = draft.buf.orderedRemove(draft.caret);
                             }
                         },
                         .char => |c| {
                             if (c >= 0x20 and c < 0x7f) {
-                                try draft.insert(alloc, draft_caret, @intCast(c));
-                                draft_caret += 1;
+                                try draft.buf.insert(alloc, draft.caret, @intCast(c));
+                                draft.caret += 1;
                             }
                         },
                         .left => {
-                            if (draft_caret > 0) draft_caret -= 1;
+                            if (draft.caret > 0) draft.caret -= 1;
                         },
                         .right => {
-                            if (draft_caret < draft.items.len) draft_caret += 1;
+                            if (draft.caret < draft.buf.items.len) draft.caret += 1;
                         },
                         .ctrl_c => running = false,
                         else => {},
@@ -294,8 +296,7 @@ fn runTui(alloc: std.mem.Allocator, io: std.Io) !u8 {
                             if (after_leader and c == 'f') {
                                 focus = .searching;
                                 search_kind = .file;
-                                draft.clearRetainingCapacity();
-                                draft_caret = 0;
+                                draft.clear();
                             } else if (c == 'q' or c == 'Q') {
                                 running = false;
                             } else if (c == ' ') {
@@ -303,8 +304,7 @@ fn runTui(alloc: std.mem.Allocator, io: std.Io) !u8 {
                             } else if (c == '/') {
                                 focus = .searching;
                                 search_kind = .text;
-                                draft.clearRetainingCapacity();
-                                draft_caret = 0;
+                                draft.clear();
                             } else if (c == 'n') {
                                 if (last_query.items.len > 0) {
                                     if (view.nextMatch(rows, last_query.items, cursor)) |hit| {
@@ -353,19 +353,11 @@ fn runTui(alloc: std.mem.Allocator, io: std.Io) !u8 {
                             } else if (c == 't') {
                                 layout_pref = view.toggleLayoutPref(layout_pref);
                             } else if (c == 'i' or c == 'c' or c == 'a') {
-                                if (view.commentAnchor(rows, sbs_slots, layout, cursor, .new)) |a| {
-                                    draft_anchor = a;
-                                    draft.clearRetainingCapacity();
-                                    draft_scroll = 0;
-                                    draft_caret = 0;
+                                if (try beginComment(&review, alloc, rows, sbs_slots, layout, cursor, .new, &draft)) {
                                     focus = .commenting;
                                 }
                             } else if (c == 'I' or c == 'C' or c == 'A') {
-                                if (view.commentAnchor(rows, sbs_slots, layout, cursor, .old)) |a| {
-                                    draft_anchor = a;
-                                    draft.clearRetainingCapacity();
-                                    draft_scroll = 0;
-                                    draft_caret = 0;
+                                if (try beginComment(&review, alloc, rows, sbs_slots, layout, cursor, .old, &draft)) {
                                     focus = .commenting;
                                 }
                             } else if (c == 'd') {
@@ -375,11 +367,7 @@ fn runTui(alloc: std.mem.Allocator, io: std.Io) !u8 {
                             }
                         },
                         .enter => {
-                            if (view.commentAnchor(rows, sbs_slots, layout, cursor, .new)) |a| {
-                                draft_anchor = a;
-                                draft.clearRetainingCapacity();
-                                draft_scroll = 0;
-                                draft_caret = 0;
+                            if (try beginComment(&review, alloc, rows, sbs_slots, layout, cursor, .new, &draft)) {
                                 focus = .commenting;
                             }
                         },
@@ -404,7 +392,7 @@ fn runTui(alloc: std.mem.Allocator, io: std.Io) !u8 {
             },
         }
         if (running) {
-            paint(&scr, size, rows, sbs_slots, layout_pref, cursor, &scroll, &col_scroll, &review, focus, search_kind, draft.items, draft_caret, &draft_scroll, draft_anchor, note.slice());
+            paint(&scr, size, rows, sbs_slots, layout_pref, cursor, &scroll, &col_scroll, &review, focus, search_kind, draft.buf.items, draft.caret, &draft.scroll, draft.anchor, note.slice());
             try scr.present(&term);
         }
     }
@@ -413,6 +401,22 @@ fn runTui(alloc: std.mem.Allocator, io: std.Io) !u8 {
 
 /// Footer key ownership: normal nav, comment draft, or `/` search prompt.
 const FooterFocus = enum { normal, commenting, searching };
+
+/// Footer box buffer plus comment-mode extras. Search uses `buf` and `caret` only.
+const Draft = struct {
+    buf: std.ArrayList(u8) = .empty,
+    scroll: usize = 0,
+    caret: usize = 0,
+    anchor: view.Anchor = .{ .path = "", .old_line = null, .new_line = null },
+    edit_id: ?[]const u8 = null,
+
+    fn clear(self: *Draft) void {
+        self.buf.clearRetainingCapacity();
+        self.scroll = 0;
+        self.caret = 0;
+        self.edit_id = null;
+    }
+};
 
 /// What the open `/` prompt matches. `n`/`N` always use `.text` (`last_query`).
 const SearchKind = enum { text, file };
@@ -529,6 +533,31 @@ fn sideForAnchor(a: view.Anchor) store.Side {
     if (a.old_line != null and a.new_line != null) return .context;
     if (a.new_line != null) return .new;
     return .old;
+}
+
+/// Open the comment box on `want` at `cursor`. Missing side: silent no-op.
+/// Existing comment: pre-fill the first in store order; caret at end. None: create.
+/// Returns true when the box opened.
+fn beginComment(
+    review: *const store.Review,
+    alloc: std.mem.Allocator,
+    rows: []const view.Row,
+    slots: []const view.SbsSlot,
+    layout: view.EffectiveLayout,
+    cursor: usize,
+    want: view.CommentSide,
+    draft: *Draft,
+) std.mem.Allocator.Error!bool {
+    const a = view.commentAnchor(rows, slots, layout, cursor, want) orelse return false;
+    draft.clear();
+    draft.anchor = a;
+    if (review.firstAt(a.path, a.old_line, a.new_line)) |idx| {
+        const c = review.comments.items[idx];
+        try draft.buf.appendSlice(alloc, c.body);
+        draft.caret = draft.buf.items.len;
+        draft.edit_id = c.id;
+    }
+    return true;
 }
 
 /// Dismiss the first live comment on `want` at `cursor`. Missing side or no
@@ -675,15 +704,15 @@ fn paint(
         fillRow(scr, 0, title_style);
         const help = switch (focus) {
             .commenting => switch (sideForAnchor(draft_anchor)) {
-                .new => "rv  comment new  Enter save  Esc cancel  ↑↓ scroll",
-                .old => "rv  comment old  Enter save  Esc cancel  ↑↓ scroll",
-                .context => "rv  comment  Enter save  Esc cancel  ↑↓ scroll",
+                .new => "rv  create/edit new  Enter save  Esc cancel  ↑↓ scroll",
+                .old => "rv  create/edit old  Enter save  Esc cancel  ↑↓ scroll",
+                .context => "rv  create/edit  Enter save  Esc cancel  ↑↓ scroll",
             },
             .searching => switch (search_kind) {
                 .text => "rv  search  Enter jump  Esc cancel",
                 .file => "rv  file  Enter jump  Esc cancel",
             },
-            .normal => "rv  j/k line  h/l pan  0/$  J/K change  [/] hunk  {/} file  / n/N search  Space f files  t layout  i/I comment  d/D dismiss  q quit",
+            .normal => "rv  j/k line  h/l pan  0/$  J/K change  [/] hunk  {/} file  / n/N search  Space f files  t layout  i/I create/edit  d/D dismiss  q quit",
         };
         scr.putStr(1, 0, help, title_style);
     }
