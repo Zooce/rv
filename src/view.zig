@@ -711,6 +711,51 @@ pub fn anchorAt(rows: []const Row, cursor: usize) ?Anchor {
     };
 }
 
+pub const CommentSide = enum { old, new };
+
+/// Line-comment target for `want` at `cursor`, or null if that side is missing.
+/// Unified: current row only. Side-by-side: current slot left (`old`) / right (`new`).
+/// Returned Anchor carries only the chosen side’s line number.
+pub fn commentAnchor(
+    rows: []const Row,
+    slots: []const SbsSlot,
+    layout: EffectiveLayout,
+    cursor: usize,
+    want: CommentSide,
+) ?Anchor {
+    if (rows.len == 0) return null;
+    const cur = clampCursor(cursor, rows.len);
+    const src: usize = switch (layout) {
+        .unified => cur,
+        .side_by_side => blk: {
+            const si = sbsSlotForRow(slots, cur) orelse return null;
+            switch (slots[si]) {
+                .header => return null,
+                .pair => |p| {
+                    const pane: ?usize = switch (want) {
+                        .old => p.left,
+                        .new => p.right,
+                    };
+                    break :blk pane orelse return null;
+                },
+            }
+        },
+    };
+    const a = anchorAt(rows, src) orelse return null;
+    return switch (want) {
+        .old => if (a.old_line) |n| .{
+            .path = a.path,
+            .old_line = n,
+            .new_line = null,
+        } else null,
+        .new => if (a.new_line) |n| .{
+            .path = a.path,
+            .old_line = null,
+            .new_line = n,
+        } else null,
+    };
+}
+
 /// Status footer fields for `cursor` within `rows`.
 pub fn statusAt(rows: []const Row, cursor: usize) Status {
     if (rows.len == 0) {
@@ -1802,4 +1847,129 @@ test "ensureVisibleStickySbs uses slot indices" {
     // Scroll past first file's slots; pin file A.
     const deep = ensureVisibleStickySbs(0, fix.rows.len - 1, 3, slots2, fix.rows);
     try testing.expect(deep.sticky.file_idx != null or deep.scroll == 0);
+}
+
+test "commentAnchor unified add delete context header" {
+    const fixture =
+        \\diff --git a/f b/f
+        \\--- a/f
+        \\+++ b/f
+        \\@@ -1,3 +1,3 @@
+        \\ keep
+        \\-old
+        \\+new
+        \\ tail
+    ;
+    var d = try diff.parse(testing.allocator, fixture);
+    defer d.deinit();
+    const rows = try flatten(testing.allocator, &d);
+    defer testing.allocator.free(rows);
+    const empty: []const SbsSlot = &.{};
+
+    try testing.expect(commentAnchor(rows, empty, .unified, 0, .new) == null);
+    try testing.expect(commentAnchor(rows, empty, .unified, 0, .old) == null);
+    try testing.expect(commentAnchor(rows, empty, .unified, 1, .new) == null);
+    try testing.expect(commentAnchor(rows, empty, .unified, 1, .old) == null);
+
+    const ctx_new = commentAnchor(rows, empty, .unified, 2, .new).?;
+    try testing.expectEqualStrings("f", ctx_new.path);
+    try testing.expectEqual(1, ctx_new.new_line.?);
+    try testing.expect(ctx_new.old_line == null);
+    const ctx_old = commentAnchor(rows, empty, .unified, 2, .old).?;
+    try testing.expectEqual(1, ctx_old.old_line.?);
+    try testing.expect(ctx_old.new_line == null);
+
+    try testing.expect(commentAnchor(rows, empty, .unified, 3, .new) == null);
+    const del = commentAnchor(rows, empty, .unified, 3, .old).?;
+    try testing.expectEqual(2, del.old_line.?);
+    try testing.expect(del.new_line == null);
+
+    const add = commentAnchor(rows, empty, .unified, 4, .new).?;
+    try testing.expectEqual(2, add.new_line.?);
+    try testing.expect(add.old_line == null);
+    try testing.expect(commentAnchor(rows, empty, .unified, 4, .old) == null);
+
+    try testing.expect(commentAnchor(&.{}, empty, .unified, 0, .new) == null);
+    try testing.expect(commentAnchor(&.{}, empty, .unified, 0, .old) == null);
+}
+
+test "commentAnchor side-by-side pair empty pane header" {
+    const pair_fix =
+        \\diff --git a/f b/f
+        \\--- a/f
+        \\+++ b/f
+        \\@@ -1 +1 @@
+        \\-old
+        \\+new
+    ;
+    var d = try diff.parse(testing.allocator, pair_fix);
+    defer d.deinit();
+    const rows = try flatten(testing.allocator, &d);
+    defer testing.allocator.free(rows);
+    const slots = try pairSideBySide(testing.allocator, rows);
+    defer testing.allocator.free(slots);
+
+    try testing.expect(commentAnchor(rows, slots, .side_by_side, 0, .new) == null);
+    try testing.expect(commentAnchor(rows, slots, .side_by_side, 0, .old) == null);
+    try testing.expect(commentAnchor(rows, slots, .side_by_side, 1, .new) == null);
+    try testing.expect(commentAnchor(rows, slots, .side_by_side, 1, .old) == null);
+
+    // Cursor on the delete (slot primary) or the add (same slot) → same sides.
+    const from_del_new = commentAnchor(rows, slots, .side_by_side, 2, .new).?;
+    try testing.expectEqualStrings("f", from_del_new.path);
+    try testing.expectEqual(1, from_del_new.new_line.?);
+    try testing.expect(from_del_new.old_line == null);
+    const from_del_old = commentAnchor(rows, slots, .side_by_side, 2, .old).?;
+    try testing.expectEqual(1, from_del_old.old_line.?);
+    try testing.expect(from_del_old.new_line == null);
+    const from_add_new = commentAnchor(rows, slots, .side_by_side, 3, .new).?;
+    try testing.expectEqual(1, from_add_new.new_line.?);
+    try testing.expect(from_add_new.old_line == null);
+    const from_add_old = commentAnchor(rows, slots, .side_by_side, 3, .old).?;
+    try testing.expectEqual(1, from_add_old.old_line.?);
+    try testing.expect(from_add_old.new_line == null);
+
+    const leftover =
+        \\diff --git a/g b/g
+        \\--- a/g
+        \\+++ b/g
+        \\@@ -1,2 +1 @@
+        \\-a
+        \\-b
+        \\+c
+    ;
+    var d2 = try diff.parse(testing.allocator, leftover);
+    defer d2.deinit();
+    const rows2 = try flatten(testing.allocator, &d2);
+    defer testing.allocator.free(rows2);
+    const slots2 = try pairSideBySide(testing.allocator, rows2);
+    defer testing.allocator.free(slots2);
+    // leftover delete `b` is left-only (row 3)
+    try testing.expect(commentAnchor(rows2, slots2, .side_by_side, 3, .new) == null);
+    const left_only = commentAnchor(rows2, slots2, .side_by_side, 3, .old).?;
+    try testing.expectEqual(2, left_only.old_line.?);
+    try testing.expect(left_only.new_line == null);
+
+    const leftover_add =
+        \\diff --git a/h b/h
+        \\--- a/h
+        \\+++ b/h
+        \\@@ -1 +1,2 @@
+        \\-x
+        \\+y
+        \\+z
+    ;
+    var d3 = try diff.parse(testing.allocator, leftover_add);
+    defer d3.deinit();
+    const rows3 = try flatten(testing.allocator, &d3);
+    defer testing.allocator.free(rows3);
+    const slots3 = try pairSideBySide(testing.allocator, rows3);
+    defer testing.allocator.free(slots3);
+    // leftover add `z` is right-only (row 4)
+    const right_only = commentAnchor(rows3, slots3, .side_by_side, 4, .new).?;
+    try testing.expectEqual(2, right_only.new_line.?);
+    try testing.expect(right_only.old_line == null);
+    try testing.expect(commentAnchor(rows3, slots3, .side_by_side, 4, .old) == null);
+
+    try testing.expect(commentAnchor(&.{}, &.{}, .side_by_side, 0, .new) == null);
 }

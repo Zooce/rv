@@ -3,7 +3,8 @@
 //! With no args: load smart-default git diff → flatten rows → load `.rv`
 //! comments → TUI (`j`/`k`, `h`/`l` pan, `0`/`$` col home/end, `[`/`]` hunk,
 //! `{`/`}` file header, `/` text search, `n`/`N` next/prev match, `Space` `f`
-//! file-path find, `i`/`c`/`a`/`Enter` comment, `q` quit).
+//! file-path find, `i`/`c`/`a`/`Enter` comment new, `I`/`C`/`A` comment old,
+//! `q` quit).
 //! Diff layout defaults to side-by-side when the terminal is wide enough;
 //! falls back to unified when narrow. `t` toggles session preference
 //! (explicit unified stays unified even when wide).
@@ -144,9 +145,9 @@ fn runTui(alloc: std.mem.Allocator, io: std.Io) !u8 {
     // Byte index of the comment / search caret into `draft` (0…len).
     var draft_caret: usize = 0;
     // Anchor captured when entering comment mode (cursor does not move then).
-    var draft_anchor: view.Anchor = undefined;
+    var draft_anchor: view.Anchor = .{ .path = "", .old_line = null, .new_line = null };
 
-    paint(&scr, size, rows, sbs_slots, layout_pref, cursor, &scroll, &col_scroll, &review, focus, search_kind, draft.items, draft_caret, &draft_scroll, note.slice());
+    paint(&scr, size, rows, sbs_slots, layout_pref, cursor, &scroll, &col_scroll, &review, focus, search_kind, draft.items, draft_caret, &draft_scroll, draft_anchor, note.slice());
     try scr.present(&term);
 
     while (running) {
@@ -287,6 +288,7 @@ fn runTui(alloc: std.mem.Allocator, io: std.Io) !u8 {
                     .normal => {
                         const after_leader = leader_pending;
                         leader_pending = false;
+                        const layout = view.effectiveLayout(layout_pref, size.cols);
                         switch (key) {
                         .char => |c| {
                             if (after_leader and c == 'f') {
@@ -351,7 +353,15 @@ fn runTui(alloc: std.mem.Allocator, io: std.Io) !u8 {
                             } else if (c == 't') {
                                 layout_pref = view.toggleLayoutPref(layout_pref);
                             } else if (c == 'i' or c == 'c' or c == 'a') {
-                                if (view.anchorAt(rows, cursor)) |a| {
+                                if (view.commentAnchor(rows, sbs_slots, layout, cursor, .new)) |a| {
+                                    draft_anchor = a;
+                                    draft.clearRetainingCapacity();
+                                    draft_scroll = 0;
+                                    draft_caret = 0;
+                                    focus = .commenting;
+                                }
+                            } else if (c == 'I' or c == 'C' or c == 'A') {
+                                if (view.commentAnchor(rows, sbs_slots, layout, cursor, .old)) |a| {
                                     draft_anchor = a;
                                     draft.clearRetainingCapacity();
                                     draft_scroll = 0;
@@ -361,7 +371,7 @@ fn runTui(alloc: std.mem.Allocator, io: std.Io) !u8 {
                             }
                         },
                         .enter => {
-                            if (view.anchorAt(rows, cursor)) |a| {
+                            if (view.commentAnchor(rows, sbs_slots, layout, cursor, .new)) |a| {
                                 draft_anchor = a;
                                 draft.clearRetainingCapacity();
                                 draft_scroll = 0;
@@ -390,7 +400,7 @@ fn runTui(alloc: std.mem.Allocator, io: std.Io) !u8 {
             },
         }
         if (running) {
-            paint(&scr, size, rows, sbs_slots, layout_pref, cursor, &scroll, &col_scroll, &review, focus, search_kind, draft.items, draft_caret, &draft_scroll, note.slice());
+            paint(&scr, size, rows, sbs_slots, layout_pref, cursor, &scroll, &col_scroll, &review, focus, search_kind, draft.items, draft_caret, &draft_scroll, draft_anchor, note.slice());
             try scr.present(&term);
         }
     }
@@ -532,6 +542,7 @@ fn paint(
     draft: []const u8,
     draft_caret: usize,
     draft_scroll: *usize,
+    draft_anchor: view.Anchor,
     status_note: []const u8,
 ) void {
     // Diff line palette (truecolor). Documented together so sticky file
@@ -627,12 +638,16 @@ fn paint(
     if (size.rows > 0) {
         fillRow(scr, 0, title_style);
         const help = switch (focus) {
-            .commenting => "rv  comment  Enter save  Esc cancel  ↑↓ scroll",
+            .commenting => switch (sideForAnchor(draft_anchor)) {
+                .new => "rv  comment new  Enter save  Esc cancel  ↑↓ scroll",
+                .old => "rv  comment old  Enter save  Esc cancel  ↑↓ scroll",
+                .context => "rv  comment  Enter save  Esc cancel  ↑↓ scroll",
+            },
             .searching => switch (search_kind) {
                 .text => "rv  search  Enter jump  Esc cancel",
                 .file => "rv  file  Enter jump  Esc cancel",
             },
-            .normal => "rv  j/k line  h/l pan  0/$  J/K change  [/] hunk  {/} file  / n/N  Space f  t  i  q",
+            .normal => "rv  j/k line  h/l pan  0/$  J/K change  [/] hunk  {/} file  / n/N  Space f  t  i/I  q",
         };
         scr.putStr(1, 0, help, title_style);
     }

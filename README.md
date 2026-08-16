@@ -97,7 +97,8 @@ Not a multi-user code-review platform. Not a GitHub replacement. A **personal re
 | `[` / `]` | Jump to the **previous / next hunk**. |
 | `/` | **Search the diff text** — incremental find across the loaded changeset (like vim `/`). `n` / `N` next / previous match. |
 | `Space` `f` | **Search changed files** — same prompt as `/`, scoped to **paths in the review** (not a floating file picker). Type a fragment; Enter jumps to the matching **file header** (first hit from the cursor, wrapping). `n`/`N` stay text-search. |
-| `i` / `c` / `a` / `Enter` | Enter **comment mode** — open a comment box **below the cursor** (same action; pick the muscle memory you prefer). |
+| `i` / `c` / `a` / `Enter` | Comment **new** code (right pane in side-by-side, or the current `+` / context line in unified). Open a box **below the cursor**. Same action; pick the muscle memory you prefer. |
+| `I` / `C` / `A` | Comment **old** code (left pane in side-by-side, or the current `-` / context line in unified). Missing side does nothing. |
 | (later) | Page/half-page scroll, jump to next comment, more `Space` leader maps — same vocabulary |
 
 Contrast with tools where `j`/`k` only pan the view and comment placement needs a mouse: in `rv`, **where the cursor is is where the comment goes.**
@@ -121,12 +122,13 @@ h/l           # optional: set start column
 Space f query # find a changed file by path fragment
 v or V        # optional: start character- or line-wise range (vim-flavored)
 j/k h/l       # extend the selection (overlapping ranges allowed later)
-i | c | a | Enter   # open comment box below the cursor
+i | c | a | Enter   # comment new (right / +)
+I | C | A           # comment old (left / -)
               # type the note; Esc cancel; Ctrl-S or equivalent save
 ```
 
 - Anchor for a plain open is the **current line** (and column if set). With an active visual selection, the box attaches to that **range**.
-- `i` / `c` / `a` / `Enter` are aliases for the same mode entry — vim insert/change/append habits plus the obvious Enter key.
+- `i` / `c` / `a` / `Enter` comment new code; `I` / `C` / `A` comment old. Same box; pick the muscle memory you prefer.
 - **Current line** is always visible as a clear highlight (not just a scroll offset).
 - **Mouse** may still scroll or click to move the cursor for people who want it; it must never be the only way to place a note.
 - Hunk jumps (`[`/`]`) move both focus and cursor to a sensible line in the target hunk (e.g. first changed line).
@@ -191,7 +193,7 @@ $ grok   # or claude - agent implements a feature
 
 $ rv     # smart default: dirty tree, else branch vs base
          # j/k line; h/l col; [/] hunks; / text; Space f files
-         # i/c/a/Enter -> comment box below cursor
+         # i/c/a/Enter -> comment new; I/C/A -> comment old
 
 $ rv export -o .rv/review.md   # or stdout / JSON
 # agent already knows the skill: address open rv comments
@@ -207,7 +209,7 @@ $ rv                         # confirm, leave more, continue
 
 1. **Clean and simple** - enjoyable to use every day; no cluttered "IDE in the terminal."
 2. **Performance** - no slop. Instant open on large diffs is a requirement, not a nice-to-have.
-3. **Vim / Helix-like keybindings** - `j`/`k` move a **highlighted current line** (not merely scroll); `h`/`l` move by column; `[`/`]` jump hunks; `/` search diff text; `Space` `f` search changed files (specialized `/`, not a floating picker); `i`/`c`/`a`/`Enter` open **comment mode** (box below the cursor).
+3. **Vim / Helix-like keybindings** - `j`/`k` move a **highlighted current line** (not merely scroll); `h`/`l` move by column; `[`/`]` jump hunks; `/` search diff text; `Space` `f` search changed files (specialized `/`, not a floating picker); `i`/`c`/`a`/`Enter` comment new code, `I`/`C`/`A` comment old (box below the cursor).
 4. **Diff-first layout** - files and hunks from the *change set*, not a full project tree.
 5. **Precise selection** - comments must attach to the exact span you care about, including overlapping ranges.
 6. **Mouse optional** - never required to place or target a comment.
