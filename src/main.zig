@@ -3,8 +3,9 @@
 //! With no args: load smart-default git diff → flatten rows → load `.rv`
 //! comments → TUI (`j`/`k`, `h`/`l` pan, `0`/`$` col home/end, `[`/`]` hunk,
 //! `{`/`}` file header, `(`/`)` prev/next comment, `/` text search, `n`/`N`
-//! next/prev match, `Space` `f` file-path find, `i`/`c`/`a`/`Enter` create or
-//! edit new, `I`/`C`/`A` old, `d` dismiss new, `D` dismiss old, `q` quit).
+//! next/prev match, `Space` `f` file-path find, `Space` `l` comment list,
+//! `i`/`c`/`a`/`Enter` create or edit new, `I`/`C`/`A` old, `d` dismiss new,
+//! `D` dismiss old, `q` quit).
 //! Diff layout defaults to side-by-side when the terminal is wide enough;
 //! falls back to unified when narrow. `t` toggles session preference
 //! (explicit unified stays unified even when wide).
@@ -30,6 +31,12 @@
 //! from the cursor (wrap). Multi-match: that first hit only — `n`/`N` stay
 //! text-search. An unmatched `Space` leader is dropped; the next key is
 //! handled as normal. Esc cancels without moving the cursor.
+//!
+//! Comment list: `Space` then `l` opens a centered overlay of live comments
+//! (same store as `rv list`). `j`/`k` move; Enter jumps with the same landing
+//! as `(`/`)` and closes the overlay. Esc closes without moving the cursor.
+//! A row whose path/line is gone from the flatten stays in the list and shows
+//! a footer note. `q` still quits.
 
 const std = @import("std");
 const git = @import("git");
@@ -127,21 +134,27 @@ fn runTui(alloc: std.mem.Allocator, io: std.Io) !u8 {
     // Prefer side-by-side; auto-unified when narrow. `t` flips session preference.
     var layout_pref: view.LayoutPref = .side_by_side;
     var running = true;
-    // Exactly one footer focus; cannot comment and search at once.
-    var focus: FooterFocus = .normal;
+    // Exactly one focus; cannot comment, search, and list at once.
+    var focus: Focus = .normal;
     // Scope for the open `/` prompt (text vs file path). Ignored otherwise.
     var search_kind: SearchKind = .text;
-    // `Space` leader: next key may be `f` (file find). Cleared on that next key.
+    // `Space` leader: next key may be `f` (file find) or `l` (comment list).
+    // Cleared on that next key.
     var leader_pending: bool = false;
     var draft: Draft = .{};
     defer draft.buf.deinit(alloc);
+    // Snapshot of `review.comments` while the list overlay is open.
+    var list_items: std.ArrayList(store.Comment) = .empty;
+    defer list_items.deinit(alloc);
+    var list_cursor: usize = 0;
+    var list_scroll: usize = 0;
     // Committed `/` text query for `n`/`N` (empty means no active text search).
     var last_query: std.ArrayList(u8) = .empty;
     defer last_query.deinit(alloc);
     // One-shot footer note (owned bytes; len 0 = none). Cleared on next key.
     var note: StatusNote = .{};
 
-    paint(&scr, size, rows, sbs_slots, layout_pref, cursor, &scroll, &col_scroll, &review, focus, search_kind, draft.buf.items, draft.caret, &draft.scroll, draft.anchor, note.slice());
+    paint(&scr, size, rows, sbs_slots, layout_pref, cursor, &scroll, &col_scroll, &review, focus, search_kind, draft.buf.items, draft.caret, &draft.scroll, draft.anchor, note.slice(), list_items.items, list_cursor, &list_scroll);
     try scr.present(&term);
 
     while (running) {
@@ -287,124 +300,166 @@ fn runTui(alloc: std.mem.Allocator, io: std.Io) !u8 {
                         .ctrl_c => running = false,
                         else => {},
                     },
+                    .listing => switch (key) {
+                        .esc => {
+                            focus = .normal;
+                        },
+                        .enter => {
+                            if (list_cursor < list_items.items.len) {
+                                if (commentLoc(list_items.items[list_cursor])) |loc| {
+                                    if (view.rowForComment(rows, loc)) |idx| {
+                                        cursor = idx;
+                                        focus = .normal;
+                                    } else {
+                                        note.set("comment not in this diff");
+                                    }
+                                } else {
+                                    note.set("comment not in this diff");
+                                }
+                            }
+                        },
+                        .char => |c| {
+                            if (c == 'q' or c == 'Q') {
+                                running = false;
+                            } else if (c == 'j') {
+                                if (list_cursor + 1 < list_items.items.len) list_cursor += 1;
+                            } else if (c == 'k') {
+                                if (list_cursor > 0) list_cursor -= 1;
+                            }
+                        },
+                        .down => {
+                            if (list_cursor + 1 < list_items.items.len) list_cursor += 1;
+                        },
+                        .up => {
+                            if (list_cursor > 0) list_cursor -= 1;
+                        },
+                        .ctrl_c => running = false,
+                        else => {},
+                    },
                     .normal => {
                         const after_leader = leader_pending;
                         leader_pending = false;
                         const layout = view.effectiveLayout(layout_pref, size.cols);
                         switch (key) {
-                        .char => |c| {
-                            if (after_leader and c == 'f') {
-                                focus = .searching;
-                                search_kind = .file;
-                                draft.clear();
-                            } else if (c == 'q' or c == 'Q') {
-                                running = false;
-                            } else if (c == ' ') {
-                                leader_pending = true;
-                            } else if (c == '/') {
-                                focus = .searching;
-                                search_kind = .text;
-                                draft.clear();
-                            } else if (c == 'n') {
-                                if (last_query.items.len > 0) {
-                                    if (view.nextMatch(rows, last_query.items, cursor)) |hit| {
-                                        cursor = hit.index;
-                                        if (hit.wrapped) note.set("search wrapped");
-                                    } else {
-                                        note.set("Pattern not found");
+                            .char => |c| {
+                                if (after_leader and c == 'f') {
+                                    focus = .searching;
+                                    search_kind = .file;
+                                    draft.clear();
+                                } else if (after_leader and c == 'l') {
+                                    list_items.clearRetainingCapacity();
+                                    try list_items.appendSlice(alloc, review.comments.items);
+                                    list_cursor = 0;
+                                    list_scroll = 0;
+                                    focus = .listing;
+                                } else if (c == 'q' or c == 'Q') {
+                                    running = false;
+                                } else if (c == ' ') {
+                                    leader_pending = true;
+                                } else if (c == '/') {
+                                    focus = .searching;
+                                    search_kind = .text;
+                                    draft.clear();
+                                } else if (c == 'n') {
+                                    if (last_query.items.len > 0) {
+                                        if (view.nextMatch(rows, last_query.items, cursor)) |hit| {
+                                            cursor = hit.index;
+                                            if (hit.wrapped) note.set("search wrapped");
+                                        } else {
+                                            note.set("Pattern not found");
+                                        }
                                     }
-                                }
-                            } else if (c == 'N') {
-                                if (last_query.items.len > 0) {
-                                    if (view.prevMatch(rows, last_query.items, cursor)) |hit| {
-                                        cursor = hit.index;
-                                        if (hit.wrapped) note.set("search wrapped");
-                                    } else {
-                                        note.set("Pattern not found");
+                                } else if (c == 'N') {
+                                    if (last_query.items.len > 0) {
+                                        if (view.prevMatch(rows, last_query.items, cursor)) |hit| {
+                                            cursor = hit.index;
+                                            if (hit.wrapped) note.set("search wrapped");
+                                        } else {
+                                            note.set("Pattern not found");
+                                        }
                                     }
+                                } else if (c == 'j') {
+                                    cursor = moveLineDown(layout_pref, size.cols, rows, sbs_slots, cursor);
+                                } else if (c == 'k') {
+                                    cursor = moveLineUp(layout_pref, size.cols, rows, sbs_slots, cursor);
+                                } else if (c == 'h') {
+                                    const step = panStep(panViewportCols(layout_pref, size.cols));
+                                    col_scroll = if (col_scroll > step) col_scroll - step else 0;
+                                } else if (c == 'l') {
+                                    col_scroll +%= panStep(panViewportCols(layout_pref, size.cols));
+                                } else if (c == '0') {
+                                    col_scroll = 0;
+                                } else if (c == '$') {
+                                    const span = view.hunkSpanAt(rows, cursor);
+                                    const vp = panViewportCols(layout_pref, size.cols);
+                                    col_scroll = view.colScrollToEnd(hunkMaxLineWidth(rows, span), vp);
+                                } else if (c == 'J') {
+                                    cursor = view.nextChange(rows, cursor);
+                                } else if (c == 'K') {
+                                    cursor = view.prevChange(rows, cursor);
+                                } else if (c == ']') {
+                                    cursor = view.nextHunkHeader(rows, cursor);
+                                } else if (c == '[') {
+                                    cursor = view.prevHunkHeader(rows, cursor);
+                                } else if (c == '}') {
+                                    cursor = view.nextFileHeader(rows, cursor);
+                                } else if (c == '{') {
+                                    cursor = view.prevFileHeader(rows, cursor);
+                                } else if (c == ')') {
+                                    try jumpLiveComment(&review, alloc, rows, &cursor, &note, .next);
+                                } else if (c == '(') {
+                                    try jumpLiveComment(&review, alloc, rows, &cursor, &note, .prev);
+                                } else if (c == 't') {
+                                    layout_pref = view.toggleLayoutPref(layout_pref);
+                                } else if (c == 'i' or c == 'c' or c == 'a') {
+                                    if (try beginComment(&review, alloc, rows, sbs_slots, layout, cursor, .new, &draft)) {
+                                        focus = .commenting;
+                                    }
+                                } else if (c == 'I' or c == 'C' or c == 'A') {
+                                    if (try beginComment(&review, alloc, rows, sbs_slots, layout, cursor, .old, &draft)) {
+                                        focus = .commenting;
+                                    }
+                                } else if (c == 'd') {
+                                    dismissAt(&review, alloc, io, rows, sbs_slots, layout, cursor, .new, &note);
+                                } else if (c == 'D') {
+                                    dismissAt(&review, alloc, io, rows, sbs_slots, layout, cursor, .old, &note);
                                 }
-                            } else if (c == 'j') {
-                                cursor = moveLineDown(layout_pref, size.cols, rows, sbs_slots, cursor);
-                            } else if (c == 'k') {
-                                cursor = moveLineUp(layout_pref, size.cols, rows, sbs_slots, cursor);
-                            } else if (c == 'h') {
-                                const step = panStep(panViewportCols(layout_pref, size.cols));
-                                col_scroll = if (col_scroll > step) col_scroll - step else 0;
-                            } else if (c == 'l') {
-                                col_scroll +%= panStep(panViewportCols(layout_pref, size.cols));
-                            } else if (c == '0') {
-                                col_scroll = 0;
-                            } else if (c == '$') {
-                                const span = view.hunkSpanAt(rows, cursor);
-                                const vp = panViewportCols(layout_pref, size.cols);
-                                col_scroll = view.colScrollToEnd(hunkMaxLineWidth(rows, span), vp);
-                            } else if (c == 'J') {
-                                cursor = view.nextChange(rows, cursor);
-                            } else if (c == 'K') {
-                                cursor = view.prevChange(rows, cursor);
-                            } else if (c == ']') {
-                                cursor = view.nextHunkHeader(rows, cursor);
-                            } else if (c == '[') {
-                                cursor = view.prevHunkHeader(rows, cursor);
-                            } else if (c == '}') {
-                                cursor = view.nextFileHeader(rows, cursor);
-                            } else if (c == '{') {
-                                cursor = view.prevFileHeader(rows, cursor);
-                            } else if (c == ')') {
-                                try jumpLiveComment(&review, alloc, rows, &cursor, &note, .next);
-                            } else if (c == '(') {
-                                try jumpLiveComment(&review, alloc, rows, &cursor, &note, .prev);
-                            } else if (c == 't') {
-                                layout_pref = view.toggleLayoutPref(layout_pref);
-                            } else if (c == 'i' or c == 'c' or c == 'a') {
+                            },
+                            .enter => {
                                 if (try beginComment(&review, alloc, rows, sbs_slots, layout, cursor, .new, &draft)) {
                                     focus = .commenting;
                                 }
-                            } else if (c == 'I' or c == 'C' or c == 'A') {
-                                if (try beginComment(&review, alloc, rows, sbs_slots, layout, cursor, .old, &draft)) {
-                                    focus = .commenting;
-                                }
-                            } else if (c == 'd') {
-                                dismissAt(&review, alloc, io, rows, sbs_slots, layout, cursor, .new, &note);
-                            } else if (c == 'D') {
-                                dismissAt(&review, alloc, io, rows, sbs_slots, layout, cursor, .old, &note);
-                            }
-                        },
-                        .enter => {
-                            if (try beginComment(&review, alloc, rows, sbs_slots, layout, cursor, .new, &draft)) {
-                                focus = .commenting;
-                            }
-                        },
-                        .down => {
-                            cursor = moveLineDown(layout_pref, size.cols, rows, sbs_slots, cursor);
-                        },
-                        .up => {
-                            cursor = moveLineUp(layout_pref, size.cols, rows, sbs_slots, cursor);
-                        },
-                        .left => {
-                            const step = panStep(panViewportCols(layout_pref, size.cols));
-                            col_scroll = if (col_scroll > step) col_scroll - step else 0;
-                        },
-                        .right => {
-                            col_scroll +%= panStep(panViewportCols(layout_pref, size.cols));
-                        },
-                        .ctrl_c => running = false,
-                        else => {},
+                            },
+                            .down => {
+                                cursor = moveLineDown(layout_pref, size.cols, rows, sbs_slots, cursor);
+                            },
+                            .up => {
+                                cursor = moveLineUp(layout_pref, size.cols, rows, sbs_slots, cursor);
+                            },
+                            .left => {
+                                const step = panStep(panViewportCols(layout_pref, size.cols));
+                                col_scroll = if (col_scroll > step) col_scroll - step else 0;
+                            },
+                            .right => {
+                                col_scroll +%= panStep(panViewportCols(layout_pref, size.cols));
+                            },
+                            .ctrl_c => running = false,
+                            else => {},
                         }
                     },
                 }
             },
         }
         if (running) {
-            paint(&scr, size, rows, sbs_slots, layout_pref, cursor, &scroll, &col_scroll, &review, focus, search_kind, draft.buf.items, draft.caret, &draft.scroll, draft.anchor, note.slice());
+            paint(&scr, size, rows, sbs_slots, layout_pref, cursor, &scroll, &col_scroll, &review, focus, search_kind, draft.buf.items, draft.caret, &draft.scroll, draft.anchor, note.slice(), list_items.items, list_cursor, &list_scroll);
             try scr.present(&term);
         }
     }
     return 0;
 }
 
-/// Footer key ownership: normal nav, comment draft, or `/` search prompt.
-const FooterFocus = enum { normal, commenting, searching };
+/// Key ownership: normal nav, comment draft, `/` search prompt, or comment list.
+const Focus = enum { normal, commenting, searching, listing };
 
 /// Footer box buffer plus comment-mode extras. Search uses `buf` and `caret` only.
 const Draft = struct {
@@ -517,6 +572,21 @@ fn commentMaxVisible(term_rows: u16) usize {
 
 fn commentMetrics(cols: u16, term_rows: u16, draft: []const u8) comment_input.Metrics {
     return comment_input.metricsLimited(cols, draft, commentMaxVisible(term_rows));
+}
+
+/// Keep `cursor` inside the overlay window of height `view_h`.
+fn ensureListCursorVisible(scroll: *usize, cursor: usize, view_h: usize, n: usize) void {
+    if (n == 0 or view_h == 0) {
+        scroll.* = 0;
+        return;
+    }
+    if (cursor < scroll.*) {
+        scroll.* = cursor;
+    } else if (cursor >= scroll.* + view_h) {
+        scroll.* = cursor - view_h + 1;
+    }
+    const max_scroll = if (n > view_h) n - view_h else 0;
+    if (scroll.* > max_scroll) scroll.* = max_scroll;
 }
 
 /// Keep the visual line under `caret` inside the comment footer window.
@@ -640,6 +710,133 @@ fn dismissAt(
     note.setFmt("deleted {s}", .{id});
 }
 
+/// Centered overlay. Width up to 120; height grows with rows, clamped to
+/// 25–70% of the terminal. Always leaves at least 2 cells on every side.
+fn listOverlayRect(cols: u16, rows: u16, n: usize) tui.Rect {
+    const n16: u16 = std.math.cast(u16, n) orelse std.math.maxInt(u16);
+    const max_w: u16 = 120;
+    const avail_h: u16 = rows -| 4;
+    const rows_n: u32 = rows;
+    const min_pct: u16 = @intCast(rows_n / 4);
+    const max_pct: u16 = @intCast(rows_n * 7 / 10);
+    const min_h: u16 = @min(avail_h, @max(3, min_pct));
+    const max_h: u16 = @min(avail_h, @max(min_h, max_pct));
+    const want_w: u16 = @min(cols -| 4, max_w);
+    const content_h: u16 = @max(3, n16 +| 2);
+    const want_h: u16 = @min(max_h, @max(min_h, content_h));
+    return tui.Rect.centered(cols, rows, want_w, want_h);
+}
+
+fn formatCommentLineCol(buf: []u8, c: store.Comment) []const u8 {
+    if (c.side) |s| {
+        switch (s) {
+            .old => if (c.old_line) |ln| return bufPrintTrunc(buf, "-{d}", .{ln}),
+            .new => if (c.new_line) |ln| return bufPrintTrunc(buf, "+{d}", .{ln}),
+            .context => {
+                if (c.new_line) |ln| return bufPrintTrunc(buf, "+{d}", .{ln});
+                if (c.old_line) |ln| return bufPrintTrunc(buf, "-{d}", .{ln});
+            },
+        }
+        return "-";
+    }
+    if (c.new_line) |ln| return bufPrintTrunc(buf, "+{d}", .{ln});
+    if (c.old_line) |ln| return bufPrintTrunc(buf, "-{d}", .{ln});
+    return "-";
+}
+
+fn formatListRow(buf: []u8, c: store.Comment) []const u8 {
+    var line_col_buf: [16]u8 = undefined;
+    const line_col = formatCommentLineCol(&line_col_buf, c);
+    const side: []const u8 = if (c.side) |s| switch (s) {
+        .old => "old",
+        .new => "new",
+        .context => "ctx",
+    } else "-";
+    const prefix = bufPrintTrunc(buf, "{s}  {s}  {s}  {s}  ", .{ c.id, c.path, side, line_col });
+    var i: usize = 0;
+    const rest = buf[prefix.len..];
+    for (c.body) |b| {
+        if (i >= rest.len) break;
+        rest[i] = if (b == '\n' or b == '\r') ' ' else b;
+        i += 1;
+    }
+    return buf[0 .. prefix.len + i];
+}
+
+fn paintCommentList(
+    scr: *tui.Screen,
+    size: tui.Size,
+    items: []const store.Comment,
+    cursor: usize,
+    scroll: *usize,
+    line_buf: []u8,
+) void {
+    const bg = tui.Color{ .rgb = .{ .r = 0x12, .g = 0x12, .b = 0x14 } };
+    const fg = tui.Color{ .rgb = .{ .r = 0xd0, .g = 0xd0, .b = 0xd0 } };
+    const panel_bg = tui.Style{ .fg = fg, .bg = bg };
+    const panel_frame = tui.Style{
+        .fg = .{ .rgb = .{ .r = 0x5d, .g = 0x81, .b = 0xb7 } },
+        .bg = bg,
+        .bold = true,
+    };
+    const row_cur = tui.Style{
+        .fg = fg,
+        .bg = .{ .rgb = .{ .r = 0x2a, .g = 0x2a, .b = 0x30 } },
+        .bold = true,
+    };
+    const bar_track = tui.Style{
+        .fg = .{ .rgb = .{ .r = 0x6a, .g = 0x7a, .b = 0x9a } },
+        .bg = bg,
+        .dim = true,
+    };
+    const bar_thumb = tui.Style{
+        .fg = .{ .rgb = .{ .r = 0xee, .g = 0xee, .b = 0xee } },
+        .bg = .{ .rgb = .{ .r = 0x4a, .g = 0x6a, .b = 0x9a } },
+        .bold = true,
+    };
+
+    const panel = listOverlayRect(size.cols, size.rows, items.len);
+    scr.fillRect(panel, ' ', panel_bg);
+    scr.drawBox(panel, panel_frame);
+    const inner = panel.inset(1);
+    if (panel.h > 0 and panel.w > 2) {
+        scr.putStr(panel.x + 2, panel.y, " comments ", panel_frame, panel);
+    }
+    ensureListCursorVisible(scroll, cursor, inner.h, items.len);
+    if (inner.h == 0 or inner.w == 0) return;
+    if (items.len == 0) {
+        scr.putStr(inner.x, inner.y, "no comments", panel_bg, inner);
+        return;
+    }
+    const show_bar = items.len > inner.h;
+    const text_area = if (show_bar)
+        tui.Rect{ .x = inner.x, .y = inner.y, .w = inner.w -| 2, .h = inner.h }
+    else
+        inner;
+    const start = scroll.*;
+    var row: u16 = 0;
+    while (row < inner.h) : (row += 1) {
+        const idx = start + row;
+        if (idx >= items.len) break;
+        const y = inner.y + row;
+        const st = if (idx == cursor) row_cur else panel_bg;
+        scr.fillRect(.{ .x = inner.x, .y = y, .w = inner.w, .h = 1 }, ' ', st);
+        const text = formatListRow(line_buf, items[idx]);
+        scr.putStr(inner.x, y, text, st, text_area);
+    }
+    if (show_bar) {
+        const bar_x: u16 = inner.x + inner.w - 1;
+        const thumb = comment_input.scrollbarThumb(items.len, inner.h, start, inner.h);
+        var br: u16 = 0;
+        while (br < inner.h) : (br += 1) {
+            const in_thumb = br >= thumb.start and br < thumb.start + thumb.len;
+            const st = if (in_thumb) bar_thumb else bar_track;
+            const ch: u21 = if (in_thumb) '█' else '│';
+            scr.setCell(bar_x, inner.y + br, .{ .char = ch, .width = 1, .style = st });
+        }
+    }
+}
+
 fn paint(
     scr: *tui.Screen,
     size: tui.Size,
@@ -650,13 +847,16 @@ fn paint(
     scroll: *usize,
     col_scroll: *usize,
     review: *const store.Review,
-    focus: FooterFocus,
+    focus: Focus,
     search_kind: SearchKind,
     draft: []const u8,
     draft_caret: usize,
     draft_scroll: *usize,
     draft_anchor: view.Anchor,
     status_note: []const u8,
+    list_items: []const store.Comment,
+    list_cursor: usize,
+    list_scroll: *usize,
 ) void {
     // Diff line palette (truecolor). Documented together so sticky file
     // headers (#36) and body paints share one table. Hierarchy:
@@ -760,7 +960,8 @@ fn paint(
                 .text => "rv  search  Enter jump  Esc cancel",
                 .file => "rv  file  Enter jump  Esc cancel",
             },
-            .normal => "rv  j/k line  h/l pan  0/$  J/K change  [/] hunk  {/} file  (/) comment  / n/N search  Space f files  t layout  i/I create/edit  d/D dismiss  q quit",
+            .listing => "rv  comments  j/k move  Enter jump  Esc close  q quit",
+            .normal => "rv  j/k line  h/l pan  0/$  J/K change  [/] hunk  {/} file  (/) comment  / n/N search  Space f files  Space l comments  t layout  i/I create/edit  d/D dismiss  q quit",
         };
         scr.putStr(1, 0, help, title_style, null);
     }
@@ -1029,6 +1230,11 @@ fn paint(
             scr.hideCursor();
         }
     } else {
+        scr.hideCursor();
+    }
+
+    if (focus == .listing) {
+        paintCommentList(scr, size, list_items, list_cursor, list_scroll, &line_buf);
         scr.hideCursor();
     }
 }
