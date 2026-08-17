@@ -5,7 +5,7 @@
 //! `{`/`}` file header, `(`/`)` prev/next comment, `/` text search, `n`/`N`
 //! next/prev match, `Space` `f` file-path find, `Space` `l` comment list,
 //! `i`/`c`/`a`/`Enter` create or edit new, `I`/`C`/`A` old, `d` dismiss new,
-//! `D` dismiss old, `q` quit).
+//! `D` dismiss old, `r` reload the loaded diff, `q` quit).
 //! Diff layout defaults to side-by-side when the terminal is wide enough;
 //! falls back to unified when narrow. `t` toggles session preference
 //! (explicit unified stays unified even when wide).
@@ -40,6 +40,7 @@
 
 const std = @import("std");
 const git = @import("git");
+const diff = @import("diff");
 const tui = @import("tui");
 const view = @import("view");
 const store = @import("store");
@@ -64,14 +65,7 @@ pub fn main(init: std.process.Init) !u8 {
 fn runTui(alloc: std.mem.Allocator, io: std.Io) !u8 {
     // Load before any TTY setup so error/empty paths never touch the terminal.
     var d = git.loadDefaultDiff(alloc, io) catch |err| {
-        const msg: []const u8 = switch (err) {
-            error.NotARepository => "not a git repository (run from a work tree)",
-            error.GitNotFound => "git executable not found in PATH",
-            error.GitFailed => "git command failed",
-            error.OutOfMemory => "out of memory",
-            error.BadHunkHeader => "failed to parse unified diff (bad hunk header)",
-        };
-        std.debug.print("rv: {s}\n", .{msg});
+        std.debug.print("rv: {s}\n", .{gitLoadMsg(err)});
         return 1;
     };
     defer d.deinit();
@@ -81,9 +75,9 @@ fn runTui(alloc: std.mem.Allocator, io: std.Io) !u8 {
         return 0;
     }
 
-    const rows = try view.flatten(alloc, &d);
+    var rows = try view.flatten(alloc, &d);
     defer alloc.free(rows);
-    const sbs_slots = try view.pairSideBySide(alloc, rows);
+    var sbs_slots = try view.pairSideBySide(alloc, rows);
     defer alloc.free(sbs_slots);
 
     var review = store.load(alloc, io, .cwd(), store.default_review_id) catch |err| {
@@ -411,6 +405,8 @@ fn runTui(alloc: std.mem.Allocator, io: std.Io) !u8 {
                                     try jumpLiveComment(&review, alloc, rows, &cursor, &note, .prev);
                                 } else if (c == 't') {
                                     layout_pref = view.toggleLayoutPref(layout_pref);
+                                } else if (c == 'r') {
+                                    reloadDiff(alloc, io, &d, &rows, &sbs_slots, &cursor, &note);
                                 } else if (c == 'i' or c == 'c' or c == 'a') {
                                     if (try beginComment(&review, alloc, rows, sbs_slots, layout, cursor, .new, &draft)) {
                                         focus = .commenting;
@@ -456,6 +452,55 @@ fn runTui(alloc: std.mem.Allocator, io: std.Io) !u8 {
         }
     }
     return 0;
+}
+
+fn gitLoadMsg(err: git.Error) []const u8 {
+    return switch (err) {
+        error.NotARepository => "not a git repository (run from a work tree)",
+        error.GitNotFound => "git executable not found in PATH",
+        error.GitFailed => "git command failed",
+        error.OutOfMemory => "out of memory",
+        error.BadHunkHeader => "failed to parse unified diff (bad hunk header)",
+    };
+}
+
+/// Re-run the startup load. On success, replace `d`/`rows`/`sbs_slots` and
+/// restore the cursor. On failure, leave the previous model and set `note`.
+/// Does not touch the comment store. `r` is only bound in normal focus.
+fn reloadDiff(
+    alloc: std.mem.Allocator,
+    io: std.Io,
+    d: *diff.Diff,
+    rows: *[]view.Row,
+    sbs_slots: *[]view.SbsSlot,
+    cursor: *usize,
+    note: *StatusNote,
+) void {
+    var new_d = git.loadDefaultDiff(alloc, io) catch |err| {
+        note.set(gitLoadMsg(err));
+        return;
+    };
+    const new_rows = view.flatten(alloc, &new_d) catch {
+        new_d.deinit();
+        note.set("out of memory");
+        return;
+    };
+    const new_sbs = view.pairSideBySide(alloc, new_rows) catch {
+        alloc.free(new_rows);
+        new_d.deinit();
+        note.set("out of memory");
+        return;
+    };
+    // `mark.path` borrows from the old `d` / `rows`. Restore before free.
+    const mark = view.cursorMarkAt(rows.*, cursor.*);
+    const new_cursor = if (mark) |m| view.restoreCursor(new_rows, m) else 0;
+    alloc.free(rows.*);
+    alloc.free(sbs_slots.*);
+    d.deinit();
+    d.* = new_d;
+    rows.* = new_rows;
+    sbs_slots.* = new_sbs;
+    cursor.* = new_cursor;
 }
 
 /// Key ownership: normal nav, comment draft, `/` search prompt, or comment list.
@@ -961,7 +1006,7 @@ fn paint(
                 .file => "rv  file  Enter jump  Esc cancel",
             },
             .listing => "rv  comments  j/k move  Enter jump  Esc close  q quit",
-            .normal => "rv  j/k line  h/l pan  0/$  J/K change  [/] hunk  {/} file  (/) comment  / n/N search  Space f files  Space l comments  t layout  i/I create/edit  d/D dismiss  q quit",
+            .normal => "rv  j/k line  h/l pan  0/$  J/K change  [/] hunk  {/} file  (/) comment  / n/N search  Space f files  Space l comments  t layout  i/I create/edit  d/D dismiss  r reload  q quit",
         };
         scr.putStr(1, 0, help, title_style, null);
     }

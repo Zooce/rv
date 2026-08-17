@@ -103,6 +103,7 @@ Not a multi-user code-review platform. Not a GitHub replacement. A **personal re
 | `I` / `C` / `A` | Create or edit the comment on **old** (left pane in side-by-side, or the current `-` / context line in unified). Missing side does nothing. |
 | `d` | Dismiss the comment on **new** (right) at the cursor. Gone from the board; no confirm. |
 | `D` | Dismiss the comment on **old** (left). Missing side or no comment there: footer note; does not take the other pane. |
+| `r` | **Reload** the loaded diff from the same source (re-runs the startup git load). Comments in `.rv` stay. Failed reload keeps the previous view and shows a footer error. Not bound while typing a comment (or in search / the comment list). |
 | (later) | Page/half-page scroll, more `Space` leader maps — same vocabulary |
 
 Contrast with tools where `j`/`k` only pan the view and comment placement needs a mouse: in `rv`, **where the cursor is is where the comment goes.**
@@ -203,7 +204,7 @@ $ grok   # or claude - agent implements a feature
 $ rv     # smart default: dirty tree, else branch vs base
          # j/k line; h/l col; [/] hunks; (/) comments; / text; Space f files
          # Space l comments; i/c/a/Enter -> create or edit new; I/C/A -> old
-         # d dismiss new; D dismiss old
+         # d dismiss new; D dismiss old; r reload
 
 $ rv export -o .rv/review.md   # or stdout / JSON
 # agent already knows the skill: address rv comments

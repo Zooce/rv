@@ -781,6 +781,54 @@ pub fn rowForComment(rows: []const Row, loc: CommentLoc) ?usize {
     return null;
 }
 
+/// Enough of a cursor to restore after a reload. `path` (and line numbers)
+/// borrow from the `rows` passed to `cursorMarkAt`.
+pub const CursorMark = struct {
+    path: []const u8,
+    side: ?CommentSide = null,
+    line: ?u32 = null,
+};
+
+/// Snapshot of `cursor` for `restoreCursor`. `null` when `rows` is empty.
+pub fn cursorMarkAt(rows: []const Row, cursor: usize) ?CursorMark {
+    if (rows.len == 0) return null;
+    const i = clampCursor(cursor, rows.len);
+    switch (rows[i]) {
+        .file_header => |fh| return .{ .path = fh.path },
+        .hunk_header => {
+            const fi = currentFileStart(rows, i) orelse return null;
+            return switch (rows[fi]) {
+                .file_header => |fh| .{ .path = fh.path },
+                else => null,
+            };
+        },
+        .line => |ln| {
+            if (ln.new_no) |n| return .{ .path = ln.path, .side = .new, .line = n };
+            if (ln.old_no) |n| return .{ .path = ln.path, .side = .old, .line = n };
+            return .{ .path = ln.path };
+        },
+    }
+}
+
+/// Best-effort cursor after reload: same path + side + line, else that file's
+/// header, else row 0.
+pub fn restoreCursor(rows: []const Row, mark: CursorMark) usize {
+    if (rows.len == 0) return 0;
+    if (mark.side) |side| {
+        if (mark.line) |line| {
+            if (rowForComment(rows, .{ .path = mark.path, .side = side, .line = line })) |idx|
+                return idx;
+        }
+    }
+    for (rows, 0..) |row, i| {
+        switch (row) {
+            .file_header => |fh| if (std.mem.eql(u8, fh.path, mark.path)) return i,
+            else => {},
+        }
+    }
+    return 0;
+}
+
 /// Status footer fields for `cursor` within `rows`.
 pub fn statusAt(rows: []const Row, cursor: usize) Status {
     if (rows.len == 0) {
@@ -2196,4 +2244,103 @@ test "nextComment same row is one stop then later row" {
     const n1 = nextComment(rows, &locs, 2).?;
     try testing.expectEqual(4, n1.index);
     try testing.expect(!n1.wrapped);
+}
+
+test "cursorMarkAt empty file hunk line" {
+    try testing.expect(cursorMarkAt(&.{}, 0) == null);
+
+    const fixture =
+        \\diff --git a/f b/f
+        \\--- a/f
+        \\+++ b/f
+        \\@@ -1,3 +1,3 @@
+        \\ keep
+        \\-old
+        \\+new
+        \\ tail
+    ;
+    var d = try diff.parse(testing.allocator, fixture);
+    defer d.deinit();
+    const rows = try flatten(testing.allocator, &d);
+    defer testing.allocator.free(rows);
+    // 0 file, 1 hunk, 2 keep, 3 del, 4 add, 5 tail
+
+    const file = cursorMarkAt(rows, 0).?;
+    try testing.expectEqualStrings("f", file.path);
+    try testing.expect(file.side == null);
+    try testing.expect(file.line == null);
+
+    const hunk = cursorMarkAt(rows, 1).?;
+    try testing.expectEqualStrings("f", hunk.path);
+    try testing.expect(hunk.side == null);
+    try testing.expect(hunk.line == null);
+
+    const ctx = cursorMarkAt(rows, 2).?;
+    try testing.expectEqualStrings("f", ctx.path);
+    try testing.expectEqual(.new, ctx.side.?);
+    try testing.expectEqual(1, ctx.line.?);
+
+    const del = cursorMarkAt(rows, 3).?;
+    try testing.expectEqual(.old, del.side.?);
+    try testing.expectEqual(2, del.line.?);
+
+    const add = cursorMarkAt(rows, 4).?;
+    try testing.expectEqual(.new, add.side.?);
+    try testing.expectEqual(2, add.line.?);
+}
+
+test "restoreCursor exact file fallback gone" {
+    try testing.expectEqual(0, restoreCursor(&.{}, .{ .path = "f" }));
+
+    const before =
+        \\diff --git a/f b/f
+        \\--- a/f
+        \\+++ b/f
+        \\@@ -1,3 +1,3 @@
+        \\ keep
+        \\-old
+        \\+new
+        \\ tail
+        \\diff --git a/g b/g
+        \\--- a/g
+        \\+++ b/g
+        \\@@ -1 +1 @@
+        \\-gone
+        \\+here
+    ;
+    var d0 = try diff.parse(testing.allocator, before);
+    defer d0.deinit();
+    const old_rows = try flatten(testing.allocator, &d0);
+    defer testing.allocator.free(old_rows);
+    // f: 0 file, 1 hunk, 2 keep, 3 del, 4 add, 5 tail
+    // g: 6 file, 7 hunk, 8 del, 9 add
+
+    const after =
+        \\diff --git a/e b/e
+        \\--- a/e
+        \\+++ b/e
+        \\@@ -1 +1 @@
+        \\-x
+        \\+y
+        \\diff --git a/f b/f
+        \\--- a/f
+        \\+++ b/f
+        \\@@ -1,3 +1,3 @@
+        \\ keep
+        \\-old
+        \\+new
+        \\ tail
+    ;
+    var d1 = try diff.parse(testing.allocator, after);
+    defer d1.deinit();
+    const new_rows = try flatten(testing.allocator, &d1);
+    defer testing.allocator.free(new_rows);
+    // e: 0 file, 1 hunk, 2 del, 3 add
+    // f: 4 file, 5 hunk, 6 keep, 7 del, 8 add, 9 tail
+
+    try testing.expectEqual(8, restoreCursor(new_rows, cursorMarkAt(old_rows, 4).?));
+    try testing.expectEqual(4, restoreCursor(new_rows, cursorMarkAt(old_rows, 0).?));
+    try testing.expectEqual(4, restoreCursor(new_rows, cursorMarkAt(old_rows, 1).?));
+    try testing.expectEqual(0, restoreCursor(new_rows, cursorMarkAt(old_rows, 6).?));
+    try testing.expectEqual(0, restoreCursor(new_rows, .{ .path = "gone" }));
 }
