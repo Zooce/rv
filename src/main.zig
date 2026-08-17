@@ -762,7 +762,7 @@ fn paint(
             },
             .normal => "rv  j/k line  h/l pan  0/$  J/K change  [/] hunk  {/} file  (/) comment  / n/N search  Space f files  t layout  i/I create/edit  d/D dismiss  q quit",
         };
-        scr.putStr(1, 0, help, title_style);
+        scr.putStr(1, 0, help, title_style, null);
     }
 
     // Footer: 1 status row, search prompt, or soft-wrapped comment box.
@@ -808,7 +808,7 @@ fn paint(
                     const text = formatRow(&line_buf, rows[fi], false);
                     const st = if (fi == cur) file_cur_style else file_style;
                     fillRow(scr, screen_y, st);
-                    scr.putStr(0, screen_y, text, st);
+                    scr.putStr(0, screen_y, text, st, null);
                     screen_y += 1;
                 }
             }
@@ -837,7 +837,7 @@ fn paint(
                 fillRow(scr, screen_y, st);
                 const pan = pan_span.containsBody(i);
                 const visible = if (pan) text[tui.screen.byteAtCol(text, cs)..] else text;
-                scr.putStr(0, screen_y, visible, st);
+                scr.putStr(0, screen_y, visible, st, null);
                 screen_y += 1;
             }
         },
@@ -853,7 +853,7 @@ fn paint(
                     const text = formatRow(&line_buf, rows[fi], false);
                     const st = if (fi == cur) file_cur_style else file_style;
                     fillRow(scr, screen_y, st);
-                    scr.putStr(0, screen_y, text, st);
+                    scr.putStr(0, screen_y, text, st, null);
                     screen_y += 1;
                 }
             }
@@ -881,7 +881,7 @@ fn paint(
                             cur_style,
                         );
                         fillRow(scr, screen_y, st);
-                        scr.putStr(0, screen_y, text, st);
+                        scr.putStr(0, screen_y, text, st, null);
                     },
                     .pair => |p| {
                         // Whole slot is current when the cursor sits on either pane
@@ -974,7 +974,7 @@ fn paint(
                 const vline = ds + row;
                 const piece = comment_input.writeVisualLine(&line_buf, draft, m.text_w, vline);
                 // Prefix + text start at column 1 (one-cell left gutter).
-                scr.putStr(1, y, piece, footer_style);
+                scr.putStr(1, y, piece, footer_style, null);
             }
 
             // Right pad is always reserved (text_w stable). Scrollbar uses the
@@ -1011,7 +1011,7 @@ fn paint(
             fillRow(scr, footer_y, footer_style);
             const caret_byte = @min(draft_caret, draft.len);
             const prompt = bufPrintTrunc(&line_buf, "/{s}", .{draft});
-            scr.putStr(1, footer_y, prompt, footer_style);
+            scr.putStr(1, footer_y, prompt, footer_style, null);
             const max_x: u16 = if (size.cols == 0) 0 else size.cols - 1;
             const raw_x: usize = 2 + caret_byte;
             const cx: u16 = if (raw_x > max_x) max_x else @intCast(raw_x);
@@ -1020,11 +1020,11 @@ fn paint(
             const footer_y = footer_top;
             fillRow(scr, footer_y, footer_style);
             if (status_note.len > 0) {
-                scr.putStr(1, footer_y, status_note, footer_style);
+                scr.putStr(1, footer_y, status_note, footer_style, null);
             } else {
                 const st = view.statusAt(rows, cur);
                 const footer_text = formatFooter(&line_buf, st, review.openCount(), layout_pref, size.cols);
-                scr.putStr(1, footer_y, footer_text, footer_style);
+                scr.putStr(1, footer_y, footer_text, footer_style, null);
             }
             scr.hideCursor();
         }
@@ -1185,5 +1185,5 @@ fn fillSpan(scr: *tui.Screen, x0: u16, x1: u16, y: u16, style: tui.Style) void {
 fn putPaneStr(scr: *tui.Screen, x: u16, y: u16, pane_w: u16, text: []const u8, style: tui.Style) void {
     if (pane_w == 0) return;
     const end = tui.screen.byteAtCol(text, pane_w);
-    scr.putStr(x, y, text[0..end], style);
+    scr.putStr(x, y, text[0..end], style, null);
 }

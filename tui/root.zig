@@ -2,7 +2,9 @@
 //!
 //! 1. `tty.zig`    — own the terminal (termios, raw mode, alt screen, restore)
 //! 2. `event.zig`  — bytes → keys; SIGWINCH → resize
-//! 3. `screen.zig` — cell grid + diff render (CUP / SGR escapes)
+//! 3. `screen.zig` — cell grid + diff render (CUP / SGR escapes);
+//!    overlay helpers (`Rect`, `fillRect`, `drawBox`; `putStr` takes an optional clip).
+//!    Still not a widget library.
 //!
 //! App loop pattern (see `examples/tui_demo.zig`):
 //!   open tty → draw into Screen → present → wait event → repeat → deinit
@@ -43,6 +45,7 @@ pub const Screen = screen.Screen;
 pub const Cell = screen.Cell;
 pub const Style = screen.Style;
 pub const Color = screen.Color;
+pub const Rect = screen.Rect;
 
 // Pull submodule tests into `zig build test` via this root.
 test {
