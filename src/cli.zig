@@ -1,8 +1,8 @@
 //! Headless CLI for the comment store (MVP-2.2–2.5).
 //!
 //! Subcommands: `status`, `list`, `show`, `resolve`, `export`,
-//! `install-skill`, help. No git load and no raw TTY modes. Bare `rv` (no
-//! args) still launches the review TUI from `main`.
+//! `install-skill`, help. No git load and no raw TTY modes. Bare `rv` and
+//! `rv <range>` launch the review TUI from `main` (`classify`).
 //! `resolve` deletes ids. There is no reopen and no list/export filter.
 
 const std = @import("std");
@@ -38,7 +38,50 @@ pub const Command = union(enum) {
     install_skill: install_skill.Opts,
 };
 
-/// Parse argv after the program name.
+/// Where the TUI diff came from. Recorded at launch; paint prints a label
+/// and must not re-resolve git.
+pub const Source = union(enum) {
+    local,
+    range: []const u8,
+};
+
+/// Status-strip text for `source`. `empty` is whether the loaded model has
+/// no display rows. Local is `HEAD` (`git diff HEAD`); an explicit range
+/// stays the user-supplied string even if empty.
+pub fn sourceLabel(source: Source, empty: bool) []const u8 {
+    return switch (source) {
+        .local => if (empty) "HEAD · empty" else "HEAD",
+        .range => |r| r,
+    };
+}
+
+/// How to start the process: TUI (with a recorded source) or a headless command.
+pub const Launch = union(enum) {
+    tui: Source,
+    command: Command,
+};
+
+/// Classify argv after the program name.
+pub fn classify(args: []const []const u8) error{Usage}!Launch {
+    if (args.len == 0) return .{ .tui = .local };
+    if (isCommand(args[0])) return .{ .command = try parse(args) };
+    if (args.len == 1 and args[0].len > 0 and args[0][0] != '-') {
+        return .{ .tui = .{ .range = args[0] } };
+    }
+    return error.Usage;
+}
+
+fn isCommand(s: []const u8) bool {
+    return isHelp(s) or
+        std.mem.eql(u8, s, "status") or
+        std.mem.eql(u8, s, "list") or
+        std.mem.eql(u8, s, "show") or
+        std.mem.eql(u8, s, "resolve") or
+        std.mem.eql(u8, s, "export") or
+        std.mem.eql(u8, s, "install-skill");
+}
+
+/// Parse a headless subcommand. argv after the program name, first token a command.
 pub fn parse(args: []const []const u8) error{Usage}!Command {
     if (args.len == 0) return error.Usage;
     const cmd = args[0];
@@ -123,10 +166,12 @@ fn parseInstallSkill(args: []const []const u8) error{Usage}!install_skill.Opts {
     return opts;
 }
 
-const usage_text =
-    \\usage: rv [<command>] [args]
+pub const usage_text =
+    \\usage: rv [<range> | <command>] [args]
     \\
-    \\With no command, opens the full-screen review TUI.
+    \\With no args, opens the review TUI on local changes (staged, unstaged,
+    \\and untracked). A clean worktree opens empty. A git revision or range
+    \\(for example main...HEAD) opens the TUI on `git diff <range>` as written.
     \\
     \\Commands:
     \\  status                         live comment count and store path
@@ -146,12 +191,8 @@ const usage_text =
     \\
 ;
 
-/// Run a CLI command. `args` is argv after the program name.
-pub fn run(alloc: Allocator, io: Io, args: []const []const u8, env: Env) u8 {
-    const cmd = parse(args) catch {
-        std.debug.print("{s}", .{usage_text});
-        return exit_usage;
-    };
+/// Run a parsed headless command.
+pub fn run(alloc: Allocator, io: Io, cmd: Command, env: Env) u8 {
     switch (cmd) {
         .help => return cmdHelp(io),
         .status => return cmdStatus(alloc, io),
@@ -528,6 +569,47 @@ test "parse usage errors" {
     try testing.expectError(error.Usage, parse(&.{ "install-skill", "--list", "--uninstall" }));
     try testing.expectError(error.Usage, parse(&.{ "install-skill", "--agent" }));
     try testing.expectError(error.Usage, parse(&.{ "install-skill", "--bogus" }));
+}
+
+test "classify tui vs command" {
+    switch (try classify(&.{})) {
+        .tui => |src| try testing.expectEqual(Source.local, src),
+        .command => return error.TestUnexpectedResult,
+    }
+    switch (try classify(&.{"main...HEAD"})) {
+        .tui => |src| try testing.expectEqualStrings("main...HEAD", src.range),
+        .command => return error.TestUnexpectedResult,
+    }
+    switch (try classify(&.{"HEAD"})) {
+        .tui => |src| try testing.expectEqualStrings("HEAD", src.range),
+        .command => return error.TestUnexpectedResult,
+    }
+    switch (try classify(&.{"@{upstream}...HEAD"})) {
+        .tui => |src| try testing.expectEqualStrings("@{upstream}...HEAD", src.range),
+        .command => return error.TestUnexpectedResult,
+    }
+    switch (try classify(&.{"status"})) {
+        .command => |cmd| try testing.expectEqual(Command.status, cmd),
+        .tui => return error.TestUnexpectedResult,
+    }
+    switch (try classify(&.{ "export", "--format", "json" })) {
+        .command => |cmd| try testing.expectEqual(ExportFormat.json, cmd.@"export".format),
+        .tui => return error.TestUnexpectedResult,
+    }
+    switch (try classify(&.{"--help"})) {
+        .command => |cmd| try testing.expectEqual(Command.help, cmd),
+        .tui => return error.TestUnexpectedResult,
+    }
+    try testing.expectError(error.Usage, classify(&.{"--bogus"}));
+    try testing.expectError(error.Usage, classify(&.{ "main...HEAD", "extra" }));
+    try testing.expectError(error.Usage, classify(&.{""}));
+}
+
+test "sourceLabel local and range" {
+    try testing.expectEqualStrings("HEAD", sourceLabel(.local, false));
+    try testing.expectEqualStrings("HEAD · empty", sourceLabel(.local, true));
+    try testing.expectEqualStrings("main...HEAD", sourceLabel(.{ .range = "main...HEAD" }, false));
+    try testing.expectEqualStrings("main...HEAD", sourceLabel(.{ .range = "main...HEAD" }, true));
 }
 
 test "formatMarkdown and formatJson envelope" {

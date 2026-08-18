@@ -50,7 +50,7 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
 
-    // Git subprocess loader + smart default (MVP-0.2).
+    // Git subprocess loader + local-only default (MVP-0.2).
     const git_mod = b.addModule("git", .{
         .root_source_file = b.path("src/git.zig"),
         .target = target,

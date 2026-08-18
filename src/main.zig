@@ -1,6 +1,6 @@
 //! `rv` entry point — CLI dispatch + full-screen diff review (MVP-1 / MVP-2.2).
 //!
-//! With no args: load smart-default git diff → flatten rows → load `.rv`
+//! With no args: load local-only git diff → flatten rows → load `.rv`
 //! comments → TUI (`j`/`k`, `h`/`l` pan, `0`/`$` col home/end, `[`/`]` hunk,
 //! `{`/`}` file header, `(`/`)` prev/next comment, `/` text search, `n`/`N`
 //! next/prev match, `Space` `f` file-path find, `Space` `l` comment list,
@@ -9,8 +9,10 @@
 //! Diff layout defaults to side-by-side when the terminal is wide enough;
 //! falls back to unified when narrow. `t` toggles session preference
 //! (explicit unified stays unified even when wide).
-//! Empty/error paths never enter raw / alt-screen mode.
+//! Error paths never enter raw / alt-screen mode. An empty model still
+//! opens the TUI; the footer shows the load source (`HEAD · empty`).
 //!
+//! With a git range arg: load `git diff <range>` as written → same TUI.
 //! With a subcommand: headless CLI (`status`, `list`, `show`, `resolve`,
 //! `export`, `install-skill`, help) — no git load and no raw TTY modes.
 //!
@@ -52,28 +54,32 @@ pub fn main(init: std.process.Init) !u8 {
     const io = init.io;
 
     const argv = try init.minimal.args.toSlice(init.arena.allocator());
-    if (argv.len > 1) {
-        const env: cli.Env = .{
-            .home = init.environ_map.get("HOME"),
-            .skill_dir = init.environ_map.get("RV_SKILL_DIR"),
-        };
-        return cli.run(alloc, io, argv[1..], env);
+    const launch = cli.classify(if (argv.len > 1) argv[1..] else &.{}) catch {
+        std.debug.print("{s}", .{cli.usage_text});
+        return 2;
+    };
+    switch (launch) {
+        .tui => |source| return try runTui(alloc, io, source),
+        .command => |cmd| {
+            const env: cli.Env = .{
+                .home = init.environ_map.get("HOME"),
+                .skill_dir = init.environ_map.get("RV_SKILL_DIR"),
+            };
+            return cli.run(alloc, io, cmd, env);
+        },
     }
-    return try runTui(alloc, io);
 }
 
-fn runTui(alloc: std.mem.Allocator, io: std.Io) !u8 {
-    // Load before any TTY setup so error/empty paths never touch the terminal.
-    var d = git.loadDefaultDiff(alloc, io) catch |err| {
+fn runTui(alloc: std.mem.Allocator, io: std.Io, source: cli.Source) !u8 {
+    // Load before any TTY setup so error paths never touch the terminal.
+    var d = switch (source) {
+        .local => git.loadDefaultDiff(alloc, io),
+        .range => |r| git.loadRangeDiff(alloc, io, .inherit, r),
+    } catch |err| {
         std.debug.print("rv: {s}\n", .{gitLoadMsg(err)});
         return 1;
     };
     defer d.deinit();
-
-    if (d.files.len == 0) {
-        std.debug.print("rv: no changes to review\n", .{});
-        return 0;
-    }
 
     var rows = try view.flatten(alloc, &d);
     defer alloc.free(rows);
@@ -148,7 +154,7 @@ fn runTui(alloc: std.mem.Allocator, io: std.Io) !u8 {
     // One-shot footer note (owned bytes; len 0 = none). Cleared on next key.
     var note: StatusNote = .{};
 
-    paint(&scr, size, rows, sbs_slots, layout_pref, cursor, &scroll, &col_scroll, &review, focus, search_kind, draft.buf.items, draft.caret, &draft.scroll, draft.anchor, note.slice(), list_items.items, list_cursor, &list_scroll);
+    paint(&scr, size, rows, sbs_slots, layout_pref, cursor, &scroll, &col_scroll, &review, source, focus, search_kind, draft.buf.items, draft.caret, &draft.scroll, draft.anchor, note.slice(), list_items.items, list_cursor, &list_scroll);
     try scr.present(&term);
 
     while (running) {
@@ -406,7 +412,7 @@ fn runTui(alloc: std.mem.Allocator, io: std.Io) !u8 {
                                 } else if (c == 't') {
                                     layout_pref = view.toggleLayoutPref(layout_pref);
                                 } else if (c == 'r') {
-                                    reloadDiff(alloc, io, &d, &rows, &sbs_slots, &cursor, &note);
+                                    reloadDiff(alloc, io, source, &d, &rows, &sbs_slots, &cursor, &note);
                                 } else if (c == 'i' or c == 'c' or c == 'a') {
                                     if (try beginComment(&review, alloc, rows, sbs_slots, layout, cursor, .new, &draft)) {
                                         focus = .commenting;
@@ -447,7 +453,7 @@ fn runTui(alloc: std.mem.Allocator, io: std.Io) !u8 {
             },
         }
         if (running) {
-            paint(&scr, size, rows, sbs_slots, layout_pref, cursor, &scroll, &col_scroll, &review, focus, search_kind, draft.buf.items, draft.caret, &draft.scroll, draft.anchor, note.slice(), list_items.items, list_cursor, &list_scroll);
+            paint(&scr, size, rows, sbs_slots, layout_pref, cursor, &scroll, &col_scroll, &review, source, focus, search_kind, draft.buf.items, draft.caret, &draft.scroll, draft.anchor, note.slice(), list_items.items, list_cursor, &list_scroll);
             try scr.present(&term);
         }
     }
@@ -470,13 +476,17 @@ fn gitLoadMsg(err: git.Error) []const u8 {
 fn reloadDiff(
     alloc: std.mem.Allocator,
     io: std.Io,
+    source: cli.Source,
     d: *diff.Diff,
     rows: *[]view.Row,
     sbs_slots: *[]view.SbsSlot,
     cursor: *usize,
     note: *StatusNote,
 ) void {
-    var new_d = git.loadDefaultDiff(alloc, io) catch |err| {
+    var new_d = switch (source) {
+        .local => git.loadDefaultDiff(alloc, io),
+        .range => |r| git.loadRangeDiff(alloc, io, .inherit, r),
+    } catch |err| {
         note.set(gitLoadMsg(err));
         return;
     };
@@ -892,6 +902,7 @@ fn paint(
     scroll: *usize,
     col_scroll: *usize,
     review: *const store.Review,
+    source: cli.Source,
     focus: Focus,
     search_kind: SearchKind,
     draft: []const u8,
@@ -1269,7 +1280,7 @@ fn paint(
                 scr.putStr(1, footer_y, status_note, footer_style, null);
             } else {
                 const st = view.statusAt(rows, cur);
-                const footer_text = formatFooter(&line_buf, st, review.openCount(), layout_pref, size.cols);
+                const footer_text = formatFooter(&line_buf, st, review.openCount(), layout_pref, size.cols, source);
                 scr.putStr(1, footer_y, footer_text, footer_style, null);
             }
             scr.hideCursor();
@@ -1312,11 +1323,14 @@ fn formatFooter(
     open_n: usize,
     layout_pref: view.LayoutPref,
     cols: u16,
+    source: cli.Source,
 ) []const u8 {
+    const src = cli.sourceLabel(source, st.row_n == 0);
     const mode = layoutFooterLabel(layout_pref, cols);
-    if (st.row_n == 0) return "no changes";
+    if (st.row_n == 0) return src;
     if (st.hunk_n == 0) {
-        return bufPrintTrunc(buf, "{s}  {d}/{d}  {d} open  {s}", .{
+        return bufPrintTrunc(buf, "{s}  {s}  {d}/{d}  {d} open  {s}", .{
+            src,
             if (st.path.len > 0) st.path else "?",
             st.row_i,
             st.row_n,
@@ -1324,7 +1338,8 @@ fn formatFooter(
             mode,
         });
     }
-    return bufPrintTrunc(buf, "{s}  hunk {d}/{d}  {d}/{d}  {d} open  {s}", .{
+    return bufPrintTrunc(buf, "{s}  {s}  hunk {d}/{d}  {d}/{d}  {d} open  {s}", .{
+        src,
         if (st.path.len > 0) st.path else "?",
         st.hunk_i,
         st.hunk_n,

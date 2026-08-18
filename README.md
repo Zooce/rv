@@ -78,11 +78,11 @@ Not a multi-user code-review platform. Not a GitHub replacement. A **personal re
 
 | Surface | Status |
 |---|---|
-| Working tree + staged (`git diff` / `git diff --cached`) | MVP |
-| Branch vs base (e.g. `main...HEAD`) | MVP |
-| Arbitrary ranges / patches | Later |
+| Working tree + staged (`git diff HEAD` + untracked) | MVP |
+| Branch vs base (e.g. `rv main...HEAD`) | MVP |
+| Arbitrary patches | Later |
 
-**Default invocation:** bare `rv` uses a smart default - if the worktree is dirty (or has staged changes), review that; otherwise review the current branch against its base.
+**Default invocation:** bare `rv` reviews local changes only (staged, unstaged, and untracked). A clean worktree opens an empty review. Branch and other diffs are opt-in: `rv <range>` (for example `rv main...HEAD`). The TUI footer shows the git range (`HEAD` for local, `HEAD · empty` when the worktree is clean, or the range you passed).
 
 ### Navigation and selection (keyboard-first)
 
@@ -201,7 +201,7 @@ $ rv install-skill             # once per machine (or after upgrade)
 
 $ grok   # or claude - agent implements a feature
 
-$ rv     # smart default: dirty tree, else branch vs base
+$ rv     # local changes only (empty when the worktree is clean)
          # j/k line; h/l col; [/] hunks; (/) comments; / text; Space f files
          # Space l comments; i/c/a/Enter -> create or edit new; I/C/A -> old
          # d dismiss new; D dismiss old; r reload
@@ -266,8 +266,8 @@ Exact schema is implementation detail; the README-level contract is: **stable id
 ### CLI surface (indicative)
 
 ```text
-rv                  # TUI, smart default range
-rv review [range]   # TUI on an explicit git range
+rv                  # TUI, local changes
+rv <range>          # TUI on `git diff <range>` (e.g. main...HEAD)
 rv list             # list comments
 rv show <id>
 rv resolve <id> ... # delete comments

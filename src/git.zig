@@ -1,29 +1,33 @@
 //! Load a parsed `Diff` by shelling out to `git` (no libgit2).
 //!
-//! ## Smart default
+//! ## Default (local only)
 //!
-//! 1. **Local changes** — if there is anything local to review, use that stream:
-//!    - Staged **and** unstaged changes to tracked files (`git diff HEAD`),
-//!      equivalent to combining `git diff` and `git diff --cached`.
-//!    - Plus **untracked** files listed by
-//!      `git ls-files --others --exclude-standard` (same ignore rules as
-//!      `git status` untracked). Each path is turned into a new-file unified
-//!      diff via `git diff --no-index -- /dev/null <path>`.
-//!    Untracked sections are appended **after** tracked paths. Empty untracked
-//!    files appear as new-file headers (often zero hunks). Binary untracked
-//!    files follow the same binary placeholder rules as tracked binary adds.
-//!    Local untracked alone (no tracked changes) still takes this path and skips
-//!    branch-vs-base. With no `HEAD` yet, only untracked content is considered.
-//! 2. **Branch vs base** — otherwise compare the current branch to a base:
-//!    - Prefer the configured upstream (`@{upstream}`) when it resolves.
-//!    - Else `main`, then `master`, when that ref exists.
-//!    Range is three-dot: `git diff <base>...HEAD` (merge-base → HEAD).
+//! Staged **and** unstaged changes to tracked files (`git diff HEAD`),
+//! equivalent to combining `git diff` and `git diff --cached`.
+//! Plus **untracked** files listed by
+//! `git ls-files --others --exclude-standard` (same ignore rules as
+//! `git status` untracked). Each path is turned into a new-file unified
+//! diff via `git diff --no-index -- /dev/null <path>`.
+//! Untracked sections are appended **after** tracked paths. Empty untracked
+//! files appear as new-file headers (often zero hunks). Binary untracked
+//! files follow the same binary placeholder rules as tracked binary adds.
+//! Local untracked alone (no tracked changes) is still this path. With no
+//! `HEAD` yet, only untracked content is considered.
+//!
+//! A clean worktree (no local / untracked) yields an empty `Diff`. There is
+//! no fall-through to branch-vs-base (`git diff <base>...HEAD`).
+//!
+//! ## Explicit range
+//!
+//! `loadRangeDiff` runs `git diff <range>` with the range string as written
+//! (no `...` / `..` rewrite). Untracked files are not appended. An empty
+//! result is an empty `Diff`. Invalid range is `GitFailed`.
 //!
 //! ## Empty diffs
 //!
 //! No matching changes yields an empty `Diff` (zero files), **not** an error.
-//! That covers a clean worktree with no untracked files and nothing ahead of
-//! base, and a repo with no commits and no untracked files.
+//! That covers a clean worktree with no untracked files, and a repo with no
+//! commits and no untracked files.
 //!
 //! ## Errors
 //!
@@ -42,7 +46,7 @@ pub const Error = error{
     GitFailed,
 } || diff.ParseError;
 
-/// Load the smart-default diff for the process current working directory.
+/// Load the local-only default diff for the process current working directory.
 pub fn loadDefaultDiff(alloc: Allocator, io: Io) Error!diff.Diff {
     return loadDefaultDiffCwd(alloc, io, .inherit);
 }
@@ -51,7 +55,6 @@ pub fn loadDefaultDiff(alloc: Allocator, io: Io) Error!diff.Diff {
 pub fn loadDefaultDiffCwd(alloc: Allocator, io: Io, cwd: std.process.Child.Cwd) Error!diff.Diff {
     try ensureInsideWorkTree(alloc, io, cwd);
 
-    // 1. Local: tracked changes vs HEAD (if any) + untracked (exclude-standard).
     const untracked = try untrackedDiff(alloc, io, cwd);
     defer if (untracked) |u| alloc.free(u);
 
@@ -59,32 +62,28 @@ pub fn loadDefaultDiffCwd(alloc: Allocator, io: Io, cwd: std.process.Child.Cwd) 
         const local = try git(alloc, io, cwd, .{ .argv = &.{ "git", "diff", "HEAD" } });
         defer alloc.free(local);
 
-        if (local.len > 0 or untracked != null) {
-            if (untracked) |u| {
-                if (local.len == 0) return try diff.parse(alloc, u);
-                const combined = try std.mem.concat(alloc, u8, &.{ local, u });
-                defer alloc.free(combined);
-                return try diff.parse(alloc, combined);
-            }
-            return try diff.parse(alloc, local);
+        if (untracked) |u| {
+            if (local.len == 0) return try diff.parse(alloc, u);
+            const combined = try std.mem.concat(alloc, u8, &.{ local, u });
+            defer alloc.free(combined);
+            return try diff.parse(alloc, combined);
         }
-    } else if (untracked) |u| {
+        return try diff.parse(alloc, local);
+    }
+    if (untracked) |u| {
         // No commits yet: still review untracked new files.
         return try diff.parse(alloc, u);
-    } else {
-        return try diff.parse(alloc, "");
     }
+    return try diff.parse(alloc, "");
+}
 
-    // 2. Branch vs base (three-dot). Requires HEAD (already verified above).
-    const base = try resolveBase(alloc, io, cwd) orelse {
-        return try diff.parse(alloc, "");
-    };
-    const range = try std.fmt.allocPrint(alloc, "{s}...HEAD", .{base});
-    defer alloc.free(range);
-
-    const branch = try git(alloc, io, cwd, .{ .argv = &.{ "git", "diff", range } });
-    defer alloc.free(branch);
-    return try diff.parse(alloc, branch);
+/// Load `git diff <range>`. `range` is passed through as written (no
+/// `...` / `..` rewrite). Pass `.inherit` for the process cwd.
+pub fn loadRangeDiff(alloc: Allocator, io: Io, cwd: std.process.Child.Cwd, range: []const u8) Error!diff.Diff {
+    try ensureInsideWorkTree(alloc, io, cwd);
+    const out = try git(alloc, io, cwd, .{ .argv = &.{ "git", "diff", range } });
+    defer alloc.free(out);
+    return try diff.parse(alloc, out);
 }
 
 // --- internals -----------------------------------------------------------
@@ -97,13 +96,6 @@ fn ensureInsideWorkTree(alloc: Allocator, io: Io, cwd: std.process.Child.Cwd) Er
     defer alloc.free(out);
     if (std.mem.eql(u8, std.mem.trim(u8, out, " \t\r\n"), "true")) return;
     return error.NotARepository;
-}
-
-fn resolveBase(alloc: Allocator, io: Io, cwd: std.process.Child.Cwd) Error!?[]const u8 {
-    if (try revExists(alloc, io, cwd, "@{upstream}")) return "@{upstream}";
-    if (try revExists(alloc, io, cwd, "main")) return "main";
-    if (try revExists(alloc, io, cwd, "master")) return "master";
-    return null;
 }
 
 fn revExists(alloc: Allocator, io: Io, cwd: std.process.Child.Cwd, rev: []const u8) Error!bool {
@@ -270,7 +262,7 @@ test "dirty worktree: staged + unstaged as one stream" {
     try expectHasDisplayPath(d, "staged.txt");
 }
 
-test "clean feature branch: diff is commits ahead of main only" {
+test "clean feature branch: empty model (no local changes)" {
     if (builtin.os.tag == .wasi) return error.SkipZigTest;
 
     const io = testing.io;
@@ -281,13 +273,12 @@ test "clean feature branch: diff is commits ahead of main only" {
 
     try initTestRepo(alloc, io, cwd);
 
-    // Base on main.
     try tmp.write(io, "shared.txt", "on main\n");
     try expectGitOk(alloc, io, cwd, &.{ "git", "add", "shared.txt" });
     try expectGitOk(alloc, io, cwd, &.{ "git", "commit", "-m", "on main" });
 
-    // Feature branch: add a file and edit the shared one (both should appear
-    // in main...HEAD; nothing is local/uncommitted).
+    // Commits ahead of main, worktree clean: default stays empty (no branch
+    // fall-through).
     try expectGitOk(alloc, io, cwd, &.{ "git", "checkout", "-b", "feature" });
     try tmp.write(io, "feature-only.txt", "only on feature\n");
     try tmp.write(io, "shared.txt", "on main\nedited on feature\n");
@@ -297,14 +288,11 @@ test "clean feature branch: diff is commits ahead of main only" {
     var d = try loadDefaultDiffCwd(alloc, io, cwd);
     defer d.deinit();
 
-    // Branch-vs-base: exactly the two files changed since main, no local changes.
-    try testing.expectEqual(2, d.files.len);
-    try testing.expectEqual(2, d.hunk_count);
-    try expectHasDisplayPath(d, "feature-only.txt");
-    try expectHasDisplayPath(d, "shared.txt");
+    try testing.expectEqual(0, d.files.len);
+    try testing.expectEqual(0, d.hunk_count);
 }
 
-test "clean main with nothing ahead of base: empty model" {
+test "clean worktree: empty model" {
     if (builtin.os.tag == .wasi) return error.SkipZigTest;
 
     const io = testing.io;
@@ -395,4 +383,95 @@ test "untracked-only worktree: non-empty local stream" {
     try testing.expectEqual(1, d.files.len);
     try expectHasDisplayPath(d, "brand_new.zig");
     try testing.expect(d.hunk_count >= 1);
+}
+
+test "range main...HEAD: commits ahead of main" {
+    if (builtin.os.tag == .wasi) return error.SkipZigTest;
+
+    const io = testing.io;
+    const alloc = testing.allocator;
+    var tmp = try IsolatedTmp.create(alloc, io);
+    defer tmp.cleanup(alloc, io);
+    const cwd = tmp.cwd();
+
+    try initTestRepo(alloc, io, cwd);
+    try tmp.write(io, "shared.txt", "on main\n");
+    try expectGitOk(alloc, io, cwd, &.{ "git", "add", "shared.txt" });
+    try expectGitOk(alloc, io, cwd, &.{ "git", "commit", "-m", "on main" });
+
+    try expectGitOk(alloc, io, cwd, &.{ "git", "checkout", "-b", "feature" });
+    try tmp.write(io, "feature-only.txt", "only on feature\n");
+    try tmp.write(io, "shared.txt", "on main\nedited on feature\n");
+    try expectGitOk(alloc, io, cwd, &.{ "git", "add", "feature-only.txt", "shared.txt" });
+    try expectGitOk(alloc, io, cwd, &.{ "git", "commit", "-m", "on feature" });
+
+    var d = try loadRangeDiff(alloc, io, cwd, "main...HEAD");
+    defer d.deinit();
+
+    try testing.expectEqual(2, d.files.len);
+    try testing.expectEqual(2, d.hunk_count);
+    try expectHasDisplayPath(d, "feature-only.txt");
+    try expectHasDisplayPath(d, "shared.txt");
+}
+
+test "range does not append untracked files" {
+    if (builtin.os.tag == .wasi) return error.SkipZigTest;
+
+    const io = testing.io;
+    const alloc = testing.allocator;
+    var tmp = try IsolatedTmp.create(alloc, io);
+    defer tmp.cleanup(alloc, io);
+    const cwd = tmp.cwd();
+
+    try initTestRepo(alloc, io, cwd);
+    try tmp.write(io, "shared.txt", "on main\n");
+    try expectGitOk(alloc, io, cwd, &.{ "git", "add", "shared.txt" });
+    try expectGitOk(alloc, io, cwd, &.{ "git", "commit", "-m", "on main" });
+
+    try expectGitOk(alloc, io, cwd, &.{ "git", "checkout", "-b", "feature" });
+    try tmp.write(io, "feature-only.txt", "only on feature\n");
+    try expectGitOk(alloc, io, cwd, &.{ "git", "add", "feature-only.txt" });
+    try expectGitOk(alloc, io, cwd, &.{ "git", "commit", "-m", "on feature" });
+
+    try tmp.write(io, "dirt.txt", "untracked, must not appear\n");
+
+    var d = try loadRangeDiff(alloc, io, cwd, "main...HEAD");
+    defer d.deinit();
+
+    try testing.expectEqual(1, d.files.len);
+    try expectHasDisplayPath(d, "feature-only.txt");
+}
+
+test "invalid range: GitFailed" {
+    if (builtin.os.tag == .wasi) return error.SkipZigTest;
+
+    const io = testing.io;
+    const alloc = testing.allocator;
+    var tmp = try IsolatedTmp.create(alloc, io);
+    defer tmp.cleanup(alloc, io);
+    const cwd = tmp.cwd();
+
+    try initTestRepo(alloc, io, cwd);
+    try tmp.write(io, "only.txt", "x\n");
+    try expectGitOk(alloc, io, cwd, &.{ "git", "add", "only.txt" });
+    try expectGitOk(alloc, io, cwd, &.{ "git", "commit", "-m", "init" });
+
+    try testing.expectError(
+        error.GitFailed,
+        loadRangeDiff(alloc, io, cwd, "this-ref-does-not-exist"),
+    );
+}
+
+test "range not a git repository" {
+    if (builtin.os.tag == .wasi) return error.SkipZigTest;
+
+    const io = testing.io;
+    const alloc = testing.allocator;
+    var tmp = try IsolatedTmp.create(alloc, io);
+    defer tmp.cleanup(alloc, io);
+
+    try testing.expectError(
+        error.NotARepository,
+        loadRangeDiff(alloc, io, tmp.cwd(), "HEAD"),
+    );
 }
