@@ -189,7 +189,25 @@ pub fn build(b: *std.Build) void {
     });
     const run_install_skill_tests = b.addRunArtifact(install_skill_tests);
 
-    const test_step = b.step("test", "Run unit tests (TUI + diff + git + view + comment_input + store + cli + install_skill)");
+    const main_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/main.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "tui", .module = tui_mod },
+                .{ .name = "diff", .module = diff_mod },
+                .{ .name = "git", .module = git_mod },
+                .{ .name = "view", .module = view_mod },
+                .{ .name = "store", .module = store_mod },
+                .{ .name = "cli", .module = cli_mod },
+                .{ .name = "comment_input", .module = comment_input_mod },
+            },
+        }),
+    });
+    const run_main_tests = b.addRunArtifact(main_tests);
+
+    const test_step = b.step("test", "Run unit tests (TUI + diff + git + view + comment_input + store + cli + install_skill + main)");
     test_step.dependOn(&run_tui_tests.step);
     test_step.dependOn(&run_diff_tests.step);
     test_step.dependOn(&run_git_tests.step);
@@ -198,4 +216,5 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&run_store_tests.step);
     test_step.dependOn(&run_cli_tests.step);
     test_step.dependOn(&run_install_skill_tests.step);
+    test_step.dependOn(&run_main_tests.step);
 }

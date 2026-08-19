@@ -42,8 +42,9 @@
 //! a footer note. `q` still quits.
 //!
 //! Help: `?` in normal (or from the comment list) opens a centered overlay
-//! on the still-painted diff. `?` or Esc closes; `q` still quits. Other keys
-//! are ignored. While commenting or searching, `?` inserts a question mark.
+//! with the grouped key catalog. `j`/`k` scroll when it does not fit. `?` or
+//! Esc closes; `q` still quits. Other keys are ignored. While commenting or
+//! searching, `?` inserts a question mark. The title bar is a short hint.
 
 const std = @import("std");
 const git = @import("git");
@@ -153,13 +154,14 @@ fn runTui(alloc: std.mem.Allocator, io: std.Io, source: cli.Source) !u8 {
     defer list_items.deinit(alloc);
     var list_cursor: usize = 0;
     var list_scroll: usize = 0;
+    var help_scroll: usize = 0;
     // Committed `/` text query for `n`/`N` (empty means no active text search).
     var last_query: std.ArrayList(u8) = .empty;
     defer last_query.deinit(alloc);
     // One-shot footer note (owned bytes; len 0 = none). Cleared on next key.
     var note: StatusNote = .{};
 
-    paint(&scr, size, rows, sbs_slots, layout_pref, cursor, &scroll, &col_scroll, &review, source, focus, search_kind, draft.buf.items, draft.caret, &draft.scroll, draft.anchor, note.slice(), list_items.items, list_cursor, &list_scroll);
+    paint(&scr, size, rows, sbs_slots, layout_pref, cursor, &scroll, &col_scroll, &review, source, focus, search_kind, draft.buf.items, draft.caret, &draft.scroll, draft.anchor, note.slice(), list_items.items, list_cursor, &list_scroll, &help_scroll);
     try scr.present(&term);
 
     while (running) {
@@ -327,6 +329,7 @@ fn runTui(alloc: std.mem.Allocator, io: std.Io, source: cli.Source) !u8 {
                             if (c == 'q' or c == 'Q') {
                                 running = false;
                             } else if (c == '?') {
+                                help_scroll = 0;
                                 focus = .helping;
                             } else if (c == 'j') {
                                 if (list_cursor + 1 < list_items.items.len) list_cursor += 1;
@@ -352,8 +355,14 @@ fn runTui(alloc: std.mem.Allocator, io: std.Io, source: cli.Source) !u8 {
                                 running = false;
                             } else if (c == '?') {
                                 focus = .normal;
+                            } else if (c == 'j') {
+                                help_scroll += 1;
+                            } else if (c == 'k') {
+                                help_scroll -|= 1;
                             }
                         },
+                        .down => help_scroll += 1,
+                        .up => help_scroll -|= 1,
                         .ctrl_c => running = false,
                         else => {},
                     },
@@ -376,6 +385,7 @@ fn runTui(alloc: std.mem.Allocator, io: std.Io, source: cli.Source) !u8 {
                                 } else if (c == 'q' or c == 'Q') {
                                     running = false;
                                 } else if (c == '?') {
+                                    help_scroll = 0;
                                     focus = .helping;
                                 } else if (c == ' ') {
                                     leader_pending = true;
@@ -476,7 +486,7 @@ fn runTui(alloc: std.mem.Allocator, io: std.Io, source: cli.Source) !u8 {
             },
         }
         if (running) {
-            paint(&scr, size, rows, sbs_slots, layout_pref, cursor, &scroll, &col_scroll, &review, source, focus, search_kind, draft.buf.items, draft.caret, &draft.scroll, draft.anchor, note.slice(), list_items.items, list_cursor, &list_scroll);
+            paint(&scr, size, rows, sbs_slots, layout_pref, cursor, &scroll, &col_scroll, &review, source, focus, search_kind, draft.buf.items, draft.caret, &draft.scroll, draft.anchor, note.slice(), list_items.items, list_cursor, &list_scroll, &help_scroll);
             try scr.present(&term);
         }
     }
@@ -915,7 +925,89 @@ fn paintCommentList(
     }
 }
 
-fn paintHelp(scr: *tui.Screen, size: tui.Size) void {
+const HelpRow = union(enum) {
+    group: []const u8,
+    item: struct { key: []const u8, label: []const u8 },
+    blank,
+};
+
+const help_rows = [_]HelpRow{
+    .{ .group = "Motion" },
+    .{ .item = .{ .key = "j/k", .label = "line (also arrows)" } },
+    .{ .item = .{ .key = "h/l", .label = "pan current hunk" } },
+    .{ .item = .{ .key = "0/$", .label = "pan home / end" } },
+    .{ .item = .{ .key = "J/K", .label = "next / prev change" } },
+    .{ .item = .{ .key = "[/]", .label = "hunk header" } },
+    .{ .item = .{ .key = "{/}", .label = "file header" } },
+    .{ .item = .{ .key = "(/)", .label = "prev / next comment" } },
+    .blank,
+    .{ .group = "Search" },
+    .{ .item = .{ .key = "/", .label = "text in the diff" } },
+    .{ .item = .{ .key = "n/N", .label = "next / prev match" } },
+    .{ .item = .{ .key = "Space f", .label = "file path" } },
+    .{ .item = .{ .key = "Space l", .label = "comment list" } },
+    .blank,
+    .{ .group = "Comments" },
+    .{ .item = .{ .key = "i/c/a/Enter", .label = "create / edit new" } },
+    .{ .item = .{ .key = "I/C/A", .label = "create / edit old" } },
+    .{ .item = .{ .key = "d/D", .label = "dismiss new / old" } },
+    .blank,
+    .{ .group = "Session" },
+    .{ .item = .{ .key = "t", .label = "layout" } },
+    .{ .item = .{ .key = "r", .label = "reload" } },
+    .{ .item = .{ .key = "?", .label = "this help" } },
+    .{ .item = .{ .key = "q", .label = "quit" } },
+    .blank,
+    .{ .group = "In a prompt" },
+    .{ .item = .{ .key = "comment", .label = "Enter save · Esc cancel · arrows move" } },
+    .{ .item = .{ .key = "search", .label = "Enter jump · Esc cancel" } },
+    .{ .item = .{ .key = "list", .label = "j/k move · Enter jump · Esc close" } },
+};
+
+const help_key_w: u16 = blk: {
+    var w: u16 = 0;
+    for (help_rows) |row| {
+        switch (row) {
+            .item => |it| {
+                const n: u16 = @intCast(it.key.len);
+                if (n > w) w = n;
+            },
+            else => {},
+        }
+    }
+    break :blk w;
+};
+
+test "help catalog includes normal bindings" {
+    const required = [_][]const u8{
+        "j/k", "h/l", "0/$", "J/K", "[/]", "{/}", "(/)", "/", "n/N",
+        "Space f", "Space l", "i", "I", "d", "D", "t", "r", "?", "q",
+    };
+    for (required) |token| {
+        var found = false;
+        for (help_rows) |row| {
+            const key = switch (row) {
+                .item => |it| it.key,
+                else => continue,
+            };
+            if (std.mem.eql(u8, key, token)) {
+                found = true;
+                break;
+            }
+            var parts = std.mem.splitScalar(u8, key, '/');
+            while (parts.next()) |part| {
+                if (part.len > 0 and std.mem.eql(u8, part, token)) {
+                    found = true;
+                    break;
+                }
+            }
+            if (found) break;
+        }
+        try std.testing.expect(found);
+    }
+}
+
+fn paintHelp(scr: *tui.Screen, size: tui.Size, scroll: *usize) void {
     const bg = tui.Color{ .rgb = .{ .r = 0x12, .g = 0x12, .b = 0x14 } };
     const fg = tui.Color{ .rgb = .{ .r = 0xd0, .g = 0xd0, .b = 0xd0 } };
     const panel_bg = tui.Style{ .fg = fg, .bg = bg };
@@ -924,12 +1016,60 @@ fn paintHelp(scr: *tui.Screen, size: tui.Size) void {
         .bg = bg,
         .bold = true,
     };
+    const group_style = tui.Style{ .fg = fg, .bg = bg, .bold = true };
+    const bar_track = tui.Style{
+        .fg = .{ .rgb = .{ .r = 0x6a, .g = 0x7a, .b = 0x9a } },
+        .bg = bg,
+        .dim = true,
+    };
+    const bar_thumb = tui.Style{
+        .fg = .{ .rgb = .{ .r = 0xee, .g = 0xee, .b = 0xee } },
+        .bg = .{ .rgb = .{ .r = 0x4a, .g = 0x6a, .b = 0x9a } },
+        .bold = true,
+    };
 
-    const panel = listOverlayRect(size.cols, size.rows, 0);
+    const panel = listOverlayRect(size.cols, size.rows, help_rows.len);
     scr.fillRect(panel, ' ', panel_bg);
     scr.drawBox(panel, panel_frame);
     if (panel.h > 0 and panel.w > 2) {
         scr.putStr(panel.x + 2, panel.y, " help ", panel_frame, panel);
+    }
+    const inner = panel.inset(1);
+    if (inner.h == 0 or inner.w == 0) return;
+    const view_h: usize = inner.h;
+    const max_scroll = if (help_rows.len > view_h) help_rows.len - view_h else 0;
+    if (scroll.* > max_scroll) scroll.* = max_scroll;
+    const show_bar = help_rows.len > inner.h;
+    const text_area = if (show_bar)
+        tui.Rect{ .x = inner.x, .y = inner.y, .w = inner.w -| 2, .h = inner.h }
+    else
+        inner;
+    const start = scroll.*;
+    var row: u16 = 0;
+    while (row < inner.h) : (row += 1) {
+        const idx = start + row;
+        if (idx >= help_rows.len) break;
+        const y = inner.y + row;
+        switch (help_rows[idx]) {
+            .blank => {},
+            .group => |name| scr.putStr(inner.x, y, name, group_style, text_area),
+            .item => |it| {
+                scr.putStr(inner.x + 2, y, it.key, panel_bg, text_area);
+                const label_x = inner.x +| 2 +| help_key_w +| 2;
+                scr.putStr(label_x, y, it.label, panel_bg, text_area);
+            },
+        }
+    }
+    if (show_bar) {
+        const bar_x: u16 = inner.x + inner.w - 1;
+        const thumb = comment_input.scrollbarThumb(help_rows.len, inner.h, start, inner.h);
+        var br: u16 = 0;
+        while (br < inner.h) : (br += 1) {
+            const in_thumb = br >= thumb.start and br < thumb.start + thumb.len;
+            const st = if (in_thumb) bar_thumb else bar_track;
+            const ch: u21 = if (in_thumb) '█' else '│';
+            scr.setCell(bar_x, inner.y + br, .{ .char = ch, .width = 1, .style = st });
+        }
     }
 }
 
@@ -954,6 +1094,7 @@ fn paint(
     list_items: []const store.Comment,
     list_cursor: usize,
     list_scroll: *usize,
+    help_scroll: *usize,
 ) void {
     // Diff line palette (truecolor). Documented together so sticky file
     // headers (#36) and body paints share one table. Hierarchy:
@@ -1335,7 +1476,7 @@ fn paint(
         paintCommentList(scr, size, list_items, list_cursor, list_scroll, &line_buf);
         scr.hideCursor();
     } else if (focus == .helping) {
-        paintHelp(scr, size);
+        paintHelp(scr, size, help_scroll);
         scr.hideCursor();
     }
 }
