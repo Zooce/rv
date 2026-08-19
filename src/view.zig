@@ -941,7 +941,7 @@ pub fn prevComment(rows: []const Row, locs: []const CommentLoc, cursor: usize) ?
 /// Searchable text for one display row, or `null` if `/` does not search it.
 ///
 /// In scope (v1): add / delete / context **body** line text only. File headers,
-/// hunk headers, and meta lines are excluded (`Space` `f` uses `searchPath`).
+/// hunk headers, and meta lines are excluded.
 pub fn searchText(row: Row) ?[]const u8 {
     return switch (row) {
         .line => |ln| switch (ln.kind) {
@@ -952,7 +952,7 @@ pub fn searchText(row: Row) ?[]const u8 {
     };
 }
 
-/// Path string for file-find (`Space` `f`), or `null` on non-header rows.
+/// Path string for a `.file_header` row, or `null` on non-header rows.
 /// Lands on the file header itself (not the first body/change line).
 pub fn searchPath(row: Row) ?[]const u8 {
     return switch (row) {
@@ -1027,8 +1027,8 @@ pub fn prevMatch(rows: []const Row, query: []const u8, cursor: usize) ?SearchHit
 }
 
 /// First file-header path match at or after `cursor`, wrapping from the top.
-/// Empty query or no hits → `null`. Used when Enter commits a `Space` `f` query.
-/// Multi-match: first hit from the cursor (same walk as `firstMatch`).
+/// Empty query or no hits → `null`. Multi-match: first hit from the cursor
+/// (same walk as `firstMatch`).
 pub fn firstPathMatch(rows: []const Row, query: []const u8, cursor: usize) ?SearchHit {
     if (query.len == 0 or rows.len == 0) return null;
     const cur = clampCursor(cursor, rows.len);

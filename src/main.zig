@@ -4,7 +4,7 @@
 //! comments → TUI (title bar is a short hint; `?` opens help). Keys: `j`/`k`,
 //! `h`/`l` pan, `0`/`$` col home/end, `[`/`]` hunk, `{`/`}` file header,
 //! `(`/`)` prev/next comment, `/` text search, `n`/`N` next/prev match,
-//! `Space` `f` file-path find, `Space` `l` comment list, `i`/`c`/`a`/`Enter`
+//! `Space` `f` file list, `Space` `l` comment list, `i`/`c`/`a`/`Enter`
 //! create or edit new, `I`/`C`/`A` old, `d` dismiss new, `D` dismiss old,
 //! `r` reload the loaded diff, `q` quit).
 //! Diff layout defaults to side-by-side when the terminal is wide enough;
@@ -29,11 +29,12 @@
 //! those text matches with wrap. No match leaves the cursor put and shows a
 //! footer note.
 //!
-//! File-path find (MVP-3b): `Space` then `f` opens the same footer prompt
-//! (prefix `/`, same keys). Enter jumps to the first matching **file header**
-//! from the cursor (wrap). Multi-match: that first hit only — `n`/`N` stay
-//! text-search. An unmatched `Space` leader is dropped; the next key is
-//! handled as normal. Esc cancels without moving the cursor.
+//! File list: `Space` then `f` opens a centered overlay of changed-file
+//! paths (flatten order). `j`/`k` move; Enter jumps to that file header and
+//! closes. Esc closes without moving the cursor. `q` still quits. Empty
+//! diff: empty overlay. Opens on the file under the cursor when there is
+//! one. An unmatched `Space` leader is dropped; the next key is handled as
+//! normal.
 //!
 //! Comment list: `Space` then `l` opens a centered overlay of live comments
 //! (same store as `rv list`). `j`/`k` move; Enter jumps with the same landing
@@ -41,7 +42,7 @@
 //! A row whose path/line is gone from the flatten stays in the list and shows
 //! a footer note. `q` still quits.
 //!
-//! Help: `?` in normal (or from the comment list) opens a centered overlay
+//! Help: `?` in normal (or from a list overlay) opens a centered overlay
 //! with the grouped key catalog. `j`/`k` scroll when it does not fit. `?` or
 //! Esc closes; `q` still quits. Other keys are ignored. While commenting or
 //! searching, `?` inserts a question mark. The title bar is a short hint.
@@ -142,16 +143,17 @@ fn runTui(alloc: std.mem.Allocator, io: std.Io, source: cli.Source) !u8 {
     var running = true;
     // Exactly one focus; cannot help, comment, search, and list at once.
     var focus: Focus = .normal;
-    // Scope for the open `/` prompt (text vs file path). Ignored otherwise.
-    var search_kind: SearchKind = .text;
-    // `Space` leader: next key may be `f` (file find) or `l` (comment list).
+    // `Space` leader: next key may be `f` (file list) or `l` (comment list).
     // Cleared on that next key.
     var leader_pending: bool = false;
     var draft: Draft = .{};
     defer draft.buf.deinit(alloc);
-    // Snapshot of `review.comments` while the list overlay is open.
+    // Snapshot of `review.comments` while the comment list overlay is open.
     var list_items: std.ArrayList(store.Comment) = .empty;
     defer list_items.deinit(alloc);
+    // Snapshot of file-header row indices while the file list overlay is open.
+    var file_items: std.ArrayList(usize) = .empty;
+    defer file_items.deinit(alloc);
     var list_cursor: usize = 0;
     var list_scroll: usize = 0;
     var help_scroll: usize = 0;
@@ -161,7 +163,7 @@ fn runTui(alloc: std.mem.Allocator, io: std.Io, source: cli.Source) !u8 {
     // One-shot footer note (owned bytes; len 0 = none). Cleared on next key.
     var note: StatusNote = .{};
 
-    paint(&scr, size, rows, sbs_slots, layout_pref, cursor, &scroll, &col_scroll, &review, source, focus, search_kind, draft.buf.items, draft.caret, &draft.scroll, draft.anchor, note.slice(), list_items.items, list_cursor, &list_scroll, &help_scroll);
+    paint(&scr, size, rows, sbs_slots, layout_pref, cursor, &scroll, &col_scroll, &review, source, focus, draft.buf.items, draft.caret, &draft.scroll, draft.anchor, note.slice(), list_items.items, file_items.items, list_cursor, &list_scroll, &help_scroll);
     try scr.present(&term);
 
     while (running) {
@@ -265,15 +267,6 @@ fn runTui(alloc: std.mem.Allocator, io: std.Io, source: cli.Source) !u8 {
                             focus = .normal;
                             if (draft.buf.items.len == 0) {
                                 draft.caret = 0;
-                            } else if (search_kind == .file) {
-                                // Single jump; do not replace the `/` n/N query.
-                                if (view.firstPathMatch(rows, draft.buf.items, cursor)) |hit| {
-                                    cursor = hit.index;
-                                    if (hit.wrapped) note.set("search wrapped");
-                                } else {
-                                    note.setFmt("Pattern not found: {s}", .{draft.buf.items});
-                                }
-                                draft.clear();
                             } else {
                                 last_query.clearRetainingCapacity();
                                 try last_query.appendSlice(alloc, draft.buf.items);
@@ -346,6 +339,37 @@ fn runTui(alloc: std.mem.Allocator, io: std.Io, source: cli.Source) !u8 {
                         .ctrl_c => running = false,
                         else => {},
                     },
+                    .files => switch (key) {
+                        .esc => {
+                            focus = .normal;
+                        },
+                        .enter => {
+                            if (list_cursor < file_items.items.len) {
+                                cursor = file_items.items[list_cursor];
+                                focus = .normal;
+                            }
+                        },
+                        .char => |c| {
+                            if (c == 'q' or c == 'Q') {
+                                running = false;
+                            } else if (c == '?') {
+                                help_scroll = 0;
+                                focus = .helping;
+                            } else if (c == 'j') {
+                                if (list_cursor + 1 < file_items.items.len) list_cursor += 1;
+                            } else if (c == 'k') {
+                                if (list_cursor > 0) list_cursor -= 1;
+                            }
+                        },
+                        .down => {
+                            if (list_cursor + 1 < file_items.items.len) list_cursor += 1;
+                        },
+                        .up => {
+                            if (list_cursor > 0) list_cursor -= 1;
+                        },
+                        .ctrl_c => running = false,
+                        else => {},
+                    },
                     .helping => switch (key) {
                         .esc => {
                             focus = .normal;
@@ -373,9 +397,21 @@ fn runTui(alloc: std.mem.Allocator, io: std.Io, source: cli.Source) !u8 {
                         switch (key) {
                             .char => |c| {
                                 if (after_leader and c == 'f') {
-                                    focus = .searching;
-                                    search_kind = .file;
-                                    draft.clear();
+                                    file_items.clearRetainingCapacity();
+                                    for (rows, 0..) |row, i| {
+                                        if (row == .file_header) try file_items.append(alloc, i);
+                                    }
+                                    list_cursor = 0;
+                                    list_scroll = 0;
+                                    if (view.currentFileStart(rows, cursor)) |start| {
+                                        for (file_items.items, 0..) |idx, n| {
+                                            if (idx == start) {
+                                                list_cursor = n;
+                                                break;
+                                            }
+                                        }
+                                    }
+                                    focus = .files;
                                 } else if (after_leader and c == 'l') {
                                     list_items.clearRetainingCapacity();
                                     try list_items.appendSlice(alloc, review.comments.items);
@@ -391,7 +427,6 @@ fn runTui(alloc: std.mem.Allocator, io: std.Io, source: cli.Source) !u8 {
                                     leader_pending = true;
                                 } else if (c == '/') {
                                     focus = .searching;
-                                    search_kind = .text;
                                     draft.clear();
                                 } else if (c == 'n') {
                                     if (last_query.items.len > 0) {
@@ -486,7 +521,7 @@ fn runTui(alloc: std.mem.Allocator, io: std.Io, source: cli.Source) !u8 {
             },
         }
         if (running) {
-            paint(&scr, size, rows, sbs_slots, layout_pref, cursor, &scroll, &col_scroll, &review, source, focus, search_kind, draft.buf.items, draft.caret, &draft.scroll, draft.anchor, note.slice(), list_items.items, list_cursor, &list_scroll, &help_scroll);
+            paint(&scr, size, rows, sbs_slots, layout_pref, cursor, &scroll, &col_scroll, &review, source, focus, draft.buf.items, draft.caret, &draft.scroll, draft.anchor, note.slice(), list_items.items, file_items.items, list_cursor, &list_scroll, &help_scroll);
             try scr.present(&term);
         }
     }
@@ -546,8 +581,9 @@ fn reloadDiff(
     cursor.* = new_cursor;
 }
 
-/// Key ownership: normal nav, comment draft, `/` search prompt, comment list, or help.
-const Focus = enum { normal, commenting, searching, listing, helping };
+/// Key ownership: normal nav, comment draft, `/` search prompt, comment list,
+/// file list, or help.
+const Focus = enum { normal, commenting, searching, listing, files, helping };
 
 /// Footer box buffer plus comment-mode extras. Search uses `buf` and `caret` only.
 const Draft = struct {
@@ -564,9 +600,6 @@ const Draft = struct {
         self.edit_id = null;
     }
 };
-
-/// What the open `/` prompt matches. `n`/`N` always use `.text` (`last_query`).
-const SearchKind = enum { text, file };
 
 /// One-shot footer message. Bytes always live in `buf`; `len == 0` means none.
 /// Avoids optional slices that sometimes point at static strings and sometimes
@@ -925,6 +958,80 @@ fn paintCommentList(
     }
 }
 
+fn paintFileList(
+    scr: *tui.Screen,
+    size: tui.Size,
+    rows: []const view.Row,
+    items: []const usize,
+    cursor: usize,
+    scroll: *usize,
+) void {
+    const bg = tui.Color{ .rgb = .{ .r = 0x12, .g = 0x12, .b = 0x14 } };
+    const fg = tui.Color{ .rgb = .{ .r = 0xd0, .g = 0xd0, .b = 0xd0 } };
+    const panel_bg = tui.Style{ .fg = fg, .bg = bg };
+    const panel_frame = tui.Style{
+        .fg = .{ .rgb = .{ .r = 0x5d, .g = 0x81, .b = 0xb7 } },
+        .bg = bg,
+        .bold = true,
+    };
+    const row_cur = tui.Style{
+        .fg = fg,
+        .bg = .{ .rgb = .{ .r = 0x2a, .g = 0x2a, .b = 0x30 } },
+        .bold = true,
+    };
+    const bar_track = tui.Style{
+        .fg = .{ .rgb = .{ .r = 0x6a, .g = 0x7a, .b = 0x9a } },
+        .bg = bg,
+        .dim = true,
+    };
+    const bar_thumb = tui.Style{
+        .fg = .{ .rgb = .{ .r = 0xee, .g = 0xee, .b = 0xee } },
+        .bg = .{ .rgb = .{ .r = 0x4a, .g = 0x6a, .b = 0x9a } },
+        .bold = true,
+    };
+
+    const panel = listOverlayRect(size.cols, size.rows, items.len);
+    scr.fillRect(panel, ' ', panel_bg);
+    scr.drawBox(panel, panel_frame);
+    const inner = panel.inset(1);
+    if (panel.h > 0 and panel.w > 2) {
+        scr.putStr(panel.x + 2, panel.y, " files ", panel_frame, panel);
+    }
+    ensureListCursorVisible(scroll, cursor, inner.h, items.len);
+    if (inner.h == 0 or inner.w == 0) return;
+    if (items.len == 0) {
+        scr.putStr(inner.x, inner.y, "no files", panel_bg, inner);
+        return;
+    }
+    const show_bar = items.len > inner.h;
+    const text_area = if (show_bar)
+        tui.Rect{ .x = inner.x, .y = inner.y, .w = inner.w -| 2, .h = inner.h }
+    else
+        inner;
+    const start = scroll.*;
+    var row: u16 = 0;
+    while (row < inner.h) : (row += 1) {
+        const idx = start + row;
+        if (idx >= items.len) break;
+        const y = inner.y + row;
+        const st = if (idx == cursor) row_cur else panel_bg;
+        scr.fillRect(.{ .x = inner.x, .y = y, .w = inner.w, .h = 1 }, ' ', st);
+        const path = rows[items[idx]].file_header.path;
+        scr.putStr(inner.x, y, path, st, text_area);
+    }
+    if (show_bar) {
+        const bar_x: u16 = inner.x + inner.w - 1;
+        const thumb = comment_input.scrollbarThumb(items.len, inner.h, start, inner.h);
+        var br: u16 = 0;
+        while (br < inner.h) : (br += 1) {
+            const in_thumb = br >= thumb.start and br < thumb.start + thumb.len;
+            const st = if (in_thumb) bar_thumb else bar_track;
+            const ch: u21 = if (in_thumb) '█' else '│';
+            scr.setCell(bar_x, inner.y + br, .{ .char = ch, .width = 1, .style = st });
+        }
+    }
+}
+
 const HelpRow = union(enum) {
     group: []const u8,
     item: struct { key: []const u8, label: []const u8 },
@@ -944,7 +1051,7 @@ const help_rows = [_]HelpRow{
     .{ .group = "Search" },
     .{ .item = .{ .key = "/", .label = "text in the diff" } },
     .{ .item = .{ .key = "n/N", .label = "next / prev match" } },
-    .{ .item = .{ .key = "Space f", .label = "file path" } },
+    .{ .item = .{ .key = "Space f", .label = "file list" } },
     .{ .item = .{ .key = "Space l", .label = "comment list" } },
     .blank,
     .{ .group = "Comments" },
@@ -1085,13 +1192,13 @@ fn paint(
     review: *const store.Review,
     source: cli.Source,
     focus: Focus,
-    search_kind: SearchKind,
     draft: []const u8,
     draft_caret: usize,
     draft_scroll: *usize,
     draft_anchor: view.Anchor,
     status_note: []const u8,
     list_items: []const store.Comment,
+    file_items: []const usize,
     list_cursor: usize,
     list_scroll: *usize,
     help_scroll: *usize,
@@ -1194,11 +1301,9 @@ fn paint(
                 .old => "rv  create/edit old  Enter save  Esc cancel  ↑↓ scroll",
                 .context => "rv  create/edit  Enter save  Esc cancel  ↑↓ scroll",
             },
-            .searching => switch (search_kind) {
-                .text => "rv  search  Enter jump  Esc cancel",
-                .file => "rv  file  Enter jump  Esc cancel",
-            },
+            .searching => "rv  search  Enter jump  Esc cancel",
             .listing => "rv  comments  j/k move  Enter jump  Esc close  q quit",
+            .files => "rv  files  j/k move  Enter jump  Esc close  q quit",
             .helping => "rv  help  j/k  Esc/? close  q quit",
             .normal => "rv  j/k  /  i/I  ? help  q quit",
         };
@@ -1445,8 +1550,8 @@ fn paint(
             const cy: u16 = footer_top + caret.y_off;
             scr.setCursor(cx, cy);
         } else if (focus == .searching) {
-            // Single-line prompt (`/` text or `Space` `f` paths): gutter col 0,
-            // `/` at 1, query at 2+. Caret 0 sits after `/` (column 2).
+            // Single-line `/` text prompt: gutter col 0, `/` at 1, query at 2+.
+            // Caret 0 sits after `/` (column 2).
             const footer_y = footer_top;
             fillRow(scr, footer_y, footer_style);
             const caret_byte = @min(draft_caret, draft.len);
@@ -1474,6 +1579,9 @@ fn paint(
 
     if (focus == .listing) {
         paintCommentList(scr, size, list_items, list_cursor, list_scroll, &line_buf);
+        scr.hideCursor();
+    } else if (focus == .files) {
+        paintFileList(scr, size, rows, file_items, list_cursor, list_scroll);
         scr.hideCursor();
     } else if (focus == .helping) {
         paintHelp(scr, size, help_scroll);

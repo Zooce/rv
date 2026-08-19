@@ -97,25 +97,25 @@ Not a multi-user code-review platform. Not a GitHub replacement. A **personal re
 | `[` / `]` | Jump to the **previous / next hunk**. |
 | `(` / `)` | Jump to the **previous / next live comment**. Cursor goes to that comment’s side (old line or new line). Wraps; no comments stays put with a footer note. |
 | `/` | **Search the diff text** — incremental find across the loaded changeset (like vim `/`). `n` / `N` next / previous match. |
-| `Space` `f` | **Search changed files** — same prompt as `/`, scoped to **paths in the review** (not a floating file picker). Type a fragment; Enter jumps to the matching **file header** (first hit from the cursor, wrapping). `n`/`N` stay text-search. |
+| `Space` `f` | **List files** — floating overlay on the still-painted diff. One row per changed file (flatten order). `j`/`k` move; Enter jumps to that **file header** and closes. Esc closes without moving the cursor. `q` still quits. Empty diff: empty overlay. Opens on the file under the cursor when there is one. |
 | `Space` `l` | **List comments** — floating overlay on the still-painted diff (same live board as `rv list`). `j`/`k` move; Enter jumps to that comment’s side (same landing as `(`/`)`) and closes the overlay. Esc closes without moving the cursor. `q` still quits. Empty board: empty overlay. A row whose path/line is gone from the flatten: footer note, stay in the list. Read-only: edit or dismiss after jumping. |
-| `?` | **Help** — centered overlay with the grouped key catalog (motion, search, comments, session, prompts). The title bar is a short hint; this is the full list. `j`/`k` (and arrows) scroll when it does not fit. `?` or Esc closes. `q` still quits. From the comment list, `?` replaces the list with help. While commenting or searching, `?` inserts a question mark. |
+| `?` | **Help** — centered overlay with the grouped key catalog (motion, search, comments, session, prompts). The title bar is a short hint; this is the full list. `j`/`k` (and arrows) scroll when it does not fit. `?` or Esc closes. `q` still quits. From a file or comment list, `?` replaces the list with help. While commenting or searching, `?` inserts a question mark. |
 | `i` / `c` / `a` / `Enter` | Create or edit the comment on **new** (right pane in side-by-side, or the current `+` / context line in unified). Open a box **below the cursor**. Same action; pick the muscle memory you prefer. |
 | `I` / `C` / `A` | Create or edit the comment on **old** (left pane in side-by-side, or the current `-` / context line in unified). Missing side does nothing. |
 | `d` | Dismiss the comment on **new** (right) at the cursor. Gone from the board; no confirm. |
 | `D` | Dismiss the comment on **old** (left). Missing side or no comment there: footer note; does not take the other pane. |
-| `r` | **Reload** the loaded diff from the same source (re-runs the startup git load). Comments in `.rv` stay. Failed reload keeps the previous view and shows a footer error. Not bound while typing a comment (or in search / the comment list). |
+| `r` | **Reload** the loaded diff from the same source (re-runs the startup git load). Comments in `.rv` stay. Failed reload keeps the previous view and shows a footer error. Not bound while typing a comment (or in search / a list overlay). |
 | (later) | Page/half-page scroll, more `Space` leader maps — same vocabulary |
 
 Contrast with tools where `j`/`k` only pan the view and comment placement needs a mouse: in `rv`, **where the cursor is is where the comment goes.**
 
-#### Search (no floating pickers)
+#### Search
 
-Both searches use one pattern: a **prompt on the status/command line** (vim-style), not a centered modal list.
+`/` is a **prompt on the status/command line** (vim-style). Query against **diff content** (added/removed/context lines as shown). Enter jumps to the first match; `n` / `N` walk matches. Prefer this over a separate search UI.
 
-- **`/`** — query against **diff content** (added/removed/context lines as shown). Landing on a match moves the **current-line cursor** there.
-- **`Space` `f`** — query against **changed file paths** only. Same prompt UX as `/` (a specialized `/` for the file set). Enter lands on the **file header** of the first match at or after the cursor (wraps). File find is a single jump; `n`/`N` still walk the last `/` text query.
-- Prefer **filter-as-you-type + jump** over browsing a separate UI. Optional match count / next-hit hints in the footer are fine; a discrete “picker widget” is not required for v1.
+#### File list
+
+`Space` `f` is a list overlay, not a search prompt — same pattern as `Space` `l`. It opens a centered overlay so the diff stays visible in the margins. Rows are flatten order: one display path per file header. Opening inside a file selects that file.
 
 #### Comment list
 
@@ -129,7 +129,7 @@ Entering comment mode inserts an inline **comment box under the current cursor p
 j/k           # land the current-line highlight on the code you care about
 h/l           # optional: set start column
 / query       # find text in the diff; n/N walk matches
-Space f query # find a changed file by path fragment
+Space f       # list changed files; j/k; Enter jump; Esc close
 Space l       # list comments; j/k; Enter jump; Esc close
 ?             # help overlay; ? or Esc close
 v or V        # optional: start character- or line-wise range (vim-flavored)
@@ -222,7 +222,7 @@ $ rv                         # confirm, leave more, continue
 
 1. **Clean and simple** - enjoyable to use every day; no cluttered "IDE in the terminal."
 2. **Performance** - no slop. Instant open on large diffs is a requirement, not a nice-to-have.
-3. **Vim / Helix-like keybindings** - `j`/`k` move a **highlighted current line** (not merely scroll); `h`/`l` move by column; `[`/`]` jump hunks; `(`/`)` jump comments; `/` search diff text; `Space` `f` search changed files (specialized `/`, not a floating picker); `Space` `l` list comments (overlay); `?` help (overlay); `i`/`c`/`a`/`Enter` create or edit on new, `I`/`C`/`A` on old (box below the cursor); `d`/`D` dismiss new/old.
+3. **Vim / Helix-like keybindings** - `j`/`k` move a **highlighted current line** (not merely scroll); `h`/`l` move by column; `[`/`]` jump hunks; `(`/`)` jump comments; `/` search diff text; `Space` `f` list changed files (overlay); `Space` `l` list comments (overlay); `?` help (overlay); `i`/`c`/`a`/`Enter` create or edit on new, `I`/`C`/`A` on old (box below the cursor); `d`/`D` dismiss new/old.
 4. **Diff-first layout** - files and hunks from the *change set*, not a full project tree.
 5. **Precise selection** - comments must attach to the exact span you care about, including overlapping ranges.
 6. **Mouse optional** - never required to place or target a comment.
