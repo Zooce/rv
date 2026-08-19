@@ -1,11 +1,12 @@
 //! `rv` entry point — CLI dispatch + full-screen diff review (MVP-1 / MVP-2.2).
 //!
 //! With no args: load local-only git diff → flatten rows → load `.rv`
-//! comments → TUI (`j`/`k`, `h`/`l` pan, `0`/`$` col home/end, `[`/`]` hunk,
-//! `{`/`}` file header, `(`/`)` prev/next comment, `/` text search, `n`/`N`
-//! next/prev match, `Space` `f` file-path find, `Space` `l` comment list,
-//! `i`/`c`/`a`/`Enter` create or edit new, `I`/`C`/`A` old, `d` dismiss new,
-//! `D` dismiss old, `r` reload the loaded diff, `q` quit).
+//! comments → TUI (title bar is a short hint; `?` opens help). Keys: `j`/`k`,
+//! `h`/`l` pan, `0`/`$` col home/end, `[`/`]` hunk, `{`/`}` file header,
+//! `(`/`)` prev/next comment, `/` text search, `n`/`N` next/prev match,
+//! `Space` `f` file-path find, `Space` `l` comment list, `i`/`c`/`a`/`Enter`
+//! create or edit new, `I`/`C`/`A` old, `d` dismiss new, `D` dismiss old,
+//! `r` reload the loaded diff, `q` quit).
 //! Diff layout defaults to side-by-side when the terminal is wide enough;
 //! falls back to unified when narrow. `t` toggles session preference
 //! (explicit unified stays unified even when wide).
@@ -39,6 +40,10 @@
 //! as `(`/`)` and closes the overlay. Esc closes without moving the cursor.
 //! A row whose path/line is gone from the flatten stays in the list and shows
 //! a footer note. `q` still quits.
+//!
+//! Help: `?` in normal (or from the comment list) opens a centered overlay
+//! on the still-painted diff. `?` or Esc closes; `q` still quits. Other keys
+//! are ignored. While commenting or searching, `?` inserts a question mark.
 
 const std = @import("std");
 const git = @import("git");
@@ -134,7 +139,7 @@ fn runTui(alloc: std.mem.Allocator, io: std.Io, source: cli.Source) !u8 {
     // Prefer side-by-side; auto-unified when narrow. `t` flips session preference.
     var layout_pref: view.LayoutPref = .side_by_side;
     var running = true;
-    // Exactly one focus; cannot comment, search, and list at once.
+    // Exactly one focus; cannot help, comment, search, and list at once.
     var focus: Focus = .normal;
     // Scope for the open `/` prompt (text vs file path). Ignored otherwise.
     var search_kind: SearchKind = .text;
@@ -321,6 +326,8 @@ fn runTui(alloc: std.mem.Allocator, io: std.Io, source: cli.Source) !u8 {
                         .char => |c| {
                             if (c == 'q' or c == 'Q') {
                                 running = false;
+                            } else if (c == '?') {
+                                focus = .helping;
                             } else if (c == 'j') {
                                 if (list_cursor + 1 < list_items.items.len) list_cursor += 1;
                             } else if (c == 'k') {
@@ -332,6 +339,20 @@ fn runTui(alloc: std.mem.Allocator, io: std.Io, source: cli.Source) !u8 {
                         },
                         .up => {
                             if (list_cursor > 0) list_cursor -= 1;
+                        },
+                        .ctrl_c => running = false,
+                        else => {},
+                    },
+                    .helping => switch (key) {
+                        .esc => {
+                            focus = .normal;
+                        },
+                        .char => |c| {
+                            if (c == 'q' or c == 'Q') {
+                                running = false;
+                            } else if (c == '?') {
+                                focus = .normal;
+                            }
                         },
                         .ctrl_c => running = false,
                         else => {},
@@ -354,6 +375,8 @@ fn runTui(alloc: std.mem.Allocator, io: std.Io, source: cli.Source) !u8 {
                                     focus = .listing;
                                 } else if (c == 'q' or c == 'Q') {
                                     running = false;
+                                } else if (c == '?') {
+                                    focus = .helping;
                                 } else if (c == ' ') {
                                     leader_pending = true;
                                 } else if (c == '/') {
@@ -513,8 +536,8 @@ fn reloadDiff(
     cursor.* = new_cursor;
 }
 
-/// Key ownership: normal nav, comment draft, `/` search prompt, or comment list.
-const Focus = enum { normal, commenting, searching, listing };
+/// Key ownership: normal nav, comment draft, `/` search prompt, comment list, or help.
+const Focus = enum { normal, commenting, searching, listing, helping };
 
 /// Footer box buffer plus comment-mode extras. Search uses `buf` and `caret` only.
 const Draft = struct {
@@ -892,6 +915,24 @@ fn paintCommentList(
     }
 }
 
+fn paintHelp(scr: *tui.Screen, size: tui.Size) void {
+    const bg = tui.Color{ .rgb = .{ .r = 0x12, .g = 0x12, .b = 0x14 } };
+    const fg = tui.Color{ .rgb = .{ .r = 0xd0, .g = 0xd0, .b = 0xd0 } };
+    const panel_bg = tui.Style{ .fg = fg, .bg = bg };
+    const panel_frame = tui.Style{
+        .fg = .{ .rgb = .{ .r = 0x5d, .g = 0x81, .b = 0xb7 } },
+        .bg = bg,
+        .bold = true,
+    };
+
+    const panel = listOverlayRect(size.cols, size.rows, 0);
+    scr.fillRect(panel, ' ', panel_bg);
+    scr.drawBox(panel, panel_frame);
+    if (panel.h > 0 and panel.w > 2) {
+        scr.putStr(panel.x + 2, panel.y, " help ", panel_frame, panel);
+    }
+}
+
 fn paint(
     scr: *tui.Screen,
     size: tui.Size,
@@ -1017,7 +1058,8 @@ fn paint(
                 .file => "rv  file  Enter jump  Esc cancel",
             },
             .listing => "rv  comments  j/k move  Enter jump  Esc close  q quit",
-            .normal => "rv  j/k line  h/l pan  0/$  J/K change  [/] hunk  {/} file  (/) comment  / n/N search  Space f files  Space l comments  t layout  i/I create/edit  d/D dismiss  r reload  q quit",
+            .helping => "rv  help  j/k  Esc/? close  q quit",
+            .normal => "rv  j/k  /  i/I  ? help  q quit",
         };
         scr.putStr(1, 0, help, title_style, null);
     }
@@ -1291,6 +1333,9 @@ fn paint(
 
     if (focus == .listing) {
         paintCommentList(scr, size, list_items, list_cursor, list_scroll, &line_buf);
+        scr.hideCursor();
+    } else if (focus == .helping) {
+        paintHelp(scr, size);
         scr.hideCursor();
     }
 }
