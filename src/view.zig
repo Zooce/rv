@@ -843,6 +843,167 @@ pub fn restoreCursor(rows: []const Row, mark: CursorMark) usize {
     return 0;
 }
 
+/// File or hunk to stage/unstage at `cursor`. `path` borrows from `rows`.
+/// `whole_file` selects the containing file (Space S from a hunk). On a file
+/// header, the target is always the file. `null` on empty lists, section
+/// headers, and untagged (range) rows.
+pub const IndexTarget = struct {
+    path: []const u8,
+    group: diff.Group,
+    /// 0-based hunk in this file; `null` means the whole file.
+    hunk_i: ?usize,
+    first: usize,
+    last: usize,
+};
+
+pub fn indexTargetAt(rows: []const Row, cursor: usize, whole_file: bool) ?IndexTarget {
+    if (rows.len == 0) return null;
+    const cur = clampCursor(cursor, rows.len);
+    if (rows[cur] == .section_header) return null;
+    const fi = currentFileStart(rows, cur) orelse return null;
+    const fh = rows[fi].file_header;
+    const group = fh.group orelse return null;
+    const in_hunk = currentHunkInFile(rows, cur);
+    if (whole_file or in_hunk == null) {
+        return .{
+            .path = fh.path,
+            .group = group,
+            .hunk_i = null,
+            .first = fi,
+            .last = rowSpanLast(rows, fi, true),
+        };
+    }
+    const hi = in_hunk.?;
+    return .{
+        .path = fh.path,
+        .group = group,
+        .hunk_i = hunkIndexInFile(rows, fi, hi),
+        .first = hi,
+        .last = rowSpanLast(rows, hi, false),
+    };
+}
+
+/// Remaining change to land on after the target is removed from this load.
+/// `path` borrows from `rows`. `hunk_i` is the index in that file *after*
+/// removing a same-file hunk target (unchanged for a different file).
+pub const NeighborMark = struct {
+    path: []const u8,
+    group: diff.Group,
+    hunk_i: ?usize,
+};
+
+/// Prefer the next file/hunk header after `target.last`; else the previous
+/// header before `target.first`. `null` when the target is the only change.
+pub fn neighborMark(rows: []const Row, target: IndexTarget) ?NeighborMark {
+    if (headerAfter(rows, target.last)) |idx| {
+        return markAtHeader(rows, idx, target);
+    }
+    if (target.first > 0) {
+        if (headerBefore(rows, target.first)) |idx| {
+            return markAtHeader(rows, idx, target);
+        }
+    }
+    return null;
+}
+
+/// Land on `mark`'s file (and hunk, if set) after reload. Missing hunk → that
+/// file's header. Missing file → row 0.
+pub fn restoreNeighbor(rows: []const Row, mark: NeighborMark) usize {
+    if (rows.len == 0) return 0;
+    for (rows, 0..) |row, i| {
+        switch (row) {
+            .file_header => |fh| {
+                const g = fh.group orelse continue;
+                if (g != mark.group or !std.mem.eql(u8, fh.path, mark.path)) continue;
+                const want = mark.hunk_i orelse return i;
+                var n: usize = 0;
+                var j = i + 1;
+                while (j < rows.len) : (j += 1) {
+                    switch (rows[j]) {
+                        .hunk_header => {
+                            if (n == want) return j;
+                            n += 1;
+                        },
+                        .file_header, .section_header => break,
+                        .line => {},
+                    }
+                }
+                return i;
+            },
+            else => {},
+        }
+    }
+    return 0;
+}
+
+fn rowSpanLast(rows: []const Row, start: usize, whole_file: bool) usize {
+    var i = start + 1;
+    while (i < rows.len) : (i += 1) {
+        switch (rows[i]) {
+            .file_header, .section_header => return i - 1,
+            .hunk_header => if (!whole_file) return i - 1,
+            .line => {},
+        }
+    }
+    return rows.len - 1;
+}
+
+fn hunkIndexInFile(rows: []const Row, file_start: usize, hunk_row: usize) usize {
+    var n: usize = 0;
+    var i = file_start;
+    while (i < rows.len) : (i += 1) {
+        switch (rows[i]) {
+            .hunk_header => {
+                if (i == hunk_row) return n;
+                n += 1;
+            },
+            .file_header => if (i != file_start) return n,
+            .section_header => return n,
+            .line => {},
+        }
+    }
+    return n;
+}
+
+fn headerAfter(rows: []const Row, last: usize) ?usize {
+    var i = last + 1;
+    while (i < rows.len) : (i += 1) {
+        switch (rows[i]) {
+            .file_header, .hunk_header => return i,
+            .section_header, .line => {},
+        }
+    }
+    return null;
+}
+
+fn headerBefore(rows: []const Row, first: usize) ?usize {
+    var i = first;
+    while (i > 0) {
+        i -= 1;
+        switch (rows[i]) {
+            .file_header, .hunk_header => return i,
+            .section_header, .line => {},
+        }
+    }
+    return null;
+}
+
+fn markAtHeader(rows: []const Row, idx: usize, target: IndexTarget) ?NeighborMark {
+    const fi = currentFileStart(rows, idx) orelse return null;
+    const fh = rows[fi].file_header;
+    const group = fh.group orelse return null;
+    var hunk_i: ?usize = null;
+    if (rows[idx] == .hunk_header) {
+        hunk_i = hunkIndexInFile(rows, fi, idx);
+        if (target.hunk_i) |t| {
+            if (std.mem.eql(u8, fh.path, target.path) and group == target.group) {
+                if (hunk_i.? > t) hunk_i = hunk_i.? - 1;
+            }
+        }
+    }
+    return .{ .path = fh.path, .group = group, .hunk_i = hunk_i };
+}
+
 /// Status footer fields for `cursor` within `rows`.
 pub fn statusAt(rows: []const Row, cursor: usize) Status {
     if (rows.len == 0) {
@@ -2505,4 +2666,174 @@ test "restoreCursor exact file fallback gone" {
     try testing.expectEqual(4, restoreCursor(new_rows, cursorMarkAt(old_rows, 1).?));
     try testing.expectEqual(0, restoreCursor(new_rows, cursorMarkAt(old_rows, 6).?));
     try testing.expectEqual(0, restoreCursor(new_rows, .{ .path = "gone" }));
+}
+
+test "indexTargetAt empty section and untagged" {
+    try testing.expect(indexTargetAt(&.{}, 0, false) == null);
+
+    const fixture =
+        \\diff --git a/f b/f
+        \\--- a/f
+        \\+++ b/f
+        \\@@ -1 +1 @@
+        \\-old
+        \\+new
+    ;
+    var d = try diff.parse(testing.allocator, fixture);
+    defer d.deinit();
+    const rows = try flatten(testing.allocator, &d);
+    defer testing.allocator.free(rows);
+    try testing.expect(indexTargetAt(rows, 0, false) == null);
+    try testing.expect(indexTargetAt(rows, 2, false) == null);
+
+    var fix = try threeGroupFixture(testing.allocator);
+    defer fix.d.deinit();
+    defer testing.allocator.free(fix.rows);
+    try testing.expect(indexTargetAt(fix.rows, 0, false) == null);
+    try testing.expect(indexTargetAt(fix.rows, 5, true) == null);
+}
+
+test "indexTargetAt file hunk and file-from-hunk" {
+    var fix = try threeGroupFixture(testing.allocator);
+    defer fix.d.deinit();
+    defer testing.allocator.free(fix.rows);
+    const rows = fix.rows;
+    // 0 Unstaged, 1 file a, 2 hunk, 3 del, 4 add, 5 Untracked, 6 file u, …
+    // 9 Staged, 10 file a, 11 hunk, 12 ctx, 13 add.
+
+    const file = indexTargetAt(rows, 1, false).?;
+    try testing.expectEqualStrings("a", file.path);
+    try testing.expectEqual(diff.Group.unstaged, file.group);
+    try testing.expect(file.hunk_i == null);
+    try testing.expectEqual(1, file.first);
+    try testing.expectEqual(4, file.last);
+
+    const hunk = indexTargetAt(rows, 3, false).?;
+    try testing.expectEqualStrings("a", hunk.path);
+    try testing.expectEqual(diff.Group.unstaged, hunk.group);
+    try testing.expectEqual(0, hunk.hunk_i.?);
+    try testing.expectEqual(2, hunk.first);
+    try testing.expectEqual(4, hunk.last);
+
+    const from_hunk = indexTargetAt(rows, 3, true).?;
+    try testing.expect(from_hunk.hunk_i == null);
+    try testing.expectEqual(1, from_hunk.first);
+    try testing.expectEqual(4, from_hunk.last);
+
+    const staged = indexTargetAt(rows, 12, false).?;
+    try testing.expectEqualStrings("a", staged.path);
+    try testing.expectEqual(diff.Group.staged, staged.group);
+    try testing.expectEqual(0, staged.hunk_i.?);
+}
+
+test "neighborMark following hunk next file and only change" {
+    const two_hunks =
+        \\diff --git a/a b/a
+        \\--- a/a
+        \\+++ b/a
+        \\@@ -1 +1 @@
+        \\-old1
+        \\+new1
+        \\@@ -10 +10 @@
+        \\-old2
+        \\+new2
+    ;
+    var d = try diff.parsePieces(testing.allocator, &.{
+        .{ .text = two_hunks, .group = .unstaged },
+    });
+    defer d.deinit();
+    const rows = try flatten(testing.allocator, &d);
+    defer testing.allocator.free(rows);
+    // 0 Unstaged, 1 file, 2 h0, 3 del, 4 add, 5 h1, 6 del, 7 add.
+
+    const first = indexTargetAt(rows, 3, false).?;
+    const after_first = neighborMark(rows, first).?;
+    try testing.expectEqualStrings("a", after_first.path);
+    try testing.expectEqual(diff.Group.unstaged, after_first.group);
+    try testing.expectEqual(0, after_first.hunk_i.?);
+
+    const second = indexTargetAt(rows, 6, false).?;
+    const before_second = neighborMark(rows, second).?;
+    try testing.expectEqualStrings("a", before_second.path);
+    try testing.expectEqual(0, before_second.hunk_i.?);
+
+    var fix = try threeGroupFixture(testing.allocator);
+    defer fix.d.deinit();
+    defer testing.allocator.free(fix.rows);
+    const next_file = neighborMark(fix.rows, indexTargetAt(fix.rows, 3, false).?).?;
+    try testing.expectEqualStrings("u", next_file.path);
+    try testing.expectEqual(diff.Group.untracked, next_file.group);
+    try testing.expect(next_file.hunk_i == null);
+
+    const only =
+        \\diff --git a/u b/u
+        \\new file mode 100644
+        \\--- /dev/null
+        \\+++ b/u
+        \\@@ -0,0 +1 @@
+        \\+hi
+    ;
+    var d_only = try diff.parsePieces(testing.allocator, &.{
+        .{ .text = only, .group = .untracked },
+    });
+    defer d_only.deinit();
+    const only_rows = try flatten(testing.allocator, &d_only);
+    defer testing.allocator.free(only_rows);
+    // Whole file is the only change: no following or previous header.
+    try testing.expect(neighborMark(only_rows, indexTargetAt(only_rows, 1, false).?) == null);
+    // Only hunk: previous header is that file’s row.
+    const prev_file = neighborMark(only_rows, indexTargetAt(only_rows, 2, false).?).?;
+    try testing.expectEqualStrings("u", prev_file.path);
+    try testing.expectEqual(diff.Group.untracked, prev_file.group);
+    try testing.expect(prev_file.hunk_i == null);
+}
+
+test "restoreNeighbor dest hunk file fallback and gone" {
+    try testing.expectEqual(0, restoreNeighbor(&.{}, .{
+        .path = "a",
+        .group = .unstaged,
+        .hunk_i = 0,
+    }));
+
+    const remaining =
+        \\diff --git a/a b/a
+        \\--- a/a
+        \\+++ b/a
+        \\@@ -10 +10 @@
+        \\-old2
+        \\+new2
+    ;
+    var d = try diff.parsePieces(testing.allocator, &.{
+        .{ .text = remaining, .group = .unstaged },
+    });
+    defer d.deinit();
+    const rows = try flatten(testing.allocator, &d);
+    defer testing.allocator.free(rows);
+    // 0 Unstaged, 1 file, 2 hunk, 3 del, 4 add.
+
+    try testing.expectEqual(2, restoreNeighbor(rows, .{
+        .path = "a",
+        .group = .unstaged,
+        .hunk_i = 0,
+    }));
+    try testing.expectEqual(1, restoreNeighbor(rows, .{
+        .path = "a",
+        .group = .unstaged,
+        .hunk_i = 4,
+    }));
+    try testing.expectEqual(1, restoreNeighbor(rows, .{
+        .path = "a",
+        .group = .unstaged,
+        .hunk_i = null,
+    }));
+    try testing.expectEqual(0, restoreNeighbor(rows, .{
+        .path = "a",
+        .group = .staged,
+        .hunk_i = 0,
+    }));
+    try testing.expectEqual(0, restoreNeighbor(rows, .{
+        .path = "gone",
+        .group = .unstaged,
+        .hunk_i = null,
+    }));
 }

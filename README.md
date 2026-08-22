@@ -99,6 +99,8 @@ Not a multi-user code-review platform. Not a GitHub replacement. A **personal re
 | `/` | **Search the diff text** — incremental find across the loaded changeset (like vim `/`). `n` / `N` next / previous match. |
 | `Space` `f` | **List files** — floating overlay on the still-painted diff. One row per changed file (flatten order). `j`/`k` move; Enter jumps to that **file header** and closes. Esc closes without moving the cursor. `q` still quits. Empty diff: empty overlay. Opens on the file under the cursor when there is one. |
 | `Space` `l` | **List comments** — floating overlay on the still-painted diff (same live board as `rv list`). `j`/`k` move; Enter jumps to that comment’s side (same landing as `(`/`)`) and closes the overlay. Esc closes without moving the cursor. `q` still quits. Empty board: empty overlay. A row whose path/line is gone from the flatten: footer note, stay in the list. Read-only: edit or dismiss after jumping. |
+| `Space` `Space` | **Stage or unstage** the current file (on a file header) or hunk (in a hunk). Local review only. Far-right hints on the current file and hunk rows name the action and chord. Range loads (`rv main...HEAD`) ignore this chord and show no hints. Git failure: centered overlay; Enter or Esc dismisses. |
+| `Space` `S` | **Stage or unstage the containing file** while the cursor is in a hunk. Local only. Temporary stand-in until Ctrl bindings exist. |
 | `?` | **Help** — centered overlay with the grouped key catalog (motion, search, comments, session, prompts). The title bar is a short hint; this is the full list. `j`/`k` (and arrows) scroll when it does not fit. `?` or Esc closes. `q` still quits. From a file or comment list, `?` replaces the list with help. While commenting or searching, `?` inserts a question mark. |
 | `i` / `c` / `a` / `Enter` | Create or edit the comment on **new** (right pane in side-by-side, or the current `+` / context line in unified). Open a box **below the cursor**. Same action; pick the muscle memory you prefer. |
 | `I` / `C` / `A` | Create or edit the comment on **old** (left pane in side-by-side, or the current `-` / context line in unified). Missing side does nothing. |
@@ -205,8 +207,9 @@ $ grok   # or claude - agent implements a feature
 
 $ rv     # local changes only (empty when the worktree is clean)
          # j/k line; h/l col; [/] hunks; (/) comments; / text; Space f files
-         # Space l comments; i/c/a/Enter -> create or edit new; I/C/A -> old
-         # d dismiss new; D dismiss old; r reload; ? help
+         # Space l comments; Space Space stage/unstage file or hunk (local)
+         # Space S file from hunk (until Ctrl); i/c/a/Enter -> create or edit new
+         # I/C/A -> old; d dismiss new; D dismiss old; r reload; ? help
 
 $ rv export -o .rv/review.md   # or stdout / JSON
 # agent already knows the skill: address rv comments

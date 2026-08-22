@@ -33,8 +33,15 @@
 //! paths (flatten order). `j`/`k` move; Enter jumps to that file header and
 //! closes. Esc closes without moving the cursor. `q` still quits. Empty
 //! diff: empty overlay. Opens on the file under the cursor when there is
-//! one. An unmatched `Space` leader is dropped; the next key is handled as
-//! normal.
+//! one. Local only: `Space` `Space` stages or unstages the current file
+//! (on a file header) or hunk (in a hunk); `Space` `S` does the containing
+//! file from a hunk. Range loads ignore those chords. An unmatched `Space`
+//! leader is dropped; the next key is handled as normal (`Space` then `d`
+//! still dismisses). Git failure opens a centered overlay with git’s error;
+//! Enter or Esc dismisses. The list is unchanged. Local load paints
+//! `Stage File` / `Unstage File` / `Stage Hunk` / `Unstage Hunk` with the
+//! chord on the far right of the current file and hunk rows (no hints on a
+//! range load).
 //!
 //! Comment list: `Space` then `l` opens a centered overlay of live comments
 //! (same store as `rv list`). `j`/`k` move; Enter jumps with the same landing
@@ -143,8 +150,10 @@ fn runTui(alloc: std.mem.Allocator, io: std.Io, source: cli.Source) !u8 {
     var running = true;
     // Exactly one focus; cannot help, comment, search, and list at once.
     var focus: Focus = .normal;
-    // `Space` leader: next key may be `f` (file list) or `l` (comment list).
-    // Cleared on that next key.
+    // `Space` leader: next key may be `f` (file list), `l` (comment list),
+    // `Space` (stage/unstage current file or hunk), or `S` (containing file
+    // from a hunk). Cleared on that next key. Unmatched leader is dropped;
+    // `Space` then `d` still dismisses.
     var leader_pending: bool = false;
     var draft: Draft = .{};
     defer draft.buf.deinit(alloc);
@@ -162,8 +171,11 @@ fn runTui(alloc: std.mem.Allocator, io: std.Io, source: cli.Source) !u8 {
     defer last_query.deinit(alloc);
     // One-shot footer note (owned bytes; len 0 = none). Cleared on next key.
     var note: StatusNote = .{};
+    // Git stderr (or a short fallback) while `focus == .git_error`.
+    var git_err: std.ArrayList(u8) = .empty;
+    defer git_err.deinit(alloc);
 
-    paint(&scr, size, rows, sbs_slots, layout_pref, cursor, &scroll, &col_scroll, &review, source, focus, draft.buf.items, draft.caret, &draft.scroll, draft.anchor, note.slice(), list_items.items, file_items.items, list_cursor, &list_scroll, &help_scroll);
+    paint(&scr, size, rows, sbs_slots, layout_pref, cursor, &scroll, &col_scroll, &review, source, focus, draft.buf.items, draft.caret, &draft.scroll, draft.anchor, note.slice(), list_items.items, file_items.items, list_cursor, &list_scroll, &help_scroll, git_err.items);
     try scr.present(&term);
 
     while (running) {
@@ -370,6 +382,17 @@ fn runTui(alloc: std.mem.Allocator, io: std.Io, source: cli.Source) !u8 {
                         .ctrl_c => running = false,
                         else => {},
                     },
+                    .git_error => switch (key) {
+                        .esc, .enter => {
+                            focus = .normal;
+                            git_err.clearRetainingCapacity();
+                        },
+                        .char => |c| {
+                            if (c == 'q' or c == 'Q') running = false;
+                        },
+                        .ctrl_c => running = false,
+                        else => {},
+                    },
                     .helping => switch (key) {
                         .esc => {
                             focus = .normal;
@@ -418,6 +441,36 @@ fn runTui(alloc: std.mem.Allocator, io: std.Io, source: cli.Source) !u8 {
                                     list_cursor = 0;
                                     list_scroll = 0;
                                     focus = .listing;
+                                } else if (after_leader and c == ' ') {
+                                    try applyIndex(
+                                        alloc,
+                                        io,
+                                        source,
+                                        &d,
+                                        &rows,
+                                        &sbs_slots,
+                                        &cursor,
+                                        &note,
+                                        &focus,
+                                        &git_err,
+                                        false,
+                                    );
+                                } else if (after_leader and c == 'S') {
+                                    if (view.currentHunkInFile(rows, cursor) != null) {
+                                        try applyIndex(
+                                            alloc,
+                                            io,
+                                            source,
+                                            &d,
+                                            &rows,
+                                            &sbs_slots,
+                                            &cursor,
+                                            &note,
+                                            &focus,
+                                            &git_err,
+                                            true,
+                                        );
+                                    }
                                 } else if (c == 'q' or c == 'Q') {
                                     running = false;
                                 } else if (c == '?') {
@@ -480,7 +533,7 @@ fn runTui(alloc: std.mem.Allocator, io: std.Io, source: cli.Source) !u8 {
                                 } else if (c == 't') {
                                     layout_pref = view.toggleLayoutPref(layout_pref);
                                 } else if (c == 'r') {
-                                    reloadDiff(alloc, io, source, &d, &rows, &sbs_slots, &cursor, &note);
+                                    reloadDiff(alloc, io, source, &d, &rows, &sbs_slots, &cursor, &note, .path_line);
                                 } else if (c == 'i' or c == 'c' or c == 'a') {
                                     if (try beginComment(&review, alloc, rows, sbs_slots, layout, cursor, .new, &draft)) {
                                         focus = .commenting;
@@ -521,7 +574,7 @@ fn runTui(alloc: std.mem.Allocator, io: std.Io, source: cli.Source) !u8 {
             },
         }
         if (running) {
-            paint(&scr, size, rows, sbs_slots, layout_pref, cursor, &scroll, &col_scroll, &review, source, focus, draft.buf.items, draft.caret, &draft.scroll, draft.anchor, note.slice(), list_items.items, file_items.items, list_cursor, &list_scroll, &help_scroll);
+            paint(&scr, size, rows, sbs_slots, layout_pref, cursor, &scroll, &col_scroll, &review, source, focus, draft.buf.items, draft.caret, &draft.scroll, draft.anchor, note.slice(), list_items.items, file_items.items, list_cursor, &list_scroll, &help_scroll, git_err.items);
             try scr.present(&term);
         }
     }
@@ -538,6 +591,17 @@ fn gitLoadMsg(err: git.Error) []const u8 {
     };
 }
 
+/// How to place the cursor after a successful reload.
+const ReloadCursor = union(enum) {
+    /// Same path + line as before the load (`r`).
+    path_line,
+    /// Remaining change after an index mutation. `path` borrows from the
+    /// pre-reload rows; restore before those rows are freed.
+    neighbor: view.NeighborMark,
+    /// No remaining neighbor (only change in the list): row 0.
+    start,
+};
+
 /// Re-run the startup load. On success, replace `d`/`rows`/`sbs_slots` and
 /// restore the cursor. On failure, leave the previous model and set `note`.
 /// Does not touch the comment store. `r` is only bound in normal focus.
@@ -550,6 +614,7 @@ fn reloadDiff(
     sbs_slots: *[]view.SbsSlot,
     cursor: *usize,
     note: *StatusNote,
+    restore: ReloadCursor,
 ) void {
     var new_d = switch (source) {
         .local => git.loadDefaultDiff(alloc, io),
@@ -569,9 +634,15 @@ fn reloadDiff(
         note.set("out of memory");
         return;
     };
-    // `mark.path` borrows from the old `d` / `rows`. Restore before free.
-    const mark = view.cursorMarkAt(rows.*, cursor.*);
-    const new_cursor = if (mark) |m| view.restoreCursor(new_rows, m) else 0;
+    // Neighbor / path-line marks borrow from the old `d` / `rows`. Restore before free.
+    const new_cursor: usize = switch (restore) {
+        .path_line => blk: {
+            const mark = view.cursorMarkAt(rows.*, cursor.*);
+            break :blk if (mark) |m| view.restoreCursor(new_rows, m) else 0;
+        },
+        .neighbor => |m| view.restoreNeighbor(new_rows, m),
+        .start => 0,
+    };
     alloc.free(rows.*);
     alloc.free(sbs_slots.*);
     d.deinit();
@@ -581,9 +652,78 @@ fn reloadDiff(
     cursor.* = new_cursor;
 }
 
+/// Stage or unstage the current file or hunk (local source only). On success,
+/// reload like `r` but land on the neighbor change, not the same path+line.
+/// On git failure, leave the list unchanged and open the error overlay.
+/// Range loads and rows with no target are no-ops. `Space` `Space` uses
+/// `whole_file == false` (file header → file, hunk → hunk); `Space` `S`
+/// passes `true` from a hunk.
+fn applyIndex(
+    alloc: std.mem.Allocator,
+    io: std.Io,
+    source: cli.Source,
+    d: *diff.Diff,
+    rows: *[]view.Row,
+    sbs_slots: *[]view.SbsSlot,
+    cursor: *usize,
+    note: *StatusNote,
+    focus: *Focus,
+    git_err: *std.ArrayList(u8),
+    whole_file: bool,
+) std.mem.Allocator.Error!void {
+    if (source != .local) return;
+    const target = view.indexTargetAt(rows.*, cursor.*, whole_file) orelse return;
+    const file = fileForTarget(d, target) orelse return;
+    const neighbor = view.neighborMark(rows.*, target);
+    var fail: []u8 = &.{};
+    git.mutate(alloc, io, .inherit, .{
+        .action = switch (target.group) {
+            .unstaged, .untracked => .stage,
+            .staged => .unstage,
+        },
+        .path = file.displayPath(),
+        .group = target.group,
+        .hunk = if (target.hunk_i) |hi| &file.hunks[hi] else null,
+        .file = if (target.hunk_i != null) file else null,
+        .fail_output = &fail,
+    }) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        error.NotARepository, error.GitNotFound, error.GitFailed, error.BadHunkHeader => {
+            git_err.clearRetainingCapacity();
+            if (fail.len > 0) {
+                defer alloc.free(fail);
+                const trimmed = std.mem.trim(u8, fail, " \t\r\n");
+                if (trimmed.len > 0) {
+                    try git_err.appendSlice(alloc, trimmed);
+                }
+            }
+            if (git_err.items.len == 0) {
+                try git_err.appendSlice(alloc, gitLoadMsg(err));
+            }
+            focus.* = .git_error;
+            return;
+        },
+    };
+    const restore: ReloadCursor = if (neighbor) |m| .{ .neighbor = m } else .start;
+    reloadDiff(alloc, io, source, d, rows, sbs_slots, cursor, note, restore);
+}
+
+fn fileForTarget(d: *const diff.Diff, target: view.IndexTarget) ?*const diff.File {
+    for (d.files) |*f| {
+        const g = f.group orelse continue;
+        if (g != target.group) continue;
+        if (!std.mem.eql(u8, f.displayPath(), target.path)) continue;
+        if (target.hunk_i) |hi| {
+            if (hi >= f.hunks.len) return null;
+        }
+        return f;
+    }
+    return null;
+}
+
 /// Key ownership: normal nav, comment draft, `/` search prompt, comment list,
-/// file list, or help.
-const Focus = enum { normal, commenting, searching, listing, files, helping };
+/// file list, help, or git error overlay.
+const Focus = enum { normal, commenting, searching, listing, files, helping, git_error };
 
 /// Footer box buffer plus comment-mode extras. Search uses `buf` and `caret` only.
 const Draft = struct {
@@ -1032,6 +1172,37 @@ fn paintFileList(
     }
 }
 
+fn paintGitError(scr: *tui.Screen, size: tui.Size, text: []const u8) void {
+    const bg = tui.Color{ .rgb = .{ .r = 0x12, .g = 0x12, .b = 0x14 } };
+    const fg = tui.Color{ .rgb = .{ .r = 0xd0, .g = 0xd0, .b = 0xd0 } };
+    const panel_bg = tui.Style{ .fg = fg, .bg = bg };
+    const panel_frame = tui.Style{
+        .fg = .{ .rgb = .{ .r = 0x5d, .g = 0x81, .b = 0xb7 } },
+        .bg = bg,
+        .bold = true,
+    };
+
+    var n: usize = 0;
+    var count_it = std.mem.splitScalar(u8, text, '\n');
+    while (count_it.next()) |_| n += 1;
+
+    const panel = listOverlayRect(size.cols, size.rows, n);
+    scr.fillRect(panel, ' ', panel_bg);
+    scr.drawBox(panel, panel_frame);
+    const inner = panel.inset(1);
+    if (panel.h > 0 and panel.w > 2) {
+        scr.putStr(panel.x + 2, panel.y, " error ", panel_frame, panel);
+    }
+    if (inner.h == 0 or inner.w == 0) return;
+    var row: u16 = 0;
+    var lines = std.mem.splitScalar(u8, text, '\n');
+    while (lines.next()) |line| {
+        if (row >= inner.h) break;
+        scr.putStr(inner.x, inner.y + row, line, panel_bg, inner);
+        row += 1;
+    }
+}
+
 const HelpRow = union(enum) {
     group: []const u8,
     item: struct { key: []const u8, label: []const u8 },
@@ -1061,6 +1232,8 @@ const help_rows = [_]HelpRow{
     .blank,
     .{ .group = "Local review" },
     .{ .item = .{ .key = "sections", .label = "Unstaged, Untracked, Staged" } },
+    .{ .item = .{ .key = "Space Space", .label = "stage / unstage file or hunk" } },
+    .{ .item = .{ .key = "Space S", .label = "file from hunk (until Ctrl)" } },
     .blank,
     .{ .group = "Session" },
     .{ .item = .{ .key = "t", .label = "layout" } },
@@ -1091,8 +1264,8 @@ const help_key_w: u16 = blk: {
 test "help catalog includes normal bindings" {
     const required = [_][]const u8{
         "j/k",     "h/l",     "0/$", "J/K", "[/]", "{/}", "(/)", "/", "n/N",
-        "Space f", "Space l", "i",   "I",   "d",   "D",   "t",   "r", "?",
-        "q",
+        "Space f", "Space l", "Space Space", "Space S", "i", "I", "d", "D",
+        "t",       "r",       "?",           "q",
     };
     for (required) |token| {
         var found = false;
@@ -1206,6 +1379,7 @@ fn paint(
     list_cursor: usize,
     list_scroll: *usize,
     help_scroll: *usize,
+    git_err: []const u8,
 ) void {
     // Diff line palette (truecolor). Documented together so sticky file
     // headers (#36) and body paints share one table. Hierarchy:
@@ -1319,6 +1493,7 @@ fn paint(
             .listing => "rv  comments  j/k move  Enter jump  Esc close  q quit",
             .files => "rv  files  j/k move  Enter jump  Esc close  q quit",
             .helping => "rv  help  j/k  Esc/? close  q quit",
+            .git_error => "rv  git error  Enter/Esc close  q quit",
             .normal => "rv  j/k  /  i/I  ? help  q quit",
         };
         scr.putStr(1, 0, help, title_style, null);
@@ -1354,6 +1529,22 @@ fn paint(
     col_scroll.* = view.clampColScroll(col_scroll.*, hunk_w, pan_vp);
     const cs = col_scroll.*;
 
+    const hint_file: ?usize = blk: {
+        if (source != .local or focus != .normal or rows.len == 0) break :blk null;
+        if (rows[cur] == .section_header) break :blk null;
+        const fi = view.currentFileStart(rows, cur) orelse break :blk null;
+        const grouped = switch (rows[fi]) {
+            .file_header => |fh| fh.group != null,
+            else => false,
+        };
+        break :blk if (grouped) fi else null;
+    };
+    const hint_hunk: ?usize = if (hint_file != null)
+        view.currentHunkInFile(rows, cur)
+    else
+        null;
+    const hint_group: ?diff.Group = if (hint_file) |fi| rows[fi].file_header.group else null;
+
     switch (layout) {
         .unified => {
             const settled = view.ensureVisibleSticky(scroll.*, cur, content_rows, rows);
@@ -1367,7 +1558,7 @@ fn paint(
                     const text = formatRow(&line_buf, rows[fi], false);
                     const st = if (fi == cur) file_cur_style else file_style;
                     fillRow(scr, screen_y, st);
-                    scr.putStr(0, screen_y, text, st, null);
+                    putRowHint(scr, screen_y, text, indexHintForRow(fi, hint_file, hint_hunk, hint_group), st);
                     screen_y += 1;
                 }
             }
@@ -1400,9 +1591,14 @@ fn paint(
                 } else {
                     fillRow(scr, screen_y, st);
                 }
-                const pan = pan_span.containsBody(i);
-                const visible = if (pan) text[tui.screen.byteAtCol(text, cs)..] else text;
-                scr.putStr(0, screen_y, visible, st, null);
+                const hint = indexHintForRow(i, hint_file, hint_hunk, hint_group);
+                if (hint.len > 0) {
+                    putRowHint(scr, screen_y, text, hint, st);
+                } else {
+                    const pan = pan_span.containsBody(i);
+                    const visible = if (pan) text[tui.screen.byteAtCol(text, cs)..] else text;
+                    scr.putStr(0, screen_y, visible, st, null);
+                }
                 screen_y += 1;
             }
         },
@@ -1418,7 +1614,7 @@ fn paint(
                     const text = formatRow(&line_buf, rows[fi], false);
                     const st = if (fi == cur) file_cur_style else file_style;
                     fillRow(scr, screen_y, st);
-                    scr.putStr(0, screen_y, text, st, null);
+                    putRowHint(scr, screen_y, text, indexHintForRow(fi, hint_file, hint_hunk, hint_group), st);
                     screen_y += 1;
                 }
             }
@@ -1449,10 +1645,11 @@ fn paint(
                         );
                         if (rows[ri] == .section_header) {
                             scr.fillRect(.{ .x = 0, .y = screen_y, .w = scr.cols, .h = 1 }, '─', st);
+                            scr.putStr(0, screen_y, text, st, null);
                         } else {
                             fillRow(scr, screen_y, st);
+                            putRowHint(scr, screen_y, text, indexHintForRow(ri, hint_file, hint_hunk, hint_group), st);
                         }
-                        scr.putStr(0, screen_y, text, st, null);
                     },
                     .pair => |p| {
                         // Whole slot is current when the cursor sits on either pane
@@ -1616,6 +1813,9 @@ fn paint(
     } else if (focus == .helping) {
         paintHelp(scr, size, help_scroll);
         scr.hideCursor();
+    } else if (focus == .git_error) {
+        paintGitError(scr, size, git_err);
+        scr.hideCursor();
     }
 }
 
@@ -1766,6 +1966,57 @@ fn bufPrintTrunc(buf: []u8, comptime fmt: []const u8, args: anytype) []const u8 
         @memcpy(buf[0..n], msg[0..n]);
         return buf[0..n];
     };
+}
+
+/// Index labels for the current file/hunk rows. Empty when `ri` is not one
+/// of those rows. File row always says File (`Space S` while the cursor is
+/// in a hunk, otherwise `Space Space`). Hunk row always says Hunk
+/// (`Space Space`). Verb follows the file’s group.
+fn indexHintForRow(ri: usize, file_i: ?usize, hunk_i: ?usize, group: ?diff.Group) []const u8 {
+    const g = group orelse return "";
+    const stage = switch (g) {
+        .unstaged, .untracked => true,
+        .staged => false,
+    };
+    if (file_i) |fi| {
+        if (ri == fi) {
+            if (hunk_i != null) {
+                return if (stage) "Stage File (Space S)" else "Unstage File (Space S)";
+            }
+            return if (stage) "Stage File (Space Space)" else "Unstage File (Space Space)";
+        }
+    }
+    if (hunk_i) |hi| {
+        if (ri == hi) {
+            return if (stage) "Stage Hunk (Space Space)" else "Unstage Hunk (Space Space)";
+        }
+    }
+    return "";
+}
+
+/// Path/header on the left; `hint` right-aligned with a one-column gap.
+/// Skips the hint when it would not leave that gap. Hint is dim on `style`.
+fn putRowHint(scr: *tui.Screen, y: u16, text: []const u8, hint: []const u8, style: tui.Style) void {
+    if (hint.len == 0) {
+        scr.putStr(0, y, text, style, null);
+        return;
+    }
+    const cols = scr.cols;
+    const hint_w: u16 = std.math.cast(u16, tui.screen.displayWidth(hint)) orelse {
+        scr.putStr(0, y, text, style, null);
+        return;
+    };
+    if (hint_w == 0 or hint_w + 1 >= cols) {
+        scr.putStr(0, y, text, style, null);
+        return;
+    }
+    const text_budget: usize = cols - hint_w - 1;
+    const end = tui.screen.byteAtCol(text, text_budget);
+    scr.putStr(0, y, text[0..end], style, null);
+    var hint_st = style;
+    hint_st.dim = true;
+    hint_st.bold = false;
+    scr.putStr(cols - hint_w, y, hint, hint_st, null);
 }
 
 fn fillRow(scr: *tui.Screen, y: u16, style: tui.Style) void {
