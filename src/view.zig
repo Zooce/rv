@@ -906,6 +906,92 @@ pub fn neighborMark(rows: []const Row, target: IndexTarget) ?NeighborMark {
     return null;
 }
 
+/// Section under the cursor and the last row of its last file. `null` when
+/// `cursor` is not a section header.
+pub const GroupSpan = struct {
+    group: diff.Group,
+    first: usize,
+    last: usize,
+};
+
+pub fn groupSpanAt(rows: []const Row, cursor: usize) ?GroupSpan {
+    if (rows.len == 0) return null;
+    const cur = clampCursor(cursor, rows.len);
+    const group = switch (rows[cur]) {
+        .section_header => |g| g,
+        else => return null,
+    };
+    var i = cur + 1;
+    while (i < rows.len) : (i += 1) {
+        switch (rows[i]) {
+            .section_header => return .{ .group = group, .first = cur, .last = i - 1 },
+            else => {},
+        }
+    }
+    return .{ .group = group, .first = cur, .last = rows.len - 1 };
+}
+
+/// Remaining section or file after a whole-group mutation. `path` borrows
+/// from `rows`.
+pub const GroupNeighborMark = union(enum) {
+    section: diff.Group,
+    file: struct { path: []const u8, group: diff.Group },
+};
+
+/// Prefer the following section or file after `span.last`; else the previous
+/// section or file before `span.first`. `null` when this group is the only
+/// change.
+pub fn groupNeighborMark(rows: []const Row, span: GroupSpan) ?GroupNeighborMark {
+    var i = span.last + 1;
+    while (i < rows.len) : (i += 1) {
+        if (sectionOrFileMark(rows, i)) |m| return m;
+    }
+    i = span.first;
+    while (i > 0) {
+        i -= 1;
+        if (sectionOrFileMark(rows, i)) |m| return m;
+    }
+    return null;
+}
+
+/// Land on `mark`'s section or file after reload. Missing mark → row 0.
+pub fn restoreGroupNeighbor(rows: []const Row, mark: GroupNeighborMark) usize {
+    if (rows.len == 0) return 0;
+    switch (mark) {
+        .section => |g| {
+            for (rows, 0..) |row, i| {
+                switch (row) {
+                    .section_header => |sg| if (sg == g) return i,
+                    else => {},
+                }
+            }
+        },
+        .file => |f| {
+            for (rows, 0..) |row, i| {
+                switch (row) {
+                    .file_header => |fh| {
+                        const g = fh.group orelse continue;
+                        if (g == f.group and std.mem.eql(u8, fh.path, f.path)) return i;
+                    },
+                    else => {},
+                }
+            }
+        },
+    }
+    return 0;
+}
+
+fn sectionOrFileMark(rows: []const Row, idx: usize) ?GroupNeighborMark {
+    switch (rows[idx]) {
+        .section_header => |g| return .{ .section = g },
+        .file_header => |fh| {
+            const g = fh.group orelse return null;
+            return .{ .file = .{ .path = fh.path, .group = g } };
+        },
+        .hunk_header, .line => return null,
+    }
+}
+
 /// Land on `mark`'s file (and hunk, if set) after reload. Missing hunk → that
 /// file's header. Missing file → row 0.
 pub fn restoreNeighbor(rows: []const Row, mark: NeighborMark) usize {
@@ -2836,4 +2922,110 @@ test "restoreNeighbor dest hunk file fallback and gone" {
         .group = .unstaged,
         .hunk_i = null,
     }));
+}
+
+test "groupSpanAt empty untagged and three groups" {
+    try testing.expect(groupSpanAt(&.{}, 0) == null);
+
+    const untagged =
+        \\diff --git a/f b/f
+        \\--- a/f
+        \\+++ b/f
+        \\@@ -1 +1 @@
+        \\-old
+        \\+new
+    ;
+    var d = try diff.parse(testing.allocator, untagged);
+    defer d.deinit();
+    const rows = try flatten(testing.allocator, &d);
+    defer testing.allocator.free(rows);
+    try testing.expect(groupSpanAt(rows, 0) == null);
+
+    var fix = try threeGroupFixture(testing.allocator);
+    defer fix.d.deinit();
+    defer testing.allocator.free(fix.rows);
+    // 0 Unstaged, 1-4 file a, 5 Untracked, 6-8 file u, 9 Staged, 10-13 file a.
+    try testing.expect(groupSpanAt(fix.rows, 1) == null);
+
+    const unstaged = groupSpanAt(fix.rows, 0).?;
+    try testing.expectEqual(diff.Group.unstaged, unstaged.group);
+    try testing.expectEqual(0, unstaged.first);
+    try testing.expectEqual(4, unstaged.last);
+
+    const untracked = groupSpanAt(fix.rows, 5).?;
+    try testing.expectEqual(diff.Group.untracked, untracked.group);
+    try testing.expectEqual(5, untracked.first);
+    try testing.expectEqual(8, untracked.last);
+
+    const staged = groupSpanAt(fix.rows, 9).?;
+    try testing.expectEqual(diff.Group.staged, staged.group);
+    try testing.expectEqual(9, staged.first);
+    try testing.expectEqual(13, staged.last);
+}
+
+test "groupNeighborMark following section previous file and only group" {
+    var fix = try threeGroupFixture(testing.allocator);
+    defer fix.d.deinit();
+    defer testing.allocator.free(fix.rows);
+
+    const after_unstaged = groupNeighborMark(fix.rows, groupSpanAt(fix.rows, 0).?).?;
+    try testing.expect(after_unstaged == .section);
+    try testing.expectEqual(diff.Group.untracked, after_unstaged.section);
+
+    const after_untracked = groupNeighborMark(fix.rows, groupSpanAt(fix.rows, 5).?).?;
+    try testing.expect(after_untracked == .section);
+    try testing.expectEqual(diff.Group.staged, after_untracked.section);
+
+    const before_staged = groupNeighborMark(fix.rows, groupSpanAt(fix.rows, 9).?).?;
+    try testing.expect(before_staged == .file);
+    try testing.expectEqualStrings("u", before_staged.file.path);
+    try testing.expectEqual(diff.Group.untracked, before_staged.file.group);
+
+    const only =
+        \\diff --git a/u b/u
+        \\new file mode 100644
+        \\--- /dev/null
+        \\+++ b/u
+        \\@@ -0,0 +1 @@
+        \\+hi
+    ;
+    var d_only = try diff.parsePieces(testing.allocator, &.{
+        .{ .text = only, .group = .untracked },
+    });
+    defer d_only.deinit();
+    const only_rows = try flatten(testing.allocator, &d_only);
+    defer testing.allocator.free(only_rows);
+    try testing.expect(groupNeighborMark(only_rows, groupSpanAt(only_rows, 0).?) == null);
+}
+
+test "restoreGroupNeighbor dest section file fallback and gone" {
+    try testing.expectEqual(0, restoreGroupNeighbor(&.{}, .{ .section = .unstaged }));
+
+    var fix = try threeGroupFixture(testing.allocator);
+    defer fix.d.deinit();
+    defer testing.allocator.free(fix.rows);
+
+    try testing.expectEqual(5, restoreGroupNeighbor(fix.rows, .{ .section = .untracked }));
+    try testing.expectEqual(6, restoreGroupNeighbor(fix.rows, .{
+        .file = .{ .path = "u", .group = .untracked },
+    }));
+    try testing.expectEqual(0, restoreGroupNeighbor(fix.rows, .{
+        .file = .{ .path = "gone", .group = .unstaged },
+    }));
+
+    const remaining =
+        \\diff --git a/a b/a
+        \\--- a/a
+        \\+++ b/a
+        \\@@ -1 +1,2 @@
+        \\ same
+        \\+staged
+    ;
+    var d = try diff.parsePieces(testing.allocator, &.{
+        .{ .text = remaining, .group = .staged },
+    });
+    defer d.deinit();
+    const rows = try flatten(testing.allocator, &d);
+    defer testing.allocator.free(rows);
+    try testing.expectEqual(0, restoreGroupNeighbor(rows, .{ .section = .untracked }));
 }

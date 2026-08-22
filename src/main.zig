@@ -34,8 +34,9 @@
 //! closes. Esc closes without moving the cursor. `q` still quits. Empty
 //! diff: empty overlay. Opens on the file under the cursor when there is
 //! one. Local only: `Space` `Space` stages or unstages the current file
-//! (on a file header) or hunk (in a hunk); `Space` `S` does the containing
-//! file from a hunk. `Space` `d` discards the current file or hunk;
+//! (on a file header), hunk (in a hunk), or whole group (on a section
+//! header; always confirms); `Space` `S` does the containing file from a
+//! hunk. `Space` `d` discards the current file or hunk;
 //! `Space` `x` discards the containing file from a hunk (stand-in until
 //! Ctrl). Discard always confirms (`No` selected; `yes` proceeds). If the
 //! target has live comments, a second overlay asks to delete them (`Yes`
@@ -46,8 +47,8 @@
 //! (`Space` then `d` still dismisses on a range load). Git failure opens
 //! a centered overlay with git’s error; Enter or Esc dismisses. The list
 //! is unchanged. Local load paints stage/unstage chords on the current
-//! file and hunk rows; unstaged/untracked rows also show discard chords
-//! (no hints on a range load).
+//! section, file, and hunk rows; unstaged/untracked file and hunk rows
+//! also show discard chords (no hints on a range load).
 //!
 //! Comment list: `Space` then `l` opens a centered overlay of live comments
 //! (same store as `rv list`). `j`/`k` move; Enter jumps with the same landing
@@ -157,10 +158,11 @@ fn runTui(alloc: std.mem.Allocator, io: std.Io, source: cli.Source) !u8 {
     // Exactly one focus; cannot help, comment, search, and list at once.
     var focus: Focus = .normal;
     // `Space` leader: next key may be `f` (file list), `l` (comment list),
-    // `Space` (stage/unstage current file or hunk), `S` (containing file
-    // from a hunk), `d` (discard current file or hunk), or `x` (discard
-    // containing file from a hunk). Cleared on that next key. Unmatched
-    // leader is dropped; on a range load `Space` then `d` still dismisses.
+    // `Space` (stage/unstage current file or hunk, or the group on a
+    // section header), `S` (containing file from a hunk), `d` (discard
+    // current file or hunk), or `x` (discard containing file from a hunk).
+    // Cleared on that next key. Unmatched leader is dropped; on a range
+    // load `Space` then `d` still dismisses.
     var leader_pending: bool = false;
     var discard_confirm: DiscardConfirm = .{};
     var draft: Draft = .{};
@@ -426,7 +428,25 @@ fn runTui(alloc: std.mem.Allocator, io: std.Io, source: cli.Source) !u8 {
                         if (abort) {
                             focus = .normal;
                         } else if (answered) {
-                            if (!discard_confirm.comments and !discard_confirm.yes) {
+                            if (discard_confirm.kind == .group) {
+                                if (!discard_confirm.yes) {
+                                    focus = .normal;
+                                } else {
+                                    focus = .normal;
+                                    try applyGroupIndex(
+                                        alloc,
+                                        io,
+                                        source,
+                                        &d,
+                                        &rows,
+                                        &sbs_slots,
+                                        &cursor,
+                                        &note,
+                                        &focus,
+                                        &git_err,
+                                    );
+                                }
+                            } else if (!discard_confirm.comments and !discard_confirm.yes) {
                                 focus = .normal;
                             } else if (!discard_confirm.comments and hasMatchingDiscardComments(
                                 &review,
@@ -525,20 +545,23 @@ fn runTui(alloc: std.mem.Allocator, io: std.Io, source: cli.Source) !u8 {
                                     list_scroll = 0;
                                     focus = .listing;
                                 } else if (after_leader and c == ' ') {
-                                    try applyIndex(
-                                        alloc,
-                                        io,
-                                        source,
-                                        &d,
-                                        &rows,
-                                        &sbs_slots,
-                                        &cursor,
-                                        &note,
-                                        &focus,
-                                        &git_err,
-                                        false,
-                                        .stage_unstage,
-                                    );
+                                    beginGroupStage(rows, cursor, &focus, &discard_confirm);
+                                    if (focus == .normal) {
+                                        try applyIndex(
+                                            alloc,
+                                            io,
+                                            source,
+                                            &d,
+                                            &rows,
+                                            &sbs_slots,
+                                            &cursor,
+                                            &note,
+                                            &focus,
+                                            &git_err,
+                                            false,
+                                            .stage_unstage,
+                                        );
+                                    }
                                 } else if (after_leader and c == 'S') {
                                     if (view.currentHunkInFile(rows, cursor) != null) {
                                         try applyIndex(
@@ -693,6 +716,8 @@ const ReloadCursor = union(enum) {
     /// Remaining change after an index mutation. `path` borrows from the
     /// pre-reload rows; restore before those rows are freed.
     neighbor: view.NeighborMark,
+    /// Remaining section or file after a whole-group mutation.
+    group_neighbor: view.GroupNeighborMark,
     /// No remaining neighbor (only change in the list): row 0.
     start,
 };
@@ -736,6 +761,7 @@ fn reloadDiff(
             break :blk if (mark) |m| view.restoreCursor(new_rows, m) else 0;
         },
         .neighbor => |m| view.restoreNeighbor(new_rows, m),
+        .group_neighbor => |m| view.restoreGroupNeighbor(new_rows, m),
         .start => 0,
     };
     alloc.free(rows.*);
@@ -812,6 +838,64 @@ fn applyIndex(
     reloadDiff(alloc, io, source, d, rows, sbs_slots, cursor, note, restore);
 }
 
+/// Stage or unstage every file in the section under the cursor (local
+/// source only). File-level mutate, in flatten order. Stop at the first
+/// git error: reload so the list matches git, then open the error overlay.
+/// On success, reload and land on the neighbor section or file. Range
+/// loads and missing groups are no-ops.
+fn applyGroupIndex(
+    alloc: std.mem.Allocator,
+    io: std.Io,
+    source: cli.Source,
+    d: *diff.Diff,
+    rows: *[]view.Row,
+    sbs_slots: *[]view.SbsSlot,
+    cursor: *usize,
+    note: *StatusNote,
+    focus: *Focus,
+    git_err: *std.ArrayList(u8),
+) std.mem.Allocator.Error!void {
+    if (source != .local) return;
+    const span = view.groupSpanAt(rows.*, cursor.*) orelse return;
+    const action: git.Action = switch (span.group) {
+        .unstaged, .untracked => .stage,
+        .staged => .unstage,
+    };
+    const neighbor = view.groupNeighborMark(rows.*, span);
+    var fail: []u8 = &.{};
+    const first_err: ?git.Error = blk: {
+        for (d.files) |f| {
+            const g = f.group orelse continue;
+            if (g != span.group) continue;
+            git.mutate(alloc, io, .inherit, .{
+                .action = action,
+                .path = f.displayPath(),
+                .group = span.group,
+                .fail_output = &fail,
+            }) catch |err| switch (err) {
+                error.OutOfMemory => return error.OutOfMemory,
+                error.NotARepository, error.GitNotFound, error.GitFailed, error.BadHunkHeader => break :blk err,
+            };
+        }
+        break :blk null;
+    };
+    const restore: ReloadCursor = if (neighbor) |m| .{ .group_neighbor = m } else .start;
+    reloadDiff(alloc, io, source, d, rows, sbs_slots, cursor, note, restore);
+    const err = first_err orelse return;
+    git_err.clearRetainingCapacity();
+    if (fail.len > 0) {
+        defer alloc.free(fail);
+        const trimmed = std.mem.trim(u8, fail, " \t\r\n");
+        if (trimmed.len > 0) {
+            try git_err.appendSlice(alloc, trimmed);
+        }
+    }
+    if (git_err.items.len == 0) {
+        try git_err.appendSlice(alloc, gitLoadMsg(err));
+    }
+    focus.* = .git_error;
+}
+
 /// Open the discard confirm overlay for the current file or hunk.
 /// Staged rows and rows with no target are no-ops. Caller handles range.
 fn beginDiscard(
@@ -827,6 +911,19 @@ fn beginDiscard(
         .unstaged, .untracked => {},
     }
     discard.* = .{ .whole_file = whole_file, .yes = false, .comments = false };
+    focus.* = .discard_confirm;
+}
+
+/// Open the group stage/unstage confirm overlay for the section header
+/// under the cursor. Missing header is a no-op.
+fn beginGroupStage(
+    rows: []const view.Row,
+    cursor: usize,
+    focus: *Focus,
+    discard: *DiscardConfirm,
+) void {
+    const span = view.groupSpanAt(rows, cursor) orelse return;
+    discard.* = .{ .kind = .group, .group = span.group, .yes = false };
     focus.* = .discard_confirm;
 }
 
@@ -974,10 +1071,14 @@ test "discard comments match this group's hunk lines" {
 /// file list, help, git error overlay, or discard confirm.
 const Focus = enum { normal, commenting, searching, listing, files, helping, git_error, discard_confirm };
 
-/// Confirm overlay for `Space` `d` / `Space` `x`. `yes` is the selected
-/// choice. First overlay defaults to **No** (abort). If the target has live
-/// comments, `comments` is the second overlay and defaults to **Yes** (delete).
+/// Confirm overlay for discard (`Space` `d` / `Space` `x`) and for group
+/// stage/unstage (`Space` `Space` on a section header). `yes` is the
+/// selected choice. Opens with **No** selected (Enter does not apply).
+/// Discard: if the target has live comments, `comments` is the second
+/// overlay and defaults to **Yes** (delete).
 const DiscardConfirm = struct {
+    kind: enum { discard, group } = .discard,
+    group: diff.Group = .unstaged,
     whole_file: bool = false,
     yes: bool = false,
     comments: bool = false,
@@ -1483,7 +1584,8 @@ fn paintDiscardConfirm(
     };
 
     var hunk_buf: [512]u8 = undefined;
-    const hunk_text: []const u8, const path: []const u8 = if (discard.comments)
+    const group = discard.kind == .group;
+    const hunk_text: []const u8, const path: []const u8 = if (group or discard.comments)
         .{ "", "" }
     else blk: {
         const target = view.indexTargetAt(rows, cursor, discard.whole_file);
@@ -1495,7 +1597,7 @@ fn paintDiscardConfirm(
         break :blk .{ ht, if (target) |t| t.path else "" };
     };
 
-    const content_n: u16 = if (discard.comments)
+    const content_n: u16 = if (group or discard.comments)
         3
     else if (hunk_text.len > 0)
         4
@@ -1506,13 +1608,29 @@ fn paintDiscardConfirm(
     scr.fillRect(panel, ' ', panel_bg);
     scr.drawBox(panel, panel_frame);
     if (panel.h > 0 and panel.w > 2) {
-        const title: []const u8 = if (discard.comments) " comments " else " discard ";
+        const title: []const u8 = switch (discard.kind) {
+            .group => switch (discard.group) {
+                .unstaged, .untracked => " stage ",
+                .staged => " unstage ",
+            },
+            .discard => if (discard.comments) " comments " else " discard ",
+        };
         scr.putStr(panel.x + 2, panel.y, title, panel_frame, panel);
     }
     const inner = panel.inset(1);
     if (inner.h == 0 or inner.w == 0) return;
     var row: u16 = 0;
-    if (discard.comments) {
+    if (group) {
+        const question: []const u8 = switch (discard.group) {
+            .unstaged => "Stage all unstaged?",
+            .untracked => "Stage all untracked?",
+            .staged => "Unstage all staged?",
+        };
+        if (row < inner.h) {
+            scr.putStr(inner.x, inner.y + row, question, panel_bg, inner);
+            row += 1;
+        }
+    } else if (discard.comments) {
         if (row < inner.h) {
             scr.putStr(inner.x, inner.y + row, "delete comments with this change?", panel_bg, inner);
             row += 1;
@@ -1588,7 +1706,7 @@ const help_rows = [_]HelpRow{
     .blank,
     .{ .group = "Local review" },
     .{ .item = .{ .key = "sections", .label = "Unstaged, Untracked, Staged" } },
-    .{ .item = .{ .key = "Space Space", .label = "stage / unstage file or hunk" } },
+    .{ .item = .{ .key = "Space Space", .label = "stage / unstage file, hunk, or group" } },
     .{ .item = .{ .key = "Space S", .label = "file from hunk (until Ctrl)" } },
     .{ .item = .{ .key = "Space d", .label = "discard file or hunk" } },
     .{ .item = .{ .key = "Space x", .label = "discard file from hunk (until Ctrl)" } },
@@ -1648,6 +1766,23 @@ test "help catalog includes normal bindings" {
         }
         try std.testing.expect(found);
     }
+}
+
+test "indexHintForRow section all" {
+    try std.testing.expectEqualStrings(
+        "Stage All (Space Space)",
+        indexHintForRow(0, null, null, 0, .unstaged),
+    );
+    try std.testing.expectEqualStrings(
+        "Stage All (Space Space)",
+        indexHintForRow(0, null, null, 0, .untracked),
+    );
+    try std.testing.expectEqualStrings(
+        "Unstage All (Space Space)",
+        indexHintForRow(0, null, null, 0, .staged),
+    );
+    try std.testing.expectEqualStrings("", indexHintForRow(1, null, null, 0, .unstaged));
+    try std.testing.expectEqualStrings("", indexHintForRow(0, null, null, null, .unstaged));
 }
 
 fn paintHelp(scr: *tui.Screen, size: tui.Size, scroll: *usize) void {
@@ -1854,10 +1989,16 @@ fn paint(
             .files => "rv  files  j/k move  Enter jump  Esc close  q quit",
             .helping => "rv  help  j/k  Esc/? close  q quit",
             .git_error => "rv  git error  Enter/Esc close  q quit",
-            .discard_confirm => if (discard.comments)
-                "rv  discard comments  no/Yes  Enter  Esc cancel  q quit"
-            else
-                "rv  discard  No/yes  Enter  Esc cancel  q quit",
+            .discard_confirm => switch (discard.kind) {
+                .group => switch (discard.group) {
+                    .unstaged, .untracked => "rv  stage all  No/yes  Enter  Esc cancel  q quit",
+                    .staged => "rv  unstage all  No/yes  Enter  Esc cancel  q quit",
+                },
+                .discard => if (discard.comments)
+                    "rv  discard comments  no/Yes  Enter  Esc cancel  q quit"
+                else
+                    "rv  discard  No/yes  Enter  Esc cancel  q quit",
+            },
             .normal => "rv  j/k  /  i/I  ? help  q quit",
         };
         scr.putStr(1, 0, help, title_style, null);
@@ -1893,9 +2034,10 @@ fn paint(
     col_scroll.* = view.clampColScroll(col_scroll.*, hunk_w, pan_vp);
     const cs = col_scroll.*;
 
+    const hints_ok = source == .local and focus == .normal and rows.len > 0;
+    const hint_section: ?usize = if (hints_ok and rows[cur] == .section_header) cur else null;
     const hint_file: ?usize = blk: {
-        if (source != .local or focus != .normal or rows.len == 0) break :blk null;
-        if (rows[cur] == .section_header) break :blk null;
+        if (!hints_ok or hint_section != null) break :blk null;
         const fi = view.currentFileStart(rows, cur) orelse break :blk null;
         const grouped = switch (rows[fi]) {
             .file_header => |fh| fh.group != null,
@@ -1907,7 +2049,12 @@ fn paint(
         view.currentHunkInFile(rows, cur)
     else
         null;
-    const hint_group: ?diff.Group = if (hint_file) |fi| rows[fi].file_header.group else null;
+    const hint_group: ?diff.Group = if (hint_file) |fi|
+        rows[fi].file_header.group
+    else if (hint_section) |si|
+        rows[si].section_header
+    else
+        null;
 
     switch (layout) {
         .unified => {
@@ -1922,7 +2069,7 @@ fn paint(
                     const text = formatRow(&line_buf, rows[fi], false);
                     const st = if (fi == cur) file_cur_style else file_style;
                     fillRow(scr, screen_y, st);
-                    putRowHint(scr, screen_y, text, indexHintForRow(fi, hint_file, hint_hunk, hint_group), st);
+                    putRowHint(scr, screen_y, text, indexHintForRow(fi, hint_file, hint_hunk, hint_section, hint_group), st);
                     screen_y += 1;
                 }
             }
@@ -1955,7 +2102,7 @@ fn paint(
                 } else {
                     fillRow(scr, screen_y, st);
                 }
-                const hint = indexHintForRow(i, hint_file, hint_hunk, hint_group);
+                const hint = indexHintForRow(i, hint_file, hint_hunk, hint_section, hint_group);
                 if (hint.len > 0) {
                     putRowHint(scr, screen_y, text, hint, st);
                 } else {
@@ -1978,7 +2125,7 @@ fn paint(
                     const text = formatRow(&line_buf, rows[fi], false);
                     const st = if (fi == cur) file_cur_style else file_style;
                     fillRow(scr, screen_y, st);
-                    putRowHint(scr, screen_y, text, indexHintForRow(fi, hint_file, hint_hunk, hint_group), st);
+                    putRowHint(scr, screen_y, text, indexHintForRow(fi, hint_file, hint_hunk, hint_section, hint_group), st);
                     screen_y += 1;
                 }
             }
@@ -2009,11 +2156,10 @@ fn paint(
                         );
                         if (rows[ri] == .section_header) {
                             scr.fillRect(.{ .x = 0, .y = screen_y, .w = scr.cols, .h = 1 }, '─', st);
-                            scr.putStr(0, screen_y, text, st, null);
                         } else {
                             fillRow(scr, screen_y, st);
-                            putRowHint(scr, screen_y, text, indexHintForRow(ri, hint_file, hint_hunk, hint_group), st);
                         }
+                        putRowHint(scr, screen_y, text, indexHintForRow(ri, hint_file, hint_hunk, hint_section, hint_group), st);
                     },
                     .pair => |p| {
                         // Whole slot is current when the cursor sits on either pane
@@ -2335,17 +2481,26 @@ fn bufPrintTrunc(buf: []u8, comptime fmt: []const u8, args: anytype) []const u8 
     };
 }
 
-/// Index labels for the current file/hunk rows. Empty when `ri` is not one
-/// of those rows. File row always says File (`Space S` / `Space x` while
-/// the cursor is in a hunk, otherwise `Space Space` / `Space d`). Hunk row
-/// always says Hunk (`Space Space` / `Space d`). Verb follows the file’s
-/// group. Discard chords only on unstaged/untracked.
-fn indexHintForRow(ri: usize, file_i: ?usize, hunk_i: ?usize, group: ?diff.Group) []const u8 {
+/// Index labels for the current section/file/hunk rows. Empty when `ri` is
+/// not one of those rows. Section row says All (`Space Space`). File row
+/// always says File (`Space S` / `Space x` while the cursor is in a hunk,
+/// otherwise `Space Space` / `Space d`). Hunk row always says Hunk
+/// (`Space Space` / `Space d`). Verb follows the file’s (or section’s)
+/// group. Discard chords only on unstaged/untracked file and hunk rows.
+fn indexHintForRow(ri: usize, file_i: ?usize, hunk_i: ?usize, section_i: ?usize, group: ?diff.Group) []const u8 {
     const g = group orelse return "";
     const stage = switch (g) {
         .unstaged, .untracked => true,
         .staged => false,
     };
+    if (section_i) |si| {
+        if (ri == si) {
+            return if (stage)
+                "Stage All (Space Space)"
+            else
+                "Unstage All (Space Space)";
+        }
+    }
     if (file_i) |fi| {
         if (ri == fi) {
             if (hunk_i != null) {
