@@ -8,6 +8,8 @@ const Allocator = std.mem.Allocator;
 /// One renderable row in the review list. String slices borrow from the
 /// parent `Diff` arena (or are static); free only the row slice itself.
 pub const Row = union(enum) {
+    /// Group divider. Local load only.
+    section_header: diff.Group,
     file_header: struct {
         path: []const u8,
         is_binary: bool,
@@ -47,7 +49,14 @@ pub fn flatten(alloc: Allocator, d: *const diff.Diff) Allocator.Error![]Row {
     var rows: std.ArrayList(Row) = .empty;
     errdefer rows.deinit(alloc);
 
+    var prev_group: ?diff.Group = null;
     for (d.files) |f| {
+        if (f.group) |g| {
+            if (prev_group == null or prev_group.? != g) {
+                try rows.append(alloc, .{ .section_header = g });
+                prev_group = g;
+            }
+        }
         try rows.append(alloc, .{ .file_header = .{
             .path = f.displayPath(),
             .is_binary = f.is_binary,
@@ -139,7 +148,7 @@ pub fn hunkSpanAt(rows: []const Row, cursor: usize) HunkSpan {
     while (end < rows.len) : (end += 1) {
         switch (rows[end]) {
             .line => {},
-            .hunk_header, .file_header => break,
+            .hunk_header, .file_header, .section_header => break,
         }
     }
     return .{
@@ -229,7 +238,7 @@ pub fn sbsPaneWidths(cols: u16) SbsPanes {
 /// One screen row in side-by-side layout. Indices refer into the unified
 /// `rows` from `flatten` (same lifetime; slots do not own string data).
 pub const SbsSlot = union(enum) {
-    /// Full-width file or hunk header.
+    /// Full-width file, hunk, or section header.
     header: usize,
     /// Body: left pane (old) and/or right pane (new). Context uses the same
     /// index on both sides. An empty pane is `null`.
@@ -315,7 +324,7 @@ pub fn pairSideBySide(alloc: Allocator, rows: []const Row) Allocator.Error![]Sbs
     var i: usize = 0;
     while (i < rows.len) {
         switch (rows[i]) {
-            .file_header, .hunk_header => {
+            .file_header, .hunk_header, .section_header => {
                 try out.append(alloc, .{ .header = i });
                 i += 1;
             },
@@ -395,7 +404,7 @@ pub fn currentHunkInFile(rows: []const Row, cursor: usize) ?usize {
     while (true) {
         switch (rows[i]) {
             .hunk_header => return i,
-            .file_header => return null,
+            .file_header, .section_header => return null,
             .line => {},
         }
         if (i == 0) return null;
@@ -549,7 +558,7 @@ pub fn landOnHunk(rows: []const Row, hunk_start: usize) usize {
                 .add, .delete => return i,
                 .context, .meta => {},
             },
-            .hunk_header, .file_header => break,
+            .hunk_header, .file_header, .section_header => break,
         }
     }
     return hunk_start;
@@ -641,7 +650,7 @@ fn isChangedLine(row: Row) bool {
             .add, .delete => true,
             .context, .meta => false,
         },
-        .file_header, .hunk_header => false,
+        .file_header, .hunk_header, .section_header => false,
     };
 }
 
@@ -711,7 +720,7 @@ pub fn anchorAt(rows: []const Row, cursor: usize) ?Anchor {
                 .new_line = ln.new_no,
             },
         },
-        .file_header, .hunk_header => null,
+        .file_header, .hunk_header, .section_header => null,
     };
 }
 
@@ -779,7 +788,7 @@ pub fn rowForComment(rows: []const Row, loc: CommentLoc) ?usize {
                 };
                 if (no == loc.line) return i;
             },
-            .file_header, .hunk_header => {},
+            .file_header, .hunk_header, .section_header => {},
         }
     }
     return null;
@@ -799,6 +808,7 @@ pub fn cursorMarkAt(rows: []const Row, cursor: usize) ?CursorMark {
     const i = clampCursor(cursor, rows.len);
     switch (rows[i]) {
         .file_header => |fh| return .{ .path = fh.path },
+        .section_header => return null,
         .hunk_header => {
             const fi = currentFileStart(rows, i) orelse return null;
             return switch (rows[fi]) {
@@ -852,7 +862,7 @@ pub fn statusAt(rows: []const Row, cursor: usize) Status {
                 hunk_n += 1;
                 if (i <= cur) hunk_i = hunk_n;
             },
-            .line => {},
+            .line, .section_header => {},
         }
     }
     return .{
@@ -952,7 +962,7 @@ pub fn searchText(row: Row) ?[]const u8 {
             .add, .delete, .context => ln.text,
             .meta => null,
         },
-        .file_header, .hunk_header => null,
+        .file_header, .hunk_header, .section_header => null,
     };
 }
 
@@ -961,7 +971,7 @@ pub fn searchText(row: Row) ?[]const u8 {
 pub fn searchPath(row: Row) ?[]const u8 {
     return switch (row) {
         .file_header => |fh| fh.path,
-        .hunk_header, .line => null,
+        .hunk_header, .line, .section_header => null,
     };
 }
 
@@ -1124,17 +1134,125 @@ test "flatten copies file group onto headers and hunks" {
     const rows = try flatten(testing.allocator, &d);
     defer testing.allocator.free(rows);
 
-    try testing.expectEqual(8, rows.len);
-    try testing.expect(rows[0] == .file_header);
-    try testing.expect(rows[1] == .hunk_header);
-    try testing.expect(rows[4] == .file_header);
-    try testing.expect(rows[5] == .hunk_header);
-    try testing.expectEqual(diff.Group.unstaged, rows[0].file_header.group.?);
-    try testing.expectEqual(diff.Group.unstaged, rows[1].hunk_header.group.?);
-    try testing.expectEqualStrings("a", rows[0].file_header.path);
-    try testing.expectEqual(diff.Group.staged, rows[4].file_header.group.?);
-    try testing.expectEqual(diff.Group.staged, rows[5].hunk_header.group.?);
-    try testing.expectEqualStrings("a", rows[4].file_header.path);
+    // Unstaged header + file/hunk/lines, Staged header + file/hunk/lines.
+    try testing.expectEqual(10, rows.len);
+    try testing.expect(rows[0] == .section_header);
+    try testing.expectEqual(diff.Group.unstaged, rows[0].section_header);
+    try testing.expect(rows[1] == .file_header);
+    try testing.expect(rows[2] == .hunk_header);
+    try testing.expect(rows[5] == .section_header);
+    try testing.expectEqual(diff.Group.staged, rows[5].section_header);
+    try testing.expect(rows[6] == .file_header);
+    try testing.expect(rows[7] == .hunk_header);
+    try testing.expectEqual(diff.Group.unstaged, rows[1].file_header.group.?);
+    try testing.expectEqual(diff.Group.unstaged, rows[2].hunk_header.group.?);
+    try testing.expectEqualStrings("a", rows[1].file_header.path);
+    try testing.expectEqual(diff.Group.staged, rows[6].file_header.group.?);
+    try testing.expectEqual(diff.Group.staged, rows[7].hunk_header.group.?);
+    try testing.expectEqualStrings("a", rows[6].file_header.path);
+}
+
+fn threeGroupFixture(alloc: Allocator) !struct { d: diff.Diff, rows: []Row } {
+    const unstaged_txt =
+        \\diff --git a/a b/a
+        \\--- a/a
+        \\+++ b/a
+        \\@@ -1 +1 @@
+        \\-old
+        \\+new
+    ;
+    const untracked_txt =
+        \\diff --git a/u b/u
+        \\new file mode 100644
+        \\--- /dev/null
+        \\+++ b/u
+        \\@@ -0,0 +1 @@
+        \\+hi
+    ;
+    const staged_txt =
+        \\diff --git a/a b/a
+        \\--- a/a
+        \\+++ b/a
+        \\@@ -1 +1,2 @@
+        \\ same
+        \\+staged
+    ;
+    var d = try diff.parsePieces(alloc, &.{
+        .{ .text = unstaged_txt, .group = .unstaged },
+        .{ .text = untracked_txt, .group = .untracked },
+        .{ .text = staged_txt, .group = .staged },
+    });
+    errdefer d.deinit();
+    const rows = try flatten(alloc, &d);
+    return .{ .d = d, .rows = rows };
+}
+
+test "flatten inserts section headers at group boundaries" {
+    var fix = try threeGroupFixture(testing.allocator);
+    defer fix.d.deinit();
+    defer testing.allocator.free(fix.rows);
+    const rows = fix.rows;
+
+    // Unstaged (1) + file/hunk/del/add (4) + Untracked (1) + file/hunk/add (3)
+    // + Staged (1) + file/hunk/ctx/add (4) = 14.
+    try testing.expectEqual(14, rows.len);
+
+    try testing.expectEqual(diff.Group.unstaged, rows[0].section_header);
+    try testing.expectEqualStrings("a", rows[1].file_header.path);
+
+    try testing.expectEqual(diff.Group.untracked, rows[5].section_header);
+    try testing.expectEqualStrings("u", rows[6].file_header.path);
+
+    try testing.expectEqual(diff.Group.staged, rows[9].section_header);
+    try testing.expectEqualStrings("a", rows[10].file_header.path);
+
+    const slots = try pairSideBySide(testing.allocator, rows);
+    defer testing.allocator.free(slots);
+    for ([_]usize{ 0, 5, 9 }) |ri| {
+        const si = sbsSlotForRow(slots, ri).?;
+        try testing.expect(slots[si] == .header);
+        try testing.expectEqual(ri, slots[si].header);
+    }
+
+    try testing.expectEqual(1, nextFileHeader(rows, 0));
+    try testing.expectEqual(6, nextFileHeader(rows, 1));
+    try testing.expectEqual(6, nextFileHeader(rows, 5));
+    try testing.expectEqual(10, nextFileHeader(rows, 6));
+    try testing.expectEqual(6, prevFileHeader(rows, 9));
+    try testing.expectEqual(6, prevFileHeader(rows, 10));
+    try testing.expectEqual(1, prevFileHeader(rows, 6));
+    try testing.expectEqual(1, prevFileHeader(rows, 5));
+
+    try testing.expectEqualStrings("", statusAt(rows, 0).path);
+    try testing.expectEqualStrings("a", statusAt(rows, 5).path);
+    try testing.expect(currentHunkInFile(rows, 0) == null);
+    try testing.expect(currentHunkInFile(rows, 5) == null);
+    try testing.expect(anchorAt(rows, 0) == null);
+    try testing.expect(searchText(rows[0]) == null);
+    try testing.expect(searchPath(rows[0]) == null);
+}
+
+test "flatten untracked-only still emits one section header" {
+    const untracked_txt =
+        \\diff --git a/u b/u
+        \\new file mode 100644
+        \\--- /dev/null
+        \\+++ b/u
+        \\@@ -0,0 +1 @@
+        \\+hi
+    ;
+    var d = try diff.parsePieces(testing.allocator, &.{
+        .{ .text = "", .group = .unstaged },
+        .{ .text = untracked_txt, .group = .untracked },
+        .{ .text = "", .group = .staged },
+    });
+    defer d.deinit();
+    const rows = try flatten(testing.allocator, &d);
+    defer testing.allocator.free(rows);
+
+    try testing.expect(rows[0] == .section_header);
+    try testing.expectEqual(diff.Group.untracked, rows[0].section_header);
+    try testing.expectEqualStrings("u", rows[1].file_header.path);
 }
 
 test "flatten binary file has header only" {

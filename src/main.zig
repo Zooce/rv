@@ -1059,6 +1059,9 @@ const help_rows = [_]HelpRow{
     .{ .item = .{ .key = "I/C/A", .label = "create / edit old" } },
     .{ .item = .{ .key = "d/D", .label = "dismiss new / old" } },
     .blank,
+    .{ .group = "Local review" },
+    .{ .item = .{ .key = "sections", .label = "Unstaged, Untracked, Staged" } },
+    .blank,
     .{ .group = "Session" },
     .{ .item = .{ .key = "t", .label = "layout" } },
     .{ .item = .{ .key = "r", .label = "reload" } },
@@ -1087,8 +1090,9 @@ const help_key_w: u16 = blk: {
 
 test "help catalog includes normal bindings" {
     const required = [_][]const u8{
-        "j/k", "h/l", "0/$", "J/K", "[/]", "{/}", "(/)", "/", "n/N",
-        "Space f", "Space l", "i", "I", "d", "D", "t", "r", "?", "q",
+        "j/k",     "h/l",     "0/$", "J/K", "[/]", "{/}", "(/)", "/", "n/N",
+        "Space f", "Space l", "i",   "I",   "d",   "D",   "t",   "r", "?",
+        "q",
     };
     for (required) |token| {
         var found = false;
@@ -1206,6 +1210,7 @@ fn paint(
     // Diff line palette (truecolor). Documented together so sticky file
     // headers (#36) and body paints share one table. Hierarchy:
     //   body          — near-black bg, neutral fg
+    //   section header — body bg, box-drawing rule (`─ Unstaged ─`)
     //   file header   — full-row dark grey bar, bold light path
     //   hunk header   — full-row deeper grey bar, light `@@`
     //   add / delete  — green/red fills (#35); markers are not restored
@@ -1215,6 +1220,15 @@ fn paint(
     const bg = tui.Color{ .rgb = .{ .r = 0x12, .g = 0x12, .b = 0x14 } };
     const fg = tui.Color{ .rgb = .{ .r = 0xd0, .g = 0xd0, .b = 0xd0 } };
     const body = tui.Style{ .fg = fg, .bg = bg };
+    const section_style = tui.Style{
+        .fg = .{ .rgb = .{ .r = 0x6a, .g = 0x6a, .b = 0x76 } },
+        .bg = bg,
+    };
+    const section_cur_style = tui.Style{
+        .fg = .{ .rgb = .{ .r = 0x7e, .g = 0x7e, .b = 0x8b } },
+        .bg = bg,
+        .bold = true,
+    };
     const title_style = tui.Style{
         .fg = .{ .rgb = .{ .r = 0xee, .g = 0xee, .b = 0xee } },
         .bg = .{ .rgb = .{ .r = 0x2a, .g = 0x3f, .b = 0x5f } },
@@ -1367,6 +1381,8 @@ fn paint(
                     rows[i],
                     is_cur,
                     body,
+                    section_style,
+                    section_cur_style,
                     file_style,
                     file_cur_style,
                     hunk_style,
@@ -1379,7 +1395,11 @@ fn paint(
                     meta_style,
                     cur_style,
                 );
-                fillRow(scr, screen_y, st);
+                if (rows[i] == .section_header) {
+                    scr.fillRect(.{ .x = 0, .y = screen_y, .w = scr.cols, .h = 1 }, '─', st);
+                } else {
+                    fillRow(scr, screen_y, st);
+                }
                 const pan = pan_span.containsBody(i);
                 const visible = if (pan) text[tui.screen.byteAtCol(text, cs)..] else text;
                 scr.putStr(0, screen_y, visible, st, null);
@@ -1413,6 +1433,8 @@ fn paint(
                             rows[ri],
                             is_cur,
                             body,
+                            section_style,
+                            section_cur_style,
                             file_style,
                             file_cur_style,
                             hunk_style,
@@ -1425,7 +1447,11 @@ fn paint(
                             meta_style,
                             cur_style,
                         );
-                        fillRow(scr, screen_y, st);
+                        if (rows[ri] == .section_header) {
+                            scr.fillRect(.{ .x = 0, .y = screen_y, .w = scr.cols, .h = 1 }, '─', st);
+                        } else {
+                            fillRow(scr, screen_y, st);
+                        }
                         scr.putStr(0, screen_y, text, st, null);
                     },
                     .pair => |p| {
@@ -1437,6 +1463,8 @@ fn paint(
                                 rows[ri],
                                 slot_cur,
                                 body,
+                                section_style,
+                                section_cur_style,
                                 file_style,
                                 file_cur_style,
                                 hunk_style,
@@ -1455,6 +1483,8 @@ fn paint(
                                 rows[ri],
                                 slot_cur,
                                 body,
+                                section_style,
+                                section_cur_style,
                                 file_style,
                                 file_cur_style,
                                 hunk_style,
@@ -1645,11 +1675,13 @@ fn formatFooter(
 }
 
 /// Style for one content row. Cursor keeps row kind: add/delete/context and
-/// file/hunk headers use a lighter lift of their bar; meta uses reverse gray.
+/// section/file/hunk headers use a lighter lift of their bar; meta uses reverse gray.
 fn rowStyle(
     row: view.Row,
     is_cur: bool,
     body: tui.Style,
+    section_style: tui.Style,
+    section_cur_style: tui.Style,
     file_style: tui.Style,
     file_cur_style: tui.Style,
     hunk_style: tui.Style,
@@ -1670,11 +1702,13 @@ fn rowStyle(
                 .context => ctx_cur_style,
                 .meta => cur_style,
             },
+            .section_header => section_cur_style,
             .file_header => file_cur_style,
             .hunk_header => hunk_cur_style,
         };
     }
     return switch (row) {
+        .section_header => section_style,
         .file_header => file_style,
         .hunk_header => hunk_style,
         .line => |ln| switch (ln.kind) {
@@ -1690,6 +1724,11 @@ fn rowStyle(
 /// pad/`\` for meta). Add/delete use background color, not `+/-` markers.
 fn formatRow(buf: []u8, row: view.Row, marked: bool) []const u8 {
     return switch (row) {
+        .section_header => |g| bufPrintTrunc(buf, "── {s} ", .{switch (g) {
+            .unstaged => "Unstaged",
+            .untracked => "Untracked",
+            .staged => "Staged",
+        }}),
         .file_header => |fh| if (fh.is_binary)
             bufPrintTrunc(buf, " {s}  (binary)", .{fh.path})
         else

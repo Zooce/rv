@@ -82,7 +82,7 @@ Not a multi-user code-review platform. Not a GitHub replacement. A **personal re
 | Branch vs base (e.g. `rv main...HEAD`) | MVP |
 | Arbitrary patches | Later |
 
-**Default invocation:** bare `rv` reviews local changes only (staged, unstaged, and untracked). A clean worktree opens an empty review. Branch and other diffs are opt-in: `rv <range>` (for example `rv main...HEAD`). The TUI footer shows the git range (`HEAD` for local, `HEAD · empty` when the worktree is clean, or the range you passed).
+**Default invocation:** bare `rv` reviews local changes only (staged, unstaged, and untracked). The TUI groups those under labeled **Unstaged**, **Untracked**, and **Staged** sections (empty groups omitted). A clean worktree opens an empty review. Branch and other diffs are opt-in: `rv <range>` (for example `rv main...HEAD`) and have no section headers. The TUI footer shows the git range (`HEAD` for local, `HEAD · empty` when the worktree is clean, or the range you passed).
 
 ### Navigation and selection (keyboard-first)
 
