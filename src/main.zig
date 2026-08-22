@@ -35,13 +35,19 @@
 //! diff: empty overlay. Opens on the file under the cursor when there is
 //! one. Local only: `Space` `Space` stages or unstages the current file
 //! (on a file header) or hunk (in a hunk); `Space` `S` does the containing
-//! file from a hunk. Range loads ignore those chords. An unmatched `Space`
-//! leader is dropped; the next key is handled as normal (`Space` then `d`
-//! still dismisses). Git failure opens a centered overlay with git’s error;
-//! Enter or Esc dismisses. The list is unchanged. Local load paints
-//! `Stage File` / `Unstage File` / `Stage Hunk` / `Unstage Hunk` with the
-//! chord on the far right of the current file and hunk rows (no hints on a
-//! range load).
+//! file from a hunk. `Space` `d` discards the current file or hunk;
+//! `Space` `x` discards the containing file from a hunk (stand-in until
+//! Ctrl). Discard always confirms (`No` selected; `yes` proceeds). If the
+//! target has live comments, a second overlay asks to delete them (`Yes`
+//! selected; `no` keeps them). Git discard runs first; comments are
+//! deleted only on success. Staged rows are no-ops (unstage first). Range
+//! loads ignore those chords. An unmatched `Space` leader is dropped; the
+//! next key is handled as normal
+//! (`Space` then `d` still dismisses on a range load). Git failure opens
+//! a centered overlay with git’s error; Enter or Esc dismisses. The list
+//! is unchanged. Local load paints stage/unstage chords on the current
+//! file and hunk rows; unstaged/untracked rows also show discard chords
+//! (no hints on a range load).
 //!
 //! Comment list: `Space` then `l` opens a centered overlay of live comments
 //! (same store as `rv list`). `j`/`k` move; Enter jumps with the same landing
@@ -151,10 +157,12 @@ fn runTui(alloc: std.mem.Allocator, io: std.Io, source: cli.Source) !u8 {
     // Exactly one focus; cannot help, comment, search, and list at once.
     var focus: Focus = .normal;
     // `Space` leader: next key may be `f` (file list), `l` (comment list),
-    // `Space` (stage/unstage current file or hunk), or `S` (containing file
-    // from a hunk). Cleared on that next key. Unmatched leader is dropped;
-    // `Space` then `d` still dismisses.
+    // `Space` (stage/unstage current file or hunk), `S` (containing file
+    // from a hunk), `d` (discard current file or hunk), or `x` (discard
+    // containing file from a hunk). Cleared on that next key. Unmatched
+    // leader is dropped; on a range load `Space` then `d` still dismisses.
     var leader_pending: bool = false;
+    var discard_confirm: DiscardConfirm = .{};
     var draft: Draft = .{};
     defer draft.buf.deinit(alloc);
     // Snapshot of `review.comments` while the comment list overlay is open.
@@ -175,7 +183,7 @@ fn runTui(alloc: std.mem.Allocator, io: std.Io, source: cli.Source) !u8 {
     var git_err: std.ArrayList(u8) = .empty;
     defer git_err.deinit(alloc);
 
-    paint(&scr, size, rows, sbs_slots, layout_pref, cursor, &scroll, &col_scroll, &review, source, focus, draft.buf.items, draft.caret, &draft.scroll, draft.anchor, note.slice(), list_items.items, file_items.items, list_cursor, &list_scroll, &help_scroll, git_err.items);
+    paint(&scr, size, rows, sbs_slots, layout_pref, cursor, &scroll, &col_scroll, &review, source, focus, draft.buf.items, draft.caret, &draft.scroll, draft.anchor, note.slice(), list_items.items, file_items.items, list_cursor, &list_scroll, &help_scroll, git_err.items, discard_confirm);
     try scr.present(&term);
 
     while (running) {
@@ -393,6 +401,81 @@ fn runTui(alloc: std.mem.Allocator, io: std.Io, source: cli.Source) !u8 {
                         .ctrl_c => running = false,
                         else => {},
                     },
+                    .discard_confirm => {
+                        var abort = false;
+                        var answered = false;
+                        switch (key) {
+                            .esc => abort = true,
+                            .enter => answered = true,
+                            .left, .up => discard_confirm.yes = false,
+                            .right, .down => discard_confirm.yes = true,
+                            .char => |c| {
+                                if (c == 'q' or c == 'Q') {
+                                    running = false;
+                                } else if (c == 'n' or c == 'N') {
+                                    discard_confirm.yes = false;
+                                    answered = true;
+                                } else if (c == 'y' or c == 'Y') {
+                                    discard_confirm.yes = true;
+                                    answered = true;
+                                }
+                            },
+                            .ctrl_c => running = false,
+                            else => {},
+                        }
+                        if (abort) {
+                            focus = .normal;
+                        } else if (answered) {
+                            if (!discard_confirm.comments and !discard_confirm.yes) {
+                                focus = .normal;
+                            } else if (!discard_confirm.comments and hasMatchingDiscardComments(
+                                &review,
+                                &d,
+                                rows,
+                                cursor,
+                                discard_confirm.whole_file,
+                            )) {
+                                discard_confirm.comments = true;
+                                discard_confirm.yes = true;
+                            } else {
+                                const delete_them = discard_confirm.comments and discard_confirm.yes;
+                                var ids: std.ArrayList([]const u8) = .empty;
+                                defer ids.deinit(alloc);
+                                var saved: std.ArrayList(DiscardCommentSnap) = .empty;
+                                defer saved.deinit(alloc);
+                                if (delete_them) {
+                                    try collectDiscardComments(
+                                        &review,
+                                        &d,
+                                        rows,
+                                        cursor,
+                                        discard_confirm.whole_file,
+                                        alloc,
+                                        &ids,
+                                        &saved,
+                                    );
+                                }
+                                focus = .normal;
+                                try applyIndex(
+                                    alloc,
+                                    io,
+                                    source,
+                                    &d,
+                                    &rows,
+                                    &sbs_slots,
+                                    &cursor,
+                                    &note,
+                                    &focus,
+                                    &git_err,
+                                    discard_confirm.whole_file,
+                                    .discard,
+                                );
+                                if (focus != .git_error and delete_them) {
+                                    removeDiscardComments(&review, alloc, io, ids.items, saved.items, &note);
+                                }
+                            }
+                        }
+                    },
                     .helping => switch (key) {
                         .esc => {
                             focus = .normal;
@@ -454,6 +537,7 @@ fn runTui(alloc: std.mem.Allocator, io: std.Io, source: cli.Source) !u8 {
                                         &focus,
                                         &git_err,
                                         false,
+                                        .stage_unstage,
                                     );
                                 } else if (after_leader and c == 'S') {
                                     if (view.currentHunkInFile(rows, cursor) != null) {
@@ -469,7 +553,18 @@ fn runTui(alloc: std.mem.Allocator, io: std.Io, source: cli.Source) !u8 {
                                             &focus,
                                             &git_err,
                                             true,
+                                            .stage_unstage,
                                         );
+                                    }
+                                } else if (after_leader and c == 'd') {
+                                    if (source == .local) {
+                                        beginDiscard(rows, cursor, false, &focus, &discard_confirm);
+                                    } else {
+                                        dismissAt(&review, alloc, io, rows, sbs_slots, layout, cursor, .new, &note);
+                                    }
+                                } else if (after_leader and c == 'x') {
+                                    if (source == .local and view.currentHunkInFile(rows, cursor) != null) {
+                                        beginDiscard(rows, cursor, true, &focus, &discard_confirm);
                                     }
                                 } else if (c == 'q' or c == 'Q') {
                                     running = false;
@@ -574,7 +669,7 @@ fn runTui(alloc: std.mem.Allocator, io: std.Io, source: cli.Source) !u8 {
             },
         }
         if (running) {
-            paint(&scr, size, rows, sbs_slots, layout_pref, cursor, &scroll, &col_scroll, &review, source, focus, draft.buf.items, draft.caret, &draft.scroll, draft.anchor, note.slice(), list_items.items, file_items.items, list_cursor, &list_scroll, &help_scroll, git_err.items);
+            paint(&scr, size, rows, sbs_slots, layout_pref, cursor, &scroll, &col_scroll, &review, source, focus, draft.buf.items, draft.caret, &draft.scroll, draft.anchor, note.slice(), list_items.items, file_items.items, list_cursor, &list_scroll, &help_scroll, git_err.items, discard_confirm);
             try scr.present(&term);
         }
     }
@@ -652,12 +747,13 @@ fn reloadDiff(
     cursor.* = new_cursor;
 }
 
-/// Stage or unstage the current file or hunk (local source only). On success,
-/// reload like `r` but land on the neighbor change, not the same path+line.
-/// On git failure, leave the list unchanged and open the error overlay.
-/// Range loads and rows with no target are no-ops. `Space` `Space` uses
-/// `whole_file == false` (file header → file, hunk → hunk); `Space` `S`
-/// passes `true` from a hunk.
+/// Stage, unstage, or discard the current file or hunk (local source only).
+/// On success, reload like `r` but land on the neighbor change, not the same
+/// path+line. On git failure, leave the list unchanged and open the error
+/// overlay. Range loads and rows with no target are no-ops. `Space` `Space`
+/// / `Space` `d` use `whole_file == false` (file header → file, hunk → hunk);
+/// `Space` `S` / `Space` `x` pass `true` from a hunk. Discard on staged is
+/// a no-op (unstage first).
 fn applyIndex(
     alloc: std.mem.Allocator,
     io: std.Io,
@@ -670,17 +766,25 @@ fn applyIndex(
     focus: *Focus,
     git_err: *std.ArrayList(u8),
     whole_file: bool,
+    kind: enum { stage_unstage, discard },
 ) std.mem.Allocator.Error!void {
     if (source != .local) return;
     const target = view.indexTargetAt(rows.*, cursor.*, whole_file) orelse return;
     const file = fileForTarget(d, target) orelse return;
-    const neighbor = view.neighborMark(rows.*, target);
-    var fail: []u8 = &.{};
-    git.mutate(alloc, io, .inherit, .{
-        .action = switch (target.group) {
+    const action: git.Action = switch (kind) {
+        .stage_unstage => switch (target.group) {
             .unstaged, .untracked => .stage,
             .staged => .unstage,
         },
+        .discard => switch (target.group) {
+            .unstaged, .untracked => .discard,
+            .staged => return,
+        },
+    };
+    const neighbor = view.neighborMark(rows.*, target);
+    var fail: []u8 = &.{};
+    git.mutate(alloc, io, .inherit, .{
+        .action = action,
         .path = file.displayPath(),
         .group = target.group,
         .hunk = if (target.hunk_i) |hi| &file.hunks[hi] else null,
@@ -708,6 +812,24 @@ fn applyIndex(
     reloadDiff(alloc, io, source, d, rows, sbs_slots, cursor, note, restore);
 }
 
+/// Open the discard confirm overlay for the current file or hunk.
+/// Staged rows and rows with no target are no-ops. Caller handles range.
+fn beginDiscard(
+    rows: []const view.Row,
+    cursor: usize,
+    whole_file: bool,
+    focus: *Focus,
+    discard: *DiscardConfirm,
+) void {
+    const target = view.indexTargetAt(rows, cursor, whole_file) orelse return;
+    switch (target.group) {
+        .staged => return,
+        .unstaged, .untracked => {},
+    }
+    discard.* = .{ .whole_file = whole_file, .yes = false, .comments = false };
+    focus.* = .discard_confirm;
+}
+
 fn fileForTarget(d: *const diff.Diff, target: view.IndexTarget) ?*const diff.File {
     for (d.files) |*f| {
         const g = f.group orelse continue;
@@ -721,9 +843,145 @@ fn fileForTarget(d: *const diff.Diff, target: view.IndexTarget) ?*const diff.Fil
     return null;
 }
 
+/// Snapshot of a comment removed during discard, for save-failure restore.
+const DiscardCommentSnap = struct {
+    idx: usize,
+    comment: store.Comment,
+};
+
+fn lineInHunkRange(line: ?u32, start: u32, count: ?u32) bool {
+    const n = line orelse return false;
+    const len = count orelse 1;
+    return n >= start and n - start < len;
+}
+
+fn commentHitsHunk(c: store.Comment, hunk: diff.Hunk) bool {
+    return lineInHunkRange(c.old_line, hunk.old_start, hunk.old_count) or
+        lineInHunkRange(c.new_line, hunk.new_start, hunk.new_count);
+}
+
+fn discardCommentMatches(c: store.Comment, file: *const diff.File, hunk_i: ?usize) bool {
+    if (c.state != .open) return false;
+    if (!std.mem.eql(u8, c.path, file.displayPath())) return false;
+    if (hunk_i) |hi| {
+        if (hi >= file.hunks.len) return false;
+        return commentHitsHunk(c, file.hunks[hi]);
+    }
+    for (file.hunks) |hunk| {
+        if (commentHitsHunk(c, hunk)) return true;
+    }
+    return false;
+}
+
+fn discardTargetFile(
+    d: *const diff.Diff,
+    rows: []const view.Row,
+    cursor: usize,
+    whole_file: bool,
+) ?struct { file: *const diff.File, hunk_i: ?usize } {
+    const target = view.indexTargetAt(rows, cursor, whole_file) orelse return null;
+    const file = fileForTarget(d, target) orelse return null;
+    return .{ .file = file, .hunk_i = target.hunk_i };
+}
+
+fn hasMatchingDiscardComments(
+    review: *const store.Review,
+    d: *const diff.Diff,
+    rows: []const view.Row,
+    cursor: usize,
+    whole_file: bool,
+) bool {
+    const found = discardTargetFile(d, rows, cursor, whole_file) orelse return false;
+    for (review.comments.items) |c| {
+        if (discardCommentMatches(c, found.file, found.hunk_i)) return true;
+    }
+    return false;
+}
+
+fn collectDiscardComments(
+    review: *const store.Review,
+    d: *const diff.Diff,
+    rows: []const view.Row,
+    cursor: usize,
+    whole_file: bool,
+    alloc: std.mem.Allocator,
+    ids: *std.ArrayList([]const u8),
+    saved: *std.ArrayList(DiscardCommentSnap),
+) std.mem.Allocator.Error!void {
+    const found = discardTargetFile(d, rows, cursor, whole_file) orelse return;
+    for (review.comments.items, 0..) |c, i| {
+        if (!discardCommentMatches(c, found.file, found.hunk_i)) continue;
+        try ids.append(alloc, c.id);
+        try saved.append(alloc, .{ .idx = i, .comment = c });
+    }
+}
+
+/// Git already succeeded. Delete matching comments; on save failure put them back.
+fn removeDiscardComments(
+    review: *store.Review,
+    alloc: std.mem.Allocator,
+    io: std.Io,
+    ids: []const []const u8,
+    saved: []const DiscardCommentSnap,
+    note: *StatusNote,
+) void {
+    if (ids.len == 0) return;
+    review.remove(ids) catch return;
+    store.save(review, alloc, io, .cwd()) catch {
+        for (saved) |s| {
+            review.comments.insert(review.arena.allocator(), s.idx, s.comment) catch {};
+        }
+        note.set("failed to save .rv comment store");
+    };
+}
+
+test "discard comments match this group's hunk lines" {
+    const hunks = [_]diff.Hunk{
+        .{ .old_start = 10, .old_count = 3, .new_start = 12, .new_count = 4 },
+        .{ .old_start = 40, .old_count = 2, .new_start = 50, .new_count = 2 },
+    };
+    const file = diff.File{
+        .new_path = "a.zig",
+        .hunks = &hunks,
+        .group = .unstaged,
+    };
+    const hit_new = store.Comment{ .id = "1", .path = "a.zig", .new_line = 13, .body = "x" };
+    const hit_old = store.Comment{ .id = "2", .path = "a.zig", .old_line = 11, .body = "x" };
+    const hit_second = store.Comment{ .id = "3", .path = "a.zig", .new_line = 51, .body = "x" };
+    const other_line = store.Comment{ .id = "4", .path = "a.zig", .new_line = 80, .body = "x" };
+    const other_path = store.Comment{ .id = "5", .path = "b.zig", .new_line = 13, .body = "x" };
+    const resolved = store.Comment{
+        .id = "6",
+        .path = "a.zig",
+        .new_line = 13,
+        .body = "x",
+        .state = .resolved,
+    };
+
+    try std.testing.expect(discardCommentMatches(hit_new, &file, 0));
+    try std.testing.expect(discardCommentMatches(hit_old, &file, 0));
+    try std.testing.expect(!discardCommentMatches(hit_second, &file, 0));
+    try std.testing.expect(!discardCommentMatches(other_line, &file, 0));
+    try std.testing.expect(!discardCommentMatches(other_path, &file, 0));
+    try std.testing.expect(!discardCommentMatches(resolved, &file, 0));
+
+    try std.testing.expect(discardCommentMatches(hit_new, &file, null));
+    try std.testing.expect(discardCommentMatches(hit_second, &file, null));
+    try std.testing.expect(!discardCommentMatches(other_line, &file, null));
+}
+
 /// Key ownership: normal nav, comment draft, `/` search prompt, comment list,
-/// file list, help, or git error overlay.
-const Focus = enum { normal, commenting, searching, listing, files, helping, git_error };
+/// file list, help, git error overlay, or discard confirm.
+const Focus = enum { normal, commenting, searching, listing, files, helping, git_error, discard_confirm };
+
+/// Confirm overlay for `Space` `d` / `Space` `x`. `yes` is the selected
+/// choice. First overlay defaults to **No** (abort). If the target has live
+/// comments, `comments` is the second overlay and defaults to **Yes** (delete).
+const DiscardConfirm = struct {
+    whole_file: bool = false,
+    yes: bool = false,
+    comments: bool = false,
+};
 
 /// Footer box buffer plus comment-mode extras. Search uses `buf` and `caret` only.
 const Draft = struct {
@@ -1203,6 +1461,104 @@ fn paintGitError(scr: *tui.Screen, size: tui.Size, text: []const u8) void {
     }
 }
 
+fn paintDiscardConfirm(
+    scr: *tui.Screen,
+    size: tui.Size,
+    rows: []const view.Row,
+    cursor: usize,
+    discard: DiscardConfirm,
+) void {
+    const bg = tui.Color{ .rgb = .{ .r = 0x12, .g = 0x12, .b = 0x14 } };
+    const fg = tui.Color{ .rgb = .{ .r = 0xd0, .g = 0xd0, .b = 0xd0 } };
+    const panel_bg = tui.Style{ .fg = fg, .bg = bg };
+    const panel_frame = tui.Style{
+        .fg = .{ .rgb = .{ .r = 0x5d, .g = 0x81, .b = 0xb7 } },
+        .bg = bg,
+        .bold = true,
+    };
+    const choice_cur = tui.Style{
+        .fg = fg,
+        .bg = .{ .rgb = .{ .r = 0x2a, .g = 0x2a, .b = 0x30 } },
+        .bold = true,
+    };
+
+    var hunk_buf: [512]u8 = undefined;
+    const hunk_text: []const u8, const path: []const u8 = if (discard.comments)
+        .{ "", "" }
+    else blk: {
+        const target = view.indexTargetAt(rows, cursor, discard.whole_file);
+        const hunk_row: ?view.Row = if (target) |t|
+            if (t.hunk_i != null) rows[t.first] else null
+        else
+            null;
+        const ht: []const u8 = if (hunk_row) |hr| formatRow(&hunk_buf, hr, false) else "";
+        break :blk .{ ht, if (target) |t| t.path else "" };
+    };
+
+    const content_n: u16 = if (discard.comments)
+        3
+    else if (hunk_text.len > 0)
+        4
+    else
+        3;
+    const want_w: u16 = @min(size.cols -| 4, 60);
+    const panel = tui.Rect.centered(size.cols, size.rows, want_w, content_n + 2);
+    scr.fillRect(panel, ' ', panel_bg);
+    scr.drawBox(panel, panel_frame);
+    if (panel.h > 0 and panel.w > 2) {
+        const title: []const u8 = if (discard.comments) " comments " else " discard ";
+        scr.putStr(panel.x + 2, panel.y, title, panel_frame, panel);
+    }
+    const inner = panel.inset(1);
+    if (inner.h == 0 or inner.w == 0) return;
+    var row: u16 = 0;
+    if (discard.comments) {
+        if (row < inner.h) {
+            scr.putStr(inner.x, inner.y + row, "delete comments with this change?", panel_bg, inner);
+            row += 1;
+        }
+    } else {
+        if (path.len > 0 and row < inner.h) {
+            scr.putStr(inner.x, inner.y + row, path, panel_bg, inner);
+            row += 1;
+        }
+        if (hunk_text.len > 0 and row < inner.h) {
+            const start: usize = if (hunk_text[0] == ' ') 1 else 0;
+            scr.putStr(inner.x, inner.y + row, hunk_text[start..], panel_bg, inner);
+            row += 1;
+        }
+    }
+    if (row < inner.h) row += 1;
+    if (row >= inner.h) return;
+    paintYesNoChoices(scr, inner, inner.y + row, discard.yes, discard.comments, panel_bg, choice_cur);
+}
+
+/// Default choice is capitalized (`No`/`Yes`); the other stays lowercase.
+/// Highlight follows the current selection.
+fn paintYesNoChoices(
+    scr: *tui.Screen,
+    inner: tui.Rect,
+    y: u16,
+    yes: bool,
+    default_yes: bool,
+    panel_bg: tui.Style,
+    choice_cur: tui.Style,
+) void {
+    const no_label: []const u8 = if (default_yes) "no" else "No";
+    const yes_label: []const u8 = if (default_yes) "Yes" else "yes";
+    const no_w: u16 = 2;
+    const yes_w: u16 = 3;
+    const mid: u16 = inner.x + inner.w / 2;
+    const no_x: u16 = mid -| 6;
+    const yes_x: u16 = mid +| 2;
+    const n_st = if (!yes) choice_cur else panel_bg;
+    const y_st = if (yes) choice_cur else panel_bg;
+    scr.fillRect(.{ .x = no_x -| 1, .y = y, .w = no_w + 2, .h = 1 }, ' ', n_st);
+    scr.putStr(no_x, y, no_label, n_st, inner);
+    scr.fillRect(.{ .x = yes_x -| 1, .y = y, .w = yes_w + 2, .h = 1 }, ' ', y_st);
+    scr.putStr(yes_x, y, yes_label, y_st, inner);
+}
+
 const HelpRow = union(enum) {
     group: []const u8,
     item: struct { key: []const u8, label: []const u8 },
@@ -1234,6 +1590,8 @@ const help_rows = [_]HelpRow{
     .{ .item = .{ .key = "sections", .label = "Unstaged, Untracked, Staged" } },
     .{ .item = .{ .key = "Space Space", .label = "stage / unstage file or hunk" } },
     .{ .item = .{ .key = "Space S", .label = "file from hunk (until Ctrl)" } },
+    .{ .item = .{ .key = "Space d", .label = "discard file or hunk" } },
+    .{ .item = .{ .key = "Space x", .label = "discard file from hunk (until Ctrl)" } },
     .blank,
     .{ .group = "Session" },
     .{ .item = .{ .key = "t", .label = "layout" } },
@@ -1245,6 +1603,7 @@ const help_rows = [_]HelpRow{
     .{ .item = .{ .key = "comment", .label = "Enter save · Esc cancel · arrows move" } },
     .{ .item = .{ .key = "search", .label = "Enter jump · Esc cancel" } },
     .{ .item = .{ .key = "list", .label = "j/k move · Enter jump · Esc close" } },
+    .{ .item = .{ .key = "discard", .label = "No/yes · comments no/Yes · Esc cancel" } },
 };
 
 const help_key_w: u16 = blk: {
@@ -1264,7 +1623,7 @@ const help_key_w: u16 = blk: {
 test "help catalog includes normal bindings" {
     const required = [_][]const u8{
         "j/k",     "h/l",     "0/$", "J/K", "[/]", "{/}", "(/)", "/", "n/N",
-        "Space f", "Space l", "Space Space", "Space S", "i", "I", "d", "D",
+        "Space f", "Space l", "Space Space", "Space S", "Space d", "Space x", "i", "I", "d", "D",
         "t",       "r",       "?",           "q",
     };
     for (required) |token| {
@@ -1380,6 +1739,7 @@ fn paint(
     list_scroll: *usize,
     help_scroll: *usize,
     git_err: []const u8,
+    discard: DiscardConfirm,
 ) void {
     // Diff line palette (truecolor). Documented together so sticky file
     // headers (#36) and body paints share one table. Hierarchy:
@@ -1494,6 +1854,10 @@ fn paint(
             .files => "rv  files  j/k move  Enter jump  Esc close  q quit",
             .helping => "rv  help  j/k  Esc/? close  q quit",
             .git_error => "rv  git error  Enter/Esc close  q quit",
+            .discard_confirm => if (discard.comments)
+                "rv  discard comments  no/Yes  Enter  Esc cancel  q quit"
+            else
+                "rv  discard  No/yes  Enter  Esc cancel  q quit",
             .normal => "rv  j/k  /  i/I  ? help  q quit",
         };
         scr.putStr(1, 0, help, title_style, null);
@@ -1816,6 +2180,9 @@ fn paint(
     } else if (focus == .git_error) {
         paintGitError(scr, size, git_err);
         scr.hideCursor();
+    } else if (focus == .discard_confirm) {
+        paintDiscardConfirm(scr, size, rows, cursor, discard);
+        scr.hideCursor();
     }
 }
 
@@ -1969,9 +2336,10 @@ fn bufPrintTrunc(buf: []u8, comptime fmt: []const u8, args: anytype) []const u8 
 }
 
 /// Index labels for the current file/hunk rows. Empty when `ri` is not one
-/// of those rows. File row always says File (`Space S` while the cursor is
-/// in a hunk, otherwise `Space Space`). Hunk row always says Hunk
-/// (`Space Space`). Verb follows the file’s group.
+/// of those rows. File row always says File (`Space S` / `Space x` while
+/// the cursor is in a hunk, otherwise `Space Space` / `Space d`). Hunk row
+/// always says Hunk (`Space Space` / `Space d`). Verb follows the file’s
+/// group. Discard chords only on unstaged/untracked.
 fn indexHintForRow(ri: usize, file_i: ?usize, hunk_i: ?usize, group: ?diff.Group) []const u8 {
     const g = group orelse return "";
     const stage = switch (g) {
@@ -1981,14 +2349,23 @@ fn indexHintForRow(ri: usize, file_i: ?usize, hunk_i: ?usize, group: ?diff.Group
     if (file_i) |fi| {
         if (ri == fi) {
             if (hunk_i != null) {
-                return if (stage) "Stage File (Space S)" else "Unstage File (Space S)";
+                return if (stage)
+                    "Stage File (Space S)  Discard File (Space x)"
+                else
+                    "Unstage File (Space S)";
             }
-            return if (stage) "Stage File (Space Space)" else "Unstage File (Space Space)";
+            return if (stage)
+                "Stage File (Space Space)  Discard File (Space d)"
+            else
+                "Unstage File (Space Space)";
         }
     }
     if (hunk_i) |hi| {
         if (ri == hi) {
-            return if (stage) "Stage Hunk (Space Space)" else "Unstage Hunk (Space Space)";
+            return if (stage)
+                "Stage Hunk (Space Space)  Discard Hunk (Space d)"
+            else
+                "Unstage Hunk (Space Space)";
         }
     }
     return "";
