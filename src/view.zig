@@ -11,6 +11,7 @@ pub const Row = union(enum) {
     file_header: struct {
         path: []const u8,
         is_binary: bool,
+        group: ?diff.Group = null,
     },
     hunk_header: struct {
         old_start: u32,
@@ -18,6 +19,7 @@ pub const Row = union(enum) {
         new_start: u32,
         new_count: ?u32,
         section: []const u8,
+        group: ?diff.Group = null,
     },
     line: struct {
         kind: diff.LineKind,
@@ -49,6 +51,7 @@ pub fn flatten(alloc: Allocator, d: *const diff.Diff) Allocator.Error![]Row {
         try rows.append(alloc, .{ .file_header = .{
             .path = f.displayPath(),
             .is_binary = f.is_binary,
+            .group = f.group,
         } });
         for (f.hunks) |h| {
             try rows.append(alloc, .{ .hunk_header = .{
@@ -57,6 +60,7 @@ pub fn flatten(alloc: Allocator, d: *const diff.Diff) Allocator.Error![]Row {
                 .new_start = h.new_start,
                 .new_count = h.new_count,
                 .section = h.section,
+                .group = f.group,
             } });
             for (h.lines) |ln| {
                 try rows.append(alloc, .{ .line = .{
@@ -1072,7 +1076,9 @@ test "flatten file hunk and lines" {
     try testing.expectEqual(4, rows.len);
     try testing.expect(rows[0] == .file_header);
     try testing.expectEqualStrings("f", rows[0].file_header.path);
+    try testing.expect(rows[0].file_header.group == null);
     try testing.expect(rows[1] == .hunk_header);
+    try testing.expect(rows[1].hunk_header.group == null);
     try testing.expect(rows[2] == .line);
     try testing.expectEqual(diff.LineKind.delete, rows[2].line.kind);
     try testing.expectEqualStrings("old", rows[2].line.text);
@@ -1091,6 +1097,44 @@ test "flatten file hunk and lines" {
     try testing.expectEqualStrings("f", a.path);
     try testing.expectEqual(1, a.old_line.?);
     try testing.expect(a.new_line == null);
+}
+
+test "flatten copies file group onto headers and hunks" {
+    const unstaged_txt =
+        \\diff --git a/a b/a
+        \\--- a/a
+        \\+++ b/a
+        \\@@ -1 +1 @@
+        \\-old
+        \\+new
+    ;
+    const staged_txt =
+        \\diff --git a/a b/a
+        \\--- a/a
+        \\+++ b/a
+        \\@@ -1 +1,2 @@
+        \\ same
+        \\+staged
+    ;
+    var d = try diff.parsePieces(testing.allocator, &.{
+        .{ .text = unstaged_txt, .group = .unstaged },
+        .{ .text = staged_txt, .group = .staged },
+    });
+    defer d.deinit();
+    const rows = try flatten(testing.allocator, &d);
+    defer testing.allocator.free(rows);
+
+    try testing.expectEqual(8, rows.len);
+    try testing.expect(rows[0] == .file_header);
+    try testing.expect(rows[1] == .hunk_header);
+    try testing.expect(rows[4] == .file_header);
+    try testing.expect(rows[5] == .hunk_header);
+    try testing.expectEqual(diff.Group.unstaged, rows[0].file_header.group.?);
+    try testing.expectEqual(diff.Group.unstaged, rows[1].hunk_header.group.?);
+    try testing.expectEqualStrings("a", rows[0].file_header.path);
+    try testing.expectEqual(diff.Group.staged, rows[4].file_header.group.?);
+    try testing.expectEqual(diff.Group.staged, rows[5].hunk_header.group.?);
+    try testing.expectEqualStrings("a", rows[4].file_header.path);
 }
 
 test "flatten binary file has header only" {

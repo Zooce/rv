@@ -2,17 +2,21 @@
 //!
 //! ## Default (local only)
 //!
-//! Staged **and** unstaged changes to tracked files (`git diff HEAD`),
-//! equivalent to combining `git diff` and `git diff --cached`.
-//! Plus **untracked** files listed by
-//! `git ls-files --others --exclude-standard` (same ignore rules as
-//! `git status` untracked). Each path is turned into a new-file unified
-//! diff via `git diff --no-index -- /dev/null <path>`.
-//! Untracked sections are appended **after** tracked paths. Empty untracked
-//! files appear as new-file headers (often zero hunks). Binary untracked
-//! files follow the same binary placeholder rules as tracked binary adds.
-//! Local untracked alone (no tracked changes) is still this path. With no
-//! `HEAD` yet, only untracked content is considered.
+//! Three groups, in this order, each file tagged (`diff.File.group`):
+//!
+//! 1. **unstaged** — `git diff` (worktree vs index)
+//! 2. **untracked** — `git ls-files --others --exclude-standard`, each path
+//!    turned into a new-file unified diff via
+//!    `git diff --no-index -- /dev/null <path>`
+//! 3. **staged** — `git diff --cached` (index vs HEAD)
+//!
+//! Empty groups are omitted. A path with both staged and unstaged hunks
+//! appears twice (unstaged remainder, then later the staged hunks).
+//! Empty untracked files appear as new-file headers (often zero hunks).
+//! Binary untracked files follow the same binary placeholder rules as
+//! tracked binary adds. Local untracked alone (no tracked changes) is
+//! still this path. With no `HEAD` yet, only untracked content is
+//! considered (staged is empty).
 //!
 //! A clean worktree (no local / untracked) yields an empty `Diff`. There is
 //! no fall-through to branch-vs-base (`git diff <base>...HEAD`).
@@ -58,23 +62,21 @@ pub fn loadDefaultDiffCwd(alloc: Allocator, io: Io, cwd: std.process.Child.Cwd) 
     const untracked = try untrackedDiff(alloc, io, cwd);
     defer if (untracked) |u| alloc.free(u);
 
-    if (try revExists(alloc, io, cwd, "HEAD")) {
-        const local = try git(alloc, io, cwd, .{ .argv = &.{ "git", "diff", "HEAD" } });
-        defer alloc.free(local);
+    var unstaged: ?[]u8 = null;
+    defer if (unstaged) |s| alloc.free(s);
+    var staged: ?[]u8 = null;
+    defer if (staged) |s| alloc.free(s);
 
-        if (untracked) |u| {
-            if (local.len == 0) return try diff.parse(alloc, u);
-            const combined = try std.mem.concat(alloc, u8, &.{ local, u });
-            defer alloc.free(combined);
-            return try diff.parse(alloc, combined);
-        }
-        return try diff.parse(alloc, local);
+    if (try revExists(alloc, io, cwd, "HEAD")) {
+        unstaged = try git(alloc, io, cwd, .{ .argv = &.{ "git", "diff" } });
+        staged = try git(alloc, io, cwd, .{ .argv = &.{ "git", "diff", "--cached" } });
     }
-    if (untracked) |u| {
-        // No commits yet: still review untracked new files.
-        return try diff.parse(alloc, u);
-    }
-    return try diff.parse(alloc, "");
+
+    return try diff.parsePieces(alloc, &.{
+        .{ .text = unstaged orelse "", .group = .unstaged },
+        .{ .text = untracked orelse "", .group = .untracked },
+        .{ .text = staged orelse "", .group = .staged },
+    });
 }
 
 /// Load `git diff <range>`. `range` is passed through as written (no
@@ -220,6 +222,11 @@ fn expectHasDisplayPath(d: diff.Diff, expected: []const u8) !void {
     return error.TestExpectedEqual;
 }
 
+fn expectFileAt(d: diff.Diff, i: usize, path: []const u8, group: diff.Group) !void {
+    try testing.expectEqualStrings(path, d.files[i].displayPath());
+    try testing.expectEqual(group, d.files[i].group.?);
+}
+
 test "not a git repository" {
     if (builtin.os.tag == .wasi) return error.SkipZigTest;
 
@@ -234,7 +241,7 @@ test "not a git repository" {
     );
 }
 
-test "dirty worktree: staged + unstaged as one stream" {
+test "dirty worktree: unstaged, untracked, then staged" {
     if (builtin.os.tag == .wasi) return error.SkipZigTest;
 
     const io = testing.io;
@@ -244,22 +251,32 @@ test "dirty worktree: staged + unstaged as one stream" {
     const cwd = tmp.cwd();
 
     try initTestRepo(alloc, io, cwd);
+    try tmp.write(io, "mixed.txt", "base\n");
     try tmp.write(io, "tracked.txt", "line1\n");
-    try expectGitOk(alloc, io, cwd, &.{ "git", "add", "tracked.txt" });
+    try expectGitOk(alloc, io, cwd, &.{ "git", "add", "mixed.txt", "tracked.txt" });
     try expectGitOk(alloc, io, cwd, &.{ "git", "commit", "-m", "init" });
 
-    // Unstaged change on an existing tracked file.
+    // Unstaged-only change.
     try tmp.write(io, "tracked.txt", "line1\nunstaged\n");
+    // Mixed path: stage one edit, then a further unstaged edit.
+    try tmp.write(io, "mixed.txt", "base\nstaged change\n");
+    try expectGitOk(alloc, io, cwd, &.{ "git", "add", "mixed.txt" });
+    try tmp.write(io, "mixed.txt", "base\nstaged change\nunstaged change\n");
     // Staged-only new file.
     try tmp.write(io, "staged.txt", "staged body\n");
     try expectGitOk(alloc, io, cwd, &.{ "git", "add", "staged.txt" });
+    // Untracked.
+    try tmp.write(io, "extra.zig", "const x = 1;\n");
 
     var d = try loadDefaultDiffCwd(alloc, io, cwd);
     defer d.deinit();
 
-    try testing.expectEqual(2, d.files.len);
-    try expectHasDisplayPath(d, "tracked.txt");
-    try expectHasDisplayPath(d, "staged.txt");
+    try testing.expectEqual(5, d.files.len);
+    try expectFileAt(d, 0, "mixed.txt", .unstaged);
+    try expectFileAt(d, 1, "tracked.txt", .unstaged);
+    try expectFileAt(d, 2, "extra.zig", .untracked);
+    try expectFileAt(d, 3, "mixed.txt", .staged);
+    try expectFileAt(d, 4, "staged.txt", .staged);
 }
 
 test "clean feature branch: empty model (no local changes)" {
@@ -333,8 +350,8 @@ test "dirty tracked plus untracked file: both in local stream" {
     defer d.deinit();
 
     try testing.expectEqual(2, d.files.len);
-    try expectHasDisplayPath(d, "tracked.txt");
-    try expectHasDisplayPath(d, "new.zig");
+    try expectFileAt(d, 0, "tracked.txt", .unstaged);
+    try expectFileAt(d, 1, "new.zig", .untracked);
 }
 
 test "ignored untracked path is not included" {
@@ -381,8 +398,27 @@ test "untracked-only worktree: non-empty local stream" {
     defer d.deinit();
 
     try testing.expectEqual(1, d.files.len);
-    try expectHasDisplayPath(d, "brand_new.zig");
+    try expectFileAt(d, 0, "brand_new.zig", .untracked);
     try testing.expect(d.hunk_count >= 1);
+}
+
+test "no HEAD: untracked-only still loads" {
+    if (builtin.os.tag == .wasi) return error.SkipZigTest;
+
+    const io = testing.io;
+    const alloc = testing.allocator;
+    var tmp = try IsolatedTmp.create(alloc, io);
+    defer tmp.cleanup(alloc, io);
+    const cwd = tmp.cwd();
+
+    try initTestRepo(alloc, io, cwd);
+    try tmp.write(io, "newbie.txt", "no commits yet\n");
+
+    var d = try loadDefaultDiffCwd(alloc, io, cwd);
+    defer d.deinit();
+
+    try testing.expectEqual(1, d.files.len);
+    try expectFileAt(d, 0, "newbie.txt", .untracked);
 }
 
 test "range main...HEAD: commits ahead of main" {
@@ -412,6 +448,8 @@ test "range main...HEAD: commits ahead of main" {
     try testing.expectEqual(2, d.hunk_count);
     try expectHasDisplayPath(d, "feature-only.txt");
     try expectHasDisplayPath(d, "shared.txt");
+    try testing.expect(d.files[0].group == null);
+    try testing.expect(d.files[1].group == null);
 }
 
 test "range does not append untracked files" {

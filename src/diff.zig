@@ -34,6 +34,12 @@
 //! Within one file section, later headers win: `---` / `+++` / `rename from|to`
 //! overwrite paths first set from `diff --git a/… b/…`. That matches git's
 //! usual order and keeps `/dev/null` (add/delete) authoritative.
+//!
+//! ## Groups
+//!
+//! `File.group` is the local-load bucket (unstaged / untracked / staged).
+//! `parse` leaves it `null`. `parsePieces` sets it per piece. Range diffs
+//! stay untagged.
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
@@ -81,6 +87,13 @@ pub const Hunk = struct {
     index: usize = 0,
 };
 
+/// Local default-load bucket. `null` on raw `parse` and range diffs.
+pub const Group = enum {
+    unstaged,
+    untracked,
+    staged,
+};
+
 /// One file change within a diff.
 pub const File = struct {
     /// Path from `---` / `rename from` / `diff --git` old side.
@@ -93,6 +106,8 @@ pub const File = struct {
     /// True when the section looked binary. Still listed so callers can show
     /// a placeholder even when there are no textual hunks.
     is_binary: bool = false,
+    /// Local-load bucket. `null` when untagged (raw `parse`, range diffs).
+    group: ?Group = null,
 
     /// Best path for display: new path, else old path, else `"?"`.
     pub fn displayPath(self: File) []const u8 {
@@ -127,11 +142,24 @@ pub const ParseError = error{
     BadHunkHeader,
 } || Allocator.Error;
 
+/// One blob of unified diff and the group to stamp on every file it yields.
+pub const ParsePiece = struct {
+    text: []const u8,
+    group: ?Group = null,
+};
+
 /// Parse a unified diff string into an owned `Diff`.
 ///
 /// `gpa` is the backing allocator for the arena. Empty input yields a Diff
-/// with zero files (not an error).
+/// with zero files (not an error). Files are untagged (`group == null`).
 pub fn parse(gpa: Allocator, input: []const u8) ParseError!Diff {
+    const pieces = [_]ParsePiece{.{ .text = input }};
+    return parsePieces(gpa, &pieces);
+}
+
+/// Parse one or more unified-diff blobs into a single `Diff` (one arena).
+/// Empty pieces add no files. Hunk indexes continue across pieces.
+pub fn parsePieces(gpa: Allocator, pieces: []const ParsePiece) ParseError!Diff {
     var arena = ArenaAllocator.init(gpa);
     errdefer arena.deinit();
     const alloc = arena.allocator();
@@ -140,7 +168,25 @@ pub fn parse(gpa: Allocator, input: []const u8) ParseError!Diff {
     defer files.deinit(alloc);
 
     var hunk_index: usize = 0;
+    for (pieces) |piece| {
+        try parseAppend(alloc, piece.text, &files, &hunk_index, piece.group);
+    }
 
+    const owned = try files.toOwnedSlice(alloc);
+    return .{
+        .arena = arena,
+        .files = owned,
+        .hunk_count = hunk_index,
+    };
+}
+
+fn parseAppend(
+    alloc: Allocator,
+    input: []const u8,
+    files: *std.ArrayList(File),
+    hunk_index: *usize,
+    group: ?Group,
+) ParseError!void {
     // File section currently being assembled (null until the first header).
     var file_builder: ?FileBuilder = null;
     defer if (file_builder) |*fb| fb.deinit(alloc);
@@ -152,7 +198,7 @@ pub fn parse(gpa: Allocator, input: []const u8) ParseError!Diff {
         // --- file boundary markers ---
         if (std.mem.startsWith(u8, line, "diff --git ")) {
             if (file_builder) |*fb| {
-                try files.append(alloc, try fb.finish(alloc, &hunk_index));
+                try files.append(alloc, try fb.finish(alloc, hunk_index, group));
             }
             file_builder = FileBuilder{};
             try file_builder.?.applyGitHeader(alloc, line);
@@ -214,7 +260,7 @@ pub fn parse(gpa: Allocator, input: []const u8) ParseError!Diff {
         if (std.mem.startsWith(u8, line, "@@")) {
             if (file_builder == null) file_builder = FileBuilder{};
             const hdr = try parseHunkHeader(line);
-            try file_builder.?.beginHunk(alloc, hdr, &hunk_index);
+            try file_builder.?.beginHunk(alloc, hdr, hunk_index);
             continue;
         }
 
@@ -261,16 +307,9 @@ pub fn parse(gpa: Allocator, input: []const u8) ParseError!Diff {
     }
 
     if (file_builder) |*fb| {
-        try files.append(alloc, try fb.finish(alloc, &hunk_index));
+        try files.append(alloc, try fb.finish(alloc, hunk_index, group));
         file_builder = null;
     }
-
-    const owned = try files.toOwnedSlice(alloc);
-    return .{
-        .arena = arena,
-        .files = owned,
-        .hunk_count = hunk_index,
-    };
 }
 
 // --- internals -----------------------------------------------------------
@@ -392,7 +431,7 @@ const FileBuilder = struct {
         });
     }
 
-    fn finish(self: *FileBuilder, a: Allocator, hunk_index: *usize) !File {
+    fn finish(self: *FileBuilder, a: Allocator, hunk_index: *usize, group: ?Group) !File {
         try self.closeHunk(a, hunk_index);
         const hunks = try self.hunks.toOwnedSlice(a);
         self.hunks = .empty;
@@ -401,6 +440,7 @@ const FileBuilder = struct {
             .new_path = self.new_path,
             .hunks = hunks,
             .is_binary = self.is_binary,
+            .group = group,
         };
     }
 };
@@ -572,6 +612,40 @@ test "whitespace-only input" {
     try testing.expectEqual(0, diff.hunk_count);
 }
 
+test "parsePieces tags groups and continues hunk indexes" {
+    const unstaged_txt =
+        \\diff --git a/a.txt b/a.txt
+        \\--- a/a.txt
+        \\+++ b/a.txt
+        \\@@ -1 +1 @@
+        \\-old
+        \\+new
+    ;
+    const staged_txt =
+        \\diff --git a/a.txt b/a.txt
+        \\--- a/a.txt
+        \\+++ b/a.txt
+        \\@@ -1 +1,2 @@
+        \\ same
+        \\+staged
+    ;
+    var d = try parsePieces(testing.allocator, &.{
+        .{ .text = unstaged_txt, .group = .unstaged },
+        .{ .text = "", .group = .untracked },
+        .{ .text = staged_txt, .group = .staged },
+    });
+    defer d.deinit();
+
+    try testing.expectEqual(2, d.files.len);
+    try testing.expectEqual(2, d.hunk_count);
+    try testing.expectEqualStrings("a.txt", d.files[0].displayPath());
+    try testing.expectEqual(Group.unstaged, d.files[0].group.?);
+    try testing.expectEqual(0, d.files[0].hunks[0].index);
+    try testing.expectEqualStrings("a.txt", d.files[1].displayPath());
+    try testing.expectEqual(Group.staged, d.files[1].group.?);
+    try testing.expectEqual(1, d.files[1].hunks[0].index);
+}
+
 test "single file multi-hunk with context add delete" {
     const fixture =
         \\diff --git a/hello.txt b/hello.txt
@@ -601,6 +675,7 @@ test "single file multi-hunk with context add delete" {
     try testing.expectEqualStrings("hello.txt", f.new_path.?);
     try testing.expectEqualStrings("hello.txt", f.displayPath());
     try testing.expect(!f.is_binary);
+    try testing.expect(f.group == null);
     try testing.expectEqual(2, f.hunks.len);
 
     const h0 = f.hunks[0];
