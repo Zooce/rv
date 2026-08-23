@@ -36,7 +36,9 @@
 //! one. Local only: `Space` `Space` stages or unstages the current file
 //! (on a file header), hunk (in a hunk), or whole group (on a section
 //! header; always confirms); `Space` `S` does the containing file from a
-//! hunk. `Space` `d` discards the current file or hunk;
+//! hunk. After a successful stage/unstage, live comments on the target
+//! keep the same file, side, and line (line numbers updated if the
+//! reloaded diff numbers that line differently). `Space` `d` discards the current file or hunk;
 //! `Space` `x` discards the containing file from a hunk (stand-in until
 //! Ctrl). Discard always confirms (`No` selected; `yes` proceeds). If the
 //! target has live comments, a second overlay asks to delete them (`Yes`
@@ -93,19 +95,21 @@ pub fn main(init: std.process.Init) !u8 {
 
 fn runTui(alloc: std.mem.Allocator, io: std.Io, source: cli.Source) !u8 {
     // Load before any TTY setup so error paths never touch the terminal.
-    var d = switch (source) {
-        .local => git.loadDefaultDiff(alloc, io),
-        .range => |r| git.loadRangeDiff(alloc, io, .inherit, r),
-    } catch |err| {
-        std.debug.print("rv: {s}\n", .{gitLoadMsg(err)});
-        return 1;
+    var diff_view: DiffView = blk: {
+        var parsed = switch (source) {
+            .local => git.loadDefaultDiff(alloc, io),
+            .range => |r| git.loadRangeDiff(alloc, io, .inherit, r),
+        } catch |err| {
+            std.debug.print("rv: {s}\n", .{gitLoadMsg(err)});
+            return 1;
+        };
+        errdefer parsed.deinit();
+        const parsed_rows = try view.flatten(alloc, &parsed);
+        errdefer alloc.free(parsed_rows);
+        const parsed_sbs = try view.pairSideBySide(alloc, parsed_rows);
+        break :blk .{ .diff = parsed, .rows = parsed_rows, .sbs_slots = parsed_sbs };
     };
-    defer d.deinit();
-
-    var rows = try view.flatten(alloc, &d);
-    defer alloc.free(rows);
-    var sbs_slots = try view.pairSideBySide(alloc, rows);
-    defer alloc.free(sbs_slots);
+    defer diff_view.deinit(alloc);
 
     var review = store.load(alloc, io, .cwd(), store.default_review_id) catch |err| {
         const msg: []const u8 = switch (err) {
@@ -185,7 +189,7 @@ fn runTui(alloc: std.mem.Allocator, io: std.Io, source: cli.Source) !u8 {
     var git_err: std.ArrayList(u8) = .empty;
     defer git_err.deinit(alloc);
 
-    paint(&scr, size, rows, sbs_slots, layout_pref, cursor, &scroll, &col_scroll, &review, source, focus, draft.buf.items, draft.caret, &draft.scroll, draft.anchor, note.slice(), list_items.items, file_items.items, list_cursor, &list_scroll, &help_scroll, git_err.items, discard_confirm);
+    paint(&scr, size, diff_view.rows, diff_view.sbs_slots, layout_pref, cursor, &scroll, &col_scroll, &review, source, focus, draft.buf.items, draft.caret, &draft.scroll, draft.anchor, note.slice(), list_items.items, file_items.items, list_cursor, &list_scroll, &help_scroll, git_err.items, discard_confirm);
     try scr.present(&term);
 
     while (running) {
@@ -293,7 +297,7 @@ fn runTui(alloc: std.mem.Allocator, io: std.Io, source: cli.Source) !u8 {
                                 last_query.clearRetainingCapacity();
                                 try last_query.appendSlice(alloc, draft.buf.items);
                                 draft.clear();
-                                if (view.firstMatch(rows, last_query.items, cursor)) |hit| {
+                                if (view.firstMatch(diff_view.rows, last_query.items, cursor)) |hit| {
                                     cursor = hit.index;
                                     if (hit.wrapped) note.set("search wrapped");
                                 } else {
@@ -329,7 +333,7 @@ fn runTui(alloc: std.mem.Allocator, io: std.Io, source: cli.Source) !u8 {
                         .enter => {
                             if (list_cursor < list_items.items.len) {
                                 if (commentLoc(list_items.items[list_cursor])) |loc| {
-                                    if (view.rowForComment(rows, loc)) |idx| {
+                                    if (view.rowForComment(diff_view.rows, loc)) |idx| {
                                         cursor = idx;
                                         focus = .normal;
                                     } else {
@@ -437,21 +441,20 @@ fn runTui(alloc: std.mem.Allocator, io: std.Io, source: cli.Source) !u8 {
                                         alloc,
                                         io,
                                         source,
-                                        &d,
-                                        &rows,
-                                        &sbs_slots,
+                                        &diff_view,
                                         &cursor,
                                         &note,
                                         &focus,
                                         &git_err,
+                                        &review,
                                     );
                                 }
                             } else if (!discard_confirm.comments and !discard_confirm.yes) {
                                 focus = .normal;
                             } else if (!discard_confirm.comments and hasMatchingDiscardComments(
                                 &review,
-                                &d,
-                                rows,
+                                &diff_view.diff,
+                                diff_view.rows,
                                 cursor,
                                 discard_confirm.whole_file,
                             )) {
@@ -466,8 +469,8 @@ fn runTui(alloc: std.mem.Allocator, io: std.Io, source: cli.Source) !u8 {
                                 if (delete_them) {
                                     try collectDiscardComments(
                                         &review,
-                                        &d,
-                                        rows,
+                                        &diff_view.diff,
+                                        diff_view.rows,
                                         cursor,
                                         discard_confirm.whole_file,
                                         alloc,
@@ -480,13 +483,12 @@ fn runTui(alloc: std.mem.Allocator, io: std.Io, source: cli.Source) !u8 {
                                     alloc,
                                     io,
                                     source,
-                                    &d,
-                                    &rows,
-                                    &sbs_slots,
+                                    &diff_view,
                                     &cursor,
                                     &note,
                                     &focus,
                                     &git_err,
+                                    &review,
                                     discard_confirm.whole_file,
                                     .discard,
                                 );
@@ -524,12 +526,12 @@ fn runTui(alloc: std.mem.Allocator, io: std.Io, source: cli.Source) !u8 {
                             .char => |c| {
                                 if (after_leader and c == 'f') {
                                     file_items.clearRetainingCapacity();
-                                    for (rows, 0..) |row, i| {
+                                    for (diff_view.rows, 0..) |row, i| {
                                         if (row == .file_header) try file_items.append(alloc, i);
                                     }
                                     list_cursor = 0;
                                     list_scroll = 0;
-                                    if (view.currentFileStart(rows, cursor)) |start| {
+                                    if (view.currentFileStart(diff_view.rows, cursor)) |start| {
                                         for (file_items.items, 0..) |idx, n| {
                                             if (idx == start) {
                                                 list_cursor = n;
@@ -545,49 +547,47 @@ fn runTui(alloc: std.mem.Allocator, io: std.Io, source: cli.Source) !u8 {
                                     list_scroll = 0;
                                     focus = .listing;
                                 } else if (after_leader and c == ' ') {
-                                    beginGroupStage(rows, cursor, &focus, &discard_confirm);
+                                    beginGroupStage(diff_view.rows, cursor, &focus, &discard_confirm);
                                     if (focus == .normal) {
                                         try applyIndex(
                                             alloc,
                                             io,
                                             source,
-                                            &d,
-                                            &rows,
-                                            &sbs_slots,
+                                            &diff_view,
                                             &cursor,
                                             &note,
                                             &focus,
                                             &git_err,
+                                            &review,
                                             false,
                                             .stage_unstage,
                                         );
                                     }
                                 } else if (after_leader and c == 'S') {
-                                    if (view.currentHunkInFile(rows, cursor) != null) {
+                                    if (view.currentHunkInFile(diff_view.rows, cursor) != null) {
                                         try applyIndex(
                                             alloc,
                                             io,
                                             source,
-                                            &d,
-                                            &rows,
-                                            &sbs_slots,
+                                            &diff_view,
                                             &cursor,
                                             &note,
                                             &focus,
                                             &git_err,
+                                            &review,
                                             true,
                                             .stage_unstage,
                                         );
                                     }
                                 } else if (after_leader and c == 'd') {
                                     if (source == .local) {
-                                        beginDiscard(rows, cursor, false, &focus, &discard_confirm);
+                                        beginDiscard(diff_view.rows, cursor, false, &focus, &discard_confirm);
                                     } else {
-                                        dismissAt(&review, alloc, io, rows, sbs_slots, layout, cursor, .new, &note);
+                                        dismissAt(&review, alloc, io, diff_view.rows, diff_view.sbs_slots, layout, cursor, .new, &note);
                                     }
                                 } else if (after_leader and c == 'x') {
-                                    if (source == .local and view.currentHunkInFile(rows, cursor) != null) {
-                                        beginDiscard(rows, cursor, true, &focus, &discard_confirm);
+                                    if (source == .local and view.currentHunkInFile(diff_view.rows, cursor) != null) {
+                                        beginDiscard(diff_view.rows, cursor, true, &focus, &discard_confirm);
                                     }
                                 } else if (c == 'q' or c == 'Q') {
                                     running = false;
@@ -601,7 +601,7 @@ fn runTui(alloc: std.mem.Allocator, io: std.Io, source: cli.Source) !u8 {
                                     draft.clear();
                                 } else if (c == 'n') {
                                     if (last_query.items.len > 0) {
-                                        if (view.nextMatch(rows, last_query.items, cursor)) |hit| {
+                                        if (view.nextMatch(diff_view.rows, last_query.items, cursor)) |hit| {
                                             cursor = hit.index;
                                             if (hit.wrapped) note.set("search wrapped");
                                         } else {
@@ -610,7 +610,7 @@ fn runTui(alloc: std.mem.Allocator, io: std.Io, source: cli.Source) !u8 {
                                     }
                                 } else if (c == 'N') {
                                     if (last_query.items.len > 0) {
-                                        if (view.prevMatch(rows, last_query.items, cursor)) |hit| {
+                                        if (view.prevMatch(diff_view.rows, last_query.items, cursor)) |hit| {
                                             cursor = hit.index;
                                             if (hit.wrapped) note.set("search wrapped");
                                         } else {
@@ -618,9 +618,9 @@ fn runTui(alloc: std.mem.Allocator, io: std.Io, source: cli.Source) !u8 {
                                         }
                                     }
                                 } else if (c == 'j') {
-                                    cursor = moveLineDown(layout_pref, size.cols, rows, sbs_slots, cursor);
+                                    cursor = moveLineDown(layout_pref, size.cols, diff_view.rows, diff_view.sbs_slots, cursor);
                                 } else if (c == 'k') {
-                                    cursor = moveLineUp(layout_pref, size.cols, rows, sbs_slots, cursor);
+                                    cursor = moveLineUp(layout_pref, size.cols, diff_view.rows, diff_view.sbs_slots, cursor);
                                 } else if (c == 'h') {
                                     const step = panStep(panViewportCols(layout_pref, size.cols));
                                     col_scroll = if (col_scroll > step) col_scroll - step else 0;
@@ -629,53 +629,53 @@ fn runTui(alloc: std.mem.Allocator, io: std.Io, source: cli.Source) !u8 {
                                 } else if (c == '0') {
                                     col_scroll = 0;
                                 } else if (c == '$') {
-                                    const span = view.hunkSpanAt(rows, cursor);
+                                    const span = view.hunkSpanAt(diff_view.rows, cursor);
                                     const vp = panViewportCols(layout_pref, size.cols);
-                                    col_scroll = view.colScrollToEnd(hunkMaxLineWidth(rows, span), vp);
+                                    col_scroll = view.colScrollToEnd(hunkMaxLineWidth(diff_view.rows, span), vp);
                                 } else if (c == 'J') {
-                                    cursor = view.nextChange(rows, cursor);
+                                    cursor = view.nextChange(diff_view.rows, cursor);
                                 } else if (c == 'K') {
-                                    cursor = view.prevChange(rows, cursor);
+                                    cursor = view.prevChange(diff_view.rows, cursor);
                                 } else if (c == ']') {
-                                    cursor = view.nextHunkHeader(rows, cursor);
+                                    cursor = view.nextHunkHeader(diff_view.rows, cursor);
                                 } else if (c == '[') {
-                                    cursor = view.prevHunkHeader(rows, cursor);
+                                    cursor = view.prevHunkHeader(diff_view.rows, cursor);
                                 } else if (c == '}') {
-                                    cursor = view.nextFileHeader(rows, cursor);
+                                    cursor = view.nextFileHeader(diff_view.rows, cursor);
                                 } else if (c == '{') {
-                                    cursor = view.prevFileHeader(rows, cursor);
+                                    cursor = view.prevFileHeader(diff_view.rows, cursor);
                                 } else if (c == ')') {
-                                    try jumpLiveComment(&review, alloc, rows, &cursor, &note, .next);
+                                    try jumpLiveComment(&review, alloc, diff_view.rows, &cursor, &note, .next);
                                 } else if (c == '(') {
-                                    try jumpLiveComment(&review, alloc, rows, &cursor, &note, .prev);
+                                    try jumpLiveComment(&review, alloc, diff_view.rows, &cursor, &note, .prev);
                                 } else if (c == 't') {
                                     layout_pref = view.toggleLayoutPref(layout_pref);
                                 } else if (c == 'r') {
-                                    reloadDiff(alloc, io, source, &d, &rows, &sbs_slots, &cursor, &note, .path_line);
+                                    reloadDiff(alloc, io, source, &diff_view, &cursor, &note, .path_line);
                                 } else if (c == 'i' or c == 'c' or c == 'a') {
-                                    if (try beginComment(&review, alloc, rows, sbs_slots, layout, cursor, .new, &draft)) {
+                                    if (try beginComment(&review, alloc, diff_view.rows, diff_view.sbs_slots, layout, cursor, .new, &draft)) {
                                         focus = .commenting;
                                     }
                                 } else if (c == 'I' or c == 'C' or c == 'A') {
-                                    if (try beginComment(&review, alloc, rows, sbs_slots, layout, cursor, .old, &draft)) {
+                                    if (try beginComment(&review, alloc, diff_view.rows, diff_view.sbs_slots, layout, cursor, .old, &draft)) {
                                         focus = .commenting;
                                     }
                                 } else if (c == 'd') {
-                                    dismissAt(&review, alloc, io, rows, sbs_slots, layout, cursor, .new, &note);
+                                    dismissAt(&review, alloc, io, diff_view.rows, diff_view.sbs_slots, layout, cursor, .new, &note);
                                 } else if (c == 'D') {
-                                    dismissAt(&review, alloc, io, rows, sbs_slots, layout, cursor, .old, &note);
+                                    dismissAt(&review, alloc, io, diff_view.rows, diff_view.sbs_slots, layout, cursor, .old, &note);
                                 }
                             },
                             .enter => {
-                                if (try beginComment(&review, alloc, rows, sbs_slots, layout, cursor, .new, &draft)) {
+                                if (try beginComment(&review, alloc, diff_view.rows, diff_view.sbs_slots, layout, cursor, .new, &draft)) {
                                     focus = .commenting;
                                 }
                             },
                             .down => {
-                                cursor = moveLineDown(layout_pref, size.cols, rows, sbs_slots, cursor);
+                                cursor = moveLineDown(layout_pref, size.cols, diff_view.rows, diff_view.sbs_slots, cursor);
                             },
                             .up => {
-                                cursor = moveLineUp(layout_pref, size.cols, rows, sbs_slots, cursor);
+                                cursor = moveLineUp(layout_pref, size.cols, diff_view.rows, diff_view.sbs_slots, cursor);
                             },
                             .left => {
                                 const step = panStep(panViewportCols(layout_pref, size.cols));
@@ -692,7 +692,7 @@ fn runTui(alloc: std.mem.Allocator, io: std.Io, source: cli.Source) !u8 {
             },
         }
         if (running) {
-            paint(&scr, size, rows, sbs_slots, layout_pref, cursor, &scroll, &col_scroll, &review, source, focus, draft.buf.items, draft.caret, &draft.scroll, draft.anchor, note.slice(), list_items.items, file_items.items, list_cursor, &list_scroll, &help_scroll, git_err.items, discard_confirm);
+            paint(&scr, size, diff_view.rows, diff_view.sbs_slots, layout_pref, cursor, &scroll, &col_scroll, &review, source, focus, draft.buf.items, draft.caret, &draft.scroll, draft.anchor, note.slice(), list_items.items, file_items.items, list_cursor, &list_scroll, &help_scroll, git_err.items, discard_confirm);
             try scr.present(&term);
         }
     }
@@ -722,81 +722,111 @@ const ReloadCursor = union(enum) {
     start,
 };
 
-/// Re-run the startup load. On success, replace `d`/`rows`/`sbs_slots` and
-/// restore the cursor. On failure, leave the previous model and set `note`.
+/// Parsed diff plus flatten rows and side-by-side slots. The TUI holds one
+/// as the live list; reload builds another and swaps it in.
+const DiffView = struct {
+    diff: diff.Diff,
+    rows: []view.Row,
+    sbs_slots: []view.SbsSlot,
+
+    fn maybeInit(
+        alloc: std.mem.Allocator,
+        io: std.Io,
+        source: cli.Source,
+        note: *StatusNote,
+    ) ?DiffView {
+        var new_diff = switch (source) {
+            .local => git.loadDefaultDiff(alloc, io),
+            .range => |r| git.loadRangeDiff(alloc, io, .inherit, r),
+        } catch |err| {
+            note.set(gitLoadMsg(err));
+            return null;
+        };
+        const new_rows = view.flatten(alloc, &new_diff) catch {
+            new_diff.deinit();
+            note.set("out of memory");
+            return null;
+        };
+        const new_sbs = view.pairSideBySide(alloc, new_rows) catch {
+            alloc.free(new_rows);
+            new_diff.deinit();
+            note.set("out of memory");
+            return null;
+        };
+        return .{ .diff = new_diff, .rows = new_rows, .sbs_slots = new_sbs };
+    }
+
+    fn deinit(self: DiffView, alloc: std.mem.Allocator) void {
+        alloc.free(self.rows);
+        alloc.free(self.sbs_slots);
+        var parsed = self.diff;
+        parsed.deinit();
+    }
+};
+
+fn commitReload(
+    alloc: std.mem.Allocator,
+    diff_view: *DiffView,
+    cursor: *usize,
+    restore: ReloadCursor,
+    loaded: DiffView,
+) void {
+    // Neighbor / path-line marks borrow from the old list. Restore before free.
+    const new_cursor: usize = switch (restore) {
+        .path_line => blk: {
+            const mark = view.cursorMarkAt(diff_view.rows, cursor.*);
+            break :blk if (mark) |m| view.restoreCursor(loaded.rows, m) else 0;
+        },
+        .neighbor => |m| view.restoreNeighbor(loaded.rows, m),
+        .group_neighbor => |m| view.restoreGroupNeighbor(loaded.rows, m),
+        .start => 0,
+    };
+    diff_view.deinit(alloc);
+    diff_view.* = loaded;
+    cursor.* = new_cursor;
+}
+
+/// Re-run the startup load. On success, replace the live DiffView and restore
+/// the cursor. On failure, leave the previous list and set `note`.
 /// Does not touch the comment store. `r` is only bound in normal focus.
 fn reloadDiff(
     alloc: std.mem.Allocator,
     io: std.Io,
     source: cli.Source,
-    d: *diff.Diff,
-    rows: *[]view.Row,
-    sbs_slots: *[]view.SbsSlot,
+    diff_view: *DiffView,
     cursor: *usize,
     note: *StatusNote,
     restore: ReloadCursor,
 ) void {
-    var new_d = switch (source) {
-        .local => git.loadDefaultDiff(alloc, io),
-        .range => |r| git.loadRangeDiff(alloc, io, .inherit, r),
-    } catch |err| {
-        note.set(gitLoadMsg(err));
-        return;
-    };
-    const new_rows = view.flatten(alloc, &new_d) catch {
-        new_d.deinit();
-        note.set("out of memory");
-        return;
-    };
-    const new_sbs = view.pairSideBySide(alloc, new_rows) catch {
-        alloc.free(new_rows);
-        new_d.deinit();
-        note.set("out of memory");
-        return;
-    };
-    // Neighbor / path-line marks borrow from the old `d` / `rows`. Restore before free.
-    const new_cursor: usize = switch (restore) {
-        .path_line => blk: {
-            const mark = view.cursorMarkAt(rows.*, cursor.*);
-            break :blk if (mark) |m| view.restoreCursor(new_rows, m) else 0;
-        },
-        .neighbor => |m| view.restoreNeighbor(new_rows, m),
-        .group_neighbor => |m| view.restoreGroupNeighbor(new_rows, m),
-        .start => 0,
-    };
-    alloc.free(rows.*);
-    alloc.free(sbs_slots.*);
-    d.deinit();
-    d.* = new_d;
-    rows.* = new_rows;
-    sbs_slots.* = new_sbs;
-    cursor.* = new_cursor;
+    const loaded = DiffView.maybeInit(alloc, io, source, note) orelse return;
+    commitReload(alloc, diff_view, cursor, restore, loaded);
 }
 
 /// Stage, unstage, or discard the current file or hunk (local source only).
 /// On success, reload like `r` but land on the neighbor change, not the same
-/// path+line. On git failure, leave the list unchanged and open the error
-/// overlay. Range loads and rows with no target are no-ops. `Space` `Space`
-/// / `Space` `d` use `whole_file == false` (file header → file, hunk → hunk);
-/// `Space` `S` / `Space` `x` pass `true` from a hunk. Discard on staged is
-/// a no-op (unstage first).
+/// path+line. Stage/unstage re-anchors live comments on the target to the
+/// same file, side, and line in the reloaded diff. On git failure, leave
+/// the list and store unchanged and open the error overlay. Range loads
+/// and rows with no target are no-ops.
+/// `Space` `Space` / `Space` `d` use `whole_file == false` (file header →
+/// file, hunk → hunk); `Space` `S` / `Space` `x` pass `true` from a hunk.
+/// Discard on staged is a no-op (unstage first).
 fn applyIndex(
     alloc: std.mem.Allocator,
     io: std.Io,
     source: cli.Source,
-    d: *diff.Diff,
-    rows: *[]view.Row,
-    sbs_slots: *[]view.SbsSlot,
+    diff_view: *DiffView,
     cursor: *usize,
     note: *StatusNote,
     focus: *Focus,
     git_err: *std.ArrayList(u8),
+    review: *store.Review,
     whole_file: bool,
     kind: enum { stage_unstage, discard },
 ) std.mem.Allocator.Error!void {
     if (source != .local) return;
-    const target = view.indexTargetAt(rows.*, cursor.*, whole_file) orelse return;
-    const file = fileForTarget(d, target) orelse return;
+    const target = view.indexTargetAt(diff_view.rows, cursor.*, whole_file) orelse return;
+    const file = fileForTarget(&diff_view.diff, target) orelse return;
     const action: git.Action = switch (kind) {
         .stage_unstage => switch (target.group) {
             .unstaged, .untracked => .stage,
@@ -807,7 +837,7 @@ fn applyIndex(
             .staged => return,
         },
     };
-    const neighbor = view.neighborMark(rows.*, target);
+    const neighbor = view.neighborMark(diff_view.rows, target);
     var fail: []u8 = &.{};
     git.mutate(alloc, io, .inherit, .{
         .action = action,
@@ -835,36 +865,45 @@ fn applyIndex(
         },
     };
     const restore: ReloadCursor = if (neighbor) |m| .{ .neighbor = m } else .start;
-    reloadDiff(alloc, io, source, d, rows, sbs_slots, cursor, note, restore);
+    {
+        const loaded = DiffView.maybeInit(alloc, io, source, note) orelse return;
+        errdefer loaded.deinit(alloc);
+        if (kind == .stage_unstage) {
+            var priors: std.ArrayList(CommentAnchorSnap) = .empty;
+            defer priors.deinit(alloc);
+            try remapMatchingComments(review, file, &loaded.diff, target.hunk_i, alloc, &priors);
+            saveCommentRemap(review, alloc, io, note, priors.items);
+        }
+        commitReload(alloc, diff_view, cursor, restore, loaded);
+    }
 }
 
 /// Stage or unstage every file in the section under the cursor (local
 /// source only). File-level mutate, in flatten order. Stop at the first
 /// git error: reload so the list matches git, then open the error overlay.
-/// On success, reload and land on the neighbor section or file. Range
-/// loads and missing groups are no-ops.
+/// On success, reload, re-anchor live comments on those files, and land on
+/// the neighbor section or file. Range loads and missing groups are no-ops.
 fn applyGroupIndex(
     alloc: std.mem.Allocator,
     io: std.Io,
     source: cli.Source,
-    d: *diff.Diff,
-    rows: *[]view.Row,
-    sbs_slots: *[]view.SbsSlot,
+    diff_view: *DiffView,
     cursor: *usize,
     note: *StatusNote,
     focus: *Focus,
     git_err: *std.ArrayList(u8),
+    review: *store.Review,
 ) std.mem.Allocator.Error!void {
     if (source != .local) return;
-    const span = view.groupSpanAt(rows.*, cursor.*) orelse return;
+    const span = view.groupSpanAt(diff_view.rows, cursor.*) orelse return;
     const action: git.Action = switch (span.group) {
         .unstaged, .untracked => .stage,
         .staged => .unstage,
     };
-    const neighbor = view.groupNeighborMark(rows.*, span);
+    const neighbor = view.groupNeighborMark(diff_view.rows, span);
     var fail: []u8 = &.{};
     const first_err: ?git.Error = blk: {
-        for (d.files) |f| {
+        for (diff_view.diff.files) |f| {
             const g = f.group orelse continue;
             if (g != span.group) continue;
             git.mutate(alloc, io, .inherit, .{
@@ -880,7 +919,18 @@ fn applyGroupIndex(
         break :blk null;
     };
     const restore: ReloadCursor = if (neighbor) |m| .{ .group_neighbor = m } else .start;
-    reloadDiff(alloc, io, source, d, rows, sbs_slots, cursor, note, restore);
+    if (DiffView.maybeInit(alloc, io, source, note)) |loaded| {
+        errdefer loaded.deinit(alloc);
+        var priors: std.ArrayList(CommentAnchorSnap) = .empty;
+        defer priors.deinit(alloc);
+        for (diff_view.diff.files) |*f| {
+            const g = f.group orelse continue;
+            if (g != span.group) continue;
+            try remapMatchingComments(review, f, &loaded.diff, null, alloc, &priors);
+        }
+        saveCommentRemap(review, alloc, io, note, priors.items);
+        commitReload(alloc, diff_view, cursor, restore, loaded);
+    }
     const err = first_err orelse return;
     git_err.clearRetainingCapacity();
     if (fail.len > 0) {
@@ -1032,6 +1082,181 @@ fn removeDiscardComments(
     };
 }
 
+/// Prior line/side for a comment remapped after stage/unstage (save-failure restore).
+const CommentAnchorSnap = struct {
+    id: []const u8,
+    old_line: ?u32,
+    new_line: ?u32,
+    side: ?store.Side,
+};
+
+const RemapAnchor = struct {
+    old_line: ?u32,
+    new_line: ?u32,
+    side: store.Side,
+};
+
+fn hunkBodyEql(a: []const diff.Line, b: []const diff.Line) bool {
+    if (a.len != b.len) return false;
+    for (a, b) |x, y| {
+        if (x.kind != y.kind) return false;
+        if (!std.mem.eql(u8, x.text, y.text)) return false;
+    }
+    return true;
+}
+
+fn commentSide(c: store.Comment) store.Side {
+    return c.side orelse if (c.new_line != null) .new else .old;
+}
+
+fn lineOnSide(ln: diff.Line, side: store.Side) bool {
+    return switch (side) {
+        .old => ln.old_no != null,
+        .new => ln.new_no != null,
+        .context => ln.old_no != null and ln.new_no != null,
+    };
+}
+
+fn commentLineIndex(c: store.Comment, hunk: diff.Hunk) ?usize {
+    const side = commentSide(c);
+    for (hunk.lines, 0..) |ln, i| {
+        const old_hit = blk: {
+            const o = c.old_line orelse break :blk false;
+            const lo = ln.old_no orelse break :blk false;
+            break :blk lo == o;
+        };
+        const new_hit = blk: {
+            const n = c.new_line orelse break :blk false;
+            const nn = ln.new_no orelse break :blk false;
+            break :blk nn == n;
+        };
+        const hit = switch (side) {
+            .old => old_hit,
+            .new => new_hit,
+            .context => old_hit or new_hit,
+        };
+        if (hit) return i;
+    }
+    return null;
+}
+
+fn destHunkLines(
+    dest: *const diff.Diff,
+    path: []const u8,
+    body: []const diff.Line,
+) ?[]const diff.Line {
+    for (dest.files) |f| {
+        if (!std.mem.eql(u8, f.displayPath(), path)) continue;
+        for (f.hunks) |h| {
+            if (hunkBodyEql(h.lines, body)) return h.lines;
+        }
+    }
+    return null;
+}
+
+fn destLineByText(
+    dest: *const diff.Diff,
+    path: []const u8,
+    side: store.Side,
+    text: []const u8,
+) ?diff.Line {
+    var found: ?diff.Line = null;
+    for (dest.files) |f| {
+        if (!std.mem.eql(u8, f.displayPath(), path)) continue;
+        for (f.hunks) |h| {
+            for (h.lines) |ln| {
+                if (!lineOnSide(ln, side)) continue;
+                if (!std.mem.eql(u8, ln.text, text)) continue;
+                if (found != null) return null;
+                found = ln;
+            }
+        }
+    }
+    return found;
+}
+
+fn remapAnchorFromLine(ln: diff.Line, side: store.Side) ?RemapAnchor {
+    return switch (side) {
+        .new => .{ .old_line = null, .new_line = ln.new_no orelse return null, .side = .new },
+        .old => .{ .old_line = ln.old_no orelse return null, .new_line = null, .side = .old },
+        .context => if (ln.old_no == null and ln.new_no == null)
+            null
+        else
+            .{ .old_line = ln.old_no, .new_line = ln.new_no, .side = .context },
+    };
+}
+
+fn destAnchor(
+    c: store.Comment,
+    src_file: *const diff.File,
+    dest: *const diff.Diff,
+    hunk_i: ?usize,
+) ?RemapAnchor {
+    if (c.state != .open) return null;
+    if (!std.mem.eql(u8, c.path, src_file.displayPath())) return null;
+    const hi = hunk_i orelse blk: {
+        for (src_file.hunks, 0..) |h, i| {
+            if (commentLineIndex(c, h) != null) break :blk i;
+        }
+        return null;
+    };
+    if (hi >= src_file.hunks.len) return null;
+    const src_hunk = src_file.hunks[hi];
+    const line_i = commentLineIndex(c, src_hunk) orelse return null;
+    const src_ln = src_hunk.lines[line_i];
+    if (src_ln.kind == .meta) return null;
+    const side = commentSide(c);
+
+    if (destHunkLines(dest, src_file.displayPath(), src_hunk.lines)) |dest_lines| {
+        if (line_i < dest_lines.len) {
+            const ln = dest_lines[line_i];
+            if (std.mem.eql(u8, ln.text, src_ln.text) and lineOnSide(ln, side)) {
+                return remapAnchorFromLine(ln, side);
+            }
+        }
+    }
+    const dest_ln = destLineByText(dest, src_file.displayPath(), side, src_ln.text) orelse return null;
+    return remapAnchorFromLine(dest_ln, side);
+}
+
+fn remapMatchingComments(
+    review: *store.Review,
+    src_file: *const diff.File,
+    dest: *const diff.Diff,
+    hunk_i: ?usize,
+    alloc: std.mem.Allocator,
+    priors: *std.ArrayList(CommentAnchorSnap),
+) std.mem.Allocator.Error!void {
+    for (review.comments.items) |c| {
+        const next = destAnchor(c, src_file, dest, hunk_i) orelse continue;
+        try priors.append(alloc, .{
+            .id = c.id,
+            .old_line = c.old_line,
+            .new_line = c.new_line,
+            .side = c.side,
+        });
+        review.setLines(c.id, next.old_line, next.new_line, next.side) catch {
+            _ = priors.pop();
+        };
+    }
+}
+
+fn saveCommentRemap(
+    review: *store.Review,
+    alloc: std.mem.Allocator,
+    io: std.Io,
+    note: *StatusNote,
+    priors: []const CommentAnchorSnap,
+) void {
+    if (priors.len == 0) return;
+    store.save(review, alloc, io, .cwd()) catch {
+        for (priors) |p| {
+            review.setLines(p.id, p.old_line, p.new_line, p.side) catch {};
+        }
+        note.set("failed to save .rv comment store");
+    };
+}
+
 test "discard comments match this group's hunk lines" {
     const hunks = [_]diff.Hunk{
         .{ .old_start = 10, .old_count = 3, .new_start = 12, .new_count = 4 },
@@ -1065,6 +1290,118 @@ test "discard comments match this group's hunk lines" {
     try std.testing.expect(discardCommentMatches(hit_new, &file, null));
     try std.testing.expect(discardCommentMatches(hit_second, &file, null));
     try std.testing.expect(!discardCommentMatches(other_line, &file, null));
+}
+
+test "destAnchor maps the commented line, not a neighbor hunk" {
+    const src_txt =
+        \\diff --git a/a.zig b/a.zig
+        \\--- a/a.zig
+        \\+++ b/a.zig
+        \\@@ -1,3 +1,4 @@
+        \\ context one
+        \\-old two
+        \\+fn commentedLine
+        \\ context three
+        \\@@ -10,2 +11,2 @@
+        \\ keep
+        \\-old tail
+        \\+new tail
+    ;
+    const dest_same =
+        \\diff --git a/a.zig b/a.zig
+        \\--- a/a.zig
+        \\+++ b/a.zig
+        \\@@ -20,3 +20,4 @@
+        \\ context one
+        \\-old two
+        \\+fn commentedLine
+        \\ context three
+        \\@@ -40,2 +41,2 @@
+        \\ keep
+        \\-old tail
+        \\+new tail
+    ;
+    const dest_resplit =
+        \\diff --git a/a.zig b/a.zig
+        \\--- a/a.zig
+        \\+++ b/a.zig
+        \\@@ -20,3 +20,4 @@
+        \\+extra context
+        \\ context one
+        \\-old two
+        \\+fn commentedLine
+        \\ context three
+    ;
+    const dest_other_hunk =
+        \\diff --git a/a.zig b/a.zig
+        \\--- a/a.zig
+        \\+++ b/a.zig
+        \\@@ -40,2 +41,2 @@
+        \\ keep
+        \\-old tail
+        \\+new tail
+    ;
+
+    var src = try diff.parsePieces(std.testing.allocator, &.{
+        .{ .text = src_txt, .group = .unstaged },
+    });
+    defer src.deinit();
+    const src_file = &src.files[0];
+    const on_add = store.Comment{
+        .id = "1",
+        .path = "a.zig",
+        .new_line = 2,
+        .side = .new,
+        .body = "x",
+    };
+
+    var dest_eq = try diff.parsePieces(std.testing.allocator, &.{
+        .{ .text = dest_same, .group = .staged },
+    });
+    defer dest_eq.deinit();
+    const same = destAnchor(on_add, src_file, &dest_eq, 0).?;
+    try std.testing.expect(same.old_line == null);
+    try std.testing.expectEqual(21, same.new_line.?);
+    try std.testing.expectEqual(store.Side.new, same.side);
+
+    var dest_untracked = try diff.parsePieces(std.testing.allocator, &.{
+        .{ .text = dest_same, .group = .untracked },
+    });
+    defer dest_untracked.deinit();
+    const via_untracked = destAnchor(on_add, src_file, &dest_untracked, 0).?;
+    try std.testing.expectEqual(21, via_untracked.new_line.?);
+    try std.testing.expectEqual(store.Side.new, via_untracked.side);
+
+    const neighbor = store.Comment{
+        .id = "2",
+        .path = "a.zig",
+        .new_line = 2,
+        .side = .new,
+        .body = "x",
+    };
+    try std.testing.expect(destAnchor(neighbor, src_file, &dest_eq, 1) == null);
+    const neighbor_ok = destAnchor(
+        store.Comment{ .id = "3", .path = "a.zig", .new_line = 12, .side = .new, .body = "x" },
+        src_file,
+        &dest_eq,
+        1,
+    ).?;
+    try std.testing.expectEqual(42, neighbor_ok.new_line.?);
+
+    var dest_split = try diff.parsePieces(std.testing.allocator, &.{
+        .{ .text = dest_resplit, .group = .staged },
+    });
+    defer dest_split.deinit();
+    const split = destAnchor(on_add, src_file, &dest_split, 0).?;
+    try std.testing.expect(split.old_line == null);
+    try std.testing.expectEqual(22, split.new_line.?);
+    try std.testing.expectEqual(store.Side.new, split.side);
+
+    var dest_other = try diff.parsePieces(std.testing.allocator, &.{
+        .{ .text = dest_other_hunk, .group = .staged },
+    });
+    defer dest_other.deinit();
+    try std.testing.expect(destAnchor(on_add, src_file, &dest_other, 0) == null);
 }
 
 /// Key ownership: normal nav, comment draft, `/` search prompt, comment list,

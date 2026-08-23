@@ -84,6 +84,20 @@ pub const Review = struct {
         self.comments.items[i].body = try self.alloc().dupe(u8, body);
     }
 
+    /// Overwrite old/new line and side. Path, body, id, and state stay put.
+    pub fn setLines(
+        self: *Review,
+        id: []const u8,
+        old_line: ?u32,
+        new_line: ?u32,
+        side: ?Side,
+    ) error{NotFound}!void {
+        const i = self.findIndex(id) orelse return error.NotFound;
+        self.comments.items[i].old_line = old_line;
+        self.comments.items[i].new_line = new_line;
+        self.comments.items[i].side = side;
+    }
+
     /// Comment with `id`, or null if none.
     pub fn find(self: *const Review, id: []const u8) ?*const Comment {
         return if (self.findIndex(id)) |i| &self.comments.items[i] else null;
@@ -372,4 +386,43 @@ test "setBody overwrites body only" {
     try testing.expectEqualStrings(id1, loaded.find(id1).?.id);
     try testing.expectEqual(10, loaded.find(id1).?.new_line.?);
     try testing.expectEqual(Side.new, loaded.find(id1).?.side.?);
+}
+
+test "setLines overwrites lines and side only" {
+    var review = try initEmpty(testing.allocator, default_review_id);
+    defer review.deinit();
+    const id1 = try review.addOpen("a.zig", null, 10, .new, "one");
+    const id2 = try review.addOpen("b.zig", 2, null, .old, "other");
+
+    try testing.expectError(error.NotFound, review.setLines("ghost", 1, 2, .context));
+    try review.setLines(id1, 4, 8, .context);
+
+    const c = review.find(id1).?;
+    try testing.expectEqualStrings(id1, c.id);
+    try testing.expectEqualStrings("a.zig", c.path);
+    try testing.expectEqual(4, c.old_line.?);
+    try testing.expectEqual(8, c.new_line.?);
+    try testing.expectEqual(Side.context, c.side.?);
+    try testing.expectEqual(State.open, c.state);
+    try testing.expectEqualStrings("one", c.body);
+    try testing.expectEqualStrings("other", review.find(id2).?.body);
+
+    try review.setLines(id1, 9, null, .old);
+    try testing.expectEqual(9, review.find(id1).?.old_line.?);
+    try testing.expect(review.find(id1).?.new_line == null);
+    try testing.expectEqual(Side.old, review.find(id1).?.side.?);
+
+    if (builtin.os.tag == .wasi) return;
+    const io = testing.io;
+    const alloc = testing.allocator;
+    var tmp = try IsolatedTmp.create(alloc, io);
+    defer tmp.cleanup(alloc, io);
+    try save(&review, alloc, io, tmp.dir);
+    var loaded = try load(alloc, io, tmp.dir, default_review_id);
+    defer loaded.deinit();
+    try testing.expectEqualStrings("one", loaded.find(id1).?.body);
+    try testing.expectEqual(9, loaded.find(id1).?.old_line.?);
+    try testing.expect(loaded.find(id1).?.new_line == null);
+    try testing.expectEqual(Side.old, loaded.find(id1).?.side.?);
+    try testing.expectEqualStrings("a.zig", loaded.find(id1).?.path);
 }
