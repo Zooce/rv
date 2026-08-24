@@ -69,6 +69,7 @@ const diff = @import("diff");
 const tui = @import("tui");
 const view = @import("view");
 const store = @import("store");
+const comments = @import("comments");
 const cli = @import("cli");
 const comment_input = @import("comment_input");
 
@@ -332,7 +333,7 @@ fn runTui(alloc: std.mem.Allocator, io: std.Io, source: cli.Source) !u8 {
                         },
                         .enter => {
                             if (list_cursor < list_items.items.len) {
-                                if (commentLoc(list_items.items[list_cursor])) |loc| {
+                                if (comments.loc(list_items.items[list_cursor])) |loc| {
                                     if (view.rowForComment(diff_view.rows, loc)) |idx| {
                                         cursor = idx;
                                         focus = .normal;
@@ -464,7 +465,7 @@ fn runTui(alloc: std.mem.Allocator, io: std.Io, source: cli.Source) !u8 {
                                 const delete_them = discard_confirm.comments and discard_confirm.yes;
                                 var ids: std.ArrayList([]const u8) = .empty;
                                 defer ids.deinit(alloc);
-                                var saved: std.ArrayList(DiscardCommentSnap) = .empty;
+                                var saved: std.ArrayList(comments.RemoveSnap) = .empty;
                                 defer saved.deinit(alloc);
                                 if (delete_them) {
                                     try collectDiscardComments(
@@ -645,9 +646,9 @@ fn runTui(alloc: std.mem.Allocator, io: std.Io, source: cli.Source) !u8 {
                                 } else if (c == '{') {
                                     cursor = view.prevFileHeader(diff_view.rows, cursor);
                                 } else if (c == ')') {
-                                    try jumpLiveComment(&review, alloc, diff_view.rows, &cursor, &note, .next);
+                                    jumpLiveComment(&review, diff_view.rows, &cursor, &note, .next);
                                 } else if (c == '(') {
-                                    try jumpLiveComment(&review, alloc, diff_view.rows, &cursor, &note, .prev);
+                                    jumpLiveComment(&review, diff_view.rows, &cursor, &note, .prev);
                                 } else if (c == 't') {
                                     layout_pref = view.toggleLayoutPref(layout_pref);
                                 } else if (c == 'r') {
@@ -869,9 +870,9 @@ fn applyIndex(
         const loaded = DiffView.maybeInit(alloc, io, source, note) orelse return;
         errdefer loaded.deinit(alloc);
         if (kind == .stage_unstage) {
-            var priors: std.ArrayList(CommentAnchorSnap) = .empty;
+            var priors: std.ArrayList(comments.AnchorSnap) = .empty;
             defer priors.deinit(alloc);
-            try remapMatchingComments(review, file, &loaded.diff, target.hunk_i, alloc, &priors);
+            try comments.remapMatching(review, file, &loaded.diff, target.hunk_i, alloc, &priors);
             saveCommentRemap(review, alloc, io, note, priors.items);
         }
         commitReload(alloc, diff_view, cursor, restore, loaded);
@@ -921,12 +922,12 @@ fn applyGroupIndex(
     const restore: ReloadCursor = if (neighbor) |m| .{ .group_neighbor = m } else .start;
     if (DiffView.maybeInit(alloc, io, source, note)) |loaded| {
         errdefer loaded.deinit(alloc);
-        var priors: std.ArrayList(CommentAnchorSnap) = .empty;
+        var priors: std.ArrayList(comments.AnchorSnap) = .empty;
         defer priors.deinit(alloc);
         for (diff_view.diff.files) |*f| {
             const g = f.group orelse continue;
             if (g != span.group) continue;
-            try remapMatchingComments(review, f, &loaded.diff, null, alloc, &priors);
+            try comments.remapMatching(review, f, &loaded.diff, null, alloc, &priors);
         }
         saveCommentRemap(review, alloc, io, note, priors.items);
         commitReload(alloc, diff_view, cursor, restore, loaded);
@@ -990,36 +991,6 @@ fn fileForTarget(d: *const diff.Diff, target: view.IndexTarget) ?*const diff.Fil
     return null;
 }
 
-/// Snapshot of a comment removed during discard, for save-failure restore.
-const DiscardCommentSnap = struct {
-    idx: usize,
-    comment: store.Comment,
-};
-
-fn lineInHunkRange(line: ?u32, start: u32, count: ?u32) bool {
-    const n = line orelse return false;
-    const len = count orelse 1;
-    return n >= start and n - start < len;
-}
-
-fn commentHitsHunk(c: store.Comment, hunk: diff.Hunk) bool {
-    return lineInHunkRange(c.old_line, hunk.old_start, hunk.old_count) or
-        lineInHunkRange(c.new_line, hunk.new_start, hunk.new_count);
-}
-
-fn discardCommentMatches(c: store.Comment, file: *const diff.File, hunk_i: ?usize) bool {
-    if (c.state != .open) return false;
-    if (!std.mem.eql(u8, c.path, file.displayPath())) return false;
-    if (hunk_i) |hi| {
-        if (hi >= file.hunks.len) return false;
-        return commentHitsHunk(c, file.hunks[hi]);
-    }
-    for (file.hunks) |hunk| {
-        if (commentHitsHunk(c, hunk)) return true;
-    }
-    return false;
-}
-
 fn discardTargetFile(
     d: *const diff.Diff,
     rows: []const view.Row,
@@ -1039,10 +1010,7 @@ fn hasMatchingDiscardComments(
     whole_file: bool,
 ) bool {
     const found = discardTargetFile(d, rows, cursor, whole_file) orelse return false;
-    for (review.comments.items) |c| {
-        if (discardCommentMatches(c, found.file, found.hunk_i)) return true;
-    }
-    return false;
+    return comments.hasMatching(review, found.file, found.hunk_i);
 }
 
 fn collectDiscardComments(
@@ -1053,14 +1021,10 @@ fn collectDiscardComments(
     whole_file: bool,
     alloc: std.mem.Allocator,
     ids: *std.ArrayList([]const u8),
-    saved: *std.ArrayList(DiscardCommentSnap),
+    saved: *std.ArrayList(comments.RemoveSnap),
 ) std.mem.Allocator.Error!void {
     const found = discardTargetFile(d, rows, cursor, whole_file) orelse return;
-    for (review.comments.items, 0..) |c, i| {
-        if (!discardCommentMatches(c, found.file, found.hunk_i)) continue;
-        try ids.append(alloc, c.id);
-        try saved.append(alloc, .{ .idx = i, .comment = c });
-    }
+    try comments.collectMatching(review, found.file, found.hunk_i, alloc, ids, saved);
 }
 
 /// Git already succeeded. Delete matching comments; on save failure put them back.
@@ -1069,7 +1033,7 @@ fn removeDiscardComments(
     alloc: std.mem.Allocator,
     io: std.Io,
     ids: []const []const u8,
-    saved: []const DiscardCommentSnap,
+    saved: []const comments.RemoveSnap,
     note: *StatusNote,
 ) void {
     if (ids.len == 0) return;
@@ -1082,171 +1046,12 @@ fn removeDiscardComments(
     };
 }
 
-/// Prior line/side for a comment remapped after stage/unstage (save-failure restore).
-const CommentAnchorSnap = struct {
-    id: []const u8,
-    old_line: ?u32,
-    new_line: ?u32,
-    side: ?store.Side,
-};
-
-const RemapAnchor = struct {
-    old_line: ?u32,
-    new_line: ?u32,
-    side: store.Side,
-};
-
-fn hunkBodyEql(a: []const diff.Line, b: []const diff.Line) bool {
-    if (a.len != b.len) return false;
-    for (a, b) |x, y| {
-        if (x.kind != y.kind) return false;
-        if (!std.mem.eql(u8, x.text, y.text)) return false;
-    }
-    return true;
-}
-
-fn commentSide(c: store.Comment) store.Side {
-    return c.side orelse if (c.new_line != null) .new else .old;
-}
-
-fn lineOnSide(ln: diff.Line, side: store.Side) bool {
-    return switch (side) {
-        .old => ln.old_no != null,
-        .new => ln.new_no != null,
-        .context => ln.old_no != null and ln.new_no != null,
-    };
-}
-
-fn commentLineIndex(c: store.Comment, hunk: diff.Hunk) ?usize {
-    const side = commentSide(c);
-    for (hunk.lines, 0..) |ln, i| {
-        const old_hit = blk: {
-            const o = c.old_line orelse break :blk false;
-            const lo = ln.old_no orelse break :blk false;
-            break :blk lo == o;
-        };
-        const new_hit = blk: {
-            const n = c.new_line orelse break :blk false;
-            const nn = ln.new_no orelse break :blk false;
-            break :blk nn == n;
-        };
-        const hit = switch (side) {
-            .old => old_hit,
-            .new => new_hit,
-            .context => old_hit or new_hit,
-        };
-        if (hit) return i;
-    }
-    return null;
-}
-
-fn destHunkLines(
-    dest: *const diff.Diff,
-    path: []const u8,
-    body: []const diff.Line,
-) ?[]const diff.Line {
-    for (dest.files) |f| {
-        if (!std.mem.eql(u8, f.displayPath(), path)) continue;
-        for (f.hunks) |h| {
-            if (hunkBodyEql(h.lines, body)) return h.lines;
-        }
-    }
-    return null;
-}
-
-fn destLineByText(
-    dest: *const diff.Diff,
-    path: []const u8,
-    side: store.Side,
-    text: []const u8,
-) ?diff.Line {
-    var found: ?diff.Line = null;
-    for (dest.files) |f| {
-        if (!std.mem.eql(u8, f.displayPath(), path)) continue;
-        for (f.hunks) |h| {
-            for (h.lines) |ln| {
-                if (!lineOnSide(ln, side)) continue;
-                if (!std.mem.eql(u8, ln.text, text)) continue;
-                if (found != null) return null;
-                found = ln;
-            }
-        }
-    }
-    return found;
-}
-
-fn remapAnchorFromLine(ln: diff.Line, side: store.Side) ?RemapAnchor {
-    return switch (side) {
-        .new => .{ .old_line = null, .new_line = ln.new_no orelse return null, .side = .new },
-        .old => .{ .old_line = ln.old_no orelse return null, .new_line = null, .side = .old },
-        .context => if (ln.old_no == null and ln.new_no == null)
-            null
-        else
-            .{ .old_line = ln.old_no, .new_line = ln.new_no, .side = .context },
-    };
-}
-
-fn destAnchor(
-    c: store.Comment,
-    src_file: *const diff.File,
-    dest: *const diff.Diff,
-    hunk_i: ?usize,
-) ?RemapAnchor {
-    if (c.state != .open) return null;
-    if (!std.mem.eql(u8, c.path, src_file.displayPath())) return null;
-    const hi = hunk_i orelse blk: {
-        for (src_file.hunks, 0..) |h, i| {
-            if (commentLineIndex(c, h) != null) break :blk i;
-        }
-        return null;
-    };
-    if (hi >= src_file.hunks.len) return null;
-    const src_hunk = src_file.hunks[hi];
-    const line_i = commentLineIndex(c, src_hunk) orelse return null;
-    const src_ln = src_hunk.lines[line_i];
-    if (src_ln.kind == .meta) return null;
-    const side = commentSide(c);
-
-    if (destHunkLines(dest, src_file.displayPath(), src_hunk.lines)) |dest_lines| {
-        if (line_i < dest_lines.len) {
-            const ln = dest_lines[line_i];
-            if (std.mem.eql(u8, ln.text, src_ln.text) and lineOnSide(ln, side)) {
-                return remapAnchorFromLine(ln, side);
-            }
-        }
-    }
-    const dest_ln = destLineByText(dest, src_file.displayPath(), side, src_ln.text) orelse return null;
-    return remapAnchorFromLine(dest_ln, side);
-}
-
-fn remapMatchingComments(
-    review: *store.Review,
-    src_file: *const diff.File,
-    dest: *const diff.Diff,
-    hunk_i: ?usize,
-    alloc: std.mem.Allocator,
-    priors: *std.ArrayList(CommentAnchorSnap),
-) std.mem.Allocator.Error!void {
-    for (review.comments.items) |c| {
-        const next = destAnchor(c, src_file, dest, hunk_i) orelse continue;
-        try priors.append(alloc, .{
-            .id = c.id,
-            .old_line = c.old_line,
-            .new_line = c.new_line,
-            .side = c.side,
-        });
-        review.setLines(c.id, next.old_line, next.new_line, next.side) catch {
-            _ = priors.pop();
-        };
-    }
-}
-
 fn saveCommentRemap(
     review: *store.Review,
     alloc: std.mem.Allocator,
     io: std.Io,
     note: *StatusNote,
-    priors: []const CommentAnchorSnap,
+    priors: []const comments.AnchorSnap,
 ) void {
     if (priors.len == 0) return;
     store.save(review, alloc, io, .cwd()) catch {
@@ -1255,153 +1060,6 @@ fn saveCommentRemap(
         }
         note.set("failed to save .rv comment store");
     };
-}
-
-test "discard comments match this group's hunk lines" {
-    const hunks = [_]diff.Hunk{
-        .{ .old_start = 10, .old_count = 3, .new_start = 12, .new_count = 4 },
-        .{ .old_start = 40, .old_count = 2, .new_start = 50, .new_count = 2 },
-    };
-    const file = diff.File{
-        .new_path = "a.zig",
-        .hunks = &hunks,
-        .group = .unstaged,
-    };
-    const hit_new = store.Comment{ .id = "1", .path = "a.zig", .new_line = 13, .body = "x" };
-    const hit_old = store.Comment{ .id = "2", .path = "a.zig", .old_line = 11, .body = "x" };
-    const hit_second = store.Comment{ .id = "3", .path = "a.zig", .new_line = 51, .body = "x" };
-    const other_line = store.Comment{ .id = "4", .path = "a.zig", .new_line = 80, .body = "x" };
-    const other_path = store.Comment{ .id = "5", .path = "b.zig", .new_line = 13, .body = "x" };
-    const resolved = store.Comment{
-        .id = "6",
-        .path = "a.zig",
-        .new_line = 13,
-        .body = "x",
-        .state = .resolved,
-    };
-
-    try std.testing.expect(discardCommentMatches(hit_new, &file, 0));
-    try std.testing.expect(discardCommentMatches(hit_old, &file, 0));
-    try std.testing.expect(!discardCommentMatches(hit_second, &file, 0));
-    try std.testing.expect(!discardCommentMatches(other_line, &file, 0));
-    try std.testing.expect(!discardCommentMatches(other_path, &file, 0));
-    try std.testing.expect(!discardCommentMatches(resolved, &file, 0));
-
-    try std.testing.expect(discardCommentMatches(hit_new, &file, null));
-    try std.testing.expect(discardCommentMatches(hit_second, &file, null));
-    try std.testing.expect(!discardCommentMatches(other_line, &file, null));
-}
-
-test "destAnchor maps the commented line, not a neighbor hunk" {
-    const src_txt =
-        \\diff --git a/a.zig b/a.zig
-        \\--- a/a.zig
-        \\+++ b/a.zig
-        \\@@ -1,3 +1,4 @@
-        \\ context one
-        \\-old two
-        \\+fn commentedLine
-        \\ context three
-        \\@@ -10,2 +11,2 @@
-        \\ keep
-        \\-old tail
-        \\+new tail
-    ;
-    const dest_same =
-        \\diff --git a/a.zig b/a.zig
-        \\--- a/a.zig
-        \\+++ b/a.zig
-        \\@@ -20,3 +20,4 @@
-        \\ context one
-        \\-old two
-        \\+fn commentedLine
-        \\ context three
-        \\@@ -40,2 +41,2 @@
-        \\ keep
-        \\-old tail
-        \\+new tail
-    ;
-    const dest_resplit =
-        \\diff --git a/a.zig b/a.zig
-        \\--- a/a.zig
-        \\+++ b/a.zig
-        \\@@ -20,3 +20,4 @@
-        \\+extra context
-        \\ context one
-        \\-old two
-        \\+fn commentedLine
-        \\ context three
-    ;
-    const dest_other_hunk =
-        \\diff --git a/a.zig b/a.zig
-        \\--- a/a.zig
-        \\+++ b/a.zig
-        \\@@ -40,2 +41,2 @@
-        \\ keep
-        \\-old tail
-        \\+new tail
-    ;
-
-    var src = try diff.parsePieces(std.testing.allocator, &.{
-        .{ .text = src_txt, .group = .unstaged },
-    });
-    defer src.deinit();
-    const src_file = &src.files[0];
-    const on_add = store.Comment{
-        .id = "1",
-        .path = "a.zig",
-        .new_line = 2,
-        .side = .new,
-        .body = "x",
-    };
-
-    var dest_eq = try diff.parsePieces(std.testing.allocator, &.{
-        .{ .text = dest_same, .group = .staged },
-    });
-    defer dest_eq.deinit();
-    const same = destAnchor(on_add, src_file, &dest_eq, 0).?;
-    try std.testing.expect(same.old_line == null);
-    try std.testing.expectEqual(21, same.new_line.?);
-    try std.testing.expectEqual(store.Side.new, same.side);
-
-    var dest_untracked = try diff.parsePieces(std.testing.allocator, &.{
-        .{ .text = dest_same, .group = .untracked },
-    });
-    defer dest_untracked.deinit();
-    const via_untracked = destAnchor(on_add, src_file, &dest_untracked, 0).?;
-    try std.testing.expectEqual(21, via_untracked.new_line.?);
-    try std.testing.expectEqual(store.Side.new, via_untracked.side);
-
-    const neighbor = store.Comment{
-        .id = "2",
-        .path = "a.zig",
-        .new_line = 2,
-        .side = .new,
-        .body = "x",
-    };
-    try std.testing.expect(destAnchor(neighbor, src_file, &dest_eq, 1) == null);
-    const neighbor_ok = destAnchor(
-        store.Comment{ .id = "3", .path = "a.zig", .new_line = 12, .side = .new, .body = "x" },
-        src_file,
-        &dest_eq,
-        1,
-    ).?;
-    try std.testing.expectEqual(42, neighbor_ok.new_line.?);
-
-    var dest_split = try diff.parsePieces(std.testing.allocator, &.{
-        .{ .text = dest_resplit, .group = .staged },
-    });
-    defer dest_split.deinit();
-    const split = destAnchor(on_add, src_file, &dest_split, 0).?;
-    try std.testing.expect(split.old_line == null);
-    try std.testing.expectEqual(22, split.new_line.?);
-    try std.testing.expectEqual(store.Side.new, split.side);
-
-    var dest_other = try diff.parsePieces(std.testing.allocator, &.{
-        .{ .text = dest_other_hunk, .group = .staged },
-    });
-    defer dest_other.deinit();
-    try std.testing.expect(destAnchor(on_add, src_file, &dest_other, 0) == null);
 }
 
 /// Key ownership: normal nav, comment draft, `/` search prompt, comment list,
@@ -1560,15 +1218,15 @@ fn ensureDraftCaretVisible(
     draft_scroll.* = comment_input.ensureVisible(draft_scroll.*, pos.line, m.height, m.line_count);
 }
 
+/// Open the comment box on `want` at `cursor`. Missing side: silent no-op.
+/// Existing comment: pre-fill the first in store order; caret at end. None: create.
+/// Returns true when the box opened.
 fn sideForAnchor(a: view.Anchor) store.Side {
     if (a.old_line != null and a.new_line != null) return .context;
     if (a.new_line != null) return .new;
     return .old;
 }
 
-/// Open the comment box on `want` at `cursor`. Missing side: silent no-op.
-/// Existing comment: pre-fill the first in store order; caret at end. None: create.
-/// Returns true when the box opened.
 fn beginComment(
     review: *const store.Review,
     alloc: std.mem.Allocator,
@@ -1579,10 +1237,10 @@ fn beginComment(
     want: view.CommentSide,
     draft: *Draft,
 ) std.mem.Allocator.Error!bool {
-    const a = view.commentAnchor(rows, slots, layout, cursor, want) orelse return false;
+    const found = comments.atSide(review, rows, slots, layout, cursor, want) orelse return false;
     draft.clear();
-    draft.anchor = a;
-    if (review.firstAt(a.path, a.old_line, a.new_line)) |idx| {
+    draft.anchor = found.anchor;
+    if (found.idx) |idx| {
         const c = review.comments.items[idx];
         try draft.buf.appendSlice(alloc, c.body);
         draft.caret = draft.buf.items.len;
@@ -1591,44 +1249,19 @@ fn beginComment(
     return true;
 }
 
-/// Live comment as a display target, or null if it has no usable side/line.
-fn commentLoc(c: store.Comment) ?view.CommentLoc {
-    if (c.state != .open) return null;
-    if (c.side) |s| {
-        switch (s) {
-            .old => if (c.old_line) |n| return .{ .path = c.path, .side = .old, .line = n },
-            .new => if (c.new_line) |n| return .{ .path = c.path, .side = .new, .line = n },
-            .context => {
-                if (c.new_line) |n| return .{ .path = c.path, .side = .new, .line = n };
-                if (c.old_line) |n| return .{ .path = c.path, .side = .old, .line = n };
-            },
-        }
-        return null;
-    }
-    if (c.new_line) |n| return .{ .path = c.path, .side = .new, .line = n };
-    if (c.old_line) |n| return .{ .path = c.path, .side = .old, .line = n };
-    return null;
-}
-
 fn jumpLiveComment(
     review: *const store.Review,
-    alloc: std.mem.Allocator,
     rows: []const view.Row,
     cursor: *usize,
     note: *StatusNote,
     comptime toward: enum { next, prev },
-) std.mem.Allocator.Error!void {
-    var locs: std.ArrayList(view.CommentLoc) = .empty;
-    defer locs.deinit(alloc);
-    for (review.comments.items) |c| {
-        if (commentLoc(c)) |loc| try locs.append(alloc, loc);
-    }
+) void {
     const hit = switch (toward) {
-        .next => view.nextComment(rows, locs.items, cursor.*),
-        .prev => view.prevComment(rows, locs.items, cursor.*),
+        .next => comments.next(review, rows, cursor.*),
+        .prev => comments.prev(review, rows, cursor.*),
     };
     if (hit) |h| {
-        cursor.* = h.index;
+        cursor.* = h.row;
         if (h.wrapped) note.set("comment wrapped");
     } else {
         note.set("no comments");
@@ -1648,11 +1281,11 @@ fn dismissAt(
     want: view.CommentSide,
     note: *StatusNote,
 ) void {
-    const a = view.commentAnchor(rows, slots, layout, cursor, want) orelse {
+    const found = comments.atSide(review, rows, slots, layout, cursor, want) orelse {
         note.set("no comment on this side");
         return;
     };
-    const idx = review.firstAt(a.path, a.old_line, a.new_line) orelse {
+    const idx = found.idx orelse {
         note.set("no comment on this side");
         return;
     };
@@ -1685,20 +1318,11 @@ fn listOverlayRect(cols: u16, rows: u16, n: usize) tui.Rect {
 }
 
 fn formatCommentLineCol(buf: []u8, c: store.Comment) []const u8 {
-    if (c.side) |s| {
-        switch (s) {
-            .old => if (c.old_line) |ln| return bufPrintTrunc(buf, "-{d}", .{ln}),
-            .new => if (c.new_line) |ln| return bufPrintTrunc(buf, "+{d}", .{ln}),
-            .context => {
-                if (c.new_line) |ln| return bufPrintTrunc(buf, "+{d}", .{ln});
-                if (c.old_line) |ln| return bufPrintTrunc(buf, "-{d}", .{ln});
-            },
-        }
-        return "-";
-    }
-    if (c.new_line) |ln| return bufPrintTrunc(buf, "+{d}", .{ln});
-    if (c.old_line) |ln| return bufPrintTrunc(buf, "-{d}", .{ln});
-    return "-";
+    const found = comments.loc(c) orelse return "-";
+    return switch (found.side) {
+        .old => bufPrintTrunc(buf, "-{d}", .{found.line}),
+        .new => bufPrintTrunc(buf, "+{d}", .{found.line}),
+    };
 }
 
 fn formatListRow(buf: []u8, c: store.Comment) []const u8 {

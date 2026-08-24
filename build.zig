@@ -88,6 +88,18 @@ pub fn build(b: *std.Build) void {
         },
     });
 
+    // Live-comment location and next/prev walk (rows are a tool).
+    const comments_mod = b.addModule("comments", .{
+        .root_source_file = b.path("src/comments.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{
+            .{ .name = "store", .module = store_mod },
+            .{ .name = "view", .module = view_mod },
+            .{ .name = "diff", .module = diff_mod },
+        },
+    });
+
     // Bundled agent skill install (MVP-2.5).
     const install_skill_mod = b.addModule("install_skill", .{
         .root_source_file = b.path("src/install_skill.zig"),
@@ -122,6 +134,7 @@ pub fn build(b: *std.Build) void {
                 .{ .name = "git", .module = git_mod },
                 .{ .name = "view", .module = view_mod },
                 .{ .name = "store", .module = store_mod },
+                .{ .name = "comments", .module = comments_mod },
                 .{ .name = "cli", .module = cli_mod },
                 .{ .name = "comment_input", .module = comment_input_mod },
             },
@@ -179,6 +192,11 @@ pub fn build(b: *std.Build) void {
     });
     const run_store_tests = b.addRunArtifact(store_tests);
 
+    const comments_tests = b.addTest(.{
+        .root_module = comments_mod,
+    });
+    const run_comments_tests = b.addRunArtifact(comments_tests);
+
     const cli_tests = b.addTest(.{
         .root_module = cli_mod,
     });
@@ -200,6 +218,7 @@ pub fn build(b: *std.Build) void {
                 .{ .name = "git", .module = git_mod },
                 .{ .name = "view", .module = view_mod },
                 .{ .name = "store", .module = store_mod },
+                .{ .name = "comments", .module = comments_mod },
                 .{ .name = "cli", .module = cli_mod },
                 .{ .name = "comment_input", .module = comment_input_mod },
             },
@@ -207,13 +226,14 @@ pub fn build(b: *std.Build) void {
     });
     const run_main_tests = b.addRunArtifact(main_tests);
 
-    const test_step = b.step("test", "Run unit tests (TUI + diff + git + view + comment_input + store + cli + install_skill + main)");
+    const test_step = b.step("test", "Run unit tests (TUI + diff + git + view + comment_input + store + comments + cli + install_skill + main)");
     test_step.dependOn(&run_tui_tests.step);
     test_step.dependOn(&run_diff_tests.step);
     test_step.dependOn(&run_git_tests.step);
     test_step.dependOn(&run_view_tests.step);
     test_step.dependOn(&run_comment_input_tests.step);
     test_step.dependOn(&run_store_tests.step);
+    test_step.dependOn(&run_comments_tests.step);
     test_step.dependOn(&run_cli_tests.step);
     test_step.dependOn(&run_install_skill_tests.step);
     test_step.dependOn(&run_main_tests.step);
