@@ -101,7 +101,7 @@ fn runTui(alloc: std.mem.Allocator, io: std.Io, source: cli.Source) !u8 {
             .local => git.loadDefaultDiff(alloc, io),
             .range => |r| git.loadRangeDiff(alloc, io, .inherit, r),
         } catch |err| {
-            std.debug.print("rv: {s}\n", .{gitLoadMsg(err)});
+            std.debug.print("rv: {s}\n", .{git.errorMessage(err)});
             return 1;
         };
         errdefer parsed.deinit();
@@ -433,10 +433,22 @@ fn runTui(alloc: std.mem.Allocator, io: std.Io, source: cli.Source) !u8 {
                         if (abort) {
                             focus = .normal;
                         } else if (answered) {
-                            if (discard_confirm.kind == .group) {
-                                if (!discard_confirm.yes) {
-                                    focus = .normal;
-                                } else {
+                            switch (git.confirmNext(
+                                discard_confirm.kind,
+                                discard_confirm.comments,
+                                discard_confirm.yes,
+                                &review,
+                                &diff_view.diff,
+                                diff_view.rows,
+                                cursor,
+                                discard_confirm.whole_file,
+                            )) {
+                                .close => focus = .normal,
+                                .comments => {
+                                    discard_confirm.comments = true;
+                                    discard_confirm.yes = true;
+                                },
+                                .group => {
                                     focus = .normal;
                                     try applyGroupIndex(
                                         alloc,
@@ -449,53 +461,24 @@ fn runTui(alloc: std.mem.Allocator, io: std.Io, source: cli.Source) !u8 {
                                         &git_err,
                                         &review,
                                     );
-                                }
-                            } else if (!discard_confirm.comments and !discard_confirm.yes) {
-                                focus = .normal;
-                            } else if (!discard_confirm.comments and hasMatchingDiscardComments(
-                                &review,
-                                &diff_view.diff,
-                                diff_view.rows,
-                                cursor,
-                                discard_confirm.whole_file,
-                            )) {
-                                discard_confirm.comments = true;
-                                discard_confirm.yes = true;
-                            } else {
-                                const delete_them = discard_confirm.comments and discard_confirm.yes;
-                                var ids: std.ArrayList([]const u8) = .empty;
-                                defer ids.deinit(alloc);
-                                var saved: std.ArrayList(comments.RemoveSnap) = .empty;
-                                defer saved.deinit(alloc);
-                                if (delete_them) {
-                                    try collectDiscardComments(
-                                        &review,
-                                        &diff_view.diff,
-                                        diff_view.rows,
-                                        cursor,
-                                        discard_confirm.whole_file,
+                                },
+                                .discard => |delete_them| {
+                                    focus = .normal;
+                                    try applyIndex(
                                         alloc,
-                                        &ids,
-                                        &saved,
+                                        io,
+                                        source,
+                                        &diff_view,
+                                        &cursor,
+                                        &note,
+                                        &focus,
+                                        &git_err,
+                                        &review,
+                                        discard_confirm.whole_file,
+                                        .discard,
+                                        delete_them,
                                     );
-                                }
-                                focus = .normal;
-                                try applyIndex(
-                                    alloc,
-                                    io,
-                                    source,
-                                    &diff_view,
-                                    &cursor,
-                                    &note,
-                                    &focus,
-                                    &git_err,
-                                    &review,
-                                    discard_confirm.whole_file,
-                                    .discard,
-                                );
-                                if (focus != .git_error and delete_them) {
-                                    removeDiscardComments(&review, alloc, io, ids.items, saved.items, &note);
-                                }
+                                },
                             }
                         }
                     },
@@ -548,25 +531,22 @@ fn runTui(alloc: std.mem.Allocator, io: std.Io, source: cli.Source) !u8 {
                                     list_scroll = 0;
                                     focus = .listing;
                                 } else if (after_leader and c == ' ') {
-                                    beginGroupStage(diff_view.rows, cursor, &focus, &discard_confirm);
-                                    if (focus == .normal) {
-                                        try applyIndex(
-                                            alloc,
-                                            io,
-                                            source,
-                                            &diff_view,
-                                            &cursor,
-                                            &note,
-                                            &focus,
-                                            &git_err,
-                                            &review,
-                                            false,
-                                            .stage_unstage,
-                                        );
-                                    }
+                                    try dispatchStage(
+                                        alloc,
+                                        io,
+                                        source,
+                                        &diff_view,
+                                        &cursor,
+                                        &note,
+                                        &focus,
+                                        &git_err,
+                                        &review,
+                                        &discard_confirm,
+                                        false,
+                                    );
                                 } else if (after_leader and c == 'S') {
                                     if (view.currentHunkInFile(diff_view.rows, cursor) != null) {
-                                        try applyIndex(
+                                        try dispatchStage(
                                             alloc,
                                             io,
                                             source,
@@ -576,19 +556,25 @@ fn runTui(alloc: std.mem.Allocator, io: std.Io, source: cli.Source) !u8 {
                                             &focus,
                                             &git_err,
                                             &review,
+                                            &discard_confirm,
                                             true,
-                                            .stage_unstage,
                                         );
                                     }
                                 } else if (after_leader and c == 'd') {
                                     if (source == .local) {
-                                        beginDiscard(diff_view.rows, cursor, false, &focus, &discard_confirm);
+                                        if (git.discardTargetAt(diff_view.rows, cursor, false) != null) {
+                                            discard_confirm = .{ .whole_file = false, .yes = false, .comments = false };
+                                            focus = .discard_confirm;
+                                        }
                                     } else {
                                         dismissAt(&review, alloc, io, diff_view.rows, diff_view.sbs_slots, layout, cursor, .new, &note);
                                     }
                                 } else if (after_leader and c == 'x') {
                                     if (source == .local and view.currentHunkInFile(diff_view.rows, cursor) != null) {
-                                        beginDiscard(diff_view.rows, cursor, true, &focus, &discard_confirm);
+                                        if (git.discardTargetAt(diff_view.rows, cursor, true) != null) {
+                                            discard_confirm = .{ .whole_file = true, .yes = false, .comments = false };
+                                            focus = .discard_confirm;
+                                        }
                                     }
                                 } else if (c == 'q' or c == 'Q') {
                                     running = false;
@@ -652,7 +638,7 @@ fn runTui(alloc: std.mem.Allocator, io: std.Io, source: cli.Source) !u8 {
                                 } else if (c == 't') {
                                     layout_pref = view.toggleLayoutPref(layout_pref);
                                 } else if (c == 'r') {
-                                    reloadDiff(alloc, io, source, &diff_view, &cursor, &note, .path_line);
+                                    reloadDiff(alloc, io, source, &diff_view, &cursor, &note);
                                 } else if (c == 'i' or c == 'c' or c == 'a') {
                                     if (try beginComment(&review, alloc, diff_view.rows, diff_view.sbs_slots, layout, cursor, .new, &draft)) {
                                         focus = .commenting;
@@ -700,29 +686,6 @@ fn runTui(alloc: std.mem.Allocator, io: std.Io, source: cli.Source) !u8 {
     return 0;
 }
 
-fn gitLoadMsg(err: git.Error) []const u8 {
-    return switch (err) {
-        error.NotARepository => "not a git repository (run from a work tree)",
-        error.GitNotFound => "git executable not found in PATH",
-        error.GitFailed => "git command failed",
-        error.OutOfMemory => "out of memory",
-        error.BadHunkHeader => "failed to parse unified diff (bad hunk header)",
-    };
-}
-
-/// How to place the cursor after a successful reload.
-const ReloadCursor = union(enum) {
-    /// Same path + line as before the load (`r`).
-    path_line,
-    /// Remaining change after an index mutation. `path` borrows from the
-    /// pre-reload rows; restore before those rows are freed.
-    neighbor: view.NeighborMark,
-    /// Remaining section or file after a whole-group mutation.
-    group_neighbor: view.GroupNeighborMark,
-    /// No remaining neighbor (only change in the list): row 0.
-    start,
-};
-
 /// Parsed diff plus flatten rows and side-by-side slots. The TUI holds one
 /// as the live list; reload builds another and swaps it in.
 const DiffView = struct {
@@ -740,7 +703,7 @@ const DiffView = struct {
             .local => git.loadDefaultDiff(alloc, io),
             .range => |r| git.loadRangeDiff(alloc, io, .inherit, r),
         } catch |err| {
-            note.set(gitLoadMsg(err));
+            note.set(git.errorMessage(err));
             return null;
         };
         const new_rows = view.flatten(alloc, &new_diff) catch {
@@ -765,31 +728,10 @@ const DiffView = struct {
     }
 };
 
-fn commitReload(
-    alloc: std.mem.Allocator,
-    diff_view: *DiffView,
-    cursor: *usize,
-    restore: ReloadCursor,
-    loaded: DiffView,
-) void {
-    // Neighbor / path-line marks borrow from the old list. Restore before free.
-    const new_cursor: usize = switch (restore) {
-        .path_line => blk: {
-            const mark = view.cursorMarkAt(diff_view.rows, cursor.*);
-            break :blk if (mark) |m| view.restoreCursor(loaded.rows, m) else 0;
-        },
-        .neighbor => |m| view.restoreNeighbor(loaded.rows, m),
-        .group_neighbor => |m| view.restoreGroupNeighbor(loaded.rows, m),
-        .start => 0,
-    };
-    diff_view.deinit(alloc);
-    diff_view.* = loaded;
-    cursor.* = new_cursor;
-}
-
 /// Re-run the startup load. On success, replace the live DiffView and restore
-/// the cursor. On failure, leave the previous list and set `note`.
-/// Does not touch the comment store. `r` is only bound in normal focus.
+/// the cursor to the same path+line. On failure, leave the previous list and
+/// set `note`. Does not touch the comment store. `r` is only bound in normal
+/// focus.
 fn reloadDiff(
     alloc: std.mem.Allocator,
     io: std.Io,
@@ -797,21 +739,20 @@ fn reloadDiff(
     diff_view: *DiffView,
     cursor: *usize,
     note: *StatusNote,
-    restore: ReloadCursor,
 ) void {
     const loaded = DiffView.maybeInit(alloc, io, source, note) orelse return;
-    commitReload(alloc, diff_view, cursor, restore, loaded);
+    const new_cursor: usize = blk: {
+        const mark = view.cursorMarkAt(diff_view.rows, cursor.*);
+        break :blk if (mark) |m| view.restoreCursor(loaded.rows, m) else 0;
+    };
+    diff_view.deinit(alloc);
+    diff_view.* = loaded;
+    cursor.* = new_cursor;
 }
 
 /// Stage, unstage, or discard the current file or hunk (local source only).
-/// On success, reload like `r` but land on the neighbor change, not the same
-/// path+line. Stage/unstage re-anchors live comments on the target to the
-/// same file, side, and line in the reloaded diff. On git failure, leave
-/// the list and store unchanged and open the error overlay. Range loads
-/// and rows with no target are no-ops.
 /// `Space` `Space` / `Space` `d` use `whole_file == false` (file header →
 /// file, hunk → hunk); `Space` `S` / `Space` `x` pass `true` from a hunk.
-/// Discard on staged is a no-op (unstage first).
 fn applyIndex(
     alloc: std.mem.Allocator,
     io: std.Io,
@@ -823,67 +764,25 @@ fn applyIndex(
     git_err: *std.ArrayList(u8),
     review: *store.Review,
     whole_file: bool,
-    kind: enum { stage_unstage, discard },
+    kind: git.MutationKind,
+    delete_comments: bool,
 ) std.mem.Allocator.Error!void {
     if (source != .local) return;
-    const target = view.indexTargetAt(diff_view.rows, cursor.*, whole_file) orelse return;
-    const file = fileForTarget(&diff_view.diff, target) orelse return;
-    const action: git.Action = switch (kind) {
-        .stage_unstage => switch (target.group) {
-            .unstaged, .untracked => .stage,
-            .staged => .unstage,
-        },
-        .discard => switch (target.group) {
-            .unstaged, .untracked => .discard,
-            .staged => return,
-        },
-    };
-    const neighbor = view.neighborMark(diff_view.rows, target);
-    var fail: []u8 = &.{};
-    git.mutate(alloc, io, .inherit, .{
-        .action = action,
-        .path = file.displayPath(),
-        .group = target.group,
-        .hunk = if (target.hunk_i) |hi| &file.hunks[hi] else null,
-        .file = if (target.hunk_i != null) file else null,
-        .fail_output = &fail,
-    }) catch |err| switch (err) {
-        error.OutOfMemory => return error.OutOfMemory,
-        error.NotARepository, error.GitNotFound, error.GitFailed, error.BadHunkHeader => {
-            git_err.clearRetainingCapacity();
-            if (fail.len > 0) {
-                defer alloc.free(fail);
-                const trimmed = std.mem.trim(u8, fail, " \t\r\n");
-                if (trimmed.len > 0) {
-                    try git_err.appendSlice(alloc, trimmed);
-                }
-            }
-            if (git_err.items.len == 0) {
-                try git_err.appendSlice(alloc, gitLoadMsg(err));
-            }
-            focus.* = .git_error;
-            return;
-        },
-    };
-    const restore: ReloadCursor = if (neighbor) |m| .{ .neighbor = m } else .start;
-    {
-        const loaded = DiffView.maybeInit(alloc, io, source, note) orelse return;
-        errdefer loaded.deinit(alloc);
-        if (kind == .stage_unstage) {
-            var priors: std.ArrayList(comments.AnchorSnap) = .empty;
-            defer priors.deinit(alloc);
-            try comments.remapMatching(review, file, &loaded.diff, target.hunk_i, alloc, &priors);
-            saveCommentRemap(review, alloc, io, note, priors.items);
-        }
-        commitReload(alloc, diff_view, cursor, restore, loaded);
-    }
+    try commitApply(alloc, diff_view, cursor, note, focus, git_err, try git.applyAtCursor(
+        alloc,
+        io,
+        .inherit,
+        &diff_view.diff,
+        diff_view.rows,
+        cursor.*,
+        review,
+        whole_file,
+        kind,
+        delete_comments,
+    ));
 }
 
-/// Stage or unstage every file in the section under the cursor (local
-/// source only). File-level mutate, in flatten order. Stop at the first
-/// git error: reload so the list matches git, then open the error overlay.
-/// On success, reload, re-anchor live comments on those files, and land on
-/// the neighbor section or file. Range loads and missing groups are no-ops.
+/// Stage or unstage every file in the section under the cursor (local only).
 fn applyGroupIndex(
     alloc: std.mem.Allocator,
     io: std.Io,
@@ -896,170 +795,88 @@ fn applyGroupIndex(
     review: *store.Review,
 ) std.mem.Allocator.Error!void {
     if (source != .local) return;
-    const span = view.groupSpanAt(diff_view.rows, cursor.*) orelse return;
-    const action: git.Action = switch (span.group) {
-        .unstaged, .untracked => .stage,
-        .staged => .unstage,
-    };
-    const neighbor = view.groupNeighborMark(diff_view.rows, span);
-    var fail: []u8 = &.{};
-    const first_err: ?git.Error = blk: {
-        for (diff_view.diff.files) |f| {
-            const g = f.group orelse continue;
-            if (g != span.group) continue;
-            git.mutate(alloc, io, .inherit, .{
-                .action = action,
-                .path = f.displayPath(),
-                .group = span.group,
-                .fail_output = &fail,
-            }) catch |err| switch (err) {
-                error.OutOfMemory => return error.OutOfMemory,
-                error.NotARepository, error.GitNotFound, error.GitFailed, error.BadHunkHeader => break :blk err,
-            };
-        }
-        break :blk null;
-    };
-    const restore: ReloadCursor = if (neighbor) |m| .{ .group_neighbor = m } else .start;
-    if (DiffView.maybeInit(alloc, io, source, note)) |loaded| {
-        errdefer loaded.deinit(alloc);
-        var priors: std.ArrayList(comments.AnchorSnap) = .empty;
-        defer priors.deinit(alloc);
-        for (diff_view.diff.files) |*f| {
-            const g = f.group orelse continue;
-            if (g != span.group) continue;
-            try comments.remapMatching(review, f, &loaded.diff, null, alloc, &priors);
-        }
-        saveCommentRemap(review, alloc, io, note, priors.items);
-        commitReload(alloc, diff_view, cursor, restore, loaded);
-    }
-    const err = first_err orelse return;
-    git_err.clearRetainingCapacity();
-    if (fail.len > 0) {
-        defer alloc.free(fail);
-        const trimmed = std.mem.trim(u8, fail, " \t\r\n");
-        if (trimmed.len > 0) {
-            try git_err.appendSlice(alloc, trimmed);
-        }
-    }
-    if (git_err.items.len == 0) {
-        try git_err.appendSlice(alloc, gitLoadMsg(err));
-    }
-    focus.* = .git_error;
+    try commitApply(alloc, diff_view, cursor, note, focus, git_err, try git.applyGroupAtCursor(
+        alloc,
+        io,
+        .inherit,
+        &diff_view.diff,
+        diff_view.rows,
+        cursor.*,
+        review,
+    ));
 }
 
-/// Open the discard confirm overlay for the current file or hunk.
-/// Staged rows and rows with no target are no-ops. Caller handles range.
-fn beginDiscard(
-    rows: []const view.Row,
-    cursor: usize,
-    whole_file: bool,
-    focus: *Focus,
-    discard: *DiscardConfirm,
-) void {
-    const target = view.indexTargetAt(rows, cursor, whole_file) orelse return;
-    switch (target.group) {
-        .staged => return,
-        .unstaged, .untracked => {},
-    }
-    discard.* = .{ .whole_file = whole_file, .yes = false, .comments = false };
-    focus.* = .discard_confirm;
-}
-
-/// Open the group stage/unstage confirm overlay for the section header
-/// under the cursor. Missing header is a no-op.
-fn beginGroupStage(
-    rows: []const view.Row,
-    cursor: usize,
-    focus: *Focus,
-    discard: *DiscardConfirm,
-) void {
-    const span = view.groupSpanAt(rows, cursor) orelse return;
-    discard.* = .{ .kind = .group, .group = span.group, .yes = false };
-    focus.* = .discard_confirm;
-}
-
-fn fileForTarget(d: *const diff.Diff, target: view.IndexTarget) ?*const diff.File {
-    for (d.files) |*f| {
-        const g = f.group orelse continue;
-        if (g != target.group) continue;
-        if (!std.mem.eql(u8, f.displayPath(), target.path)) continue;
-        if (target.hunk_i) |hi| {
-            if (hi >= f.hunks.len) return null;
-        }
-        return f;
-    }
-    return null;
-}
-
-fn discardTargetFile(
-    d: *const diff.Diff,
-    rows: []const view.Row,
-    cursor: usize,
-    whole_file: bool,
-) ?struct { file: *const diff.File, hunk_i: ?usize } {
-    const target = view.indexTargetAt(rows, cursor, whole_file) orelse return null;
-    const file = fileForTarget(d, target) orelse return null;
-    return .{ .file = file, .hunk_i = target.hunk_i };
-}
-
-fn hasMatchingDiscardComments(
-    review: *const store.Review,
-    d: *const diff.Diff,
-    rows: []const view.Row,
-    cursor: usize,
-    whole_file: bool,
-) bool {
-    const found = discardTargetFile(d, rows, cursor, whole_file) orelse return false;
-    return comments.hasMatching(review, found.file, found.hunk_i);
-}
-
-fn collectDiscardComments(
-    review: *const store.Review,
-    d: *const diff.Diff,
-    rows: []const view.Row,
-    cursor: usize,
-    whole_file: bool,
+/// Stage/unstage at the cursor: group confirm overlay, or apply the file/hunk.
+fn dispatchStage(
     alloc: std.mem.Allocator,
-    ids: *std.ArrayList([]const u8),
-    saved: *std.ArrayList(comments.RemoveSnap),
+    io: std.Io,
+    source: cli.Source,
+    diff_view: *DiffView,
+    cursor: *usize,
+    note: *StatusNote,
+    focus: *Focus,
+    git_err: *std.ArrayList(u8),
+    review: *store.Review,
+    discard: *DiscardConfirm,
+    whole_file: bool,
 ) std.mem.Allocator.Error!void {
-    const found = discardTargetFile(d, rows, cursor, whole_file) orelse return;
-    try comments.collectMatching(review, found.file, found.hunk_i, alloc, ids, saved);
+    switch (git.stagePlan(diff_view.rows, cursor.*, whole_file)) {
+        .none => {},
+        .group => |g| {
+            discard.* = .{ .kind = .group, .group = g, .yes = false };
+            focus.* = .discard_confirm;
+        },
+        .cursor => try applyIndex(
+            alloc,
+            io,
+            source,
+            diff_view,
+            cursor,
+            note,
+            focus,
+            git_err,
+            review,
+            whole_file,
+            .stage_unstage,
+            false,
+        ),
+    }
 }
 
-/// Git already succeeded. Delete matching comments; on save failure put them back.
-fn removeDiscardComments(
-    review: *store.Review,
+/// Map a mutation result onto the live DiffView, status note, and git-error overlay.
+fn commitApply(
     alloc: std.mem.Allocator,
-    io: std.Io,
-    ids: []const []const u8,
-    saved: []const comments.RemoveSnap,
+    diff_view: *DiffView,
+    cursor: *usize,
     note: *StatusNote,
-) void {
-    if (ids.len == 0) return;
-    review.remove(ids) catch return;
-    store.save(review, alloc, io, .cwd()) catch {
-        for (saved) |s| {
-            review.comments.insert(review.arena.allocator(), s.idx, s.comment) catch {};
-        }
-        note.set("failed to save .rv comment store");
+    focus: *Focus,
+    git_err: *std.ArrayList(u8),
+    status: git.MutationStatus,
+) std.mem.Allocator.Error!void {
+    const result = switch (status) {
+        .noop => return,
+        .result => |r| r,
     };
-}
-
-fn saveCommentRemap(
-    review: *store.Review,
-    alloc: std.mem.Allocator,
-    io: std.Io,
-    note: *StatusNote,
-    priors: []const comments.AnchorSnap,
-) void {
-    if (priors.len == 0) return;
-    store.save(review, alloc, io, .cwd()) catch {
-        for (priors) |p| {
-            review.setLines(p.id, p.old_line, p.new_line, p.side) catch {};
+    if (result.snapshot) |snap| {
+        if (view.pairSideBySide(alloc, snap.rows)) |new_sbs| {
+            const loaded: DiffView = .{ .diff = snap.diff, .rows = snap.rows, .sbs_slots = new_sbs };
+            diff_view.deinit(alloc);
+            diff_view.* = loaded;
+            cursor.* = snap.cursor;
+        } else |_| {
+            snap.deinit(alloc);
+            note.set("out of memory");
         }
-        note.set("failed to save .rv comment store");
-    };
+    } else if (result.reload_err) |err| {
+        note.set(git.errorMessage(err));
+    }
+    if (result.save_failed) note.set("failed to save .rv comment store");
+    if (result.fail_message) |msg| {
+        defer alloc.free(msg);
+        git_err.clearRetainingCapacity();
+        try git_err.appendSlice(alloc, msg);
+        focus.* = .git_error;
+    }
 }
 
 /// Key ownership: normal nav, comment draft, `/` search prompt, comment list,
@@ -1072,7 +889,7 @@ const Focus = enum { normal, commenting, searching, listing, files, helping, git
 /// Discard: if the target has live comments, `comments` is the second
 /// overlay and defaults to **Yes** (delete).
 const DiscardConfirm = struct {
-    kind: enum { discard, group } = .discard,
+    kind: git.ConfirmKind = .discard,
     group: diff.Group = .unstaged,
     whole_file: bool = false,
     yes: bool = false,
@@ -1549,7 +1366,7 @@ fn paintDiscardConfirm(
     const hunk_text: []const u8, const path: []const u8 = if (group or discard.comments)
         .{ "", "" }
     else blk: {
-        const target = view.indexTargetAt(rows, cursor, discard.whole_file);
+        const target = git.indexTargetAt(rows, cursor, discard.whole_file);
         const hunk_row: ?view.Row = if (target) |t|
             if (t.hunk_i != null) rows[t.first] else null
         else
