@@ -223,14 +223,14 @@ pub const IndexTarget = struct {
     last: usize,
 };
 
-pub fn indexTargetAt(rows: []const view.Row, cursor: usize, whole_file: bool) ?IndexTarget {
+pub fn indexTargetAt(rows: []const view.row.Row, cursor: usize, whole_file: bool) ?IndexTarget {
     if (rows.len == 0) return null;
-    const cur = view.clampCursor(cursor, rows.len);
+    const cur = view.row.clampCursor(cursor, rows.len);
     if (rows[cur] == .section_header) return null;
-    const fi = view.currentFileStart(rows, cur) orelse return null;
+    const fi = view.nav.currentFileStart(rows, cur) orelse return null;
     const fh = rows[fi].file_header;
     const group = fh.group orelse return null;
-    const in_hunk = view.currentHunkInFile(rows, cur);
+    const in_hunk = view.nav.currentHunkInFile(rows, cur);
     if (whole_file or in_hunk == null) {
         return .{
             .path = fh.path,
@@ -261,7 +261,7 @@ pub const NeighborMark = struct {
 
 /// Prefer the next file/hunk header after `target.last`; else the previous
 /// header before `target.first`. `null` when the target is the only change.
-pub fn neighborMark(rows: []const view.Row, target: IndexTarget) ?NeighborMark {
+pub fn neighborMark(rows: []const view.row.Row, target: IndexTarget) ?NeighborMark {
     if (headerAfter(rows, target.last)) |idx| {
         return markAtHeader(rows, idx, target);
     }
@@ -281,9 +281,9 @@ pub const GroupSpan = struct {
     last: usize,
 };
 
-pub fn groupSpanAt(rows: []const view.Row, cursor: usize) ?GroupSpan {
+pub fn groupSpanAt(rows: []const view.row.Row, cursor: usize) ?GroupSpan {
     if (rows.len == 0) return null;
-    const cur = view.clampCursor(cursor, rows.len);
+    const cur = view.row.clampCursor(cursor, rows.len);
     const group = switch (rows[cur]) {
         .section_header => |g| g,
         else => return null,
@@ -308,7 +308,7 @@ pub const GroupNeighborMark = union(enum) {
 /// Prefer the following section or file after `span.last`; else the previous
 /// section or file before `span.first`. `null` when this group is the only
 /// change.
-pub fn groupNeighborMark(rows: []const view.Row, span: GroupSpan) ?GroupNeighborMark {
+pub fn groupNeighborMark(rows: []const view.row.Row, span: GroupSpan) ?GroupNeighborMark {
     var i = span.last + 1;
     while (i < rows.len) : (i += 1) {
         if (sectionOrFileMark(rows, i)) |m| return m;
@@ -322,7 +322,7 @@ pub fn groupNeighborMark(rows: []const view.Row, span: GroupSpan) ?GroupNeighbor
 }
 
 /// Land on `mark`'s section or file after reload. Missing mark → row 0.
-pub fn restoreGroupNeighbor(rows: []const view.Row, mark: GroupNeighborMark) usize {
+pub fn restoreGroupNeighbor(rows: []const view.row.Row, mark: GroupNeighborMark) usize {
     if (rows.len == 0) return 0;
     switch (mark) {
         .section => |g| {
@@ -350,7 +350,7 @@ pub fn restoreGroupNeighbor(rows: []const view.Row, mark: GroupNeighborMark) usi
 
 /// Land on `mark`'s file (and hunk, if set) after reload. Missing hunk → that
 /// file's header. Missing file → row 0.
-pub fn restoreNeighbor(rows: []const view.Row, mark: NeighborMark) usize {
+pub fn restoreNeighbor(rows: []const view.row.Row, mark: NeighborMark) usize {
     if (rows.len == 0) return 0;
     for (rows, 0..) |row, i| {
         switch (row) {
@@ -378,7 +378,7 @@ pub fn restoreNeighbor(rows: []const view.Row, mark: NeighborMark) usize {
     return 0;
 }
 
-fn sectionOrFileMark(rows: []const view.Row, idx: usize) ?GroupNeighborMark {
+fn sectionOrFileMark(rows: []const view.row.Row, idx: usize) ?GroupNeighborMark {
     switch (rows[idx]) {
         .section_header => |g| return .{ .section = g },
         .file_header => |fh| {
@@ -389,7 +389,7 @@ fn sectionOrFileMark(rows: []const view.Row, idx: usize) ?GroupNeighborMark {
     }
 }
 
-fn rowSpanLast(rows: []const view.Row, start: usize, whole_file: bool) usize {
+fn rowSpanLast(rows: []const view.row.Row, start: usize, whole_file: bool) usize {
     var i = start + 1;
     while (i < rows.len) : (i += 1) {
         switch (rows[i]) {
@@ -401,7 +401,7 @@ fn rowSpanLast(rows: []const view.Row, start: usize, whole_file: bool) usize {
     return rows.len - 1;
 }
 
-fn hunkIndexInFile(rows: []const view.Row, file_start: usize, hunk_row: usize) usize {
+fn hunkIndexInFile(rows: []const view.row.Row, file_start: usize, hunk_row: usize) usize {
     var n: usize = 0;
     var i = file_start;
     while (i < rows.len) : (i += 1) {
@@ -418,7 +418,7 @@ fn hunkIndexInFile(rows: []const view.Row, file_start: usize, hunk_row: usize) u
     return n;
 }
 
-fn headerAfter(rows: []const view.Row, last: usize) ?usize {
+fn headerAfter(rows: []const view.row.Row, last: usize) ?usize {
     var i = last + 1;
     while (i < rows.len) : (i += 1) {
         switch (rows[i]) {
@@ -429,7 +429,7 @@ fn headerAfter(rows: []const view.Row, last: usize) ?usize {
     return null;
 }
 
-fn headerBefore(rows: []const view.Row, first: usize) ?usize {
+fn headerBefore(rows: []const view.row.Row, first: usize) ?usize {
     var i = first;
     while (i > 0) {
         i -= 1;
@@ -441,8 +441,8 @@ fn headerBefore(rows: []const view.Row, first: usize) ?usize {
     return null;
 }
 
-fn markAtHeader(rows: []const view.Row, idx: usize, target: IndexTarget) ?NeighborMark {
-    const fi = view.currentFileStart(rows, idx) orelse return null;
+fn markAtHeader(rows: []const view.row.Row, idx: usize, target: IndexTarget) ?NeighborMark {
+    const fi = view.nav.currentFileStart(rows, idx) orelse return null;
     const fh = rows[fi].file_header;
     const group = fh.group orelse return null;
     var hunk_i: ?usize = null;
@@ -459,7 +459,7 @@ fn markAtHeader(rows: []const view.Row, idx: usize, target: IndexTarget) ?Neighb
 
 /// File or hunk at `cursor` that discard may run. `null` on empty, section,
 /// untagged, or staged rows (unstage first).
-pub fn discardTargetAt(rows: []const view.Row, cursor: usize, whole_file: bool) ?IndexTarget {
+pub fn discardTargetAt(rows: []const view.row.Row, cursor: usize, whole_file: bool) ?IndexTarget {
     const target = indexTargetAt(rows, cursor, whole_file) orelse return null;
     return switch (target.group) {
         .staged => null,
@@ -471,7 +471,7 @@ pub fn discardTargetAt(rows: []const view.Row, cursor: usize, whole_file: bool) 
 pub fn discardHasComments(
     review: *const store.Review,
     d: *const diff.Diff,
-    rows: []const view.Row,
+    rows: []const view.row.Row,
     cursor: usize,
     whole_file: bool,
 ) bool {
@@ -489,7 +489,7 @@ pub const StagePlan = union(enum) {
     cursor,
 };
 
-pub fn stagePlan(rows: []const view.Row, cursor: usize, whole_file: bool) StagePlan {
+pub fn stagePlan(rows: []const view.row.Row, cursor: usize, whole_file: bool) StagePlan {
     if (!whole_file) {
         if (groupSpanAt(rows, cursor)) |span| return .{ .group = span.group };
     }
@@ -514,7 +514,7 @@ pub fn confirmNext(
     yes: bool,
     review: *const store.Review,
     d: *const diff.Diff,
-    rows: []const view.Row,
+    rows: []const view.row.Row,
     cursor: usize,
     whole_file: bool,
 ) ConfirmNext {
@@ -548,7 +548,7 @@ pub const MutationKind = enum { stage_unstage, discard };
 /// Caller owns `diff` and `rows`.
 pub const Snapshot = struct {
     diff: diff.Diff,
-    rows: []view.Row,
+    rows: []view.row.Row,
     cursor: usize,
 
     pub fn deinit(self: Snapshot, alloc: Allocator) void {
@@ -581,7 +581,7 @@ pub fn applyAtCursor(
     io: Io,
     cwd: std.process.Child.Cwd,
     d: *const diff.Diff,
-    rows: []const view.Row,
+    rows: []const view.row.Row,
     cursor: usize,
     review: *store.Review,
     whole_file: bool,
@@ -668,7 +668,7 @@ pub fn applyGroupAtCursor(
     io: Io,
     cwd: std.process.Child.Cwd,
     d: *const diff.Diff,
-    rows: []const view.Row,
+    rows: []const view.row.Row,
     cursor: usize,
     review: *store.Review,
 ) Allocator.Error!MutationStatus {
@@ -745,9 +745,9 @@ fn failMessage(alloc: Allocator, fail: []const u8, err: Error) Allocator.Error![
     return try alloc.dupe(u8, errorMessage(err));
 }
 
-fn reloadLocal(alloc: Allocator, io: Io, cwd: std.process.Child.Cwd) Error!struct { diff: diff.Diff, rows: []view.Row } {
+fn reloadLocal(alloc: Allocator, io: Io, cwd: std.process.Child.Cwd) Error!struct { diff: diff.Diff, rows: []view.row.Row } {
     var new_diff = try loadDefaultDiffCwd(alloc, io, cwd);
-    const new_rows = view.flatten(alloc, &new_diff) catch {
+    const new_rows = view.row.flatten(alloc, &new_diff) catch {
         new_diff.deinit();
         return error.OutOfMemory;
     };
@@ -1658,7 +1658,7 @@ test "mutate hunk: apply mismatch leaves prior content" {
     try testing.expectEqualStrings(changed, got);
 }
 
-fn threeGroupRows(alloc: Allocator) !struct { d: diff.Diff, rows: []view.Row } {
+fn threeGroupRows(alloc: Allocator) !struct { d: diff.Diff, rows: []view.row.Row } {
     const unstaged_txt =
         \\diff --git a/a b/a
         \\--- a/a
@@ -1689,7 +1689,7 @@ fn threeGroupRows(alloc: Allocator) !struct { d: diff.Diff, rows: []view.Row } {
         .{ .text = staged_txt, .group = .staged },
     });
     errdefer d.deinit();
-    const rows = try view.flatten(alloc, &d);
+    const rows = try view.row.flatten(alloc, &d);
     return .{ .d = d, .rows = rows };
 }
 
@@ -1706,7 +1706,7 @@ test "indexTargetAt empty section and untagged" {
     ;
     var d = try diff.parse(testing.allocator, fixture);
     defer d.deinit();
-    const rows = try view.flatten(testing.allocator, &d);
+    const rows = try view.row.flatten(testing.allocator, &d);
     defer testing.allocator.free(rows);
     try testing.expect(indexTargetAt(rows, 0, false) == null);
     try testing.expect(indexTargetAt(rows, 2, false) == null);
@@ -1767,7 +1767,7 @@ test "neighborMark following hunk next file and only change" {
         .{ .text = two_hunks, .group = .unstaged },
     });
     defer d.deinit();
-    const rows = try view.flatten(testing.allocator, &d);
+    const rows = try view.row.flatten(testing.allocator, &d);
     defer testing.allocator.free(rows);
     // 0 Unstaged, 1 file, 2 h0, 3 del, 4 add, 5 h1, 6 del, 7 add.
 
@@ -1802,7 +1802,7 @@ test "neighborMark following hunk next file and only change" {
         .{ .text = only, .group = .untracked },
     });
     defer d_only.deinit();
-    const only_rows = try view.flatten(testing.allocator, &d_only);
+    const only_rows = try view.row.flatten(testing.allocator, &d_only);
     defer testing.allocator.free(only_rows);
     // Whole file is the only change: no following or previous header.
     try testing.expect(neighborMark(only_rows, indexTargetAt(only_rows, 1, false).?) == null);
@@ -1832,7 +1832,7 @@ test "restoreNeighbor dest hunk file fallback and gone" {
         .{ .text = remaining, .group = .unstaged },
     });
     defer d.deinit();
-    const rows = try view.flatten(testing.allocator, &d);
+    const rows = try view.row.flatten(testing.allocator, &d);
     defer testing.allocator.free(rows);
     // 0 Unstaged, 1 file, 2 hunk, 3 del, 4 add.
 
@@ -1876,7 +1876,7 @@ test "groupSpanAt empty untagged and three groups" {
     ;
     var d = try diff.parse(testing.allocator, untagged);
     defer d.deinit();
-    const rows = try view.flatten(testing.allocator, &d);
+    const rows = try view.row.flatten(testing.allocator, &d);
     defer testing.allocator.free(rows);
     try testing.expect(groupSpanAt(rows, 0) == null);
 
@@ -1932,7 +1932,7 @@ test "groupNeighborMark following section previous file and only group" {
         .{ .text = only, .group = .untracked },
     });
     defer d_only.deinit();
-    const only_rows = try view.flatten(testing.allocator, &d_only);
+    const only_rows = try view.row.flatten(testing.allocator, &d_only);
     defer testing.allocator.free(only_rows);
     try testing.expect(groupNeighborMark(only_rows, groupSpanAt(only_rows, 0).?) == null);
 }
@@ -1964,7 +1964,7 @@ test "restoreGroupNeighbor dest section file fallback and gone" {
         .{ .text = remaining, .group = .staged },
     });
     defer d.deinit();
-    const rows = try view.flatten(testing.allocator, &d);
+    const rows = try view.row.flatten(testing.allocator, &d);
     defer testing.allocator.free(rows);
     try testing.expectEqual(0, restoreGroupNeighbor(rows, .{ .section = .untracked }));
 }

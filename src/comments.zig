@@ -47,7 +47,7 @@ const Rank = struct {
     }
 };
 
-fn rankOf(c: store.Comment, i: usize, rows: []const view.Row) ?Rank {
+fn rankOf(c: store.Comment, i: usize, rows: []const view.row.Row) ?Rank {
     const found = loc(c) orelse return null;
     const row = view.rowForComment(rows, found) orelse return null;
     return .{
@@ -62,9 +62,9 @@ fn rankOf(c: store.Comment, i: usize, rows: []const view.Row) ?Rank {
 
 /// Next live comment strictly after `cursor` in display order. Wraps to the
 /// first comment when none follow. Null when no live comment resolves to a row.
-pub fn next(review: *const store.Review, rows: []const view.Row, cursor: usize) ?Walk {
+pub fn next(review: *const store.Review, rows: []const view.row.Row, cursor: usize) ?Walk {
     if (rows.len == 0 or review.comments.items.len == 0) return null;
-    const cur = view.clampCursor(cursor, rows.len);
+    const cur = view.row.clampCursor(cursor, rows.len);
     var best_after: ?Rank = null;
     var best_wrap: ?Rank = null;
     for (review.comments.items, 0..) |c, i| {
@@ -82,9 +82,9 @@ pub fn next(review: *const store.Review, rows: []const view.Row, cursor: usize) 
 
 /// Previous live comment strictly before `cursor` in display order. Wraps to
 /// the last comment when none precede. Null when no live comment resolves to a row.
-pub fn prev(review: *const store.Review, rows: []const view.Row, cursor: usize) ?Walk {
+pub fn prev(review: *const store.Review, rows: []const view.row.Row, cursor: usize) ?Walk {
     if (rows.len == 0 or review.comments.items.len == 0) return null;
-    const cur = view.clampCursor(cursor, rows.len);
+    const cur = view.row.clampCursor(cursor, rows.len);
     var best_before: ?Rank = null;
     var best_wrap: ?Rank = null;
     for (review.comments.items, 0..) |c, i| {
@@ -320,17 +320,17 @@ pub fn collectMatching(
 /// Cursor-side open target, plus the first live comment there when one exists.
 /// Null when that side is missing on the current row.
 pub const AtSide = struct {
-    anchor: view.Anchor,
+    anchor: view.row.Anchor,
     idx: ?usize,
 };
 
 pub fn atSide(
     review: *const store.Review,
-    rows: []const view.Row,
-    slots: []const view.SbsSlot,
-    layout: view.EffectiveLayout,
+    rows: []const view.row.Row,
+    slots: []const view.layout.SbsSlot,
+    layout: view.layout.EffectiveLayout,
     cursor: usize,
-    want: view.CommentSide,
+    want: view.row.CommentSide,
 ) ?AtSide {
     const a = view.commentAnchor(rows, slots, layout, cursor, want) orelse return null;
     return .{
@@ -432,7 +432,7 @@ test "next prev display order wrap skip missing" {
     ;
     var d = try diff.parse(testing.allocator, fixture);
     defer d.deinit();
-    const rows = try view.flatten(testing.allocator, &d);
+    const rows = try view.row.flatten(testing.allocator, &d);
     defer testing.allocator.free(rows);
 
     var review = try store.initEmpty(testing.allocator, "t");
@@ -486,7 +486,7 @@ test "next same row is one stop then later row" {
     ;
     var d = try diff.parse(testing.allocator, fixture);
     defer d.deinit();
-    const rows = try view.flatten(testing.allocator, &d);
+    const rows = try view.row.flatten(testing.allocator, &d);
     defer testing.allocator.free(rows);
 
     var review = try store.initEmpty(testing.allocator, "t");
