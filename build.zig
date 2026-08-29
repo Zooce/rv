@@ -80,6 +80,17 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
 
+    // `?` help overlay (TitleCase: the file is the struct).
+    const help_mod = b.addModule("Help", .{
+        .root_source_file = b.path("src/Help.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{
+            .{ .name = "tui", .module = tui_mod },
+            .{ .name = "comment_input", .module = comment_input_mod },
+        },
+    });
+
     // Comment model + `.rv/reviews/` JSON store (MVP-1).
     const store_mod = b.addModule("store", .{
         .root_source_file = b.path("src/store.zig"),
@@ -142,6 +153,7 @@ pub fn build(b: *std.Build) void {
                 .{ .name = "comments", .module = comments_mod },
                 .{ .name = "cli", .module = cli_mod },
                 .{ .name = "comment_input", .module = comment_input_mod },
+                .{ .name = "Help", .module = help_mod },
             },
         }),
     });
@@ -192,6 +204,11 @@ pub fn build(b: *std.Build) void {
     });
     const run_comment_input_tests = b.addRunArtifact(comment_input_tests);
 
+    const help_tests = b.addTest(.{
+        .root_module = help_mod,
+    });
+    const run_help_tests = b.addRunArtifact(help_tests);
+
     const store_tests = b.addTest(.{
         .root_module = store_mod,
     });
@@ -226,17 +243,19 @@ pub fn build(b: *std.Build) void {
                 .{ .name = "comments", .module = comments_mod },
                 .{ .name = "cli", .module = cli_mod },
                 .{ .name = "comment_input", .module = comment_input_mod },
+                .{ .name = "Help", .module = help_mod },
             },
         }),
     });
     const run_main_tests = b.addRunArtifact(main_tests);
 
-    const test_step = b.step("test", "Run unit tests (TUI + diff + git + view + comment_input + store + comments + cli + install_skill + main)");
+    const test_step = b.step("test", "Run unit tests (TUI + diff + git + view + comment_input + Help + store + comments + cli + install_skill + main)");
     test_step.dependOn(&run_tui_tests.step);
     test_step.dependOn(&run_diff_tests.step);
     test_step.dependOn(&run_git_tests.step);
     test_step.dependOn(&run_view_tests.step);
     test_step.dependOn(&run_comment_input_tests.step);
+    test_step.dependOn(&run_help_tests.step);
     test_step.dependOn(&run_store_tests.step);
     test_step.dependOn(&run_comments_tests.step);
     test_step.dependOn(&run_cli_tests.step);

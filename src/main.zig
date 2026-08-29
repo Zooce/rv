@@ -72,6 +72,7 @@ const store = @import("store");
 const comments = @import("comments");
 const cli = @import("cli");
 const comment_input = @import("comment_input");
+const Help = @import("Help");
 
 pub fn main(init: std.process.Init) !u8 {
     const alloc = init.gpa;
@@ -175,22 +176,20 @@ fn runTui(alloc: std.mem.Allocator, io: std.Io, source: cli.Source) !u8 {
     // Snapshot of `review.comments` while the comment list overlay is open.
     var list_items: std.ArrayList(store.Comment) = .empty;
     defer list_items.deinit(alloc);
-    // Snapshot of file-header row indices while the file list overlay is open.
-    var file_items: std.ArrayList(usize) = .empty;
-    defer file_items.deinit(alloc);
     var list_cursor: usize = 0;
     var list_scroll: usize = 0;
-    var help_scroll: usize = 0;
+    var file_list: FileList = .{};
+    defer file_list.items.deinit(alloc);
+    var help: Help = .{};
     // Committed `/` text query for `n`/`N` (empty means no active text search).
     var last_query: std.ArrayList(u8) = .empty;
     defer last_query.deinit(alloc);
     // One-shot footer note (owned bytes; len 0 = none). Cleared on next key.
     var note: StatusNote = .{};
-    // Git stderr (or a short fallback) while `focus == .git_error`.
-    var git_err: std.ArrayList(u8) = .empty;
-    defer git_err.deinit(alloc);
+    var failure: Failure = .{};
+    defer failure.buf.deinit(alloc);
 
-    paint(&scr, size, diff_view.rows, diff_view.sbs_slots, layout_pref, cursor, &scroll, &col_scroll, &review, source, focus, draft.buf.items, draft.caret, &draft.scroll, draft.anchor, note.slice(), list_items.items, file_items.items, list_cursor, &list_scroll, &help_scroll, git_err.items, discard_confirm);
+    paint(&scr, size, diff_view.rows, diff_view.sbs_slots, layout_pref, cursor, &scroll, &col_scroll, &review, source, focus, draft.buf.items, draft.caret, &draft.scroll, draft.anchor, note.slice(), list_items.items, list_cursor, &list_scroll, discard_confirm);
     try scr.present(&term);
 
     while (running) {
@@ -349,7 +348,7 @@ fn runTui(alloc: std.mem.Allocator, io: std.Io, source: cli.Source) !u8 {
                             if (c == 'q' or c == 'Q') {
                                 running = false;
                             } else if (c == '?') {
-                                help_scroll = 0;
+                                help.scroll = 0;
                                 focus = .helping;
                             } else if (c == 'j') {
                                 if (list_cursor + 1 < list_items.items.len) list_cursor += 1;
@@ -366,47 +365,23 @@ fn runTui(alloc: std.mem.Allocator, io: std.Io, source: cli.Source) !u8 {
                         .ctrl_c => running = false,
                         else => {},
                     },
-                    .files => switch (key) {
-                        .esc => {
+                    .files => switch (file_list.handleKey(key)) {
+                        .closed => focus = .normal,
+                        .quit => running = false,
+                        .help => {
+                            help.scroll = 0;
+                            focus = .helping;
+                        },
+                        .jump => |row| {
+                            cursor = row;
                             focus = .normal;
                         },
-                        .enter => {
-                            if (list_cursor < file_items.items.len) {
-                                cursor = file_items.items[list_cursor];
-                                focus = .normal;
-                            }
-                        },
-                        .char => |c| {
-                            if (c == 'q' or c == 'Q') {
-                                running = false;
-                            } else if (c == '?') {
-                                help_scroll = 0;
-                                focus = .helping;
-                            } else if (c == 'j') {
-                                if (list_cursor + 1 < file_items.items.len) list_cursor += 1;
-                            } else if (c == 'k') {
-                                if (list_cursor > 0) list_cursor -= 1;
-                            }
-                        },
-                        .down => {
-                            if (list_cursor + 1 < file_items.items.len) list_cursor += 1;
-                        },
-                        .up => {
-                            if (list_cursor > 0) list_cursor -= 1;
-                        },
-                        .ctrl_c => running = false,
-                        else => {},
+                        .open => {},
                     },
-                    .git_error => switch (key) {
-                        .esc, .enter => {
-                            focus = .normal;
-                            git_err.clearRetainingCapacity();
-                        },
-                        .char => |c| {
-                            if (c == 'q' or c == 'Q') running = false;
-                        },
-                        .ctrl_c => running = false,
-                        else => {},
+                    .git_error => switch (failure.handleKey(key)) {
+                        .closed => focus = .normal,
+                        .quit => running = false,
+                        .open => {},
                     },
                     .discard_confirm => {
                         var abort = false;
@@ -458,7 +433,7 @@ fn runTui(alloc: std.mem.Allocator, io: std.Io, source: cli.Source) !u8 {
                                         &cursor,
                                         &note,
                                         &focus,
-                                        &git_err,
+                                        &failure,
                                         &review,
                                     );
                                 },
@@ -472,7 +447,7 @@ fn runTui(alloc: std.mem.Allocator, io: std.Io, source: cli.Source) !u8 {
                                         &cursor,
                                         &note,
                                         &focus,
-                                        &git_err,
+                                        &failure,
                                         &review,
                                         discard_confirm.whole_file,
                                         .discard,
@@ -482,25 +457,10 @@ fn runTui(alloc: std.mem.Allocator, io: std.Io, source: cli.Source) !u8 {
                             }
                         }
                     },
-                    .helping => switch (key) {
-                        .esc => {
-                            focus = .normal;
-                        },
-                        .char => |c| {
-                            if (c == 'q' or c == 'Q') {
-                                running = false;
-                            } else if (c == '?') {
-                                focus = .normal;
-                            } else if (c == 'j') {
-                                help_scroll += 1;
-                            } else if (c == 'k') {
-                                help_scroll -|= 1;
-                            }
-                        },
-                        .down => help_scroll += 1,
-                        .up => help_scroll -|= 1,
-                        .ctrl_c => running = false,
-                        else => {},
+                    .helping => switch (help.handleKey(key)) {
+                        .closed => focus = .normal,
+                        .quit => running = false,
+                        .open => {},
                     },
                     .normal => {
                         const after_leader = leader_pending;
@@ -509,20 +469,7 @@ fn runTui(alloc: std.mem.Allocator, io: std.Io, source: cli.Source) !u8 {
                         switch (key) {
                             .char => |c| {
                                 if (after_leader and c == 'f') {
-                                    file_items.clearRetainingCapacity();
-                                    for (diff_view.rows, 0..) |row, i| {
-                                        if (row == .file_header) try file_items.append(alloc, i);
-                                    }
-                                    list_cursor = 0;
-                                    list_scroll = 0;
-                                    if (view.nav.currentFileStart(diff_view.rows, cursor)) |start| {
-                                        for (file_items.items, 0..) |idx, n| {
-                                            if (idx == start) {
-                                                list_cursor = n;
-                                                break;
-                                            }
-                                        }
-                                    }
+                                    try file_list.load(alloc, diff_view.rows, view.nav.currentFileStart(diff_view.rows, cursor));
                                     focus = .files;
                                 } else if (after_leader and c == 'l') {
                                     list_items.clearRetainingCapacity();
@@ -539,7 +486,7 @@ fn runTui(alloc: std.mem.Allocator, io: std.Io, source: cli.Source) !u8 {
                                         &cursor,
                                         &note,
                                         &focus,
-                                        &git_err,
+                                        &failure,
                                         &review,
                                         &discard_confirm,
                                         false,
@@ -554,7 +501,7 @@ fn runTui(alloc: std.mem.Allocator, io: std.Io, source: cli.Source) !u8 {
                                             &cursor,
                                             &note,
                                             &focus,
-                                            &git_err,
+                                            &failure,
                                             &review,
                                             &discard_confirm,
                                             true,
@@ -579,7 +526,7 @@ fn runTui(alloc: std.mem.Allocator, io: std.Io, source: cli.Source) !u8 {
                                 } else if (c == 'q' or c == 'Q') {
                                     running = false;
                                 } else if (c == '?') {
-                                    help_scroll = 0;
+                                    help.scroll = 0;
                                     focus = .helping;
                                 } else if (c == ' ') {
                                     leader_pending = true;
@@ -679,7 +626,17 @@ fn runTui(alloc: std.mem.Allocator, io: std.Io, source: cli.Source) !u8 {
             },
         }
         if (running) {
-            paint(&scr, size, diff_view.rows, diff_view.sbs_slots, layout_pref, cursor, &scroll, &col_scroll, &review, source, focus, draft.buf.items, draft.caret, &draft.scroll, draft.anchor, note.slice(), list_items.items, file_items.items, list_cursor, &list_scroll, &help_scroll, git_err.items, discard_confirm);
+            paint(&scr, size, diff_view.rows, diff_view.sbs_slots, layout_pref, cursor, &scroll, &col_scroll, &review, source, focus, draft.buf.items, draft.caret, &draft.scroll, draft.anchor, note.slice(), list_items.items, list_cursor, &list_scroll, discard_confirm);
+            if (focus == .helping) {
+                help.paint(&scr, size);
+                scr.hideCursor();
+            } else if (focus == .git_error) {
+                failure.paint(&scr, size);
+                scr.hideCursor();
+            } else if (focus == .files) {
+                file_list.paint(&scr, size, diff_view.rows);
+                scr.hideCursor();
+            }
             try scr.present(&term);
         }
     }
@@ -761,14 +718,14 @@ fn applyIndex(
     cursor: *usize,
     note: *StatusNote,
     focus: *Focus,
-    git_err: *std.ArrayList(u8),
+    failure: *Failure,
     review: *store.Review,
     whole_file: bool,
     kind: git.MutationKind,
     delete_comments: bool,
 ) std.mem.Allocator.Error!void {
     if (source != .local) return;
-    try commitApply(alloc, diff_view, cursor, note, focus, git_err, try git.applyAtCursor(
+    try commitApply(alloc, diff_view, cursor, note, focus, failure, try git.applyAtCursor(
         alloc,
         io,
         .inherit,
@@ -791,11 +748,11 @@ fn applyGroupIndex(
     cursor: *usize,
     note: *StatusNote,
     focus: *Focus,
-    git_err: *std.ArrayList(u8),
+    failure: *Failure,
     review: *store.Review,
 ) std.mem.Allocator.Error!void {
     if (source != .local) return;
-    try commitApply(alloc, diff_view, cursor, note, focus, git_err, try git.applyGroupAtCursor(
+    try commitApply(alloc, diff_view, cursor, note, focus, failure, try git.applyGroupAtCursor(
         alloc,
         io,
         .inherit,
@@ -815,7 +772,7 @@ fn dispatchStage(
     cursor: *usize,
     note: *StatusNote,
     focus: *Focus,
-    git_err: *std.ArrayList(u8),
+    failure: *Failure,
     review: *store.Review,
     discard: *DiscardConfirm,
     whole_file: bool,
@@ -834,7 +791,7 @@ fn dispatchStage(
             cursor,
             note,
             focus,
-            git_err,
+            failure,
             review,
             whole_file,
             .stage_unstage,
@@ -850,7 +807,7 @@ fn commitApply(
     cursor: *usize,
     note: *StatusNote,
     focus: *Focus,
-    git_err: *std.ArrayList(u8),
+    failure: *Failure,
     status: git.MutationStatus,
 ) std.mem.Allocator.Error!void {
     const result = switch (status) {
@@ -873,8 +830,8 @@ fn commitApply(
     if (result.save_failed) note.set("failed to save .rv comment store");
     if (result.fail_message) |msg| {
         defer alloc.free(msg);
-        git_err.clearRetainingCapacity();
-        try git_err.appendSlice(alloc, msg);
+        failure.buf.clearRetainingCapacity();
+        try failure.buf.appendSlice(alloc, msg);
         focus.* = .git_error;
     }
 }
@@ -1235,111 +1192,6 @@ fn paintCommentList(
     }
 }
 
-fn paintFileList(
-    scr: *tui.Screen,
-    size: tui.Size,
-    rows: []const view.row.Row,
-    items: []const usize,
-    cursor: usize,
-    scroll: *usize,
-) void {
-    const bg = tui.Color{ .rgb = .{ .r = 0x12, .g = 0x12, .b = 0x14 } };
-    const fg = tui.Color{ .rgb = .{ .r = 0xd0, .g = 0xd0, .b = 0xd0 } };
-    const panel_bg = tui.Style{ .fg = fg, .bg = bg };
-    const panel_frame = tui.Style{
-        .fg = .{ .rgb = .{ .r = 0x5d, .g = 0x81, .b = 0xb7 } },
-        .bg = bg,
-        .bold = true,
-    };
-    const row_cur = tui.Style{
-        .fg = fg,
-        .bg = .{ .rgb = .{ .r = 0x2a, .g = 0x2a, .b = 0x30 } },
-        .bold = true,
-    };
-    const bar_track = tui.Style{
-        .fg = .{ .rgb = .{ .r = 0x6a, .g = 0x7a, .b = 0x9a } },
-        .bg = bg,
-        .dim = true,
-    };
-    const bar_thumb = tui.Style{
-        .fg = .{ .rgb = .{ .r = 0xee, .g = 0xee, .b = 0xee } },
-        .bg = .{ .rgb = .{ .r = 0x4a, .g = 0x6a, .b = 0x9a } },
-        .bold = true,
-    };
-
-    const panel = listOverlayRect(size.cols, size.rows, items.len);
-    scr.fillRect(panel, ' ', panel_bg);
-    scr.drawBox(panel, panel_frame);
-    const inner = panel.inset(1);
-    if (panel.h > 0 and panel.w > 2) {
-        scr.putStr(panel.x + 2, panel.y, " files ", panel_frame, panel);
-    }
-    ensureListCursorVisible(scroll, cursor, inner.h, items.len);
-    if (inner.h == 0 or inner.w == 0) return;
-    if (items.len == 0) {
-        scr.putStr(inner.x, inner.y, "no files", panel_bg, inner);
-        return;
-    }
-    const show_bar = items.len > inner.h;
-    const text_area = if (show_bar)
-        tui.Rect{ .x = inner.x, .y = inner.y, .w = inner.w -| 2, .h = inner.h }
-    else
-        inner;
-    const start = scroll.*;
-    var row: u16 = 0;
-    while (row < inner.h) : (row += 1) {
-        const idx = start + row;
-        if (idx >= items.len) break;
-        const y = inner.y + row;
-        const st = if (idx == cursor) row_cur else panel_bg;
-        scr.fillRect(.{ .x = inner.x, .y = y, .w = inner.w, .h = 1 }, ' ', st);
-        const path = rows[items[idx]].file_header.path;
-        scr.putStr(inner.x, y, path, st, text_area);
-    }
-    if (show_bar) {
-        const bar_x: u16 = inner.x + inner.w - 1;
-        const thumb = comment_input.scrollbarThumb(items.len, inner.h, start, inner.h);
-        var br: u16 = 0;
-        while (br < inner.h) : (br += 1) {
-            const in_thumb = br >= thumb.start and br < thumb.start + thumb.len;
-            const st = if (in_thumb) bar_thumb else bar_track;
-            const ch: u21 = if (in_thumb) '█' else '│';
-            scr.setCell(bar_x, inner.y + br, .{ .char = ch, .width = 1, .style = st });
-        }
-    }
-}
-
-fn paintGitError(scr: *tui.Screen, size: tui.Size, text: []const u8) void {
-    const bg = tui.Color{ .rgb = .{ .r = 0x12, .g = 0x12, .b = 0x14 } };
-    const fg = tui.Color{ .rgb = .{ .r = 0xd0, .g = 0xd0, .b = 0xd0 } };
-    const panel_bg = tui.Style{ .fg = fg, .bg = bg };
-    const panel_frame = tui.Style{
-        .fg = .{ .rgb = .{ .r = 0x5d, .g = 0x81, .b = 0xb7 } },
-        .bg = bg,
-        .bold = true,
-    };
-
-    var n: usize = 0;
-    var count_it = std.mem.splitScalar(u8, text, '\n');
-    while (count_it.next()) |_| n += 1;
-
-    const panel = listOverlayRect(size.cols, size.rows, n);
-    scr.fillRect(panel, ' ', panel_bg);
-    scr.drawBox(panel, panel_frame);
-    const inner = panel.inset(1);
-    if (panel.h > 0 and panel.w > 2) {
-        scr.putStr(panel.x + 2, panel.y, " error ", panel_frame, panel);
-    }
-    if (inner.h == 0 or inner.w == 0) return;
-    var row: u16 = 0;
-    var lines = std.mem.splitScalar(u8, text, '\n');
-    while (lines.next()) |line| {
-        if (row >= inner.h) break;
-        scr.putStr(inner.x, inner.y + row, line, panel_bg, inner);
-        row += 1;
-    }
-}
-
 fn paintDiscardConfirm(
     scr: *tui.Screen,
     size: tui.Size,
@@ -1455,96 +1307,191 @@ fn paintYesNoChoices(
     scr.putStr(yes_x, y, yes_label, y_st, inner);
 }
 
-const HelpRow = union(enum) {
-    group: []const u8,
-    item: struct { key: []const u8, label: []const u8 },
-    blank,
-};
-
-const help_rows = [_]HelpRow{
-    .{ .group = "Motion" },
-    .{ .item = .{ .key = "j/k", .label = "line (also arrows)" } },
-    .{ .item = .{ .key = "h/l", .label = "pan current hunk" } },
-    .{ .item = .{ .key = "0/$", .label = "pan home / end" } },
-    .{ .item = .{ .key = "J/K", .label = "next / prev change" } },
-    .{ .item = .{ .key = "[/]", .label = "hunk header" } },
-    .{ .item = .{ .key = "{/}", .label = "file header" } },
-    .{ .item = .{ .key = "(/)", .label = "prev / next comment" } },
-    .blank,
-    .{ .group = "Search" },
-    .{ .item = .{ .key = "/", .label = "text in the diff" } },
-    .{ .item = .{ .key = "n/N", .label = "next / prev match" } },
-    .{ .item = .{ .key = "Space f", .label = "file list" } },
-    .{ .item = .{ .key = "Space l", .label = "comment list" } },
-    .blank,
-    .{ .group = "Comments" },
-    .{ .item = .{ .key = "i/c/a/Enter", .label = "create / edit new" } },
-    .{ .item = .{ .key = "I/C/A", .label = "create / edit old" } },
-    .{ .item = .{ .key = "d/D", .label = "dismiss new / old" } },
-    .blank,
-    .{ .group = "Local review" },
-    .{ .item = .{ .key = "sections", .label = "Unstaged, Untracked, Staged" } },
-    .{ .item = .{ .key = "Space Space", .label = "stage / unstage file, hunk, or group" } },
-    .{ .item = .{ .key = "Space S", .label = "file from hunk (until Ctrl)" } },
-    .{ .item = .{ .key = "Space d", .label = "discard file or hunk" } },
-    .{ .item = .{ .key = "Space x", .label = "discard file from hunk (until Ctrl)" } },
-    .blank,
-    .{ .group = "Session" },
-    .{ .item = .{ .key = "t", .label = "layout" } },
-    .{ .item = .{ .key = "r", .label = "reload" } },
-    .{ .item = .{ .key = "?", .label = "this help" } },
-    .{ .item = .{ .key = "q", .label = "quit" } },
-    .blank,
-    .{ .group = "In a prompt" },
-    .{ .item = .{ .key = "comment", .label = "Enter save · Esc cancel · arrows move" } },
-    .{ .item = .{ .key = "search", .label = "Enter jump · Esc cancel" } },
-    .{ .item = .{ .key = "list", .label = "j/k move · Enter jump · Esc close" } },
-    .{ .item = .{ .key = "discard", .label = "No/yes · comments no/Yes · Esc cancel" } },
-};
-
-const help_key_w: u16 = blk: {
-    var w: u16 = 0;
-    for (help_rows) |row| {
-        switch (row) {
-            .item => |it| {
-                const n: u16 = @intCast(it.key.len);
-                if (n > w) w = n;
-            },
-            else => {},
-        }
-    }
-    break :blk w;
-};
-
-test "help catalog includes normal bindings" {
-    const required = [_][]const u8{
-        "j/k",     "h/l",     "0/$", "J/K", "[/]", "{/}", "(/)", "/", "n/N",
-        "Space f", "Space l", "Space Space", "Space S", "Space d", "Space x", "i", "I", "d", "D",
-        "t",       "r",       "?",           "q",
+/// File-list overlay (`Space` `f`): snapshot of file-header rows, cursor, keys, and paint.
+const FileList = struct {
+    const Result = union(enum) {
+        open,
+        closed,
+        quit,
+        help,
+        jump: usize,
     };
-    for (required) |token| {
-        var found = false;
-        for (help_rows) |row| {
-            const key = switch (row) {
-                .item => |it| it.key,
-                else => continue,
-            };
-            if (std.mem.eql(u8, key, token)) {
-                found = true;
-                break;
-            }
-            var parts = std.mem.splitScalar(u8, key, '/');
-            while (parts.next()) |part| {
-                if (part.len > 0 and std.mem.eql(u8, part, token)) {
-                    found = true;
+
+    items: std.ArrayList(usize) = .empty,
+    cursor: usize = 0,
+    scroll: usize = 0,
+
+    fn load(
+        self: *FileList,
+        alloc: std.mem.Allocator,
+        rows: []const view.row.Row,
+        current_file: ?usize,
+    ) std.mem.Allocator.Error!void {
+        self.items.clearRetainingCapacity();
+        for (rows, 0..) |row, i| {
+            if (row == .file_header) try self.items.append(alloc, i);
+        }
+        self.cursor = 0;
+        self.scroll = 0;
+        if (current_file) |start| {
+            for (self.items.items, 0..) |idx, n| {
+                if (idx == start) {
+                    self.cursor = n;
                     break;
                 }
             }
-            if (found) break;
         }
-        try std.testing.expect(found);
     }
-}
+
+    fn handleKey(self: *FileList, key: tui.Key) Result {
+        switch (key) {
+            .esc => return .closed,
+            .enter => {
+                if (self.cursor < self.items.items.len) return .{ .jump = self.items.items[self.cursor] };
+            },
+            .char => |c| {
+                if (c == 'q' or c == 'Q') return .quit;
+                if (c == '?') return .help;
+                if (c == 'j') {
+                    if (self.cursor + 1 < self.items.items.len) self.cursor += 1;
+                } else if (c == 'k') {
+                    if (self.cursor > 0) self.cursor -= 1;
+                }
+            },
+            .down => {
+                if (self.cursor + 1 < self.items.items.len) self.cursor += 1;
+            },
+            .up => {
+                if (self.cursor > 0) self.cursor -= 1;
+            },
+            .ctrl_c => return .quit,
+            else => {},
+        }
+        return .open;
+    }
+
+    fn paint(self: *FileList, scr: *tui.Screen, size: tui.Size, rows: []const view.row.Row) void {
+        const bg = tui.Color{ .rgb = .{ .r = 0x12, .g = 0x12, .b = 0x14 } };
+        const fg = tui.Color{ .rgb = .{ .r = 0xd0, .g = 0xd0, .b = 0xd0 } };
+        const panel_bg = tui.Style{ .fg = fg, .bg = bg };
+        const panel_frame = tui.Style{
+            .fg = .{ .rgb = .{ .r = 0x5d, .g = 0x81, .b = 0xb7 } },
+            .bg = bg,
+            .bold = true,
+        };
+        const row_cur = tui.Style{
+            .fg = fg,
+            .bg = .{ .rgb = .{ .r = 0x2a, .g = 0x2a, .b = 0x30 } },
+            .bold = true,
+        };
+        const bar_track = tui.Style{
+            .fg = .{ .rgb = .{ .r = 0x6a, .g = 0x7a, .b = 0x9a } },
+            .bg = bg,
+            .dim = true,
+        };
+        const bar_thumb = tui.Style{
+            .fg = .{ .rgb = .{ .r = 0xee, .g = 0xee, .b = 0xee } },
+            .bg = .{ .rgb = .{ .r = 0x4a, .g = 0x6a, .b = 0x9a } },
+            .bold = true,
+        };
+
+        const items = self.items.items;
+        const panel = listOverlayRect(size.cols, size.rows, items.len);
+        scr.fillRect(panel, ' ', panel_bg);
+        scr.drawBox(panel, panel_frame);
+        const inner = panel.inset(1);
+        if (panel.h > 0 and panel.w > 2) {
+            scr.putStr(panel.x + 2, panel.y, " files ", panel_frame, panel);
+        }
+        ensureListCursorVisible(&self.scroll, self.cursor, inner.h, items.len);
+        if (inner.h == 0 or inner.w == 0) return;
+        if (items.len == 0) {
+            scr.putStr(inner.x, inner.y, "no files", panel_bg, inner);
+            return;
+        }
+        const show_bar = items.len > inner.h;
+        const text_area = if (show_bar)
+            tui.Rect{ .x = inner.x, .y = inner.y, .w = inner.w -| 2, .h = inner.h }
+        else
+            inner;
+        const start = self.scroll;
+        var row: u16 = 0;
+        while (row < inner.h) : (row += 1) {
+            const idx = start + row;
+            if (idx >= items.len) break;
+            const y = inner.y + row;
+            const st = if (idx == self.cursor) row_cur else panel_bg;
+            scr.fillRect(.{ .x = inner.x, .y = y, .w = inner.w, .h = 1 }, ' ', st);
+            const path = rows[items[idx]].file_header.path;
+            scr.putStr(inner.x, y, path, st, text_area);
+        }
+        if (show_bar) {
+            const bar_x: u16 = inner.x + inner.w - 1;
+            const thumb = comment_input.scrollbarThumb(items.len, inner.h, start, inner.h);
+            var br: u16 = 0;
+            while (br < inner.h) : (br += 1) {
+                const in_thumb = br >= thumb.start and br < thumb.start + thumb.len;
+                const st = if (in_thumb) bar_thumb else bar_track;
+                const ch: u21 = if (in_thumb) '█' else '│';
+                scr.setCell(bar_x, inner.y + br, .{ .char = ch, .width = 1, .style = st });
+            }
+        }
+    }
+};
+
+/// Dismissible error overlay: message text, keys, and paint.
+const Failure = struct {
+    const Result = enum { open, closed, quit };
+
+    buf: std.ArrayList(u8) = .empty,
+
+    fn handleKey(self: *Failure, key: tui.Key) Result {
+        switch (key) {
+            .esc, .enter => {
+                self.buf.clearRetainingCapacity();
+                return .closed;
+            },
+            .char => |c| {
+                if (c == 'q' or c == 'Q') return .quit;
+            },
+            .ctrl_c => return .quit,
+            else => {},
+        }
+        return .open;
+    }
+
+    fn paint(self: *const Failure, scr: *tui.Screen, size: tui.Size) void {
+        const text = self.buf.items;
+        const bg = tui.Color{ .rgb = .{ .r = 0x12, .g = 0x12, .b = 0x14 } };
+        const fg = tui.Color{ .rgb = .{ .r = 0xd0, .g = 0xd0, .b = 0xd0 } };
+        const panel_bg = tui.Style{ .fg = fg, .bg = bg };
+        const panel_frame = tui.Style{
+            .fg = .{ .rgb = .{ .r = 0x5d, .g = 0x81, .b = 0xb7 } },
+            .bg = bg,
+            .bold = true,
+        };
+
+        var n: usize = 0;
+        var count_it = std.mem.splitScalar(u8, text, '\n');
+        while (count_it.next()) |_| n += 1;
+
+        const panel = listOverlayRect(size.cols, size.rows, n);
+        scr.fillRect(panel, ' ', panel_bg);
+        scr.drawBox(panel, panel_frame);
+        const inner = panel.inset(1);
+        if (panel.h > 0 and panel.w > 2) {
+            scr.putStr(panel.x + 2, panel.y, " error ", panel_frame, panel);
+        }
+        if (inner.h == 0 or inner.w == 0) return;
+        var row: u16 = 0;
+        var lines = std.mem.splitScalar(u8, text, '\n');
+        while (lines.next()) |line| {
+            if (row >= inner.h) break;
+            scr.putStr(inner.x, inner.y + row, line, panel_bg, inner);
+            row += 1;
+        }
+    }
+};
 
 test "indexHintForRow section all" {
     try std.testing.expectEqualStrings(
@@ -1561,72 +1508,6 @@ test "indexHintForRow section all" {
     );
     try std.testing.expectEqualStrings("", indexHintForRow(1, null, null, 0, .unstaged));
     try std.testing.expectEqualStrings("", indexHintForRow(0, null, null, null, .unstaged));
-}
-
-fn paintHelp(scr: *tui.Screen, size: tui.Size, scroll: *usize) void {
-    const bg = tui.Color{ .rgb = .{ .r = 0x12, .g = 0x12, .b = 0x14 } };
-    const fg = tui.Color{ .rgb = .{ .r = 0xd0, .g = 0xd0, .b = 0xd0 } };
-    const panel_bg = tui.Style{ .fg = fg, .bg = bg };
-    const panel_frame = tui.Style{
-        .fg = .{ .rgb = .{ .r = 0x5d, .g = 0x81, .b = 0xb7 } },
-        .bg = bg,
-        .bold = true,
-    };
-    const group_style = tui.Style{ .fg = fg, .bg = bg, .bold = true };
-    const bar_track = tui.Style{
-        .fg = .{ .rgb = .{ .r = 0x6a, .g = 0x7a, .b = 0x9a } },
-        .bg = bg,
-        .dim = true,
-    };
-    const bar_thumb = tui.Style{
-        .fg = .{ .rgb = .{ .r = 0xee, .g = 0xee, .b = 0xee } },
-        .bg = .{ .rgb = .{ .r = 0x4a, .g = 0x6a, .b = 0x9a } },
-        .bold = true,
-    };
-
-    const panel = listOverlayRect(size.cols, size.rows, help_rows.len);
-    scr.fillRect(panel, ' ', panel_bg);
-    scr.drawBox(panel, panel_frame);
-    if (panel.h > 0 and panel.w > 2) {
-        scr.putStr(panel.x + 2, panel.y, " help ", panel_frame, panel);
-    }
-    const inner = panel.inset(1);
-    if (inner.h == 0 or inner.w == 0) return;
-    const view_h: usize = inner.h;
-    const max_scroll = if (help_rows.len > view_h) help_rows.len - view_h else 0;
-    if (scroll.* > max_scroll) scroll.* = max_scroll;
-    const show_bar = help_rows.len > inner.h;
-    const text_area = if (show_bar)
-        tui.Rect{ .x = inner.x, .y = inner.y, .w = inner.w -| 2, .h = inner.h }
-    else
-        inner;
-    const start = scroll.*;
-    var row: u16 = 0;
-    while (row < inner.h) : (row += 1) {
-        const idx = start + row;
-        if (idx >= help_rows.len) break;
-        const y = inner.y + row;
-        switch (help_rows[idx]) {
-            .blank => {},
-            .group => |name| scr.putStr(inner.x, y, name, group_style, text_area),
-            .item => |it| {
-                scr.putStr(inner.x + 2, y, it.key, panel_bg, text_area);
-                const label_x = inner.x +| 2 +| help_key_w +| 2;
-                scr.putStr(label_x, y, it.label, panel_bg, text_area);
-            },
-        }
-    }
-    if (show_bar) {
-        const bar_x: u16 = inner.x + inner.w - 1;
-        const thumb = comment_input.scrollbarThumb(help_rows.len, inner.h, start, inner.h);
-        var br: u16 = 0;
-        while (br < inner.h) : (br += 1) {
-            const in_thumb = br >= thumb.start and br < thumb.start + thumb.len;
-            const st = if (in_thumb) bar_thumb else bar_track;
-            const ch: u21 = if (in_thumb) '█' else '│';
-            scr.setCell(bar_x, inner.y + br, .{ .char = ch, .width = 1, .style = st });
-        }
-    }
 }
 
 fn paint(
@@ -1647,11 +1528,8 @@ fn paint(
     draft_anchor: view.row.Anchor,
     status_note: []const u8,
     list_items: []const store.Comment,
-    file_items: []const usize,
     list_cursor: usize,
     list_scroll: *usize,
-    help_scroll: *usize,
-    git_err: []const u8,
     discard: DiscardConfirm,
 ) void {
     // Diff line palette (truecolor). Documented together so sticky file
@@ -2094,15 +1972,6 @@ fn paint(
 
     if (focus == .listing) {
         paintCommentList(scr, size, list_items, list_cursor, list_scroll, &line_buf);
-        scr.hideCursor();
-    } else if (focus == .files) {
-        paintFileList(scr, size, rows, file_items, list_cursor, list_scroll);
-        scr.hideCursor();
-    } else if (focus == .helping) {
-        paintHelp(scr, size, help_scroll);
-        scr.hideCursor();
-    } else if (focus == .git_error) {
-        paintGitError(scr, size, git_err);
         scr.hideCursor();
     } else if (focus == .discard_confirm) {
         paintDiscardConfirm(scr, size, rows, cursor, discard);
