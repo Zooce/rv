@@ -173,14 +173,14 @@ fn runTui(alloc: std.mem.Allocator, io: std.Io, source: cli.Source) !u8 {
     var discard_confirm: DiscardConfirm = .{};
     var draft: Draft = .{};
     defer draft.buf.deinit(alloc);
+    var search: Search = .{};
+    defer search.buf.deinit(alloc);
+    defer search.last_query.deinit(alloc);
     var comment_list: CommentList = .{};
     defer comment_list.items.deinit(alloc);
     var file_list: FileList = .{};
     defer file_list.items.deinit(alloc);
     var help: Help = .{};
-    // Committed `/` text query for `n`/`N` (empty means no active text search).
-    var last_query: std.ArrayList(u8) = .empty;
-    defer last_query.deinit(alloc);
     // One-shot footer note (owned bytes; len 0 = none). Cleared on next key.
     var note: StatusNote = .{};
     var failure: Failure = .{};
@@ -280,48 +280,19 @@ fn runTui(alloc: std.mem.Allocator, io: std.Io, source: cli.Source) !u8 {
                         .ctrl_c => running = false,
                         else => {},
                     },
-                    .searching => switch (key) {
-                        .esc => {
-                            // Cancel: leave cursor where it was; discard draft only.
+                    .searching => switch (try search.handleKey(alloc, key, diff_view.rows, cursor)) {
+                        .closed => focus = .normal,
+                        .quit => running = false,
+                        .jump => |hit| {
+                            cursor = hit.index;
                             focus = .normal;
-                            draft.clear();
+                            if (hit.wrapped) note.set("search wrapped");
                         },
-                        .enter => {
+                        .missing => {
                             focus = .normal;
-                            if (draft.buf.items.len == 0) {
-                                draft.caret = 0;
-                            } else {
-                                last_query.clearRetainingCapacity();
-                                try last_query.appendSlice(alloc, draft.buf.items);
-                                draft.clear();
-                                if (view.search.firstMatch(diff_view.rows, last_query.items, cursor)) |hit| {
-                                    cursor = hit.index;
-                                    if (hit.wrapped) note.set("search wrapped");
-                                } else {
-                                    note.setFmt("Pattern not found: {s}", .{last_query.items});
-                                }
-                            }
+                            note.setFmt("Pattern not found: {s}", .{search.last_query.items});
                         },
-                        .backspace => {
-                            if (draft.caret > 0) {
-                                draft.caret -= 1;
-                                _ = draft.buf.orderedRemove(draft.caret);
-                            }
-                        },
-                        .char => |c| {
-                            if (c >= 0x20 and c < 0x7f) {
-                                try draft.buf.insert(alloc, draft.caret, @intCast(c));
-                                draft.caret += 1;
-                            }
-                        },
-                        .left => {
-                            if (draft.caret > 0) draft.caret -= 1;
-                        },
-                        .right => {
-                            if (draft.caret < draft.buf.items.len) draft.caret += 1;
-                        },
-                        .ctrl_c => running = false,
-                        else => {},
+                        .open => {},
                     },
                     .listing => switch (comment_list.handleKey(key, diff_view.rows)) {
                         .closed => focus = .normal,
@@ -468,25 +439,26 @@ fn runTui(alloc: std.mem.Allocator, io: std.Io, source: cli.Source) !u8 {
                                 } else if (c == ' ') {
                                     leader_pending = true;
                                 } else if (c == '/') {
+                                    search.buf.clearRetainingCapacity();
+                                    search.caret = 0;
                                     focus = .searching;
-                                    draft.clear();
                                 } else if (c == 'n') {
-                                    if (last_query.items.len > 0) {
-                                        if (view.search.nextMatch(diff_view.rows, last_query.items, cursor)) |hit| {
+                                    switch (search.next(diff_view.rows, cursor)) {
+                                        .none => {},
+                                        .missing => note.set("Pattern not found"),
+                                        .hit => |hit| {
                                             cursor = hit.index;
                                             if (hit.wrapped) note.set("search wrapped");
-                                        } else {
-                                            note.set("Pattern not found");
-                                        }
+                                        },
                                     }
                                 } else if (c == 'N') {
-                                    if (last_query.items.len > 0) {
-                                        if (view.search.prevMatch(diff_view.rows, last_query.items, cursor)) |hit| {
+                                    switch (search.prev(diff_view.rows, cursor)) {
+                                        .none => {},
+                                        .missing => note.set("Pattern not found"),
+                                        .hit => |hit| {
                                             cursor = hit.index;
                                             if (hit.wrapped) note.set("search wrapped");
-                                        } else {
-                                            note.set("Pattern not found");
-                                        }
+                                        },
                                     }
                                 } else if (c == 'j') {
                                     cursor = moveLineDown(layout_pref, size.cols, diff_view.rows, diff_view.sbs_slots, cursor);
@@ -579,6 +551,8 @@ fn runTui(alloc: std.mem.Allocator, io: std.Io, source: cli.Source) !u8 {
             } else if (focus == .discard_confirm) {
                 discard_confirm.paint(&scr, size, diff_view.rows, cursor);
                 scr.hideCursor();
+            } else if (focus == .searching) {
+                search.paintFooter(&scr, size);
             }
             try scr.present(&term);
         }
@@ -970,7 +944,7 @@ const DiscardConfirm = struct {
     }
 };
 
-/// Footer box buffer plus comment-mode extras. Search uses `buf` and `caret` only.
+/// Footer box buffer plus comment-mode extras.
 const Draft = struct {
     buf: std.ArrayList(u8) = .empty,
     scroll: usize = 0,
@@ -983,6 +957,108 @@ const Draft = struct {
         self.scroll = 0;
         self.caret = 0;
         self.edit_id = null;
+    }
+};
+
+/// `/` text search: prompt, committed query for `n`/`N`, keys, and footer paint.
+const Search = struct {
+    const Result = union(enum) {
+        open,
+        closed,
+        quit,
+        jump: view.search.SearchHit,
+        missing,
+    };
+
+    const Match = union(enum) {
+        none,
+        missing,
+        hit: view.search.SearchHit,
+    };
+
+    buf: std.ArrayList(u8) = .empty,
+    caret: usize = 0,
+    last_query: std.ArrayList(u8) = .empty,
+
+    fn handleKey(
+        self: *Search,
+        alloc: std.mem.Allocator,
+        key: tui.Key,
+        rows: []const view.row.Row,
+        cursor: usize,
+    ) std.mem.Allocator.Error!Result {
+        switch (key) {
+            .esc => {
+                self.buf.clearRetainingCapacity();
+                self.caret = 0;
+                return .closed;
+            },
+            .enter => {
+                if (self.buf.items.len == 0) {
+                    self.caret = 0;
+                    return .closed;
+                }
+                self.last_query.clearRetainingCapacity();
+                try self.last_query.appendSlice(alloc, self.buf.items);
+                self.buf.clearRetainingCapacity();
+                self.caret = 0;
+                if (view.search.firstMatch(rows, self.last_query.items, cursor)) |hit| {
+                    return .{ .jump = hit };
+                }
+                return .missing;
+            },
+            .backspace => {
+                if (self.caret > 0) {
+                    self.caret -= 1;
+                    _ = self.buf.orderedRemove(self.caret);
+                }
+            },
+            .char => |c| {
+                if (c >= 0x20 and c < 0x7f) {
+                    try self.buf.insert(alloc, self.caret, @intCast(c));
+                    self.caret += 1;
+                }
+            },
+            .left => {
+                if (self.caret > 0) self.caret -= 1;
+            },
+            .right => {
+                if (self.caret < self.buf.items.len) self.caret += 1;
+            },
+            .ctrl_c => return .quit,
+            else => {},
+        }
+        return .open;
+    }
+
+    fn next(self: *const Search, rows: []const view.row.Row, cursor: usize) Match {
+        if (self.last_query.items.len == 0) return .none;
+        if (view.search.nextMatch(rows, self.last_query.items, cursor)) |hit| return .{ .hit = hit };
+        return .missing;
+    }
+
+    fn prev(self: *const Search, rows: []const view.row.Row, cursor: usize) Match {
+        if (self.last_query.items.len == 0) return .none;
+        if (view.search.prevMatch(rows, self.last_query.items, cursor)) |hit| return .{ .hit = hit };
+        return .missing;
+    }
+
+    fn paintFooter(self: *const Search, scr: *tui.Screen, size: tui.Size) void {
+        if (size.rows < 2) return;
+        const footer_style = tui.Style{
+            .fg = .{ .rgb = .{ .r = 0xee, .g = 0xee, .b = 0xee } },
+            .bg = .{ .rgb = .{ .r = 0x2a, .g = 0x3f, .b = 0x5f } },
+        };
+        const footer_y = size.rows - 1;
+        fillRow(scr, footer_y, footer_style);
+        var line_buf: [512]u8 = undefined;
+        const caret_byte = @min(self.caret, self.buf.items.len);
+        const prompt = bufPrintTrunc(&line_buf, "/{s}", .{self.buf.items});
+        scr.putStr(1, footer_y, prompt, footer_style, null);
+        const max_x: u16 = if (size.cols == 0) 0 else size.cols - 1;
+        const raw_x: usize = 2 + caret_byte;
+        const cx: u16 = if (raw_x > max_x) max_x else @intCast(raw_x);
+        scr.setCursor(cx, footer_y);
     }
 };
 
@@ -1993,19 +2069,7 @@ fn paint(
             const cx: u16 = @min(caret.x, max_x);
             const cy: u16 = footer_top + caret.y_off;
             scr.setCursor(cx, cy);
-        } else if (focus == .searching) {
-            // Single-line `/` text prompt: gutter col 0, `/` at 1, query at 2+.
-            // Caret 0 sits after `/` (column 2).
-            const footer_y = footer_top;
-            fillRow(scr, footer_y, footer_style);
-            const caret_byte = @min(draft_caret, draft.len);
-            const prompt = bufPrintTrunc(&line_buf, "/{s}", .{draft});
-            scr.putStr(1, footer_y, prompt, footer_style, null);
-            const max_x: u16 = if (size.cols == 0) 0 else size.cols - 1;
-            const raw_x: usize = 2 + caret_byte;
-            const cx: u16 = if (raw_x > max_x) max_x else @intCast(raw_x);
-            scr.setCursor(cx, footer_y);
-        } else {
+        } else if (focus != .searching) {
             const footer_y = footer_top;
             fillRow(scr, footer_y, footer_style);
             if (status_note.len > 0) {
