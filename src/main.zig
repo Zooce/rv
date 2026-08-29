@@ -1279,6 +1279,36 @@ const Viewport = struct {
         }
         return .handled;
     }
+
+    /// Clamp pan and vertical scroll for the current cursor and content area.
+    /// Returns the sticky file header to pin above the body.
+    fn settle(
+        self: *Viewport,
+        cols: u16,
+        content_rows: usize,
+        rows: []const view.row.Row,
+        slots: []const view.layout.SbsSlot,
+    ) view.viewport.Sticky {
+        const cur = view.row.clampCursor(self.cursor, rows.len);
+        const pan_span = view.viewport.hunkSpanAt(rows, cur);
+        self.col_scroll = view.viewport.clampColScroll(
+            self.col_scroll,
+            hunkMaxLineWidth(rows, pan_span),
+            self.panViewportCols(cols),
+        );
+        switch (view.layout.effectiveLayout(self.layout_pref, cols)) {
+            .unified => {
+                const settled = view.viewport.ensureVisibleSticky(self.scroll, cur, content_rows, rows);
+                self.scroll = settled.scroll;
+                return settled.sticky;
+            },
+            .side_by_side => {
+                const settled = view.viewport.ensureVisibleStickySbs(self.scroll, cur, content_rows, slots, rows);
+                self.scroll = settled.scroll;
+                return settled.sticky;
+            },
+        }
+    }
 };
 
 /// Widest formatted **line** in the hunk body (headers excluded). 0 if empty.
@@ -1890,9 +1920,7 @@ const Frame = struct {
         var line_buf: [512]u8 = undefined;
         // Only lines in the cursor's hunk pan; file/hunk headers never pan.
         const pan_span = view.viewport.hunkSpanAt(rows, cur);
-        const hunk_w = hunkMaxLineWidth(rows, pan_span);
-        const pan_vp: usize = viewport.panViewportCols(size.cols);
-        viewport.col_scroll = view.viewport.clampColScroll(viewport.col_scroll, hunk_w, pan_vp);
+        const sticky = viewport.settle(size.cols, content_rows, rows, sbs_slots);
         const cs = viewport.col_scroll;
 
         const hints_ok = source == .local and focus == .normal and rows.len > 0;
@@ -1919,9 +1947,6 @@ const Frame = struct {
 
         switch (layout) {
             .unified => {
-                const settled = view.viewport.ensureVisibleSticky(viewport.scroll, cur, content_rows, rows);
-                viewport.scroll = settled.scroll;
-                const sticky = settled.sticky;
                 var screen_y: u16 = content_top;
 
                 // Sticky file path under the title bar (hunk headers scroll with body).
@@ -1975,9 +2000,6 @@ const Frame = struct {
                 }
             },
             .side_by_side => {
-                const settled = view.viewport.ensureVisibleStickySbs(viewport.scroll, cur, content_rows, sbs_slots, rows);
-                viewport.scroll = settled.scroll;
-                const sticky = settled.sticky;
                 const panes = view.layout.sbsPaneWidths(size.cols);
                 var screen_y: u16 = content_top;
 
