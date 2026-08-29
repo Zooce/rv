@@ -173,11 +173,8 @@ fn runTui(alloc: std.mem.Allocator, io: std.Io, source: cli.Source) !u8 {
     var discard_confirm: DiscardConfirm = .{};
     var draft: Draft = .{};
     defer draft.buf.deinit(alloc);
-    // Snapshot of `review.comments` while the comment list overlay is open.
-    var list_items: std.ArrayList(store.Comment) = .empty;
-    defer list_items.deinit(alloc);
-    var list_cursor: usize = 0;
-    var list_scroll: usize = 0;
+    var comment_list: CommentList = .{};
+    defer comment_list.items.deinit(alloc);
     var file_list: FileList = .{};
     defer file_list.items.deinit(alloc);
     var help: Help = .{};
@@ -189,7 +186,7 @@ fn runTui(alloc: std.mem.Allocator, io: std.Io, source: cli.Source) !u8 {
     var failure: Failure = .{};
     defer failure.buf.deinit(alloc);
 
-    paint(&scr, size, diff_view.rows, diff_view.sbs_slots, layout_pref, cursor, &scroll, &col_scroll, &review, source, focus, draft.buf.items, draft.caret, &draft.scroll, draft.anchor, note.slice(), list_items.items, list_cursor, &list_scroll, discard_confirm);
+    paint(&scr, size, diff_view.rows, diff_view.sbs_slots, layout_pref, cursor, &scroll, &col_scroll, &review, source, focus, draft.buf.items, draft.caret, &draft.scroll, draft.anchor, note.slice(), discard_confirm);
     try scr.present(&term);
 
     while (running) {
@@ -326,44 +323,19 @@ fn runTui(alloc: std.mem.Allocator, io: std.Io, source: cli.Source) !u8 {
                         .ctrl_c => running = false,
                         else => {},
                     },
-                    .listing => switch (key) {
-                        .esc => {
+                    .listing => switch (comment_list.handleKey(key, diff_view.rows)) {
+                        .closed => focus = .normal,
+                        .quit => running = false,
+                        .help => {
+                            help.scroll = 0;
+                            focus = .helping;
+                        },
+                        .jump => |row| {
+                            cursor = row;
                             focus = .normal;
                         },
-                        .enter => {
-                            if (list_cursor < list_items.items.len) {
-                                if (comments.loc(list_items.items[list_cursor])) |loc| {
-                                    if (view.rowForComment(diff_view.rows, loc)) |idx| {
-                                        cursor = idx;
-                                        focus = .normal;
-                                    } else {
-                                        note.set("comment not in this diff");
-                                    }
-                                } else {
-                                    note.set("comment not in this diff");
-                                }
-                            }
-                        },
-                        .char => |c| {
-                            if (c == 'q' or c == 'Q') {
-                                running = false;
-                            } else if (c == '?') {
-                                help.scroll = 0;
-                                focus = .helping;
-                            } else if (c == 'j') {
-                                if (list_cursor + 1 < list_items.items.len) list_cursor += 1;
-                            } else if (c == 'k') {
-                                if (list_cursor > 0) list_cursor -= 1;
-                            }
-                        },
-                        .down => {
-                            if (list_cursor + 1 < list_items.items.len) list_cursor += 1;
-                        },
-                        .up => {
-                            if (list_cursor > 0) list_cursor -= 1;
-                        },
-                        .ctrl_c => running = false,
-                        else => {},
+                        .missing => note.set("comment not in this diff"),
+                        .open => {},
                     },
                     .files => switch (file_list.handleKey(key)) {
                         .closed => focus = .normal,
@@ -383,79 +355,47 @@ fn runTui(alloc: std.mem.Allocator, io: std.Io, source: cli.Source) !u8 {
                         .quit => running = false,
                         .open => {},
                     },
-                    .discard_confirm => {
-                        var abort = false;
-                        var answered = false;
-                        switch (key) {
-                            .esc => abort = true,
-                            .enter => answered = true,
-                            .left, .up => discard_confirm.yes = false,
-                            .right, .down => discard_confirm.yes = true,
-                            .char => |c| {
-                                if (c == 'q' or c == 'Q') {
-                                    running = false;
-                                } else if (c == 'n' or c == 'N') {
-                                    discard_confirm.yes = false;
-                                    answered = true;
-                                } else if (c == 'y' or c == 'Y') {
-                                    discard_confirm.yes = true;
-                                    answered = true;
-                                }
-                            },
-                            .ctrl_c => running = false,
-                            else => {},
-                        }
-                        if (abort) {
+                    .discard_confirm => switch (discard_confirm.handleKey(
+                        key,
+                        &review,
+                        &diff_view.diff,
+                        diff_view.rows,
+                        cursor,
+                    )) {
+                        .closed => focus = .normal,
+                        .quit => running = false,
+                        .open => {},
+                        .group => {
                             focus = .normal;
-                        } else if (answered) {
-                            switch (git.confirmNext(
-                                discard_confirm.kind,
-                                discard_confirm.comments,
-                                discard_confirm.yes,
+                            try applyGroupIndex(
+                                alloc,
+                                io,
+                                source,
+                                &diff_view,
+                                &cursor,
+                                &note,
+                                &focus,
+                                &failure,
                                 &review,
-                                &diff_view.diff,
-                                diff_view.rows,
-                                cursor,
+                            );
+                        },
+                        .discard => |delete_them| {
+                            focus = .normal;
+                            try applyIndex(
+                                alloc,
+                                io,
+                                source,
+                                &diff_view,
+                                &cursor,
+                                &note,
+                                &focus,
+                                &failure,
+                                &review,
                                 discard_confirm.whole_file,
-                            )) {
-                                .close => focus = .normal,
-                                .comments => {
-                                    discard_confirm.comments = true;
-                                    discard_confirm.yes = true;
-                                },
-                                .group => {
-                                    focus = .normal;
-                                    try applyGroupIndex(
-                                        alloc,
-                                        io,
-                                        source,
-                                        &diff_view,
-                                        &cursor,
-                                        &note,
-                                        &focus,
-                                        &failure,
-                                        &review,
-                                    );
-                                },
-                                .discard => |delete_them| {
-                                    focus = .normal;
-                                    try applyIndex(
-                                        alloc,
-                                        io,
-                                        source,
-                                        &diff_view,
-                                        &cursor,
-                                        &note,
-                                        &focus,
-                                        &failure,
-                                        &review,
-                                        discard_confirm.whole_file,
-                                        .discard,
-                                        delete_them,
-                                    );
-                                },
-                            }
-                        }
+                                .discard,
+                                delete_them,
+                            );
+                        },
                     },
                     .helping => switch (help.handleKey(key)) {
                         .closed => focus = .normal,
@@ -472,10 +412,7 @@ fn runTui(alloc: std.mem.Allocator, io: std.Io, source: cli.Source) !u8 {
                                     try file_list.load(alloc, diff_view.rows, view.nav.currentFileStart(diff_view.rows, cursor));
                                     focus = .files;
                                 } else if (after_leader and c == 'l') {
-                                    list_items.clearRetainingCapacity();
-                                    try list_items.appendSlice(alloc, review.comments.items);
-                                    list_cursor = 0;
-                                    list_scroll = 0;
+                                    try comment_list.load(alloc, review.comments.items);
                                     focus = .listing;
                                 } else if (after_leader and c == ' ') {
                                     try dispatchStage(
@@ -626,7 +563,7 @@ fn runTui(alloc: std.mem.Allocator, io: std.Io, source: cli.Source) !u8 {
             },
         }
         if (running) {
-            paint(&scr, size, diff_view.rows, diff_view.sbs_slots, layout_pref, cursor, &scroll, &col_scroll, &review, source, focus, draft.buf.items, draft.caret, &draft.scroll, draft.anchor, note.slice(), list_items.items, list_cursor, &list_scroll, discard_confirm);
+            paint(&scr, size, diff_view.rows, diff_view.sbs_slots, layout_pref, cursor, &scroll, &col_scroll, &review, source, focus, draft.buf.items, draft.caret, &draft.scroll, draft.anchor, note.slice(), discard_confirm);
             if (focus == .helping) {
                 help.paint(&scr, size);
                 scr.hideCursor();
@@ -635,6 +572,12 @@ fn runTui(alloc: std.mem.Allocator, io: std.Io, source: cli.Source) !u8 {
                 scr.hideCursor();
             } else if (focus == .files) {
                 file_list.paint(&scr, size, diff_view.rows);
+                scr.hideCursor();
+            } else if (focus == .listing) {
+                comment_list.paint(&scr, size);
+                scr.hideCursor();
+            } else if (focus == .discard_confirm) {
+                discard_confirm.paint(&scr, size, diff_view.rows, cursor);
                 scr.hideCursor();
             }
             try scr.present(&term);
@@ -846,11 +789,185 @@ const Focus = enum { normal, commenting, searching, listing, files, helping, git
 /// Discard: if the target has live comments, `comments` is the second
 /// overlay and defaults to **Yes** (delete).
 const DiscardConfirm = struct {
+    const Result = union(enum) {
+        open,
+        closed,
+        quit,
+        group,
+        discard: bool,
+    };
+
     kind: git.ConfirmKind = .discard,
     group: diff.Group = .unstaged,
     whole_file: bool = false,
     yes: bool = false,
     comments: bool = false,
+
+    fn handleKey(
+        self: *DiscardConfirm,
+        key: tui.Key,
+        review: *const store.Review,
+        d: *const diff.Diff,
+        rows: []const view.row.Row,
+        cursor: usize,
+    ) Result {
+        var abort = false;
+        var answered = false;
+        switch (key) {
+            .esc => abort = true,
+            .enter => answered = true,
+            .left, .up => self.yes = false,
+            .right, .down => self.yes = true,
+            .char => |c| {
+                if (c == 'q' or c == 'Q') return .quit;
+                if (c == 'n' or c == 'N') {
+                    self.yes = false;
+                    answered = true;
+                } else if (c == 'y' or c == 'Y') {
+                    self.yes = true;
+                    answered = true;
+                }
+            },
+            .ctrl_c => return .quit,
+            else => {},
+        }
+        if (abort) return .closed;
+        if (!answered) return .open;
+        switch (git.confirmNext(
+            self.kind,
+            self.comments,
+            self.yes,
+            review,
+            d,
+            rows,
+            cursor,
+            self.whole_file,
+        )) {
+            .close => return .closed,
+            .comments => {
+                self.comments = true;
+                self.yes = true;
+                return .open;
+            },
+            .group => return .group,
+            .discard => |delete_them| return .{ .discard = delete_them },
+        }
+    }
+
+    fn paint(
+        self: DiscardConfirm,
+        scr: *tui.Screen,
+        size: tui.Size,
+        rows: []const view.row.Row,
+        cursor: usize,
+    ) void {
+        const bg = tui.Color{ .rgb = .{ .r = 0x12, .g = 0x12, .b = 0x14 } };
+        const fg = tui.Color{ .rgb = .{ .r = 0xd0, .g = 0xd0, .b = 0xd0 } };
+        const panel_bg = tui.Style{ .fg = fg, .bg = bg };
+        const panel_frame = tui.Style{
+            .fg = .{ .rgb = .{ .r = 0x5d, .g = 0x81, .b = 0xb7 } },
+            .bg = bg,
+            .bold = true,
+        };
+        const choice_cur = tui.Style{
+            .fg = fg,
+            .bg = .{ .rgb = .{ .r = 0x2a, .g = 0x2a, .b = 0x30 } },
+            .bold = true,
+        };
+
+        var hunk_buf: [512]u8 = undefined;
+        const group = self.kind == .group;
+        const hunk_text: []const u8, const path: []const u8 = if (group or self.comments)
+            .{ "", "" }
+        else blk: {
+            const target = git.indexTargetAt(rows, cursor, self.whole_file);
+            const hunk_row: ?view.row.Row = if (target) |t|
+                if (t.hunk_i != null) rows[t.first] else null
+            else
+                null;
+            const ht: []const u8 = if (hunk_row) |hr| formatRow(&hunk_buf, hr, false) else "";
+            break :blk .{ ht, if (target) |t| t.path else "" };
+        };
+
+        const content_n: u16 = if (group or self.comments)
+            3
+        else if (hunk_text.len > 0)
+            4
+        else
+            3;
+        const want_w: u16 = @min(size.cols -| 4, 60);
+        const panel = tui.Rect.centered(size.cols, size.rows, want_w, content_n + 2);
+        scr.fillRect(panel, ' ', panel_bg);
+        scr.drawBox(panel, panel_frame);
+        if (panel.h > 0 and panel.w > 2) {
+            const title: []const u8 = switch (self.kind) {
+                .group => switch (self.group) {
+                    .unstaged, .untracked => " stage ",
+                    .staged => " unstage ",
+                },
+                .discard => if (self.comments) " comments " else " discard ",
+            };
+            scr.putStr(panel.x + 2, panel.y, title, panel_frame, panel);
+        }
+        const inner = panel.inset(1);
+        if (inner.h == 0 or inner.w == 0) return;
+        var row: u16 = 0;
+        if (group) {
+            const question: []const u8 = switch (self.group) {
+                .unstaged => "Stage all unstaged?",
+                .untracked => "Stage all untracked?",
+                .staged => "Unstage all staged?",
+            };
+            if (row < inner.h) {
+                scr.putStr(inner.x, inner.y + row, question, panel_bg, inner);
+                row += 1;
+            }
+        } else if (self.comments) {
+            if (row < inner.h) {
+                scr.putStr(inner.x, inner.y + row, "delete comments with this change?", panel_bg, inner);
+                row += 1;
+            }
+        } else {
+            if (path.len > 0 and row < inner.h) {
+                scr.putStr(inner.x, inner.y + row, path, panel_bg, inner);
+                row += 1;
+            }
+            if (hunk_text.len > 0 and row < inner.h) {
+                const start: usize = if (hunk_text[0] == ' ') 1 else 0;
+                scr.putStr(inner.x, inner.y + row, hunk_text[start..], panel_bg, inner);
+                row += 1;
+            }
+        }
+        if (row < inner.h) row += 1;
+        if (row >= inner.h) return;
+        paintYesNoChoices(scr, inner, inner.y + row, self.yes, self.comments, panel_bg, choice_cur);
+    }
+
+    /// Default choice is capitalized (`No`/`Yes`); the other stays lowercase.
+    /// Highlight follows the current selection.
+    fn paintYesNoChoices(
+        scr: *tui.Screen,
+        inner: tui.Rect,
+        y: u16,
+        yes: bool,
+        default_yes: bool,
+        panel_bg: tui.Style,
+        choice_cur: tui.Style,
+    ) void {
+        const no_label: []const u8 = if (default_yes) "no" else "No";
+        const yes_label: []const u8 = if (default_yes) "Yes" else "yes";
+        const no_w: u16 = 2;
+        const yes_w: u16 = 3;
+        const mid: u16 = inner.x + inner.w / 2;
+        const no_x: u16 = mid -| 6;
+        const yes_x: u16 = mid +| 2;
+        const n_st = if (!yes) choice_cur else panel_bg;
+        const y_st = if (yes) choice_cur else panel_bg;
+        scr.fillRect(.{ .x = no_x -| 1, .y = y, .w = no_w + 2, .h = 1 }, ' ', n_st);
+        scr.putStr(no_x, y, no_label, n_st, inner);
+        scr.fillRect(.{ .x = yes_x -| 1, .y = y, .w = yes_w + 2, .h = 1 }, ' ', y_st);
+        scr.putStr(yes_x, y, yes_label, y_st, inner);
+    }
 };
 
 /// Footer box buffer plus comment-mode extras. Search uses `buf` and `caret` only.
@@ -1091,221 +1208,158 @@ fn listOverlayRect(cols: u16, rows: u16, n: usize) tui.Rect {
     return tui.Rect.centered(cols, rows, want_w, want_h);
 }
 
-fn formatCommentLineCol(buf: []u8, c: store.Comment) []const u8 {
-    const found = comments.loc(c) orelse return "-";
-    return switch (found.side) {
-        .old => bufPrintTrunc(buf, "-{d}", .{found.line}),
-        .new => bufPrintTrunc(buf, "+{d}", .{found.line}),
+/// Comment-list overlay (`Space` `l`): snapshot of live comments, cursor, keys, and paint.
+const CommentList = struct {
+    const Result = union(enum) {
+        open,
+        closed,
+        quit,
+        help,
+        jump: usize,
+        missing,
     };
-}
 
-fn formatListRow(buf: []u8, c: store.Comment) []const u8 {
-    var line_col_buf: [16]u8 = undefined;
-    const line_col = formatCommentLineCol(&line_col_buf, c);
-    const side: []const u8 = if (c.side) |s| switch (s) {
-        .old => "old",
-        .new => "new",
-        .context => "ctx",
-    } else "-";
-    const prefix = bufPrintTrunc(buf, "{s}  {s}  {s}  {s}  ", .{ c.id, c.path, side, line_col });
-    var i: usize = 0;
-    const rest = buf[prefix.len..];
-    for (c.body) |b| {
-        if (i >= rest.len) break;
-        rest[i] = if (b == '\n' or b == '\r') ' ' else b;
-        i += 1;
+    items: std.ArrayList(store.Comment) = .empty,
+    cursor: usize = 0,
+    scroll: usize = 0,
+
+    fn load(
+        self: *CommentList,
+        alloc: std.mem.Allocator,
+        live: []const store.Comment,
+    ) std.mem.Allocator.Error!void {
+        self.items.clearRetainingCapacity();
+        try self.items.appendSlice(alloc, live);
+        self.cursor = 0;
+        self.scroll = 0;
     }
-    return buf[0 .. prefix.len + i];
-}
 
-fn paintCommentList(
-    scr: *tui.Screen,
-    size: tui.Size,
-    items: []const store.Comment,
-    cursor: usize,
-    scroll: *usize,
-    line_buf: []u8,
-) void {
-    const bg = tui.Color{ .rgb = .{ .r = 0x12, .g = 0x12, .b = 0x14 } };
-    const fg = tui.Color{ .rgb = .{ .r = 0xd0, .g = 0xd0, .b = 0xd0 } };
-    const panel_bg = tui.Style{ .fg = fg, .bg = bg };
-    const panel_frame = tui.Style{
-        .fg = .{ .rgb = .{ .r = 0x5d, .g = 0x81, .b = 0xb7 } },
-        .bg = bg,
-        .bold = true,
-    };
-    const row_cur = tui.Style{
-        .fg = fg,
-        .bg = .{ .rgb = .{ .r = 0x2a, .g = 0x2a, .b = 0x30 } },
-        .bold = true,
-    };
-    const bar_track = tui.Style{
-        .fg = .{ .rgb = .{ .r = 0x6a, .g = 0x7a, .b = 0x9a } },
-        .bg = bg,
-        .dim = true,
-    };
-    const bar_thumb = tui.Style{
-        .fg = .{ .rgb = .{ .r = 0xee, .g = 0xee, .b = 0xee } },
-        .bg = .{ .rgb = .{ .r = 0x4a, .g = 0x6a, .b = 0x9a } },
-        .bold = true,
-    };
-
-    const panel = listOverlayRect(size.cols, size.rows, items.len);
-    scr.fillRect(panel, ' ', panel_bg);
-    scr.drawBox(panel, panel_frame);
-    const inner = panel.inset(1);
-    if (panel.h > 0 and panel.w > 2) {
-        scr.putStr(panel.x + 2, panel.y, " comments ", panel_frame, panel);
-    }
-    ensureListCursorVisible(scroll, cursor, inner.h, items.len);
-    if (inner.h == 0 or inner.w == 0) return;
-    if (items.len == 0) {
-        scr.putStr(inner.x, inner.y, "no comments", panel_bg, inner);
-        return;
-    }
-    const show_bar = items.len > inner.h;
-    const text_area = if (show_bar)
-        tui.Rect{ .x = inner.x, .y = inner.y, .w = inner.w -| 2, .h = inner.h }
-    else
-        inner;
-    const start = scroll.*;
-    var row: u16 = 0;
-    while (row < inner.h) : (row += 1) {
-        const idx = start + row;
-        if (idx >= items.len) break;
-        const y = inner.y + row;
-        const st = if (idx == cursor) row_cur else panel_bg;
-        scr.fillRect(.{ .x = inner.x, .y = y, .w = inner.w, .h = 1 }, ' ', st);
-        const text = formatListRow(line_buf, items[idx]);
-        scr.putStr(inner.x, y, text, st, text_area);
-    }
-    if (show_bar) {
-        const bar_x: u16 = inner.x + inner.w - 1;
-        const thumb = comment_input.scrollbarThumb(items.len, inner.h, start, inner.h);
-        var br: u16 = 0;
-        while (br < inner.h) : (br += 1) {
-            const in_thumb = br >= thumb.start and br < thumb.start + thumb.len;
-            const st = if (in_thumb) bar_thumb else bar_track;
-            const ch: u21 = if (in_thumb) '█' else '│';
-            scr.setCell(bar_x, inner.y + br, .{ .char = ch, .width = 1, .style = st });
-        }
-    }
-}
-
-fn paintDiscardConfirm(
-    scr: *tui.Screen,
-    size: tui.Size,
-    rows: []const view.row.Row,
-    cursor: usize,
-    discard: DiscardConfirm,
-) void {
-    const bg = tui.Color{ .rgb = .{ .r = 0x12, .g = 0x12, .b = 0x14 } };
-    const fg = tui.Color{ .rgb = .{ .r = 0xd0, .g = 0xd0, .b = 0xd0 } };
-    const panel_bg = tui.Style{ .fg = fg, .bg = bg };
-    const panel_frame = tui.Style{
-        .fg = .{ .rgb = .{ .r = 0x5d, .g = 0x81, .b = 0xb7 } },
-        .bg = bg,
-        .bold = true,
-    };
-    const choice_cur = tui.Style{
-        .fg = fg,
-        .bg = .{ .rgb = .{ .r = 0x2a, .g = 0x2a, .b = 0x30 } },
-        .bold = true,
-    };
-
-    var hunk_buf: [512]u8 = undefined;
-    const group = discard.kind == .group;
-    const hunk_text: []const u8, const path: []const u8 = if (group or discard.comments)
-        .{ "", "" }
-    else blk: {
-        const target = git.indexTargetAt(rows, cursor, discard.whole_file);
-        const hunk_row: ?view.row.Row = if (target) |t|
-            if (t.hunk_i != null) rows[t.first] else null
-        else
-            null;
-        const ht: []const u8 = if (hunk_row) |hr| formatRow(&hunk_buf, hr, false) else "";
-        break :blk .{ ht, if (target) |t| t.path else "" };
-    };
-
-    const content_n: u16 = if (group or discard.comments)
-        3
-    else if (hunk_text.len > 0)
-        4
-    else
-        3;
-    const want_w: u16 = @min(size.cols -| 4, 60);
-    const panel = tui.Rect.centered(size.cols, size.rows, want_w, content_n + 2);
-    scr.fillRect(panel, ' ', panel_bg);
-    scr.drawBox(panel, panel_frame);
-    if (panel.h > 0 and panel.w > 2) {
-        const title: []const u8 = switch (discard.kind) {
-            .group => switch (discard.group) {
-                .unstaged, .untracked => " stage ",
-                .staged => " unstage ",
+    fn handleKey(self: *CommentList, key: tui.Key, rows: []const view.row.Row) Result {
+        switch (key) {
+            .esc => return .closed,
+            .enter => {
+                if (self.cursor >= self.items.items.len) return .open;
+                const loc = comments.loc(self.items.items[self.cursor]) orelse return .missing;
+                const idx = view.rowForComment(rows, loc) orelse return .missing;
+                return .{ .jump = idx };
             },
-            .discard => if (discard.comments) " comments " else " discard ",
-        };
-        scr.putStr(panel.x + 2, panel.y, title, panel_frame, panel);
+            .char => |c| {
+                if (c == 'q' or c == 'Q') return .quit;
+                if (c == '?') return .help;
+                if (c == 'j') {
+                    if (self.cursor + 1 < self.items.items.len) self.cursor += 1;
+                } else if (c == 'k') {
+                    if (self.cursor > 0) self.cursor -= 1;
+                }
+            },
+            .down => {
+                if (self.cursor + 1 < self.items.items.len) self.cursor += 1;
+            },
+            .up => {
+                if (self.cursor > 0) self.cursor -= 1;
+            },
+            .ctrl_c => return .quit,
+            else => {},
+        }
+        return .open;
     }
-    const inner = panel.inset(1);
-    if (inner.h == 0 or inner.w == 0) return;
-    var row: u16 = 0;
-    if (group) {
-        const question: []const u8 = switch (discard.group) {
-            .unstaged => "Stage all unstaged?",
-            .untracked => "Stage all untracked?",
-            .staged => "Unstage all staged?",
-        };
-        if (row < inner.h) {
-            scr.putStr(inner.x, inner.y + row, question, panel_bg, inner);
-            row += 1;
-        }
-    } else if (discard.comments) {
-        if (row < inner.h) {
-            scr.putStr(inner.x, inner.y + row, "delete comments with this change?", panel_bg, inner);
-            row += 1;
-        }
-    } else {
-        if (path.len > 0 and row < inner.h) {
-            scr.putStr(inner.x, inner.y + row, path, panel_bg, inner);
-            row += 1;
-        }
-        if (hunk_text.len > 0 and row < inner.h) {
-            const start: usize = if (hunk_text[0] == ' ') 1 else 0;
-            scr.putStr(inner.x, inner.y + row, hunk_text[start..], panel_bg, inner);
-            row += 1;
-        }
-    }
-    if (row < inner.h) row += 1;
-    if (row >= inner.h) return;
-    paintYesNoChoices(scr, inner, inner.y + row, discard.yes, discard.comments, panel_bg, choice_cur);
-}
 
-/// Default choice is capitalized (`No`/`Yes`); the other stays lowercase.
-/// Highlight follows the current selection.
-fn paintYesNoChoices(
-    scr: *tui.Screen,
-    inner: tui.Rect,
-    y: u16,
-    yes: bool,
-    default_yes: bool,
-    panel_bg: tui.Style,
-    choice_cur: tui.Style,
-) void {
-    const no_label: []const u8 = if (default_yes) "no" else "No";
-    const yes_label: []const u8 = if (default_yes) "Yes" else "yes";
-    const no_w: u16 = 2;
-    const yes_w: u16 = 3;
-    const mid: u16 = inner.x + inner.w / 2;
-    const no_x: u16 = mid -| 6;
-    const yes_x: u16 = mid +| 2;
-    const n_st = if (!yes) choice_cur else panel_bg;
-    const y_st = if (yes) choice_cur else panel_bg;
-    scr.fillRect(.{ .x = no_x -| 1, .y = y, .w = no_w + 2, .h = 1 }, ' ', n_st);
-    scr.putStr(no_x, y, no_label, n_st, inner);
-    scr.fillRect(.{ .x = yes_x -| 1, .y = y, .w = yes_w + 2, .h = 1 }, ' ', y_st);
-    scr.putStr(yes_x, y, yes_label, y_st, inner);
-}
+    fn formatLineCol(buf: []u8, c: store.Comment) []const u8 {
+        const found = comments.loc(c) orelse return "-";
+        return switch (found.side) {
+            .old => bufPrintTrunc(buf, "-{d}", .{found.line}),
+            .new => bufPrintTrunc(buf, "+{d}", .{found.line}),
+        };
+    }
+
+    fn formatLine(buf: []u8, c: store.Comment) []const u8 {
+        var line_col_buf: [16]u8 = undefined;
+        const line_col = formatLineCol(&line_col_buf, c);
+        const side: []const u8 = if (c.side) |s| switch (s) {
+            .old => "old",
+            .new => "new",
+            .context => "ctx",
+        } else "-";
+        const prefix = bufPrintTrunc(buf, "{s}  {s}  {s}  {s}  ", .{ c.id, c.path, side, line_col });
+        var i: usize = 0;
+        const rest = buf[prefix.len..];
+        for (c.body) |b| {
+            if (i >= rest.len) break;
+            rest[i] = if (b == '\n' or b == '\r') ' ' else b;
+            i += 1;
+        }
+        return buf[0 .. prefix.len + i];
+    }
+
+    fn paint(self: *CommentList, scr: *tui.Screen, size: tui.Size) void {
+        const bg = tui.Color{ .rgb = .{ .r = 0x12, .g = 0x12, .b = 0x14 } };
+        const fg = tui.Color{ .rgb = .{ .r = 0xd0, .g = 0xd0, .b = 0xd0 } };
+        const panel_bg = tui.Style{ .fg = fg, .bg = bg };
+        const panel_frame = tui.Style{
+            .fg = .{ .rgb = .{ .r = 0x5d, .g = 0x81, .b = 0xb7 } },
+            .bg = bg,
+            .bold = true,
+        };
+        const row_cur = tui.Style{
+            .fg = fg,
+            .bg = .{ .rgb = .{ .r = 0x2a, .g = 0x2a, .b = 0x30 } },
+            .bold = true,
+        };
+        const bar_track = tui.Style{
+            .fg = .{ .rgb = .{ .r = 0x6a, .g = 0x7a, .b = 0x9a } },
+            .bg = bg,
+            .dim = true,
+        };
+        const bar_thumb = tui.Style{
+            .fg = .{ .rgb = .{ .r = 0xee, .g = 0xee, .b = 0xee } },
+            .bg = .{ .rgb = .{ .r = 0x4a, .g = 0x6a, .b = 0x9a } },
+            .bold = true,
+        };
+
+        const items = self.items.items;
+        const panel = listOverlayRect(size.cols, size.rows, items.len);
+        scr.fillRect(panel, ' ', panel_bg);
+        scr.drawBox(panel, panel_frame);
+        const inner = panel.inset(1);
+        if (panel.h > 0 and panel.w > 2) {
+            scr.putStr(panel.x + 2, panel.y, " comments ", panel_frame, panel);
+        }
+        ensureListCursorVisible(&self.scroll, self.cursor, inner.h, items.len);
+        if (inner.h == 0 or inner.w == 0) return;
+        if (items.len == 0) {
+            scr.putStr(inner.x, inner.y, "no comments", panel_bg, inner);
+            return;
+        }
+        const show_bar = items.len > inner.h;
+        const text_area = if (show_bar)
+            tui.Rect{ .x = inner.x, .y = inner.y, .w = inner.w -| 2, .h = inner.h }
+        else
+            inner;
+        const start = self.scroll;
+        var line_buf: [512]u8 = undefined;
+        var row: u16 = 0;
+        while (row < inner.h) : (row += 1) {
+            const idx = start + row;
+            if (idx >= items.len) break;
+            const y = inner.y + row;
+            const st = if (idx == self.cursor) row_cur else panel_bg;
+            scr.fillRect(.{ .x = inner.x, .y = y, .w = inner.w, .h = 1 }, ' ', st);
+            const text = formatLine(&line_buf, items[idx]);
+            scr.putStr(inner.x, y, text, st, text_area);
+        }
+        if (show_bar) {
+            const bar_x: u16 = inner.x + inner.w - 1;
+            const thumb = comment_input.scrollbarThumb(items.len, inner.h, start, inner.h);
+            var br: u16 = 0;
+            while (br < inner.h) : (br += 1) {
+                const in_thumb = br >= thumb.start and br < thumb.start + thumb.len;
+                const st = if (in_thumb) bar_thumb else bar_track;
+                const ch: u21 = if (in_thumb) '█' else '│';
+                scr.setCell(bar_x, inner.y + br, .{ .char = ch, .width = 1, .style = st });
+            }
+        }
+    }
+};
 
 /// File-list overlay (`Space` `f`): snapshot of file-header rows, cursor, keys, and paint.
 const FileList = struct {
@@ -1527,9 +1581,6 @@ fn paint(
     draft_scroll: *usize,
     draft_anchor: view.row.Anchor,
     status_note: []const u8,
-    list_items: []const store.Comment,
-    list_cursor: usize,
-    list_scroll: *usize,
     discard: DiscardConfirm,
 ) void {
     // Diff line palette (truecolor). Documented together so sticky file
@@ -1970,13 +2021,6 @@ fn paint(
         scr.hideCursor();
     }
 
-    if (focus == .listing) {
-        paintCommentList(scr, size, list_items, list_cursor, list_scroll, &line_buf);
-        scr.hideCursor();
-    } else if (focus == .discard_confirm) {
-        paintDiscardConfirm(scr, size, rows, cursor, discard);
-        scr.hideCursor();
-    }
 }
 
 fn rowMarked(row: view.row.Row, review: *const store.Review) bool {
