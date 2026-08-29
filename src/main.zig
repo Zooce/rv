@@ -176,12 +176,11 @@ fn runTui(alloc: std.mem.Allocator, io: std.Io, source: cli.Source) !u8 {
     var file_list: FileList = .{};
     defer file_list.items.deinit(alloc);
     var help: Help = .{};
-    // One-shot footer note (owned bytes; len 0 = none). Cleared on next key.
-    var note: StatusNote = .{};
+    var frame: Frame = .{};
     var failure: Failure = .{};
     defer failure.buf.deinit(alloc);
 
-    paint(&scr, size, diff_view.rows, diff_view.sbs_slots, &viewport, &review, source, focus, &draft, note.slice(), discard_confirm);
+    frame.paint(&scr, size, &diff_view, &viewport, &review, source, focus, &draft, discard_confirm);
     try scr.present(&term);
 
     while (running) {
@@ -194,14 +193,14 @@ fn runTui(alloc: std.mem.Allocator, io: std.Io, source: cli.Source) !u8 {
             },
             .key => |key| {
                 // Notes are one-shot; any key clears them (including keys that no-op).
-                note.clear();
+                frame.note.clear();
                 switch (focus) {
                     .commenting => switch (try draft.handleKey(alloc, io, &review, key, size)) {
                         .closed => focus = .normal,
                         .quit => running = false,
                         .save_failed => {
                             focus = .normal;
-                            note.set("failed to save .rv comment store");
+                            frame.note.set("failed to save .rv comment store");
                         },
                         .open => {},
                     },
@@ -211,11 +210,11 @@ fn runTui(alloc: std.mem.Allocator, io: std.Io, source: cli.Source) !u8 {
                         .jump => |hit| {
                             viewport.cursor = hit.index;
                             focus = .normal;
-                            if (hit.wrapped) note.set("search wrapped");
+                            if (hit.wrapped) frame.note.set("search wrapped");
                         },
                         .missing => {
                             focus = .normal;
-                            note.setFmt("Pattern not found: {s}", .{search.last_query.items});
+                            frame.note.setFmt("Pattern not found: {s}", .{search.last_query.items});
                         },
                         .open => {},
                     },
@@ -230,7 +229,7 @@ fn runTui(alloc: std.mem.Allocator, io: std.Io, source: cli.Source) !u8 {
                             viewport.cursor = row;
                             focus = .normal;
                         },
-                        .missing => note.set("comment not in this diff"),
+                        .missing => frame.note.set("comment not in this diff"),
                         .open => {},
                     },
                     .files => switch (file_list.handleKey(key)) {
@@ -269,7 +268,7 @@ fn runTui(alloc: std.mem.Allocator, io: std.Io, source: cli.Source) !u8 {
                                 source,
                                 &diff_view,
                                 &viewport.cursor,
-                                &note,
+                                &frame.note,
                                 &focus,
                                 &failure,
                                 &review,
@@ -283,7 +282,7 @@ fn runTui(alloc: std.mem.Allocator, io: std.Io, source: cli.Source) !u8 {
                                 source,
                                 &diff_view,
                                 &viewport.cursor,
-                                &note,
+                                &frame.note,
                                 &focus,
                                 &failure,
                                 &review,
@@ -317,7 +316,7 @@ fn runTui(alloc: std.mem.Allocator, io: std.Io, source: cli.Source) !u8 {
                                         source,
                                         &diff_view,
                                         &viewport.cursor,
-                                        &note,
+                                        &frame.note,
                                         &focus,
                                         &failure,
                                         &review,
@@ -332,7 +331,7 @@ fn runTui(alloc: std.mem.Allocator, io: std.Io, source: cli.Source) !u8 {
                                             source,
                                             &diff_view,
                                             &viewport.cursor,
-                                            &note,
+                                            &frame.note,
                                             &focus,
                                             &failure,
                                             &review,
@@ -347,7 +346,7 @@ fn runTui(alloc: std.mem.Allocator, io: std.Io, source: cli.Source) !u8 {
                                             focus = .discard_confirm;
                                         }
                                     } else {
-                                        dismissAt(&review, alloc, io, diff_view.rows, diff_view.sbs_slots, layout, viewport.cursor, .new, &note);
+                                        dismissAt(&review, alloc, io, diff_view.rows, diff_view.sbs_slots, layout, viewport.cursor, .new, &frame.note);
                                     }
                                 } else if (after_leader and c == 'x') {
                                     if (source == .local and view.nav.currentHunkInFile(diff_view.rows, viewport.cursor) != null) {
@@ -372,27 +371,27 @@ fn runTui(alloc: std.mem.Allocator, io: std.Io, source: cli.Source) !u8 {
                                 } else if (c == 'n') {
                                     switch (search.next(diff_view.rows, viewport.cursor)) {
                                         .none => {},
-                                        .missing => note.set("Pattern not found"),
+                                        .missing => frame.note.set("Pattern not found"),
                                         .hit => |hit| {
                                             viewport.cursor = hit.index;
-                                            if (hit.wrapped) note.set("search wrapped");
+                                            if (hit.wrapped) frame.note.set("search wrapped");
                                         },
                                     }
                                 } else if (c == 'N') {
                                     switch (search.prev(diff_view.rows, viewport.cursor)) {
                                         .none => {},
-                                        .missing => note.set("Pattern not found"),
+                                        .missing => frame.note.set("Pattern not found"),
                                         .hit => |hit| {
                                             viewport.cursor = hit.index;
-                                            if (hit.wrapped) note.set("search wrapped");
+                                            if (hit.wrapped) frame.note.set("search wrapped");
                                         },
                                     }
                                 } else if (c == ')') {
-                                    jumpLiveComment(&review, diff_view.rows, &viewport.cursor, &note, .next);
+                                    jumpLiveComment(&review, diff_view.rows, &viewport.cursor, &frame.note, .next);
                                 } else if (c == '(') {
-                                    jumpLiveComment(&review, diff_view.rows, &viewport.cursor, &note, .prev);
+                                    jumpLiveComment(&review, diff_view.rows, &viewport.cursor, &frame.note, .prev);
                                 } else if (c == 'r') {
-                                    reloadDiff(alloc, io, source, &diff_view, &viewport.cursor, &note);
+                                    reloadDiff(alloc, io, source, &diff_view, &viewport.cursor, &frame.note);
                                 } else if (c == 'i' or c == 'c' or c == 'a') {
                                     if (try draft.begin(&review, alloc, diff_view.rows, diff_view.sbs_slots, layout, viewport.cursor, .new)) {
                                         focus = .commenting;
@@ -402,9 +401,9 @@ fn runTui(alloc: std.mem.Allocator, io: std.Io, source: cli.Source) !u8 {
                                         focus = .commenting;
                                     }
                                 } else if (c == 'd') {
-                                    dismissAt(&review, alloc, io, diff_view.rows, diff_view.sbs_slots, layout, viewport.cursor, .new, &note);
+                                    dismissAt(&review, alloc, io, diff_view.rows, diff_view.sbs_slots, layout, viewport.cursor, .new, &frame.note);
                                 } else if (c == 'D') {
-                                    dismissAt(&review, alloc, io, diff_view.rows, diff_view.sbs_slots, layout, viewport.cursor, .old, &note);
+                                    dismissAt(&review, alloc, io, diff_view.rows, diff_view.sbs_slots, layout, viewport.cursor, .old, &frame.note);
                                 }
                             },
                             .enter => {
@@ -423,7 +422,7 @@ fn runTui(alloc: std.mem.Allocator, io: std.Io, source: cli.Source) !u8 {
             },
         }
         if (running) {
-            paint(&scr, size, diff_view.rows, diff_view.sbs_slots, &viewport, &review, source, focus, &draft, note.slice(), discard_confirm);
+            frame.paint(&scr, size, &diff_view, &viewport, &review, source, focus, &draft, discard_confirm);
             if (focus == .helping) {
                 help.paint(&scr, size);
                 scr.hideCursor();
@@ -807,6 +806,19 @@ const DiscardConfirm = struct {
         paintYesNoChoices(scr, inner, inner.y + row, self.yes, self.comments, panel_bg, choice_cur);
     }
 
+    fn titleBar(self: DiscardConfirm) []const u8 {
+        return switch (self.kind) {
+            .group => switch (self.group) {
+                .unstaged, .untracked => "rv  stage all  No/yes  Enter  Esc cancel  q quit",
+                .staged => "rv  unstage all  No/yes  Enter  Esc cancel  q quit",
+            },
+            .discard => if (self.comments)
+                "rv  discard comments  no/Yes  Enter  Esc cancel  q quit"
+            else
+                "rv  discard  No/yes  Enter  Esc cancel  q quit",
+        };
+    }
+
     /// Default choice is capitalized (`No`/`Yes`); the other stays lowercase.
     /// Highlight follows the current selection.
     fn paintYesNoChoices(
@@ -885,6 +897,14 @@ const Draft = struct {
             self.edit_id = c.id;
         }
         return true;
+    }
+
+    fn titleBar(self: *const Draft) []const u8 {
+        return switch (sideForAnchor(self.anchor)) {
+            .new => "rv  create/edit new  Enter save  Esc cancel  ↑↓ scroll",
+            .old => "rv  create/edit old  Enter save  Esc cancel  ↑↓ scroll",
+            .context => "rv  create/edit  Enter save  Esc cancel  ↑↓ scroll",
+        };
     }
 
     fn handleKey(
@@ -1145,9 +1165,9 @@ const Search = struct {
     }
 };
 
-/// One-shot footer message. Bytes always live in `buf`; `len == 0` means none.
-/// Avoids optional slices that sometimes point at static strings and sometimes
-/// at a separate buffer.
+/// One-shot footer message owned by `Frame`. Bytes always live in `buf`;
+/// `len == 0` means none. Avoids optional slices that sometimes point at
+/// static strings and sometimes at a separate buffer.
 const StatusNote = struct {
     buf: [96]u8 = undefined,
     len: usize = 0,
@@ -1719,303 +1739,267 @@ test "indexHintForRow section all" {
     try std.testing.expectEqualStrings("", indexHintForRow(0, null, null, null, .unstaged));
 }
 
-fn paint(
-    scr: *tui.Screen,
-    size: tui.Size,
-    rows: []const view.row.Row,
-    sbs_slots: []const view.layout.SbsSlot,
-    viewport: *Viewport,
-    review: *const store.Review,
-    source: cli.Source,
-    focus: Focus,
-    draft: *const Draft,
-    status_note: []const u8,
-    discard: DiscardConfirm,
-) void {
-    // Diff line palette (truecolor). Documented together so sticky file
-    // headers (#36) and body paints share one table. Hierarchy:
-    //   body          — near-black bg, neutral fg
-    //   section header — body bg, box-drawing rule (`─ Unstaged ─`)
-    //   file header   — full-row dark grey bar, bold light path
-    //   hunk header   — full-row deeper grey bar, light `@@`
-    //   add / delete  — green/red fills (#35); markers are not restored
-    //   *@_cur        — lighter lift of the same kind (keeps identity)
-    //   meta / meta@cur — dim / reverse gray only
-    // No color → bg may not show; structure still relies on bold/dim when set.
-    const bg = tui.Color{ .rgb = .{ .r = 0x12, .g = 0x12, .b = 0x14 } };
-    const fg = tui.Color{ .rgb = .{ .r = 0xd0, .g = 0xd0, .b = 0xd0 } };
-    const body = tui.Style{ .fg = fg, .bg = bg };
-    const section_style = tui.Style{
-        .fg = .{ .rgb = .{ .r = 0x6a, .g = 0x6a, .b = 0x76 } },
-        .bg = bg,
-    };
-    const section_cur_style = tui.Style{
-        .fg = .{ .rgb = .{ .r = 0x7e, .g = 0x7e, .b = 0x8b } },
-        .bg = bg,
-        .bold = true,
-    };
-    const title_style = tui.Style{
-        .fg = .{ .rgb = .{ .r = 0xee, .g = 0xee, .b = 0xee } },
-        .bg = .{ .rgb = .{ .r = 0x2a, .g = 0x3f, .b = 0x5f } },
-        .bold = true,
-    };
-    const footer_style = tui.Style{
-        .fg = .{ .rgb = .{ .r = 0xee, .g = 0xee, .b = 0xee } },
-        .bg = .{ .rgb = .{ .r = 0x2a, .g = 0x3f, .b = 0x5f } },
-    };
-    // File header: dark grey bar + light bold path (clear vs body; not green/red).
-    const file_style = tui.Style{
-        .fg = .{ .rgb = .{ .r = 0xee, .g = 0xee, .b = 0xf0 } },
-        .bg = .{ .rgb = .{ .r = 0x48, .g = 0x48, .b = 0x4c } },
-        .bold = true,
-    };
-    const file_cur_style = tui.Style{
-        .fg = .{ .rgb = .{ .r = 0xff, .g = 0xff, .b = 0xff } },
-        .bg = .{ .rgb = .{ .r = 0x60, .g = 0x60, .b = 0x64 } },
-        .bold = true,
-    };
-    // Hunk header: deeper grey bar (dimmer than file; light `@@`).
-    const hunk_style = tui.Style{
-        .fg = .{ .rgb = .{ .r = 0xc8, .g = 0xc8, .b = 0xcc } },
-        .bg = .{ .rgb = .{ .r = 0x30, .g = 0x30, .b = 0x34 } },
-    };
-    const hunk_cur_style = tui.Style{
-        .fg = .{ .rgb = .{ .r = 0xee, .g = 0xee, .b = 0xf0 } },
-        .bg = .{ .rgb = .{ .r = 0x44, .g = 0x44, .b = 0x48 } },
-        .bold = true,
-    };
-    const add_style = tui.Style{
-        .fg = .{ .rgb = .{ .r = 0xb8, .g = 0xe0, .b = 0xb8 } },
-        .bg = .{ .rgb = .{ .r = 0x1a, .g = 0x2e, .b = 0x1f } },
-    };
-    const del_style = tui.Style{
-        .fg = .{ .rgb = .{ .r = 0xe8, .g = 0xc0, .b = 0xc4 } },
-        .bg = .{ .rgb = .{ .r = 0x3a, .g = 0x1c, .b = 0x20 } },
-    };
-    const add_cur_style = tui.Style{
-        .fg = .{ .rgb = .{ .r = 0xe8, .g = 0xff, .b = 0xe8 } },
-        .bg = .{ .rgb = .{ .r = 0x24, .g = 0x52, .b = 0x30 } },
-        .bold = true,
-    };
-    const del_cur_style = tui.Style{
-        .fg = .{ .rgb = .{ .r = 0xff, .g = 0xe8, .b = 0xea } },
-        .bg = .{ .rgb = .{ .r = 0x6b, .g = 0x2a, .b = 0x32 } },
-        .bold = true,
-    };
-    // Context cursor: lighter lift of body bg (same idea as add/delete cursor).
-    const ctx_cur_style = tui.Style{
-        .fg = fg,
-        .bg = .{ .rgb = .{ .r = 0x2a, .g = 0x2a, .b = 0x30 } },
-        .bold = true,
-    };
-    const meta_style = tui.Style{
-        .fg = .{ .rgb = .{ .r = 0x80, .g = 0x80, .b = 0x80 } },
-        .bg = bg,
-        .dim = true,
-    };
-    // Meta cursor only (headers use file_cur / hunk_cur).
-    const cur_style = tui.Style{
-        .fg = .{ .rgb = .{ .r = 0x12, .g = 0x12, .b = 0x14 } },
-        .bg = .{ .rgb = .{ .r = 0xc8, .g = 0xc8, .b = 0xc8 } },
-        .bold = true,
-    };
+/// Review frame: title bar, diff body, status footer, and one-shot footer note.
+const Frame = struct {
+    note: StatusNote = .{},
 
-    scr.clearStyle(body);
+    fn paint(
+        self: *const Frame,
+        scr: *tui.Screen,
+        size: tui.Size,
+        diff_view: *const DiffView,
+        viewport: *Viewport,
+        review: *const store.Review,
+        source: cli.Source,
+        focus: Focus,
+        draft: *const Draft,
+        discard: DiscardConfirm,
+    ) void {
+        const rows = diff_view.rows;
+        const sbs_slots = diff_view.sbs_slots;
+        const status_note = self.note.slice();
 
-    if (size.rows > 0) {
-        fillRow(scr, 0, title_style);
-        const help = switch (focus) {
-            .commenting => switch (sideForAnchor(draft.anchor)) {
-                .new => "rv  create/edit new  Enter save  Esc cancel  ↑↓ scroll",
-                .old => "rv  create/edit old  Enter save  Esc cancel  ↑↓ scroll",
-                .context => "rv  create/edit  Enter save  Esc cancel  ↑↓ scroll",
-            },
-            .searching => "rv  search  Enter jump  Esc cancel",
-            .listing => "rv  comments  j/k move  Enter jump  Esc close  q quit",
-            .files => "rv  files  j/k move  Enter jump  Esc close  q quit",
-            .helping => "rv  help  j/k  Esc/? close  q quit",
-            .git_error => "rv  git error  Enter/Esc close  q quit",
-            .discard_confirm => switch (discard.kind) {
-                .group => switch (discard.group) {
-                    .unstaged, .untracked => "rv  stage all  No/yes  Enter  Esc cancel  q quit",
-                    .staged => "rv  unstage all  No/yes  Enter  Esc cancel  q quit",
-                },
-                .discard => if (discard.comments)
-                    "rv  discard comments  no/Yes  Enter  Esc cancel  q quit"
-                else
-                    "rv  discard  No/yes  Enter  Esc cancel  q quit",
-            },
-            .normal => "rv  j/k  /  i/I  ? help  q quit",
+        // Diff line palette (truecolor). Documented together so sticky file
+        // headers (#36) and body paints share one table. Hierarchy:
+        //   body          — near-black bg, neutral fg
+        //   section header — body bg, box-drawing rule (`─ Unstaged ─`)
+        //   file header   — full-row dark grey bar, bold light path
+        //   hunk header   — full-row deeper grey bar, light `@@`
+        //   add / delete  — green/red fills (#35); markers are not restored
+        //   *@_cur        — lighter lift of the same kind (keeps identity)
+        //   meta / meta@cur — dim / reverse gray only
+        // No color → bg may not show; structure still relies on bold/dim when set.
+        const bg = tui.Color{ .rgb = .{ .r = 0x12, .g = 0x12, .b = 0x14 } };
+        const fg = tui.Color{ .rgb = .{ .r = 0xd0, .g = 0xd0, .b = 0xd0 } };
+        const body = tui.Style{ .fg = fg, .bg = bg };
+        const section_style = tui.Style{
+            .fg = .{ .rgb = .{ .r = 0x6a, .g = 0x6a, .b = 0x76 } },
+            .bg = bg,
         };
-        scr.putStr(1, 0, help, title_style, null);
-    }
-
-    // Footer: 1 status row, search prompt, or soft-wrapped comment box.
-    const has_footer = size.rows >= 2;
-    const footer_h: u16 = if (!has_footer)
-        0
-    else if (focus == .commenting)
-        draft.metrics(size).height
-    else
-        1;
-    const footer_top: u16 = if (has_footer) size.rows - footer_h else 0;
-    const content_top: u16 = 1;
-    const content_bottom: u16 = if (has_footer) footer_top else size.rows;
-    const content_rows: usize = if (content_bottom > content_top)
-        content_bottom - content_top
-    else
-        0;
-
-    const cur = view.row.clampCursor(viewport.cursor, rows.len);
-    const layout = view.layout.effectiveLayout(viewport.layout_pref, size.cols);
-    const gutter_style = tui.Style{
-        .fg = .{ .rgb = .{ .r = 0x50, .g = 0x50, .b = 0x58 } },
-        .bg = bg,
-    };
-
-    var line_buf: [512]u8 = undefined;
-    // Only lines in the cursor's hunk pan; file/hunk headers never pan.
-    const pan_span = view.viewport.hunkSpanAt(rows, cur);
-    const hunk_w = hunkMaxLineWidth(rows, pan_span);
-    const pan_vp: usize = viewport.panViewportCols(size.cols);
-    viewport.col_scroll = view.viewport.clampColScroll(viewport.col_scroll, hunk_w, pan_vp);
-    const cs = viewport.col_scroll;
-
-    const hints_ok = source == .local and focus == .normal and rows.len > 0;
-    const hint_section: ?usize = if (hints_ok and rows[cur] == .section_header) cur else null;
-    const hint_file: ?usize = blk: {
-        if (!hints_ok or hint_section != null) break :blk null;
-        const fi = view.nav.currentFileStart(rows, cur) orelse break :blk null;
-        const grouped = switch (rows[fi]) {
-            .file_header => |fh| fh.group != null,
-            else => false,
+        const section_cur_style = tui.Style{
+            .fg = .{ .rgb = .{ .r = 0x7e, .g = 0x7e, .b = 0x8b } },
+            .bg = bg,
+            .bold = true,
         };
-        break :blk if (grouped) fi else null;
-    };
-    const hint_hunk: ?usize = if (hint_file != null)
-        view.nav.currentHunkInFile(rows, cur)
-    else
-        null;
-    const hint_group: ?diff.Group = if (hint_file) |fi|
-        rows[fi].file_header.group
-    else if (hint_section) |si|
-        rows[si].section_header
-    else
-        null;
+        const title_style = tui.Style{
+            .fg = .{ .rgb = .{ .r = 0xee, .g = 0xee, .b = 0xee } },
+            .bg = .{ .rgb = .{ .r = 0x2a, .g = 0x3f, .b = 0x5f } },
+            .bold = true,
+        };
+        const footer_style = tui.Style{
+            .fg = .{ .rgb = .{ .r = 0xee, .g = 0xee, .b = 0xee } },
+            .bg = .{ .rgb = .{ .r = 0x2a, .g = 0x3f, .b = 0x5f } },
+        };
+        // File header: dark grey bar + light bold path (clear vs body; not green/red).
+        const file_style = tui.Style{
+            .fg = .{ .rgb = .{ .r = 0xee, .g = 0xee, .b = 0xf0 } },
+            .bg = .{ .rgb = .{ .r = 0x48, .g = 0x48, .b = 0x4c } },
+            .bold = true,
+        };
+        const file_cur_style = tui.Style{
+            .fg = .{ .rgb = .{ .r = 0xff, .g = 0xff, .b = 0xff } },
+            .bg = .{ .rgb = .{ .r = 0x60, .g = 0x60, .b = 0x64 } },
+            .bold = true,
+        };
+        // Hunk header: deeper grey bar (dimmer than file; light `@@`).
+        const hunk_style = tui.Style{
+            .fg = .{ .rgb = .{ .r = 0xc8, .g = 0xc8, .b = 0xcc } },
+            .bg = .{ .rgb = .{ .r = 0x30, .g = 0x30, .b = 0x34 } },
+        };
+        const hunk_cur_style = tui.Style{
+            .fg = .{ .rgb = .{ .r = 0xee, .g = 0xee, .b = 0xf0 } },
+            .bg = .{ .rgb = .{ .r = 0x44, .g = 0x44, .b = 0x48 } },
+            .bold = true,
+        };
+        const add_style = tui.Style{
+            .fg = .{ .rgb = .{ .r = 0xb8, .g = 0xe0, .b = 0xb8 } },
+            .bg = .{ .rgb = .{ .r = 0x1a, .g = 0x2e, .b = 0x1f } },
+        };
+        const del_style = tui.Style{
+            .fg = .{ .rgb = .{ .r = 0xe8, .g = 0xc0, .b = 0xc4 } },
+            .bg = .{ .rgb = .{ .r = 0x3a, .g = 0x1c, .b = 0x20 } },
+        };
+        const add_cur_style = tui.Style{
+            .fg = .{ .rgb = .{ .r = 0xe8, .g = 0xff, .b = 0xe8 } },
+            .bg = .{ .rgb = .{ .r = 0x24, .g = 0x52, .b = 0x30 } },
+            .bold = true,
+        };
+        const del_cur_style = tui.Style{
+            .fg = .{ .rgb = .{ .r = 0xff, .g = 0xe8, .b = 0xea } },
+            .bg = .{ .rgb = .{ .r = 0x6b, .g = 0x2a, .b = 0x32 } },
+            .bold = true,
+        };
+        // Context cursor: lighter lift of body bg (same idea as add/delete cursor).
+        const ctx_cur_style = tui.Style{
+            .fg = fg,
+            .bg = .{ .rgb = .{ .r = 0x2a, .g = 0x2a, .b = 0x30 } },
+            .bold = true,
+        };
+        const meta_style = tui.Style{
+            .fg = .{ .rgb = .{ .r = 0x80, .g = 0x80, .b = 0x80 } },
+            .bg = bg,
+            .dim = true,
+        };
+        // Meta cursor only (headers use file_cur / hunk_cur).
+        const cur_style = tui.Style{
+            .fg = .{ .rgb = .{ .r = 0x12, .g = 0x12, .b = 0x14 } },
+            .bg = .{ .rgb = .{ .r = 0xc8, .g = 0xc8, .b = 0xc8 } },
+            .bold = true,
+        };
 
-    switch (layout) {
-        .unified => {
-            const settled = view.viewport.ensureVisibleSticky(viewport.scroll, cur, content_rows, rows);
-            viewport.scroll = settled.scroll;
-            const sticky = settled.sticky;
-            var screen_y: u16 = content_top;
+        scr.clearStyle(body);
 
-            // Sticky file path under the title bar (hunk headers scroll with body).
-            if (sticky.file_idx) |fi| {
-                if (screen_y < content_bottom) {
-                    const text = formatRow(&line_buf, rows[fi], false);
-                    const st = if (fi == cur) file_cur_style else file_style;
-                    fillRow(scr, screen_y, st);
-                    putRowHint(scr, screen_y, text, indexHintForRow(fi, hint_file, hint_hunk, hint_section, hint_group), st);
+        if (size.rows > 0) {
+            fillRow(scr, 0, title_style);
+            const help = switch (focus) {
+                .commenting => draft.titleBar(),
+                .searching => "rv  search  Enter jump  Esc cancel",
+                .listing => "rv  comments  j/k move  Enter jump  Esc close  q quit",
+                .files => "rv  files  j/k move  Enter jump  Esc close  q quit",
+                .helping => "rv  help  j/k  Esc/? close  q quit",
+                .git_error => "rv  git error  Enter/Esc close  q quit",
+                .discard_confirm => discard.titleBar(),
+                .normal => "rv  j/k  /  i/I  ? help  q quit",
+            };
+            scr.putStr(1, 0, help, title_style, null);
+        }
+
+        // Footer: 1 status row, search prompt, or soft-wrapped comment box.
+        const has_footer = size.rows >= 2;
+        const footer_h: u16 = if (!has_footer)
+            0
+        else if (focus == .commenting)
+            draft.metrics(size).height
+        else
+            1;
+        const footer_top: u16 = if (has_footer) size.rows - footer_h else 0;
+        const content_top: u16 = 1;
+        const content_bottom: u16 = if (has_footer) footer_top else size.rows;
+        const content_rows: usize = if (content_bottom > content_top)
+            content_bottom - content_top
+        else
+            0;
+
+        const cur = view.row.clampCursor(viewport.cursor, rows.len);
+        const layout = view.layout.effectiveLayout(viewport.layout_pref, size.cols);
+        const gutter_style = tui.Style{
+            .fg = .{ .rgb = .{ .r = 0x50, .g = 0x50, .b = 0x58 } },
+            .bg = bg,
+        };
+
+        var line_buf: [512]u8 = undefined;
+        // Only lines in the cursor's hunk pan; file/hunk headers never pan.
+        const pan_span = view.viewport.hunkSpanAt(rows, cur);
+        const hunk_w = hunkMaxLineWidth(rows, pan_span);
+        const pan_vp: usize = viewport.panViewportCols(size.cols);
+        viewport.col_scroll = view.viewport.clampColScroll(viewport.col_scroll, hunk_w, pan_vp);
+        const cs = viewport.col_scroll;
+
+        const hints_ok = source == .local and focus == .normal and rows.len > 0;
+        const hint_section: ?usize = if (hints_ok and rows[cur] == .section_header) cur else null;
+        const hint_file: ?usize = blk: {
+            if (!hints_ok or hint_section != null) break :blk null;
+            const fi = view.nav.currentFileStart(rows, cur) orelse break :blk null;
+            const grouped = switch (rows[fi]) {
+                .file_header => |fh| fh.group != null,
+                else => false,
+            };
+            break :blk if (grouped) fi else null;
+        };
+        const hint_hunk: ?usize = if (hint_file != null)
+            view.nav.currentHunkInFile(rows, cur)
+        else
+            null;
+        const hint_group: ?diff.Group = if (hint_file) |fi|
+            rows[fi].file_header.group
+        else if (hint_section) |si|
+            rows[si].section_header
+        else
+            null;
+
+        switch (layout) {
+            .unified => {
+                const settled = view.viewport.ensureVisibleSticky(viewport.scroll, cur, content_rows, rows);
+                viewport.scroll = settled.scroll;
+                const sticky = settled.sticky;
+                var screen_y: u16 = content_top;
+
+                // Sticky file path under the title bar (hunk headers scroll with body).
+                if (sticky.file_idx) |fi| {
+                    if (screen_y < content_bottom) {
+                        const text = formatRow(&line_buf, rows[fi], false);
+                        const st = if (fi == cur) file_cur_style else file_style;
+                        fillRow(scr, screen_y, st);
+                        putRowHint(scr, screen_y, text, indexHintForRow(fi, hint_file, hint_hunk, hint_section, hint_group), st);
+                        screen_y += 1;
+                    }
+                }
+
+                var i: usize = viewport.scroll;
+                while (i < rows.len and screen_y < content_bottom) : (i += 1) {
+                    const is_cur = i == cur;
+                    const marked = rowMarked(rows[i], review);
+                    const text = formatRow(&line_buf, rows[i], marked);
+                    const st = rowStyle(
+                        rows[i],
+                        is_cur,
+                        body,
+                        section_style,
+                        section_cur_style,
+                        file_style,
+                        file_cur_style,
+                        hunk_style,
+                        hunk_cur_style,
+                        add_style,
+                        del_style,
+                        add_cur_style,
+                        del_cur_style,
+                        ctx_cur_style,
+                        meta_style,
+                        cur_style,
+                    );
+                    if (rows[i] == .section_header) {
+                        scr.fillRect(.{ .x = 0, .y = screen_y, .w = scr.cols, .h = 1 }, '─', st);
+                    } else {
+                        fillRow(scr, screen_y, st);
+                    }
+                    const hint = indexHintForRow(i, hint_file, hint_hunk, hint_section, hint_group);
+                    if (hint.len > 0) {
+                        putRowHint(scr, screen_y, text, hint, st);
+                    } else {
+                        const pan = pan_span.containsBody(i);
+                        const visible = if (pan) text[tui.screen.byteAtCol(text, cs)..] else text;
+                        scr.putStr(0, screen_y, visible, st, null);
+                    }
                     screen_y += 1;
                 }
-            }
+            },
+            .side_by_side => {
+                const settled = view.viewport.ensureVisibleStickySbs(viewport.scroll, cur, content_rows, sbs_slots, rows);
+                viewport.scroll = settled.scroll;
+                const sticky = settled.sticky;
+                const panes = view.layout.sbsPaneWidths(size.cols);
+                var screen_y: u16 = content_top;
 
-            var i: usize = viewport.scroll;
-            while (i < rows.len and screen_y < content_bottom) : (i += 1) {
-                const is_cur = i == cur;
-                const marked = rowMarked(rows[i], review);
-                const text = formatRow(&line_buf, rows[i], marked);
-                const st = rowStyle(
-                    rows[i],
-                    is_cur,
-                    body,
-                    section_style,
-                    section_cur_style,
-                    file_style,
-                    file_cur_style,
-                    hunk_style,
-                    hunk_cur_style,
-                    add_style,
-                    del_style,
-                    add_cur_style,
-                    del_cur_style,
-                    ctx_cur_style,
-                    meta_style,
-                    cur_style,
-                );
-                if (rows[i] == .section_header) {
-                    scr.fillRect(.{ .x = 0, .y = screen_y, .w = scr.cols, .h = 1 }, '─', st);
-                } else {
-                    fillRow(scr, screen_y, st);
+                if (sticky.file_idx) |fi| {
+                    if (screen_y < content_bottom) {
+                        const text = formatRow(&line_buf, rows[fi], false);
+                        const st = if (fi == cur) file_cur_style else file_style;
+                        fillRow(scr, screen_y, st);
+                        putRowHint(scr, screen_y, text, indexHintForRow(fi, hint_file, hint_hunk, hint_section, hint_group), st);
+                        screen_y += 1;
+                    }
                 }
-                const hint = indexHintForRow(i, hint_file, hint_hunk, hint_section, hint_group);
-                if (hint.len > 0) {
-                    putRowHint(scr, screen_y, text, hint, st);
-                } else {
-                    const pan = pan_span.containsBody(i);
-                    const visible = if (pan) text[tui.screen.byteAtCol(text, cs)..] else text;
-                    scr.putStr(0, screen_y, visible, st, null);
-                }
-                screen_y += 1;
-            }
-        },
-        .side_by_side => {
-            const settled = view.viewport.ensureVisibleStickySbs(viewport.scroll, cur, content_rows, sbs_slots, rows);
-            viewport.scroll = settled.scroll;
-            const sticky = settled.sticky;
-            const panes = view.layout.sbsPaneWidths(size.cols);
-            var screen_y: u16 = content_top;
 
-            if (sticky.file_idx) |fi| {
-                if (screen_y < content_bottom) {
-                    const text = formatRow(&line_buf, rows[fi], false);
-                    const st = if (fi == cur) file_cur_style else file_style;
-                    fillRow(scr, screen_y, st);
-                    putRowHint(scr, screen_y, text, indexHintForRow(fi, hint_file, hint_hunk, hint_section, hint_group), st);
-                    screen_y += 1;
-                }
-            }
-
-            var si: usize = viewport.scroll;
-            while (si < sbs_slots.len and screen_y < content_bottom) : (si += 1) {
-                switch (sbs_slots[si]) {
-                    .header => |ri| {
-                        const is_cur = ri == cur;
-                        const text = formatRow(&line_buf, rows[ri], false);
-                        const st = rowStyle(
-                            rows[ri],
-                            is_cur,
-                            body,
-                            section_style,
-                            section_cur_style,
-                            file_style,
-                            file_cur_style,
-                            hunk_style,
-                            hunk_cur_style,
-                            add_style,
-                            del_style,
-                            add_cur_style,
-                            del_cur_style,
-                            ctx_cur_style,
-                            meta_style,
-                            cur_style,
-                        );
-                        if (rows[ri] == .section_header) {
-                            scr.fillRect(.{ .x = 0, .y = screen_y, .w = scr.cols, .h = 1 }, '─', st);
-                        } else {
-                            fillRow(scr, screen_y, st);
-                        }
-                        putRowHint(scr, screen_y, text, indexHintForRow(ri, hint_file, hint_hunk, hint_section, hint_group), st);
-                    },
-                    .pair => |p| {
-                        // Whole slot is current when the cursor sits on either pane
-                        // (paired del|add highlight together as one split row).
-                        const slot_cur = sbs_slots[si].containsRow(cur);
-                        const left_st = if (p.left) |ri|
-                            rowStyle(
+                var si: usize = viewport.scroll;
+                while (si < sbs_slots.len and screen_y < content_bottom) : (si += 1) {
+                    switch (sbs_slots[si]) {
+                        .header => |ri| {
+                            const is_cur = ri == cur;
+                            const text = formatRow(&line_buf, rows[ri], false);
+                            const st = rowStyle(
                                 rows[ri],
-                                slot_cur,
+                                is_cur,
                                 body,
                                 section_style,
                                 section_cur_style,
@@ -2030,82 +2014,112 @@ fn paint(
                                 ctx_cur_style,
                                 meta_style,
                                 cur_style,
-                            )
-                        else if (slot_cur) ctx_cur_style else body;
-                        const right_st = if (p.right) |ri|
-                            rowStyle(
-                                rows[ri],
-                                slot_cur,
-                                body,
-                                section_style,
-                                section_cur_style,
-                                file_style,
-                                file_cur_style,
-                                hunk_style,
-                                hunk_cur_style,
-                                add_style,
-                                del_style,
-                                add_cur_style,
-                                del_cur_style,
-                                ctx_cur_style,
-                                meta_style,
-                                cur_style,
-                            )
-                        else if (slot_cur) ctx_cur_style else body;
-
-                        fillSpan(scr, 0, panes.gutter_x, screen_y, left_st);
-                        if (panes.right_w > 0 or panes.gutter_x < size.cols) {
-                            fillSpan(scr, panes.gutter_x, panes.gutter_x + 1, screen_y, gutter_style);
-                            if (panes.gutter_x < size.cols) {
-                                scr.setCell(panes.gutter_x, screen_y, .{
-                                    .char = '│',
-                                    .width = 1,
-                                    .style = gutter_style,
-                                });
+                            );
+                            if (rows[ri] == .section_header) {
+                                scr.fillRect(.{ .x = 0, .y = screen_y, .w = scr.cols, .h = 1 }, '─', st);
+                            } else {
+                                fillRow(scr, screen_y, st);
                             }
-                        }
-                        const right_x: u16 = panes.gutter_x + 1;
-                        fillSpan(scr, right_x, size.cols, screen_y, right_st);
+                            putRowHint(scr, screen_y, text, indexHintForRow(ri, hint_file, hint_hunk, hint_section, hint_group), st);
+                        },
+                        .pair => |p| {
+                            // Whole slot is current when the cursor sits on either pane
+                            // (paired del|add highlight together as one split row).
+                            const slot_cur = sbs_slots[si].containsRow(cur);
+                            const left_st = if (p.left) |ri|
+                                rowStyle(
+                                    rows[ri],
+                                    slot_cur,
+                                    body,
+                                    section_style,
+                                    section_cur_style,
+                                    file_style,
+                                    file_cur_style,
+                                    hunk_style,
+                                    hunk_cur_style,
+                                    add_style,
+                                    del_style,
+                                    add_cur_style,
+                                    del_cur_style,
+                                    ctx_cur_style,
+                                    meta_style,
+                                    cur_style,
+                                )
+                            else if (slot_cur) ctx_cur_style else body;
+                            const right_st = if (p.right) |ri|
+                                rowStyle(
+                                    rows[ri],
+                                    slot_cur,
+                                    body,
+                                    section_style,
+                                    section_cur_style,
+                                    file_style,
+                                    file_cur_style,
+                                    hunk_style,
+                                    hunk_cur_style,
+                                    add_style,
+                                    del_style,
+                                    add_cur_style,
+                                    del_cur_style,
+                                    ctx_cur_style,
+                                    meta_style,
+                                    cur_style,
+                                )
+                            else if (slot_cur) ctx_cur_style else body;
 
-                        if (p.left) |ri| {
-                            const marked = rowMarked(rows[ri], review);
-                            const text = formatRow(&line_buf, rows[ri], marked);
-                            const pan = pan_span.containsBody(ri);
-                            const visible = if (pan) text[tui.screen.byteAtCol(text, cs)..] else text;
-                            putPaneStr(scr, 0, screen_y, panes.left_w, visible, left_st);
-                        }
-                        if (p.right) |ri| {
-                            const marked = rowMarked(rows[ri], review);
-                            const text = formatRow(&line_buf, rows[ri], marked);
-                            const pan = pan_span.containsBody(ri);
-                            const visible = if (pan) text[tui.screen.byteAtCol(text, cs)..] else text;
-                            putPaneStr(scr, right_x, screen_y, panes.right_w, visible, right_st);
-                        }
-                    },
+                            fillSpan(scr, 0, panes.gutter_x, screen_y, left_st);
+                            if (panes.right_w > 0 or panes.gutter_x < size.cols) {
+                                fillSpan(scr, panes.gutter_x, panes.gutter_x + 1, screen_y, gutter_style);
+                                if (panes.gutter_x < size.cols) {
+                                    scr.setCell(panes.gutter_x, screen_y, .{
+                                        .char = '│',
+                                        .width = 1,
+                                        .style = gutter_style,
+                                    });
+                                }
+                            }
+                            const right_x: u16 = panes.gutter_x + 1;
+                            fillSpan(scr, right_x, size.cols, screen_y, right_st);
+
+                            if (p.left) |ri| {
+                                const marked = rowMarked(rows[ri], review);
+                                const text = formatRow(&line_buf, rows[ri], marked);
+                                const pan = pan_span.containsBody(ri);
+                                const visible = if (pan) text[tui.screen.byteAtCol(text, cs)..] else text;
+                                putPaneStr(scr, 0, screen_y, panes.left_w, visible, left_st);
+                            }
+                            if (p.right) |ri| {
+                                const marked = rowMarked(rows[ri], review);
+                                const text = formatRow(&line_buf, rows[ri], marked);
+                                const pan = pan_span.containsBody(ri);
+                                const visible = if (pan) text[tui.screen.byteAtCol(text, cs)..] else text;
+                                putPaneStr(scr, right_x, screen_y, panes.right_w, visible, right_st);
+                            }
+                        },
+                    }
+                    screen_y += 1;
                 }
-                screen_y += 1;
-            }
-        },
-    }
+            },
+        }
 
-    if (has_footer) {
-        if (focus != .searching and focus != .commenting) {
-            const footer_y = footer_top;
-            fillRow(scr, footer_y, footer_style);
-            if (status_note.len > 0) {
-                scr.putStr(1, footer_y, status_note, footer_style, null);
-            } else {
-                const st = view.nav.statusAt(rows, cur);
-                const footer_text = formatFooter(&line_buf, st, review.openCount(), viewport.layout_pref, size.cols, source);
-                scr.putStr(1, footer_y, footer_text, footer_style, null);
+        if (has_footer) {
+            if (focus != .searching and focus != .commenting) {
+                const footer_y = footer_top;
+                fillRow(scr, footer_y, footer_style);
+                if (status_note.len > 0) {
+                    scr.putStr(1, footer_y, status_note, footer_style, null);
+                } else {
+                    const st = view.nav.statusAt(rows, cur);
+                    const footer_text = formatFooter(&line_buf, st, review.openCount(), viewport.layout_pref, size.cols, source);
+                    scr.putStr(1, footer_y, footer_text, footer_style, null);
+                }
+                scr.hideCursor();
             }
+        } else {
             scr.hideCursor();
         }
-    } else {
-        scr.hideCursor();
     }
-
-}
+};
 
 fn rowMarked(row: view.row.Row, review: *const store.Review) bool {
     return switch (row) {
