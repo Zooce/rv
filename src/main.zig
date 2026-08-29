@@ -154,12 +154,7 @@ fn runTui(alloc: std.mem.Allocator, io: std.Io, source: cli.Source) !u8 {
     };
     defer scr.deinit();
 
-    var cursor: usize = 0;
-    var scroll: usize = 0;
-    // First visible display column for lines in the cursor's hunk only.
-    var col_scroll: usize = 0;
-    // Prefer side-by-side; auto-unified when narrow. `t` flips session preference.
-    var layout_pref: view.layout.LayoutPref = .side_by_side;
+    var viewport: Viewport = .{};
     var running = true;
     // Exactly one focus; cannot help, comment, search, and list at once.
     var focus: Focus = .normal;
@@ -186,7 +181,7 @@ fn runTui(alloc: std.mem.Allocator, io: std.Io, source: cli.Source) !u8 {
     var failure: Failure = .{};
     defer failure.buf.deinit(alloc);
 
-    paint(&scr, size, diff_view.rows, diff_view.sbs_slots, layout_pref, cursor, &scroll, &col_scroll, &review, source, focus, draft.buf.items, draft.caret, &draft.scroll, draft.anchor, note.slice(), discard_confirm);
+    paint(&scr, size, diff_view.rows, diff_view.sbs_slots, &viewport, &review, source, focus, &draft, note.slice(), discard_confirm);
     try scr.present(&term);
 
     while (running) {
@@ -201,90 +196,20 @@ fn runTui(alloc: std.mem.Allocator, io: std.Io, source: cli.Source) !u8 {
                 // Notes are one-shot; any key clears them (including keys that no-op).
                 note.clear();
                 switch (focus) {
-                    .commenting => switch (key) {
-                        .esc => {
+                    .commenting => switch (try draft.handleKey(alloc, io, &review, key, size)) {
+                        .closed => focus = .normal,
+                        .quit => running = false,
+                        .save_failed => {
                             focus = .normal;
-                            draft.clear();
+                            note.set("failed to save .rv comment store");
                         },
-                        .enter => {
-                            if (draft.buf.items.len > 0) {
-                                if (draft.edit_id) |id| {
-                                    if (review.find(id)) |c| {
-                                        const prior = c.body;
-                                        if (review.setBody(id, draft.buf.items)) |_| {
-                                            store.save(&review, alloc, io, .cwd()) catch {
-                                                review.setBody(id, prior) catch {};
-                                                note.set("failed to save .rv comment store");
-                                            };
-                                        } else |err| switch (err) {
-                                            error.NotFound => {},
-                                            error.OutOfMemory => return error.OutOfMemory,
-                                        }
-                                    }
-                                } else {
-                                    const side = sideForAnchor(draft.anchor);
-                                    _ = try review.addOpen(
-                                        draft.anchor.path,
-                                        draft.anchor.old_line,
-                                        draft.anchor.new_line,
-                                        side,
-                                        draft.buf.items,
-                                    );
-                                    store.save(&review, alloc, io, .cwd()) catch {
-                                        // Stay in review; next save can retry. Marker is in-memory.
-                                    };
-                                }
-                            }
-                            focus = .normal;
-                            draft.clear();
-                        },
-                        .backspace => {
-                            if (draft.caret > 0) {
-                                draft.caret -= 1;
-                                _ = draft.buf.orderedRemove(draft.caret);
-                                ensureDraftCaretVisible(size.cols, size.rows, draft.buf.items, &draft.scroll, draft.caret);
-                            }
-                        },
-                        .char => |c| {
-                            if (c >= 0x20 and c < 0x7f) {
-                                try draft.buf.insert(alloc, draft.caret, @intCast(c));
-                                draft.caret += 1;
-                                ensureDraftCaretVisible(size.cols, size.rows, draft.buf.items, &draft.scroll, draft.caret);
-                            }
-                        },
-                        .left => {
-                            if (draft.caret > 0) draft.caret -= 1;
-                            ensureDraftCaretVisible(size.cols, size.rows, draft.buf.items, &draft.scroll, draft.caret);
-                        },
-                        .right => {
-                            if (draft.caret < draft.buf.items.len) draft.caret += 1;
-                            ensureDraftCaretVisible(size.cols, size.rows, draft.buf.items, &draft.scroll, draft.caret);
-                        },
-                        .up => {
-                            const m = commentMetrics(size.cols, size.rows, draft.buf.items);
-                            const pos = comment_input.VisualPos.init(draft.buf.items, m.text_w, draft.caret);
-                            // On the first visual line, stay put (keep column).
-                            if (pos.line > 0) {
-                                draft.caret = comment_input.byteAtVisual(draft.buf.items, m.text_w, pos.line - 1, pos.col);
-                                ensureDraftCaretVisible(size.cols, size.rows, draft.buf.items, &draft.scroll, draft.caret);
-                            }
-                        },
-                        .down => {
-                            const m = commentMetrics(size.cols, size.rows, draft.buf.items);
-                            const pos = comment_input.VisualPos.init(draft.buf.items, m.text_w, draft.caret);
-                            if (pos.line + 1 < m.line_count) {
-                                draft.caret = comment_input.byteAtVisual(draft.buf.items, m.text_w, pos.line + 1, pos.col);
-                            }
-                            ensureDraftCaretVisible(size.cols, size.rows, draft.buf.items, &draft.scroll, draft.caret);
-                        },
-                        .ctrl_c => running = false,
-                        else => {},
+                        .open => {},
                     },
-                    .searching => switch (try search.handleKey(alloc, key, diff_view.rows, cursor)) {
+                    .searching => switch (try search.handleKey(alloc, key, diff_view.rows, viewport.cursor)) {
                         .closed => focus = .normal,
                         .quit => running = false,
                         .jump => |hit| {
-                            cursor = hit.index;
+                            viewport.cursor = hit.index;
                             focus = .normal;
                             if (hit.wrapped) note.set("search wrapped");
                         },
@@ -302,7 +227,7 @@ fn runTui(alloc: std.mem.Allocator, io: std.Io, source: cli.Source) !u8 {
                             focus = .helping;
                         },
                         .jump => |row| {
-                            cursor = row;
+                            viewport.cursor = row;
                             focus = .normal;
                         },
                         .missing => note.set("comment not in this diff"),
@@ -316,7 +241,7 @@ fn runTui(alloc: std.mem.Allocator, io: std.Io, source: cli.Source) !u8 {
                             focus = .helping;
                         },
                         .jump => |row| {
-                            cursor = row;
+                            viewport.cursor = row;
                             focus = .normal;
                         },
                         .open => {},
@@ -331,7 +256,7 @@ fn runTui(alloc: std.mem.Allocator, io: std.Io, source: cli.Source) !u8 {
                         &review,
                         &diff_view.diff,
                         diff_view.rows,
-                        cursor,
+                        viewport.cursor,
                     )) {
                         .closed => focus = .normal,
                         .quit => running = false,
@@ -343,7 +268,7 @@ fn runTui(alloc: std.mem.Allocator, io: std.Io, source: cli.Source) !u8 {
                                 io,
                                 source,
                                 &diff_view,
-                                &cursor,
+                                &viewport.cursor,
                                 &note,
                                 &focus,
                                 &failure,
@@ -357,7 +282,7 @@ fn runTui(alloc: std.mem.Allocator, io: std.Io, source: cli.Source) !u8 {
                                 io,
                                 source,
                                 &diff_view,
-                                &cursor,
+                                &viewport.cursor,
                                 &note,
                                 &focus,
                                 &failure,
@@ -376,11 +301,11 @@ fn runTui(alloc: std.mem.Allocator, io: std.Io, source: cli.Source) !u8 {
                     .normal => {
                         const after_leader = leader_pending;
                         leader_pending = false;
-                        const layout = view.layout.effectiveLayout(layout_pref, size.cols);
+                        const layout = view.layout.effectiveLayout(viewport.layout_pref, size.cols);
                         switch (key) {
                             .char => |c| {
                                 if (after_leader and c == 'f') {
-                                    try file_list.load(alloc, diff_view.rows, view.nav.currentFileStart(diff_view.rows, cursor));
+                                    try file_list.load(alloc, diff_view.rows, view.nav.currentFileStart(diff_view.rows, viewport.cursor));
                                     focus = .files;
                                 } else if (after_leader and c == 'l') {
                                     try comment_list.load(alloc, review.comments.items);
@@ -391,7 +316,7 @@ fn runTui(alloc: std.mem.Allocator, io: std.Io, source: cli.Source) !u8 {
                                         io,
                                         source,
                                         &diff_view,
-                                        &cursor,
+                                        &viewport.cursor,
                                         &note,
                                         &focus,
                                         &failure,
@@ -400,13 +325,13 @@ fn runTui(alloc: std.mem.Allocator, io: std.Io, source: cli.Source) !u8 {
                                         false,
                                     );
                                 } else if (after_leader and c == 'S') {
-                                    if (view.nav.currentHunkInFile(diff_view.rows, cursor) != null) {
+                                    if (view.nav.currentHunkInFile(diff_view.rows, viewport.cursor) != null) {
                                         try dispatchStage(
                                             alloc,
                                             io,
                                             source,
                                             &diff_view,
-                                            &cursor,
+                                            &viewport.cursor,
                                             &note,
                                             &focus,
                                             &failure,
@@ -417,20 +342,22 @@ fn runTui(alloc: std.mem.Allocator, io: std.Io, source: cli.Source) !u8 {
                                     }
                                 } else if (after_leader and c == 'd') {
                                     if (source == .local) {
-                                        if (git.discardTargetAt(diff_view.rows, cursor, false) != null) {
+                                        if (git.discardTargetAt(diff_view.rows, viewport.cursor, false) != null) {
                                             discard_confirm = .{ .whole_file = false, .yes = false, .comments = false };
                                             focus = .discard_confirm;
                                         }
                                     } else {
-                                        dismissAt(&review, alloc, io, diff_view.rows, diff_view.sbs_slots, layout, cursor, .new, &note);
+                                        dismissAt(&review, alloc, io, diff_view.rows, diff_view.sbs_slots, layout, viewport.cursor, .new, &note);
                                     }
                                 } else if (after_leader and c == 'x') {
-                                    if (source == .local and view.nav.currentHunkInFile(diff_view.rows, cursor) != null) {
-                                        if (git.discardTargetAt(diff_view.rows, cursor, true) != null) {
+                                    if (source == .local and view.nav.currentHunkInFile(diff_view.rows, viewport.cursor) != null) {
+                                        if (git.discardTargetAt(diff_view.rows, viewport.cursor, true) != null) {
                                             discard_confirm = .{ .whole_file = true, .yes = false, .comments = false };
                                             focus = .discard_confirm;
                                         }
                                     }
+                                } else if (viewport.handleKey(.{ .char = c }, size.cols, diff_view.rows, diff_view.sbs_slots) == .handled) {
+                                    // j/k/h/l/0/$/J/K/[/]/{/}/t
                                 } else if (c == 'q' or c == 'Q') {
                                     running = false;
                                 } else if (c == '?') {
@@ -443,89 +370,50 @@ fn runTui(alloc: std.mem.Allocator, io: std.Io, source: cli.Source) !u8 {
                                     search.caret = 0;
                                     focus = .searching;
                                 } else if (c == 'n') {
-                                    switch (search.next(diff_view.rows, cursor)) {
+                                    switch (search.next(diff_view.rows, viewport.cursor)) {
                                         .none => {},
                                         .missing => note.set("Pattern not found"),
                                         .hit => |hit| {
-                                            cursor = hit.index;
+                                            viewport.cursor = hit.index;
                                             if (hit.wrapped) note.set("search wrapped");
                                         },
                                     }
                                 } else if (c == 'N') {
-                                    switch (search.prev(diff_view.rows, cursor)) {
+                                    switch (search.prev(diff_view.rows, viewport.cursor)) {
                                         .none => {},
                                         .missing => note.set("Pattern not found"),
                                         .hit => |hit| {
-                                            cursor = hit.index;
+                                            viewport.cursor = hit.index;
                                             if (hit.wrapped) note.set("search wrapped");
                                         },
                                     }
-                                } else if (c == 'j') {
-                                    cursor = moveLineDown(layout_pref, size.cols, diff_view.rows, diff_view.sbs_slots, cursor);
-                                } else if (c == 'k') {
-                                    cursor = moveLineUp(layout_pref, size.cols, diff_view.rows, diff_view.sbs_slots, cursor);
-                                } else if (c == 'h') {
-                                    const step = panStep(panViewportCols(layout_pref, size.cols));
-                                    col_scroll = if (col_scroll > step) col_scroll - step else 0;
-                                } else if (c == 'l') {
-                                    col_scroll +%= panStep(panViewportCols(layout_pref, size.cols));
-                                } else if (c == '0') {
-                                    col_scroll = 0;
-                                } else if (c == '$') {
-                                    const span = view.viewport.hunkSpanAt(diff_view.rows, cursor);
-                                    const vp = panViewportCols(layout_pref, size.cols);
-                                    col_scroll = view.viewport.colScrollToEnd(hunkMaxLineWidth(diff_view.rows, span), vp);
-                                } else if (c == 'J') {
-                                    cursor = view.nav.nextChange(diff_view.rows, cursor);
-                                } else if (c == 'K') {
-                                    cursor = view.nav.prevChange(diff_view.rows, cursor);
-                                } else if (c == ']') {
-                                    cursor = view.nav.nextHunkHeader(diff_view.rows, cursor);
-                                } else if (c == '[') {
-                                    cursor = view.nav.prevHunkHeader(diff_view.rows, cursor);
-                                } else if (c == '}') {
-                                    cursor = view.nav.nextFileHeader(diff_view.rows, cursor);
-                                } else if (c == '{') {
-                                    cursor = view.nav.prevFileHeader(diff_view.rows, cursor);
                                 } else if (c == ')') {
-                                    jumpLiveComment(&review, diff_view.rows, &cursor, &note, .next);
+                                    jumpLiveComment(&review, diff_view.rows, &viewport.cursor, &note, .next);
                                 } else if (c == '(') {
-                                    jumpLiveComment(&review, diff_view.rows, &cursor, &note, .prev);
-                                } else if (c == 't') {
-                                    layout_pref = view.layout.toggleLayoutPref(layout_pref);
+                                    jumpLiveComment(&review, diff_view.rows, &viewport.cursor, &note, .prev);
                                 } else if (c == 'r') {
-                                    reloadDiff(alloc, io, source, &diff_view, &cursor, &note);
+                                    reloadDiff(alloc, io, source, &diff_view, &viewport.cursor, &note);
                                 } else if (c == 'i' or c == 'c' or c == 'a') {
-                                    if (try beginComment(&review, alloc, diff_view.rows, diff_view.sbs_slots, layout, cursor, .new, &draft)) {
+                                    if (try draft.begin(&review, alloc, diff_view.rows, diff_view.sbs_slots, layout, viewport.cursor, .new)) {
                                         focus = .commenting;
                                     }
                                 } else if (c == 'I' or c == 'C' or c == 'A') {
-                                    if (try beginComment(&review, alloc, diff_view.rows, diff_view.sbs_slots, layout, cursor, .old, &draft)) {
+                                    if (try draft.begin(&review, alloc, diff_view.rows, diff_view.sbs_slots, layout, viewport.cursor, .old)) {
                                         focus = .commenting;
                                     }
                                 } else if (c == 'd') {
-                                    dismissAt(&review, alloc, io, diff_view.rows, diff_view.sbs_slots, layout, cursor, .new, &note);
+                                    dismissAt(&review, alloc, io, diff_view.rows, diff_view.sbs_slots, layout, viewport.cursor, .new, &note);
                                 } else if (c == 'D') {
-                                    dismissAt(&review, alloc, io, diff_view.rows, diff_view.sbs_slots, layout, cursor, .old, &note);
+                                    dismissAt(&review, alloc, io, diff_view.rows, diff_view.sbs_slots, layout, viewport.cursor, .old, &note);
                                 }
                             },
                             .enter => {
-                                if (try beginComment(&review, alloc, diff_view.rows, diff_view.sbs_slots, layout, cursor, .new, &draft)) {
+                                if (try draft.begin(&review, alloc, diff_view.rows, diff_view.sbs_slots, layout, viewport.cursor, .new)) {
                                     focus = .commenting;
                                 }
                             },
-                            .down => {
-                                cursor = moveLineDown(layout_pref, size.cols, diff_view.rows, diff_view.sbs_slots, cursor);
-                            },
-                            .up => {
-                                cursor = moveLineUp(layout_pref, size.cols, diff_view.rows, diff_view.sbs_slots, cursor);
-                            },
-                            .left => {
-                                const step = panStep(panViewportCols(layout_pref, size.cols));
-                                col_scroll = if (col_scroll > step) col_scroll - step else 0;
-                            },
-                            .right => {
-                                col_scroll +%= panStep(panViewportCols(layout_pref, size.cols));
+                            .down, .up, .left, .right => {
+                                _ = viewport.handleKey(key, size.cols, diff_view.rows, diff_view.sbs_slots);
                             },
                             .ctrl_c => running = false,
                             else => {},
@@ -535,7 +423,7 @@ fn runTui(alloc: std.mem.Allocator, io: std.Io, source: cli.Source) !u8 {
             },
         }
         if (running) {
-            paint(&scr, size, diff_view.rows, diff_view.sbs_slots, layout_pref, cursor, &scroll, &col_scroll, &review, source, focus, draft.buf.items, draft.caret, &draft.scroll, draft.anchor, note.slice(), discard_confirm);
+            paint(&scr, size, diff_view.rows, diff_view.sbs_slots, &viewport, &review, source, focus, &draft, note.slice(), discard_confirm);
             if (focus == .helping) {
                 help.paint(&scr, size);
                 scr.hideCursor();
@@ -549,10 +437,12 @@ fn runTui(alloc: std.mem.Allocator, io: std.Io, source: cli.Source) !u8 {
                 comment_list.paint(&scr, size);
                 scr.hideCursor();
             } else if (focus == .discard_confirm) {
-                discard_confirm.paint(&scr, size, diff_view.rows, cursor);
+                discard_confirm.paint(&scr, size, diff_view.rows, viewport.cursor);
                 scr.hideCursor();
             } else if (focus == .searching) {
                 search.paintFooter(&scr, size);
+            } else if (focus == .commenting) {
+                draft.paintFooter(&scr, size);
             }
             try scr.present(&term);
         }
@@ -944,8 +834,10 @@ const DiscardConfirm = struct {
     }
 };
 
-/// Footer box buffer plus comment-mode extras.
+/// Comment prompt: buffer, caret, keys, save, and footer paint.
 const Draft = struct {
+    const Result = enum { open, closed, quit, save_failed };
+
     buf: std.ArrayList(u8) = .empty,
     scroll: usize = 0,
     caret: usize = 0,
@@ -957,6 +849,197 @@ const Draft = struct {
         self.scroll = 0;
         self.caret = 0;
         self.edit_id = null;
+    }
+
+    fn metrics(self: *const Draft, size: tui.Size) comment_input.Metrics {
+        const available: usize = if (size.rows <= 1) 1 else size.rows - 1;
+        return comment_input.metricsLimited(size.cols, self.buf.items, @min(comment_input.max_rows, available));
+    }
+
+    fn ensureCaretVisible(self: *Draft, size: tui.Size) void {
+        const m = self.metrics(size);
+        const pos = comment_input.VisualPos.init(self.buf.items, m.text_w, self.caret);
+        self.scroll = comment_input.ensureVisible(self.scroll, pos.line, m.height, m.line_count);
+    }
+
+    /// Open the comment box on `want` at `cursor`. Missing side: silent no-op.
+    /// Existing comment: pre-fill the first in store order; caret at end. None: create.
+    /// Returns true when the box opened.
+    fn begin(
+        self: *Draft,
+        review: *const store.Review,
+        alloc: std.mem.Allocator,
+        rows: []const view.row.Row,
+        slots: []const view.layout.SbsSlot,
+        layout: view.layout.EffectiveLayout,
+        cursor: usize,
+        want: view.row.CommentSide,
+    ) std.mem.Allocator.Error!bool {
+        const found = comments.atSide(review, rows, slots, layout, cursor, want) orelse return false;
+        self.clear();
+        self.anchor = found.anchor;
+        if (found.idx) |idx| {
+            const c = review.comments.items[idx];
+            try self.buf.appendSlice(alloc, c.body);
+            self.caret = self.buf.items.len;
+            self.edit_id = c.id;
+        }
+        return true;
+    }
+
+    fn handleKey(
+        self: *Draft,
+        alloc: std.mem.Allocator,
+        io: std.Io,
+        review: *store.Review,
+        key: tui.Key,
+        size: tui.Size,
+    ) std.mem.Allocator.Error!Result {
+        switch (key) {
+            .esc => {
+                self.clear();
+                return .closed;
+            },
+            .enter => {
+                if (self.buf.items.len > 0) {
+                    if (self.edit_id) |id| {
+                        if (review.find(id)) |c| {
+                            const prior = c.body;
+                            if (review.setBody(id, self.buf.items)) |_| {
+                                store.save(review, alloc, io, .cwd()) catch {
+                                    review.setBody(id, prior) catch {};
+                                    self.clear();
+                                    return .save_failed;
+                                };
+                            } else |err| switch (err) {
+                                error.NotFound => {},
+                                error.OutOfMemory => return error.OutOfMemory,
+                            }
+                        }
+                    } else {
+                        const side = sideForAnchor(self.anchor);
+                        _ = try review.addOpen(
+                            self.anchor.path,
+                            self.anchor.old_line,
+                            self.anchor.new_line,
+                            side,
+                            self.buf.items,
+                        );
+                        store.save(review, alloc, io, .cwd()) catch {
+                            // Stay in review; next save can retry. Marker is in-memory.
+                        };
+                    }
+                }
+                self.clear();
+                return .closed;
+            },
+            .backspace => {
+                if (self.caret > 0) {
+                    self.caret -= 1;
+                    _ = self.buf.orderedRemove(self.caret);
+                    self.ensureCaretVisible(size);
+                }
+            },
+            .char => |c| {
+                if (c >= 0x20 and c < 0x7f) {
+                    try self.buf.insert(alloc, self.caret, @intCast(c));
+                    self.caret += 1;
+                    self.ensureCaretVisible(size);
+                }
+            },
+            .left => {
+                if (self.caret > 0) self.caret -= 1;
+                self.ensureCaretVisible(size);
+            },
+            .right => {
+                if (self.caret < self.buf.items.len) self.caret += 1;
+                self.ensureCaretVisible(size);
+            },
+            .up => {
+                const m = self.metrics(size);
+                const pos = comment_input.VisualPos.init(self.buf.items, m.text_w, self.caret);
+                // On the first visual line, stay put (keep column).
+                if (pos.line > 0) {
+                    self.caret = comment_input.byteAtVisual(self.buf.items, m.text_w, pos.line - 1, pos.col);
+                    self.ensureCaretVisible(size);
+                }
+            },
+            .down => {
+                const m = self.metrics(size);
+                const pos = comment_input.VisualPos.init(self.buf.items, m.text_w, self.caret);
+                if (pos.line + 1 < m.line_count) {
+                    self.caret = comment_input.byteAtVisual(self.buf.items, m.text_w, pos.line + 1, pos.col);
+                }
+                self.ensureCaretVisible(size);
+            },
+            .ctrl_c => return .quit,
+            else => {},
+        }
+        return .open;
+    }
+
+    fn paintFooter(self: *Draft, scr: *tui.Screen, size: tui.Size) void {
+        if (size.rows < 2) return;
+        const footer_style = tui.Style{
+            .fg = .{ .rgb = .{ .r = 0xee, .g = 0xee, .b = 0xee } },
+            .bg = .{ .rgb = .{ .r = 0x2a, .g = 0x3f, .b = 0x5f } },
+        };
+        const footer_bar_track = tui.Style{
+            .fg = .{ .rgb = .{ .r = 0x6a, .g = 0x7a, .b = 0x9a } },
+            .bg = .{ .rgb = .{ .r = 0x2a, .g = 0x3f, .b = 0x5f } },
+            .dim = true,
+        };
+        const footer_bar_thumb = tui.Style{
+            .fg = .{ .rgb = .{ .r = 0xee, .g = 0xee, .b = 0xee } },
+            .bg = .{ .rgb = .{ .r = 0x4a, .g = 0x6a, .b = 0x9a } },
+            .bold = true,
+        };
+
+        const m = self.metrics(size);
+        const footer_h = m.height;
+        const footer_top: u16 = size.rows - footer_h;
+        self.ensureCaretVisible(size);
+        const ds = self.scroll;
+        const text = self.buf.items;
+
+        var line_buf: [512]u8 = undefined;
+        var row: u16 = 0;
+        while (row < footer_h) : (row += 1) {
+            const y: u16 = footer_top + row;
+            fillRow(scr, y, footer_style);
+            const vline = ds + row;
+            const piece = comment_input.writeVisualLine(&line_buf, text, m.text_w, vline);
+            // Prefix + text start at column 1 (one-cell left gutter).
+            scr.putStr(1, y, piece, footer_style, null);
+        }
+
+        // Right pad is always reserved (text_w stable). Scrollbar uses the
+        // rightmost column of that pad when needed; the pad column left of
+        // it stays empty so wrap does not reflow when the bar appears.
+        if (m.show_scrollbar and size.cols > 0) {
+            const bar_x: u16 = size.cols - 1;
+            const thumb = comment_input.scrollbarThumb(
+                m.line_count,
+                m.height,
+                ds,
+                m.height,
+            );
+            var br: u16 = 0;
+            while (br < footer_h) : (br += 1) {
+                const y: u16 = footer_top + br;
+                const in_thumb = br >= thumb.start and br < thumb.start + thumb.len;
+                const st = if (in_thumb) footer_bar_thumb else footer_bar_track;
+                const ch: u21 = if (in_thumb) '█' else '│';
+                scr.setCell(bar_x, y, .{ .char = ch, .width = 1, .style = st });
+            }
+        }
+
+        const caret_byte = @min(self.caret, text.len);
+        const caret = comment_input.cursorAt(text, m.text_w, ds, m.height, caret_byte);
+        const max_x: u16 = if (size.cols == 0) 0 else size.cols - 1;
+        const cx: u16 = @min(caret.x, max_x);
+        const cy: u16 = footer_top + caret.y_off;
+        scr.setCursor(cx, cy);
     }
 };
 
@@ -1092,47 +1175,91 @@ const StatusNote = struct {
     }
 };
 
-/// Columns available for horizontal pan: full width (unified) or one pane (SBS).
-fn panViewportCols(pref: view.layout.LayoutPref, cols: u16) u16 {
-    return switch (view.layout.effectiveLayout(pref, cols)) {
-        .unified => cols,
-        .side_by_side => view.layout.sbsPaneWidths(cols).left_w,
-    };
-}
+/// Session viewport: cursor, scroll, pan, layout preference, and motion keys.
+const Viewport = struct {
+    const Result = enum { handled, unhandled };
 
-/// One step down: unified row in unified layout; next SBS slot in side-by-side.
-fn moveLineDown(
-    pref: view.layout.LayoutPref,
-    cols: u16,
-    rows: []const view.row.Row,
-    slots: []const view.layout.SbsSlot,
-    cursor: usize,
-) usize {
-    return switch (view.layout.effectiveLayout(pref, cols)) {
-        .unified => if (cursor + 1 < rows.len) cursor + 1 else cursor,
-        .side_by_side => view.layout.nextSbsCursor(slots, rows, cursor),
-    };
-}
+    cursor: usize = 0,
+    scroll: usize = 0,
+    /// First visible display column for lines in the cursor's hunk only.
+    col_scroll: usize = 0,
+    /// Prefer side-by-side; auto-unified when narrow. `t` flips session preference.
+    layout_pref: view.layout.LayoutPref = .side_by_side,
 
-/// One step up: unified row in unified layout; previous SBS slot in side-by-side.
-fn moveLineUp(
-    pref: view.layout.LayoutPref,
-    cols: u16,
-    rows: []const view.row.Row,
-    slots: []const view.layout.SbsSlot,
-    cursor: usize,
-) usize {
-    return switch (view.layout.effectiveLayout(pref, cols)) {
-        .unified => if (cursor > 0) cursor - 1 else cursor,
-        .side_by_side => view.layout.prevSbsCursor(slots, rows, cursor),
-    };
-}
+    /// Columns available for horizontal pan: full width (unified) or one pane (SBS).
+    fn panViewportCols(self: *const Viewport, cols: u16) u16 {
+        return switch (view.layout.effectiveLayout(self.layout_pref, cols)) {
+            .unified => cols,
+            .side_by_side => view.layout.sbsPaneWidths(cols).left_w,
+        };
+    }
 
-/// Horizontal pan step: about a quarter of the pan viewport (at least 1).
-fn panStep(cols: u16) usize {
-    if (cols == 0) return 1;
-    return @max(1, cols / 4);
-}
+    /// Horizontal pan step: about a quarter of the pan viewport (at least 1).
+    fn panStep(cols: u16) usize {
+        if (cols == 0) return 1;
+        return @max(1, cols / 4);
+    }
+
+    /// One step down: unified row in unified layout; next SBS slot in side-by-side.
+    fn moveLineDown(self: *Viewport, cols: u16, rows: []const view.row.Row, slots: []const view.layout.SbsSlot) void {
+        self.cursor = switch (view.layout.effectiveLayout(self.layout_pref, cols)) {
+            .unified => if (self.cursor + 1 < rows.len) self.cursor + 1 else self.cursor,
+            .side_by_side => view.layout.nextSbsCursor(slots, rows, self.cursor),
+        };
+    }
+
+    /// One step up: unified row in unified layout; previous SBS slot in side-by-side.
+    fn moveLineUp(self: *Viewport, cols: u16, rows: []const view.row.Row, slots: []const view.layout.SbsSlot) void {
+        self.cursor = switch (view.layout.effectiveLayout(self.layout_pref, cols)) {
+            .unified => if (self.cursor > 0) self.cursor - 1 else self.cursor,
+            .side_by_side => view.layout.prevSbsCursor(slots, rows, self.cursor),
+        };
+    }
+
+    fn panLeft(self: *Viewport, cols: u16) void {
+        const step = panStep(self.panViewportCols(cols));
+        self.col_scroll = if (self.col_scroll > step) self.col_scroll - step else 0;
+    }
+
+    fn handleKey(
+        self: *Viewport,
+        key: tui.Key,
+        cols: u16,
+        rows: []const view.row.Row,
+        slots: []const view.layout.SbsSlot,
+    ) Result {
+        switch (key) {
+            .char => |c| switch (c) {
+                'j' => self.moveLineDown(cols, rows, slots),
+                'k' => self.moveLineUp(cols, rows, slots),
+                'h' => self.panLeft(cols),
+                'l' => self.col_scroll +%= panStep(self.panViewportCols(cols)),
+                '0' => self.col_scroll = 0,
+                '$' => {
+                    const span = view.viewport.hunkSpanAt(rows, self.cursor);
+                    self.col_scroll = view.viewport.colScrollToEnd(
+                        hunkMaxLineWidth(rows, span),
+                        self.panViewportCols(cols),
+                    );
+                },
+                'J' => self.cursor = view.nav.nextChange(rows, self.cursor),
+                'K' => self.cursor = view.nav.prevChange(rows, self.cursor),
+                ']' => self.cursor = view.nav.nextHunkHeader(rows, self.cursor),
+                '[' => self.cursor = view.nav.prevHunkHeader(rows, self.cursor),
+                '}' => self.cursor = view.nav.nextFileHeader(rows, self.cursor),
+                '{' => self.cursor = view.nav.prevFileHeader(rows, self.cursor),
+                't' => self.layout_pref = view.layout.toggleLayoutPref(self.layout_pref),
+                else => return .unhandled,
+            },
+            .down => self.moveLineDown(cols, rows, slots),
+            .up => self.moveLineUp(cols, rows, slots),
+            .left => self.panLeft(cols),
+            .right => self.col_scroll +%= panStep(self.panViewportCols(cols)),
+            else => return .unhandled,
+        }
+        return .handled;
+    }
+};
 
 /// Widest formatted **line** in the hunk body (headers excluded). 0 if empty.
 fn hunkMaxLineWidth(rows: []const view.row.Row, span: view.viewport.HunkSpan) usize {
@@ -1144,16 +1271,6 @@ fn hunkMaxLineWidth(rows: []const view.row.Row, span: view.viewport.HunkSpan) us
         max_w = @max(max_w, tui.screen.displayWidth(text));
     }
     return max_w;
-}
-
-/// Visible comment-box row budget: keep the title row; cap at `max_rows`.
-fn commentMaxVisible(term_rows: u16) usize {
-    if (term_rows <= 1) return 1;
-    return @min(comment_input.max_rows, @as(usize, term_rows - 1));
-}
-
-fn commentMetrics(cols: u16, term_rows: u16, draft: []const u8) comment_input.Metrics {
-    return comment_input.metricsLimited(cols, draft, commentMaxVisible(term_rows));
 }
 
 /// Keep `cursor` inside the overlay window of height `view_h`.
@@ -1171,49 +1288,11 @@ fn ensureListCursorVisible(scroll: *usize, cursor: usize, view_h: usize, n: usiz
     if (scroll.* > max_scroll) scroll.* = max_scroll;
 }
 
-/// Keep the visual line under `caret` inside the comment footer window.
-/// Typing at the end still end-follows (last line is the caret line).
-fn ensureDraftCaretVisible(
-    cols: u16,
-    term_rows: u16,
-    draft: []const u8,
-    draft_scroll: *usize,
-    caret: usize,
-) void {
-    const m = commentMetrics(cols, term_rows, draft);
-    const pos = comment_input.VisualPos.init(draft, m.text_w, caret);
-    draft_scroll.* = comment_input.ensureVisible(draft_scroll.*, pos.line, m.height, m.line_count);
-}
-
-/// Open the comment box on `want` at `cursor`. Missing side: silent no-op.
-/// Existing comment: pre-fill the first in store order; caret at end. None: create.
-/// Returns true when the box opened.
+/// Comment side implied by which line numbers the anchor has.
 fn sideForAnchor(a: view.row.Anchor) store.Side {
     if (a.old_line != null and a.new_line != null) return .context;
     if (a.new_line != null) return .new;
     return .old;
-}
-
-fn beginComment(
-    review: *const store.Review,
-    alloc: std.mem.Allocator,
-    rows: []const view.row.Row,
-    slots: []const view.layout.SbsSlot,
-    layout: view.layout.EffectiveLayout,
-    cursor: usize,
-    want: view.row.CommentSide,
-    draft: *Draft,
-) std.mem.Allocator.Error!bool {
-    const found = comments.atSide(review, rows, slots, layout, cursor, want) orelse return false;
-    draft.clear();
-    draft.anchor = found.anchor;
-    if (found.idx) |idx| {
-        const c = review.comments.items[idx];
-        try draft.buf.appendSlice(alloc, c.body);
-        draft.caret = draft.buf.items.len;
-        draft.edit_id = c.id;
-    }
-    return true;
 }
 
 fn jumpLiveComment(
@@ -1645,17 +1724,11 @@ fn paint(
     size: tui.Size,
     rows: []const view.row.Row,
     sbs_slots: []const view.layout.SbsSlot,
-    layout_pref: view.layout.LayoutPref,
-    cursor: usize,
-    scroll: *usize,
-    col_scroll: *usize,
+    viewport: *Viewport,
     review: *const store.Review,
     source: cli.Source,
     focus: Focus,
-    draft: []const u8,
-    draft_caret: usize,
-    draft_scroll: *usize,
-    draft_anchor: view.row.Anchor,
+    draft: *const Draft,
     status_note: []const u8,
     discard: DiscardConfirm,
 ) void {
@@ -1689,16 +1762,6 @@ fn paint(
     const footer_style = tui.Style{
         .fg = .{ .rgb = .{ .r = 0xee, .g = 0xee, .b = 0xee } },
         .bg = .{ .rgb = .{ .r = 0x2a, .g = 0x3f, .b = 0x5f } },
-    };
-    const footer_bar_track = tui.Style{
-        .fg = .{ .rgb = .{ .r = 0x6a, .g = 0x7a, .b = 0x9a } },
-        .bg = .{ .rgb = .{ .r = 0x2a, .g = 0x3f, .b = 0x5f } },
-        .dim = true,
-    };
-    const footer_bar_thumb = tui.Style{
-        .fg = .{ .rgb = .{ .r = 0xee, .g = 0xee, .b = 0xee } },
-        .bg = .{ .rgb = .{ .r = 0x4a, .g = 0x6a, .b = 0x9a } },
-        .bold = true,
     };
     // File header: dark grey bar + light bold path (clear vs body; not green/red).
     const file_style = tui.Style{
@@ -1762,7 +1825,7 @@ fn paint(
     if (size.rows > 0) {
         fillRow(scr, 0, title_style);
         const help = switch (focus) {
-            .commenting => switch (sideForAnchor(draft_anchor)) {
+            .commenting => switch (sideForAnchor(draft.anchor)) {
                 .new => "rv  create/edit new  Enter save  Esc cancel  ↑↓ scroll",
                 .old => "rv  create/edit old  Enter save  Esc cancel  ↑↓ scroll",
                 .context => "rv  create/edit  Enter save  Esc cancel  ↑↓ scroll",
@@ -1789,11 +1852,12 @@ fn paint(
 
     // Footer: 1 status row, search prompt, or soft-wrapped comment box.
     const has_footer = size.rows >= 2;
-    const cm: ?comment_input.Metrics = if (focus == .commenting and has_footer)
-        commentMetrics(size.cols, size.rows, draft)
+    const footer_h: u16 = if (!has_footer)
+        0
+    else if (focus == .commenting)
+        draft.metrics(size).height
     else
-        null;
-    const footer_h: u16 = if (!has_footer) 0 else if (cm) |m| m.height else 1;
+        1;
     const footer_top: u16 = if (has_footer) size.rows - footer_h else 0;
     const content_top: u16 = 1;
     const content_bottom: u16 = if (has_footer) footer_top else size.rows;
@@ -1802,8 +1866,8 @@ fn paint(
     else
         0;
 
-    const cur = view.row.clampCursor(cursor, rows.len);
-    const layout = view.layout.effectiveLayout(layout_pref, size.cols);
+    const cur = view.row.clampCursor(viewport.cursor, rows.len);
+    const layout = view.layout.effectiveLayout(viewport.layout_pref, size.cols);
     const gutter_style = tui.Style{
         .fg = .{ .rgb = .{ .r = 0x50, .g = 0x50, .b = 0x58 } },
         .bg = bg,
@@ -1813,9 +1877,9 @@ fn paint(
     // Only lines in the cursor's hunk pan; file/hunk headers never pan.
     const pan_span = view.viewport.hunkSpanAt(rows, cur);
     const hunk_w = hunkMaxLineWidth(rows, pan_span);
-    const pan_vp: usize = panViewportCols(layout_pref, size.cols);
-    col_scroll.* = view.viewport.clampColScroll(col_scroll.*, hunk_w, pan_vp);
-    const cs = col_scroll.*;
+    const pan_vp: usize = viewport.panViewportCols(size.cols);
+    viewport.col_scroll = view.viewport.clampColScroll(viewport.col_scroll, hunk_w, pan_vp);
+    const cs = viewport.col_scroll;
 
     const hints_ok = source == .local and focus == .normal and rows.len > 0;
     const hint_section: ?usize = if (hints_ok and rows[cur] == .section_header) cur else null;
@@ -1841,8 +1905,8 @@ fn paint(
 
     switch (layout) {
         .unified => {
-            const settled = view.viewport.ensureVisibleSticky(scroll.*, cur, content_rows, rows);
-            scroll.* = settled.scroll;
+            const settled = view.viewport.ensureVisibleSticky(viewport.scroll, cur, content_rows, rows);
+            viewport.scroll = settled.scroll;
             const sticky = settled.sticky;
             var screen_y: u16 = content_top;
 
@@ -1857,7 +1921,7 @@ fn paint(
                 }
             }
 
-            var i: usize = scroll.*;
+            var i: usize = viewport.scroll;
             while (i < rows.len and screen_y < content_bottom) : (i += 1) {
                 const is_cur = i == cur;
                 const marked = rowMarked(rows[i], review);
@@ -1897,8 +1961,8 @@ fn paint(
             }
         },
         .side_by_side => {
-            const settled = view.viewport.ensureVisibleStickySbs(scroll.*, cur, content_rows, sbs_slots, rows);
-            scroll.* = settled.scroll;
+            const settled = view.viewport.ensureVisibleStickySbs(viewport.scroll, cur, content_rows, sbs_slots, rows);
+            viewport.scroll = settled.scroll;
             const sticky = settled.sticky;
             const panes = view.layout.sbsPaneWidths(size.cols);
             var screen_y: u16 = content_top;
@@ -1913,7 +1977,7 @@ fn paint(
                 }
             }
 
-            var si: usize = scroll.*;
+            var si: usize = viewport.scroll;
             while (si < sbs_slots.len and screen_y < content_bottom) : (si += 1) {
                 switch (sbs_slots[si]) {
                     .header => |ri| {
@@ -2025,58 +2089,14 @@ fn paint(
     }
 
     if (has_footer) {
-        if (cm) |m| {
-            // Reflow (e.g. resize) can move the caret line; keep it on-screen.
-            const caret_byte = @min(draft_caret, draft.len);
-            const pos = comment_input.VisualPos.init(draft, m.text_w, caret_byte);
-            draft_scroll.* = comment_input.ensureVisible(draft_scroll.*, pos.line, m.height, m.line_count);
-            const ds = draft_scroll.*;
-
-            var row: u16 = 0;
-            while (row < footer_h) : (row += 1) {
-                const y: u16 = footer_top + row;
-                fillRow(scr, y, footer_style);
-                const vline = ds + row;
-                const piece = comment_input.writeVisualLine(&line_buf, draft, m.text_w, vline);
-                // Prefix + text start at column 1 (one-cell left gutter).
-                scr.putStr(1, y, piece, footer_style, null);
-            }
-
-            // Right pad is always reserved (text_w stable). Scrollbar uses the
-            // rightmost column of that pad when needed; the pad column left of
-            // it stays empty so wrap does not reflow when the bar appears.
-            if (m.show_scrollbar and size.cols > 0) {
-                const bar_x: u16 = size.cols - 1;
-                const thumb = comment_input.scrollbarThumb(
-                    m.line_count,
-                    m.height,
-                    ds,
-                    m.height,
-                );
-                var br: u16 = 0;
-                while (br < footer_h) : (br += 1) {
-                    const y: u16 = footer_top + br;
-                    const in_thumb = br >= thumb.start and br < thumb.start + thumb.len;
-                    const st = if (in_thumb) footer_bar_thumb else footer_bar_track;
-                    const ch: u21 = if (in_thumb) '█' else '│';
-                    scr.setCell(bar_x, y, .{ .char = ch, .width = 1, .style = st });
-                }
-            }
-
-            // Hardware caret at draft_caret (insert position). Clamp x to cols.
-            const caret = comment_input.cursorAt(draft, m.text_w, ds, m.height, caret_byte);
-            const max_x: u16 = if (size.cols == 0) 0 else size.cols - 1;
-            const cx: u16 = @min(caret.x, max_x);
-            const cy: u16 = footer_top + caret.y_off;
-            scr.setCursor(cx, cy);
-        } else if (focus != .searching) {
+        if (focus != .searching and focus != .commenting) {
             const footer_y = footer_top;
             fillRow(scr, footer_y, footer_style);
             if (status_note.len > 0) {
                 scr.putStr(1, footer_y, status_note, footer_style, null);
             } else {
                 const st = view.nav.statusAt(rows, cur);
-                const footer_text = formatFooter(&line_buf, st, review.openCount(), layout_pref, size.cols, source);
+                const footer_text = formatFooter(&line_buf, st, review.openCount(), viewport.layout_pref, size.cols, source);
                 scr.putStr(1, footer_y, footer_text, footer_style, null);
             }
             scr.hideCursor();
