@@ -127,7 +127,7 @@ pub const Rect = struct {
 
 /// Double-buffered character grid + the code that turns a diff into escapes.
 pub const Screen = struct {
-    allocator: std.mem.Allocator, // owns front/back slices
+    alloc: std.mem.Allocator, // owns front/back slices
     cols: u16, // grid width
     rows: u16, // grid height
     /// What the app wants on screen *this* frame (draw target).
@@ -140,17 +140,17 @@ pub const Screen = struct {
     dirty_all: bool = true,
 
     /// Allocate front + back grids of `size.cols * size.rows` blank cells.
-    pub fn init(allocator: std.mem.Allocator, size: Size) !Screen {
+    pub fn init(alloc: std.mem.Allocator, size: Size) !Screen {
         // Total cells in the grid (row-major: index = y * cols + x).
         const n: usize = @as(usize, size.cols) * @as(usize, size.rows);
-        const front = try allocator.alloc(Cell, n); // draw buffer
-        errdefer allocator.free(front); // free if the next alloc fails
-        const back = try allocator.alloc(Cell, n); // last-presented buffer
-        errdefer allocator.free(back);
+        const front = try alloc.alloc(Cell, n); // draw buffer
+        errdefer alloc.free(front); // free if the next alloc fails
+        const back = try alloc.alloc(Cell, n); // last-presented buffer
+        errdefer alloc.free(back);
         @memset(front, Cell.blank()); // start empty
         @memset(back, Cell.blank()); // "terminal matches empty" until first present
         return .{
-            .allocator = allocator,
+            .alloc = alloc,
             .cols = size.cols,
             .rows = size.rows,
             .front = front,
@@ -161,8 +161,8 @@ pub const Screen = struct {
 
     /// Free both grids. Invalidates `self`.
     pub fn deinit(self: *Screen) void {
-        self.allocator.free(self.front);
-        self.allocator.free(self.back);
+        self.alloc.free(self.front);
+        self.alloc.free(self.back);
         self.* = undefined; // poison so use-after-free is louder in debug
     }
 
@@ -171,14 +171,14 @@ pub const Screen = struct {
         // No-op if nothing changed (avoids needless full repaint).
         if (size.cols == self.cols and size.rows == self.rows) return;
         const n: usize = @as(usize, size.cols) * @as(usize, size.rows);
-        const front = try self.allocator.alloc(Cell, n);
-        errdefer self.allocator.free(front);
-        const back = try self.allocator.alloc(Cell, n);
-        errdefer self.allocator.free(back);
+        const front = try self.alloc.alloc(Cell, n);
+        errdefer self.alloc.free(front);
+        const back = try self.alloc.alloc(Cell, n);
+        errdefer self.alloc.free(back);
         @memset(front, Cell.blank());
         @memset(back, Cell.blank());
-        self.allocator.free(self.front); // drop old grids
-        self.allocator.free(self.back);
+        self.alloc.free(self.front); // drop old grids
+        self.alloc.free(self.back);
         self.front = front;
         self.back = back;
         self.cols = size.cols;

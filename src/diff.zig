@@ -129,12 +129,6 @@ pub const Diff = struct {
         self.arena.deinit();
         self.* = undefined;
     }
-
-    /// Allocator that backs nested data (for advanced callers). Prefer not to
-    /// allocate after parse unless the lifetime is still the Diff's.
-    pub fn allocator(self: *Diff) Allocator {
-        return self.arena.allocator();
-    }
 };
 
 pub const ParseError = error{
@@ -150,29 +144,28 @@ pub const ParsePiece = struct {
 
 /// Parse a unified diff string into an owned `Diff`.
 ///
-/// `gpa` is the backing allocator for the arena. Empty input yields a Diff
+/// `alloc` is the backing allocator for the arena. Empty input yields a Diff
 /// with zero files (not an error). Files are untagged (`group == null`).
-pub fn parse(gpa: Allocator, input: []const u8) ParseError!Diff {
+pub fn parse(alloc: Allocator, input: []const u8) ParseError!Diff {
     const pieces = [_]ParsePiece{.{ .text = input }};
-    return parsePieces(gpa, &pieces);
+    return parsePieces(alloc, &pieces);
 }
 
 /// Parse one or more unified-diff blobs into a single `Diff` (one arena).
 /// Empty pieces add no files. Hunk indexes continue across pieces.
-pub fn parsePieces(gpa: Allocator, pieces: []const ParsePiece) ParseError!Diff {
-    var arena = ArenaAllocator.init(gpa);
+pub fn parsePieces(alloc: Allocator, pieces: []const ParsePiece) ParseError!Diff {
+    var arena = ArenaAllocator.init(alloc);
     errdefer arena.deinit();
-    const alloc = arena.allocator();
 
     var files: std.ArrayList(File) = .empty;
-    defer files.deinit(alloc);
+    defer files.deinit(arena.allocator());
 
     var hunk_index: usize = 0;
     for (pieces) |piece| {
-        try parseAppend(alloc, piece.text, &files, &hunk_index, piece.group);
+        try parseAppend(arena.allocator(), piece.text, &files, &hunk_index, piece.group);
     }
 
-    const owned = try files.toOwnedSlice(alloc);
+    const owned = try files.toOwnedSlice(arena.allocator());
     return .{
         .arena = arena,
         .files = owned,

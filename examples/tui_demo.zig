@@ -18,7 +18,7 @@ pub fn main() !void {
     // DebugAllocator tracks leaks in Debug builds (Zig 0.16 name for the old GPA).
     var gpa_state: std.heap.DebugAllocator(.{}) = .init;
     defer _ = gpa_state.deinit(); // returns .leak if something was not freed
-    const gpa = gpa_state.allocator(); // the Allocator interface we pass to Screen
+    const alloc = gpa_state.allocator(); // the Allocator interface we pass to Screen
 
     // open(): /dev/tty + raw termios + alt screen + signal handlers.
     // defer deinit(): always restore the shell, even if we return via error.
@@ -28,7 +28,7 @@ pub fn main() !void {
     // Ask the kernel how big the window is right now.
     var size = try term.getSize();
     // Allocate front/back cell grids matching that size.
-    var scr = try tui.Screen.init(gpa, size);
+    var scr = try tui.Screen.init(alloc, size);
     defer scr.deinit();
 
     // --- app state (immediate-mode: screen is rebuilt from this each time) ---

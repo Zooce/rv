@@ -33,10 +33,6 @@ pub const Review = struct {
         self.* = undefined;
     }
 
-    fn alloc(self: *Review) Allocator {
-        return self.arena.allocator();
-    }
-
     pub fn openCount(self: *const Review) usize {
         var n: usize = 0;
         for (self.comments.items) |c| {
@@ -63,16 +59,16 @@ pub const Review = struct {
         side: ?Side,
         body: []const u8,
     ) Allocator.Error![]const u8 {
-        const a = self.alloc();
-        const id = try std.fmt.allocPrint(a, "{d}", .{self.next_seq});
+        const alloc = self.arena.allocator();
+        const id = try std.fmt.allocPrint(alloc, "{d}", .{self.next_seq});
         self.next_seq += 1;
-        try self.comments.append(a, .{
+        try self.comments.append(alloc, .{
             .id = id,
-            .path = try a.dupe(u8, path),
+            .path = try alloc.dupe(u8, path),
             .old_line = old_line,
             .new_line = new_line,
             .side = side,
-            .body = try a.dupe(u8, body),
+            .body = try alloc.dupe(u8, body),
             .state = .open,
         });
         return id;
@@ -81,7 +77,7 @@ pub const Review = struct {
     /// Overwrite `body` only. Path, lines, side, id, and state stay put.
     pub fn setBody(self: *Review, id: []const u8, body: []const u8) (error{NotFound} || Allocator.Error)!void {
         const i = self.findIndex(id) orelse return error.NotFound;
-        self.comments.items[i].body = try self.alloc().dupe(u8, body);
+        self.comments.items[i].body = try self.arena.allocator().dupe(u8, body);
     }
 
     /// Overwrite old/new line and side. Path, body, id, and state stay put.
@@ -140,30 +136,30 @@ pub const LoadError = error{ InvalidJson, InvalidState, InvalidSide } ||
 pub const SaveError = error{WriteFailed} || Allocator.Error ||
     Io.Dir.CreateFileAtomicError || Io.File.Writer.Error || Io.File.Atomic.ReplaceError;
 
-pub fn initEmpty(gpa: Allocator, review_id: []const u8) Allocator.Error!Review {
-    var arena = ArenaAllocator.init(gpa);
+pub fn initEmpty(alloc: Allocator, review_id: []const u8) Allocator.Error!Review {
+    var arena = ArenaAllocator.init(alloc);
     errdefer arena.deinit();
     // Allocate before moving `arena` (field order would snapshot empty state).
     const id = try arena.allocator().dupe(u8, review_id);
     return .{ .arena = arena, .id = id, .comments = .empty, .next_seq = 1 };
 }
 
-pub fn load(gpa: Allocator, io: Io, root: Io.Dir, review_id: []const u8) LoadError!Review {
-    const rel = try reviewRelPath(gpa, review_id);
-    defer gpa.free(rel);
-    const raw = root.readFileAlloc(io, rel, gpa, .limited(8 * 1024 * 1024)) catch |err| switch (err) {
-        error.FileNotFound => return try initEmpty(gpa, review_id),
+pub fn load(alloc: Allocator, io: Io, root: Io.Dir, review_id: []const u8) LoadError!Review {
+    const rel = try reviewRelPath(alloc, review_id);
+    defer alloc.free(rel);
+    const raw = root.readFileAlloc(io, rel, alloc, .limited(8 * 1024 * 1024)) catch |err| switch (err) {
+        error.FileNotFound => return try initEmpty(alloc, review_id),
         else => return err,
     };
-    defer gpa.free(raw);
-    return try parseJson(gpa, raw, review_id);
+    defer alloc.free(raw);
+    return try parseJson(alloc, raw, review_id);
 }
 
-pub fn save(self: *const Review, gpa: Allocator, io: Io, root: Io.Dir) SaveError!void {
-    const rel = try reviewRelPath(gpa, self.id);
-    defer gpa.free(rel);
-    const bytes = try stringify(self, gpa);
-    defer gpa.free(bytes);
+pub fn save(self: *const Review, alloc: Allocator, io: Io, root: Io.Dir) SaveError!void {
+    const rel = try reviewRelPath(alloc, self.id);
+    defer alloc.free(rel);
+    const bytes = try stringify(self, alloc);
+    defer alloc.free(bytes);
     var af = try root.createFileAtomic(io, rel, .{ .make_path = true, .replace = true });
     defer af.deinit(io);
     af.file.writeStreamingAll(io, bytes) catch return error.WriteFailed;
@@ -190,17 +186,16 @@ const WireReview = struct {
     comments: []const WireComment = &.{},
 };
 
-fn parseJson(gpa: Allocator, raw: []const u8, fallback_id: []const u8) LoadError!Review {
-    var parsed = std.json.parseFromSlice(WireReview, gpa, raw, .{
+fn parseJson(alloc: Allocator, raw: []const u8, fallback_id: []const u8) LoadError!Review {
+    var parsed = std.json.parseFromSlice(WireReview, alloc, raw, .{
         .allocate = .alloc_always,
         .ignore_unknown_fields = true,
     }) catch return error.InvalidJson;
     defer parsed.deinit();
     const wire = parsed.value;
 
-    var review = try initEmpty(gpa, if (wire.id.len > 0) wire.id else fallback_id);
+    var review = try initEmpty(alloc, if (wire.id.len > 0) wire.id else fallback_id);
     errdefer review.deinit();
-    const a = review.alloc();
     var max_seq: u64 = 0;
     for (wire.comments) |wc| {
         const state = std.meta.stringToEnum(State, wc.state) orelse return error.InvalidState;
@@ -213,13 +208,13 @@ fn parseJson(gpa: Allocator, raw: []const u8, fallback_id: []const u8) LoadError
             (std.meta.stringToEnum(Side, s) orelse return error.InvalidSide)
         else
             null;
-        try review.comments.append(a, .{
-            .id = try a.dupe(u8, wc.id),
-            .path = try a.dupe(u8, wc.path),
+        try review.comments.append(review.arena.allocator(), .{
+            .id = try review.arena.allocator().dupe(u8, wc.id),
+            .path = try review.arena.allocator().dupe(u8, wc.path),
             .old_line = wc.old_line,
             .new_line = wc.new_line,
             .side = side,
-            .body = try a.dupe(u8, wc.body),
+            .body = try review.arena.allocator().dupe(u8, wc.body),
             .state = state,
         });
     }
@@ -227,10 +222,10 @@ fn parseJson(gpa: Allocator, raw: []const u8, fallback_id: []const u8) LoadError
     return review;
 }
 
-fn stringify(self: *const Review, gpa: Allocator) Allocator.Error![]u8 {
+fn stringify(self: *const Review, alloc: Allocator) Allocator.Error![]u8 {
     var wire_comments: std.ArrayList(WireComment) = .empty;
-    defer wire_comments.deinit(gpa);
-    try wire_comments.ensureTotalCapacity(gpa, self.comments.items.len);
+    defer wire_comments.deinit(alloc);
+    try wire_comments.ensureTotalCapacity(alloc, self.comments.items.len);
     for (self.comments.items) |c| {
         wire_comments.appendAssumeCapacity(.{
             .id = c.id,
@@ -247,7 +242,7 @@ fn stringify(self: *const Review, gpa: Allocator) Allocator.Error![]u8 {
         .id = self.id,
         .comments = wire_comments.items,
     };
-    var out: std.Io.Writer.Allocating = .init(gpa);
+    var out: std.Io.Writer.Allocating = .init(alloc);
     errdefer out.deinit();
     std.json.Stringify.value(wire, .{ .whitespace = .indent_2 }, &out.writer) catch return error.OutOfMemory;
     out.writer.writeByte('\n') catch return error.OutOfMemory;
