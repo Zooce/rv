@@ -268,8 +268,8 @@ test "addOpen firstAt and roundtrip" {
     if (builtin.os.tag == .wasi) return;
     const io = testing.io;
     const alloc = testing.allocator;
-    var tmp = try IsolatedTmp.create(alloc, io);
-    defer tmp.cleanup(alloc, io);
+    var tmp = try IsolatedTmp.init(alloc, io);
+    defer tmp.deinit(alloc, io);
 
     var empty = try load(alloc, io, tmp.dir, default_review_id);
     defer empty.deinit();
@@ -372,8 +372,8 @@ test "setBody overwrites body only" {
     if (builtin.os.tag == .wasi) return;
     const io = testing.io;
     const alloc = testing.allocator;
-    var tmp = try IsolatedTmp.create(alloc, io);
-    defer tmp.cleanup(alloc, io);
+    var tmp = try IsolatedTmp.init(alloc, io);
+    defer tmp.deinit(alloc, io);
     try save(&review, alloc, io, tmp.dir);
     var loaded = try load(alloc, io, tmp.dir, default_review_id);
     defer loaded.deinit();
@@ -410,8 +410,8 @@ test "setLines overwrites lines and side only" {
     if (builtin.os.tag == .wasi) return;
     const io = testing.io;
     const alloc = testing.allocator;
-    var tmp = try IsolatedTmp.create(alloc, io);
-    defer tmp.cleanup(alloc, io);
+    var tmp = try IsolatedTmp.init(alloc, io);
+    defer tmp.deinit(alloc, io);
     try save(&review, alloc, io, tmp.dir);
     var loaded = try load(alloc, io, tmp.dir, default_review_id);
     defer loaded.deinit();

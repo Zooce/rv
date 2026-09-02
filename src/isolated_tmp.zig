@@ -11,7 +11,7 @@ pub const IsolatedTmp = struct {
     path: []u8,
     dir: Io.Dir,
 
-    pub fn create(alloc: Allocator, io: Io) !IsolatedTmp {
+    pub fn init(alloc: Allocator, io: Io) !IsolatedTmp {
         var random_bytes: [12]u8 = undefined;
         io.random(&random_bytes);
         var name_buf: [16]u8 = undefined;
@@ -26,7 +26,7 @@ pub const IsolatedTmp = struct {
         return .{ .path = path, .dir = dir };
     }
 
-    pub fn cleanup(self: *IsolatedTmp, alloc: Allocator, io: Io) void {
+    pub fn deinit(self: *IsolatedTmp, alloc: Allocator, io: Io) void {
         self.dir.close(io);
         // Best-effort remove; tests should not leave junk on success.
         Io.Dir.cwd().deleteTree(io, self.path) catch {};

@@ -328,10 +328,10 @@ test "install list uninstall: stdout capture and fs roundtrip" {
     const io = testing.io;
     const alloc = testing.allocator;
 
-    var home_tmp = try IsolatedTmp.create(alloc, io);
-    defer home_tmp.cleanup(alloc, io);
-    var src_tmp = try IsolatedTmp.create(alloc, io);
-    defer src_tmp.cleanup(alloc, io);
+    var home_tmp = try IsolatedTmp.init(alloc, io);
+    defer home_tmp.deinit(alloc, io);
+    var src_tmp = try IsolatedTmp.init(alloc, io);
+    defer src_tmp.deinit(alloc, io);
     try src_tmp.write(io, skill_md, "# rv\n");
 
     const grok = try homeJoin(alloc, home_tmp.path, ".grok/skills");

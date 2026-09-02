@@ -1082,8 +1082,8 @@ test "not a git repository" {
 
     const io = testing.io;
     const alloc = testing.allocator;
-    var tmp = try IsolatedTmp.create(alloc, io);
-    defer tmp.cleanup(alloc, io);
+    var tmp = try IsolatedTmp.init(alloc, io);
+    defer tmp.deinit(alloc, io);
 
     try testing.expectError(
         error.NotARepository,
@@ -1096,8 +1096,8 @@ test "dirty worktree: unstaged, untracked, then staged" {
 
     const io = testing.io;
     const alloc = testing.allocator;
-    var tmp = try IsolatedTmp.create(alloc, io);
-    defer tmp.cleanup(alloc, io);
+    var tmp = try IsolatedTmp.init(alloc, io);
+    defer tmp.deinit(alloc, io);
     const cwd = tmp.cwd();
 
     try initTestRepo(alloc, io, cwd);
@@ -1134,8 +1134,8 @@ test "clean feature branch: empty model (no local changes)" {
 
     const io = testing.io;
     const alloc = testing.allocator;
-    var tmp = try IsolatedTmp.create(alloc, io);
-    defer tmp.cleanup(alloc, io);
+    var tmp = try IsolatedTmp.init(alloc, io);
+    defer tmp.deinit(alloc, io);
     const cwd = tmp.cwd();
 
     try initTestRepo(alloc, io, cwd);
@@ -1164,8 +1164,8 @@ test "clean worktree: empty model" {
 
     const io = testing.io;
     const alloc = testing.allocator;
-    var tmp = try IsolatedTmp.create(alloc, io);
-    defer tmp.cleanup(alloc, io);
+    var tmp = try IsolatedTmp.init(alloc, io);
+    defer tmp.deinit(alloc, io);
     const cwd = tmp.cwd();
 
     try initTestRepo(alloc, io, cwd);
@@ -1184,8 +1184,8 @@ test "dirty tracked plus untracked file: both in local stream" {
 
     const io = testing.io;
     const alloc = testing.allocator;
-    var tmp = try IsolatedTmp.create(alloc, io);
-    defer tmp.cleanup(alloc, io);
+    var tmp = try IsolatedTmp.init(alloc, io);
+    defer tmp.deinit(alloc, io);
     const cwd = tmp.cwd();
 
     try initTestRepo(alloc, io, cwd);
@@ -1209,8 +1209,8 @@ test "ignored untracked path is not included" {
 
     const io = testing.io;
     const alloc = testing.allocator;
-    var tmp = try IsolatedTmp.create(alloc, io);
-    defer tmp.cleanup(alloc, io);
+    var tmp = try IsolatedTmp.init(alloc, io);
+    defer tmp.deinit(alloc, io);
     const cwd = tmp.cwd();
 
     try initTestRepo(alloc, io, cwd);
@@ -1232,8 +1232,8 @@ test "untracked-only worktree: non-empty local stream" {
 
     const io = testing.io;
     const alloc = testing.allocator;
-    var tmp = try IsolatedTmp.create(alloc, io);
-    defer tmp.cleanup(alloc, io);
+    var tmp = try IsolatedTmp.init(alloc, io);
+    defer tmp.deinit(alloc, io);
     const cwd = tmp.cwd();
 
     try initTestRepo(alloc, io, cwd);
@@ -1257,8 +1257,8 @@ test "no HEAD: untracked-only still loads" {
 
     const io = testing.io;
     const alloc = testing.allocator;
-    var tmp = try IsolatedTmp.create(alloc, io);
-    defer tmp.cleanup(alloc, io);
+    var tmp = try IsolatedTmp.init(alloc, io);
+    defer tmp.deinit(alloc, io);
     const cwd = tmp.cwd();
 
     try initTestRepo(alloc, io, cwd);
@@ -1276,8 +1276,8 @@ test "range main...HEAD: commits ahead of main" {
 
     const io = testing.io;
     const alloc = testing.allocator;
-    var tmp = try IsolatedTmp.create(alloc, io);
-    defer tmp.cleanup(alloc, io);
+    var tmp = try IsolatedTmp.init(alloc, io);
+    defer tmp.deinit(alloc, io);
     const cwd = tmp.cwd();
 
     try initTestRepo(alloc, io, cwd);
@@ -1307,8 +1307,8 @@ test "range does not append untracked files" {
 
     const io = testing.io;
     const alloc = testing.allocator;
-    var tmp = try IsolatedTmp.create(alloc, io);
-    defer tmp.cleanup(alloc, io);
+    var tmp = try IsolatedTmp.init(alloc, io);
+    defer tmp.deinit(alloc, io);
     const cwd = tmp.cwd();
 
     try initTestRepo(alloc, io, cwd);
@@ -1335,8 +1335,8 @@ test "invalid range: GitFailed" {
 
     const io = testing.io;
     const alloc = testing.allocator;
-    var tmp = try IsolatedTmp.create(alloc, io);
-    defer tmp.cleanup(alloc, io);
+    var tmp = try IsolatedTmp.init(alloc, io);
+    defer tmp.deinit(alloc, io);
     const cwd = tmp.cwd();
 
     try initTestRepo(alloc, io, cwd);
@@ -1355,8 +1355,8 @@ test "range not a git repository" {
 
     const io = testing.io;
     const alloc = testing.allocator;
-    var tmp = try IsolatedTmp.create(alloc, io);
-    defer tmp.cleanup(alloc, io);
+    var tmp = try IsolatedTmp.init(alloc, io);
+    defer tmp.deinit(alloc, io);
 
     try testing.expectError(
         error.NotARepository,
@@ -1369,8 +1369,8 @@ test "mutate file: stage, unstage, discard; refuse discard staged" {
 
     const io = testing.io;
     const alloc = testing.allocator;
-    var tmp = try IsolatedTmp.create(alloc, io);
-    defer tmp.cleanup(alloc, io);
+    var tmp = try IsolatedTmp.init(alloc, io);
+    defer tmp.deinit(alloc, io);
     const cwd = tmp.cwd();
 
     try initTestRepo(alloc, io, cwd);
@@ -1449,8 +1449,8 @@ test "mutate: not a git repository" {
 
     const io = testing.io;
     const alloc = testing.allocator;
-    var tmp = try IsolatedTmp.create(alloc, io);
-    defer tmp.cleanup(alloc, io);
+    var tmp = try IsolatedTmp.init(alloc, io);
+    defer tmp.deinit(alloc, io);
 
     try testing.expectError(error.NotARepository, mutate(alloc, io, tmp.cwd(), .{
         .action = .stage,
@@ -1464,8 +1464,8 @@ test "mutate: GitFailed fills fail_output from git stderr" {
 
     const io = testing.io;
     const alloc = testing.allocator;
-    var tmp = try IsolatedTmp.create(alloc, io);
-    defer tmp.cleanup(alloc, io);
+    var tmp = try IsolatedTmp.init(alloc, io);
+    defer tmp.deinit(alloc, io);
     const cwd = tmp.cwd();
 
     try initTestRepo(alloc, io, cwd);
@@ -1489,8 +1489,8 @@ test "mutate hunk: mixed file, other group remains" {
 
     const io = testing.io;
     const alloc = testing.allocator;
-    var tmp = try IsolatedTmp.create(alloc, io);
-    defer tmp.cleanup(alloc, io);
+    var tmp = try IsolatedTmp.init(alloc, io);
+    defer tmp.deinit(alloc, io);
     const cwd = tmp.cwd();
 
     try initTestRepo(alloc, io, cwd);
@@ -1568,8 +1568,8 @@ test "mutate hunk: untracked stage and discard" {
 
     const io = testing.io;
     const alloc = testing.allocator;
-    var tmp = try IsolatedTmp.create(alloc, io);
-    defer tmp.cleanup(alloc, io);
+    var tmp = try IsolatedTmp.init(alloc, io);
+    defer tmp.deinit(alloc, io);
     const cwd = tmp.cwd();
 
     try initTestRepo(alloc, io, cwd);
@@ -1623,8 +1623,8 @@ test "mutate hunk: apply mismatch leaves prior content" {
 
     const io = testing.io;
     const alloc = testing.allocator;
-    var tmp = try IsolatedTmp.create(alloc, io);
-    defer tmp.cleanup(alloc, io);
+    var tmp = try IsolatedTmp.init(alloc, io);
+    defer tmp.deinit(alloc, io);
     const cwd = tmp.cwd();
 
     try initTestRepo(alloc, io, cwd);
