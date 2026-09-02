@@ -73,7 +73,7 @@ pub fn main() !void {
                         } else {
                             counter += 1;
                             // Format into last_key_buf; last_key borrows that buffer.
-                            last_key = try std.fmt.bufPrint(&last_key_buf, "char '{c}'", .{@as(u8, @intCast(c))});
+                            last_key = try std.fmt.bufPrint(&last_key_buf, "char '{u}'", .{c});
                         }
                     },
                     .enter => {

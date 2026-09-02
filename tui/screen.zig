@@ -142,7 +142,9 @@ pub const Screen = struct {
     /// Allocate front + back grids of `size.cols * size.rows` blank cells.
     pub fn init(alloc: std.mem.Allocator, size: Size) !Screen {
         // Total cells in the grid (row-major: index = y * cols + x).
-        const n: usize = @as(usize, size.cols) * @as(usize, size.rows);
+        const cols: usize = size.cols;
+        const rows: usize = size.rows;
+        const n = cols * rows;
         const front = try alloc.alloc(Cell, n); // draw buffer
         errdefer alloc.free(front); // free if the next alloc fails
         const back = try alloc.alloc(Cell, n); // last-presented buffer
@@ -170,7 +172,9 @@ pub const Screen = struct {
     pub fn resize(self: *Screen, size: Size) !void {
         // No-op if nothing changed (avoids needless full repaint).
         if (size.cols == self.cols and size.rows == self.rows) return;
-        const n: usize = @as(usize, size.cols) * @as(usize, size.rows);
+        const cols: usize = size.cols;
+        const rows: usize = size.rows;
+        const n = cols * rows;
         const front = try self.alloc.alloc(Cell, n);
         errdefer self.alloc.free(front);
         const back = try self.alloc.alloc(Cell, n);
@@ -199,7 +203,10 @@ pub const Screen = struct {
 
     /// Row-major index of cell (x, y). x is column, y is row; both 0-based.
     fn index(self: *const Screen, x: u16, y: u16) usize {
-        return @as(usize, y) * @as(usize, self.cols) + @as(usize, x);
+        const col: usize = x;
+        const row: usize = y;
+        const width: usize = self.cols;
+        return row * width + col;
     }
 
     /// Write one cell into the front buffer (clipped to the grid).
@@ -468,7 +475,8 @@ fn writeColor(t: *Tty, color: Color, is_fg: bool) !void {
     switch (color) {
         .default => {
             // SGR 39 = default fg, 49 = default bg
-            const s = try std.fmt.bufPrint(&buf, ";{d}", .{if (is_fg) @as(u8, 39) else 49});
+            const kind: u8 = if (is_fg) 39 else 49;
+            const s = try std.fmt.bufPrint(&buf, ";{d}", .{kind});
             try t.write(s);
         },
         .indexed => |idx| {
@@ -484,14 +492,16 @@ fn writeColor(t: *Tty, color: Color, is_fg: bool) !void {
                 try t.write(s);
             } else {
                 // 256-color: SGR 38;5;n (fg) or 48;5;n (bg)
-                const s = try std.fmt.bufPrint(&buf, ";{d};5;{d}", .{ if (is_fg) @as(u8, 38) else 48, idx });
+                const kind: u8 = if (is_fg) 38 else 48;
+                const s = try std.fmt.bufPrint(&buf, ";{d};5;{d}", .{ kind, idx });
                 try t.write(s);
             }
         },
         .rgb => |rgb| {
             // truecolor: SGR 38;2;r;g;b (fg) or 48;2;r;g;b (bg)
+            const kind: u8 = if (is_fg) 38 else 48;
             const s = try std.fmt.bufPrint(&buf, ";{d};2;{d};{d};{d}", .{
-                if (is_fg) @as(u8, 38) else 48,
+                kind,
                 rgb.r,
                 rgb.g,
                 rgb.b,

@@ -155,7 +155,7 @@ pub fn metricsLimited(cols: u16, draft: []const u8, max_visible: usize) Metrics 
     const cap: usize = if (max_visible == 0) 1 else max_visible;
     const tw = textWidth(cols);
     const lines = lineCount(draft, tw);
-    const height: u16 = @intCast(@min(cap, @max(@as(usize, 1), lines)));
+    const height: u16 = @intCast(if (lines < cap) lines else cap);
     return .{
         .text_w = tw,
         .line_count = lines,
