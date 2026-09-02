@@ -565,7 +565,7 @@ test "readTimeout returns 0 on real timeout with open peer" {
     };
     var buf: [1]u8 = undefined;
     const n = try t.readTimeout(&buf, 30);
-    try std.testing.expectEqual(@as(usize, 0), n);
+    try std.testing.expectEqual(0, n);
 }
 
 // Contract: emergencyRestore puts termios back and clears g.active.

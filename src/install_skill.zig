@@ -349,7 +349,7 @@ test "install list uninstall: stdout capture and fs roundtrip" {
     const streams = cap.init();
 
     // install
-    try testing.expectEqual(@as(u8, 0), run(alloc, io, .{}, home, src, streams));
+    try testing.expectEqual(0, run(alloc, io, .{}, home, src, streams));
     try testing.expect(isLink(io, canonical));
     try testing.expect(isLink(io, gl));
     const install_out = try std.fmt.allocPrint(alloc, "canonical: {s} -> {s}\nagent grok: {s} -> {s}\n", .{
@@ -361,13 +361,13 @@ test "install list uninstall: stdout capture and fs roundtrip" {
     cap.resetOut();
 
     // idempotent re-run
-    try testing.expectEqual(@as(u8, 0), run(alloc, io, .{}, home, src, streams));
+    try testing.expectEqual(0, run(alloc, io, .{}, home, src, streams));
     try testing.expectEqualStrings(install_out, cap.stdout());
     try testing.expectEqualStrings("", cap.stderr());
     cap.resetOut();
 
     // list
-    try testing.expectEqual(@as(u8, 0), run(alloc, io, .{ .list = true }, home, src, streams));
+    try testing.expectEqual(0, run(alloc, io, .{ .list = true }, home, src, streams));
     const list_out = try std.fmt.allocPrint(alloc,
         \\source: {s}
         \\canonical: {s} -> {s}
@@ -383,7 +383,7 @@ test "install list uninstall: stdout capture and fs roundtrip" {
     cap.resetOut();
 
     // uninstall
-    try testing.expectEqual(@as(u8, 0), run(alloc, io, .{ .uninstall = true }, home, null, streams));
+    try testing.expectEqual(0, run(alloc, io, .{ .uninstall = true }, home, null, streams));
     try testing.expect(!exists(io, canonical));
     try testing.expect(!isLink(io, gl));
     const un_out = try std.fmt.allocPrint(alloc, "removed: {s}\nremoved: {s}\n", .{ gl, canonical });
@@ -395,7 +395,7 @@ test "install list uninstall: stdout capture and fs roundtrip" {
 test "unknown agent writes usage to stderr" {
     var cap: Capture = .{};
     const streams = cap.init();
-    try testing.expectEqual(@as(u8, 2), run(
+    try testing.expectEqual(2, run(
         testing.allocator,
         testing.io,
         .{ .agent = "nope" },

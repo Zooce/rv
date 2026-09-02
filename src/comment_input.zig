@@ -313,18 +313,18 @@ pub fn scrollbarThumb(total: usize, visible: usize, scroll: usize, track: usize)
 
 test "textWidth reserves gutter prefix and right pad" {
     // cols=20 → 20 - 1 - 2 - 2 = 15
-    try testing.expectEqual(@as(u16, 15), textWidth(20));
-    try testing.expectEqual(@as(u16, 1), textWidth(3)); // degenerate
+    try testing.expectEqual(15, textWidth(20));
+    try testing.expectEqual(1, textWidth(3)); // degenerate
 }
 
 test "lineCount empty" {
-    try testing.expectEqual(@as(usize, 1), lineCount("", 10));
+    try testing.expectEqual(1, lineCount("", 10));
 }
 
 test "word wrap breaks on spaces" {
     // text_w=10: "hello world" → "hello" / "world"
     const d = "hello world";
-    try testing.expectEqual(@as(usize, 2), lineCount(d, 10));
+    try testing.expectEqual(2, lineCount(d, 10));
     const a = lineRange(d, 10, 0).?;
     const b = lineRange(d, 10, 1).?;
     try testing.expectEqualStrings("hello", d[a.start..a.end]);
@@ -341,7 +341,7 @@ test "word wrap breaks after hyphen and comma" {
 
 test "hard split long token" {
     const d = "abcdefghijXYZ"; // 13 chars, text_w=10 → abcd...ij / XYZ
-    try testing.expectEqual(@as(usize, 2), lineCount(d, 10));
+    try testing.expectEqual(2, lineCount(d, 10));
     try testing.expectEqualStrings("abcdefghij", d[lineRange(d, 10, 0).?.start..lineRange(d, 10, 0).?.end]);
     try testing.expectEqualStrings("XYZ", d[lineRange(d, 10, 1).?.start..lineRange(d, 10, 1).?.end]);
 }
@@ -361,7 +361,7 @@ test "metrics text_w stable with scrollbar" {
     try testing.expectEqual(textWidth(12), m.text_w);
     try testing.expect(m.line_count > max_rows);
     try testing.expect(m.show_scrollbar);
-    try testing.expectEqual(@as(u16, 4), m.height);
+    try testing.expectEqual(4, m.height);
     // Same text_w without needing scroll (short draft).
     const m1 = metrics(12, "hi");
     try testing.expectEqual(m.text_w, m1.text_w);
@@ -371,29 +371,29 @@ test "metrics text_w stable with scrollbar" {
 test "metricsLimited short terminal" {
     const d = "alpha bravo charlie delta";
     const m = metricsLimited(12, d, 2);
-    try testing.expectEqual(@as(u16, 2), m.height);
+    try testing.expectEqual(2, m.height);
     try testing.expect(m.show_scrollbar);
     try testing.expectEqual(textWidth(12), m.text_w);
 }
 
 test "clampScroll and scrollToEnd" {
-    try testing.expectEqual(@as(usize, 0), maxScroll(3, 4));
-    try testing.expectEqual(@as(usize, 2), maxScroll(6, 4));
-    try testing.expectEqual(@as(usize, 2), clampScroll(99, 6, 4));
-    try testing.expectEqual(@as(usize, 2), scrollToEnd(6, 4));
-    try testing.expectEqual(@as(usize, 0), scrollToEnd(2, 4));
+    try testing.expectEqual(0, maxScroll(3, 4));
+    try testing.expectEqual(2, maxScroll(6, 4));
+    try testing.expectEqual(2, clampScroll(99, 6, 4));
+    try testing.expectEqual(2, scrollToEnd(6, 4));
+    try testing.expectEqual(0, scrollToEnd(2, 4));
 }
 
 test "cursorAtEnd empty and wrapped" {
     const e = cursorAtEnd("", 10, 0, 1);
-    try testing.expectEqual(@as(u16, left_gutter + prefix_w), e.x);
-    try testing.expectEqual(@as(u16, 0), e.y_off);
+    try testing.expectEqual(left_gutter + prefix_w, e.x);
+    try testing.expectEqual(0, e.y_off);
 
     const d = "hello world";
     // 2 lines; caret after "world" on line 1
     const c = cursorAtEnd(d, 10, 0, 2);
-    try testing.expectEqual(@as(u16, 1), c.y_off);
-    try testing.expectEqual(@as(u16, left_gutter + prefix_w + 5), c.x); // "world"
+    try testing.expectEqual(1, c.y_off);
+    try testing.expectEqual(left_gutter + prefix_w + 5, c.x); // "world"
 }
 
 test "VisualPos.init empty mid and end" {
@@ -463,12 +463,12 @@ test "ensureVisible keeps caret line in window" {
 
 test "scrollbarThumb extremes" {
     const top = scrollbarThumb(10, 4, 0, 4);
-    try testing.expectEqual(@as(usize, 0), top.start);
+    try testing.expectEqual(0, top.start);
     try testing.expect(top.len >= 1);
 
     const bot = scrollbarThumb(10, 4, 6, 4);
-    try testing.expectEqual(bot.start + bot.len, @as(usize, 4));
+    try testing.expectEqual(4, bot.start + bot.len);
 
     const none = scrollbarThumb(3, 4, 0, 4);
-    try testing.expectEqual(@as(usize, 0), none.len);
+    try testing.expectEqual(0, none.len);
 }

@@ -696,20 +696,20 @@ test "putStr on a tiny off-origin rect" {
 }
 
 test "displayWidth and byteAtCol ASCII" {
-    try std.testing.expectEqual(@as(usize, 0), displayWidth(""));
-    try std.testing.expectEqual(@as(usize, 5), displayWidth("hello"));
-    try std.testing.expectEqual(@as(usize, 0), byteAtCol("hello", 0));
-    try std.testing.expectEqual(@as(usize, 2), byteAtCol("hello", 2));
-    try std.testing.expectEqual(@as(usize, 5), byteAtCol("hello", 5));
-    try std.testing.expectEqual(@as(usize, 5), byteAtCol("hello", 99));
+    try std.testing.expectEqual(0, displayWidth(""));
+    try std.testing.expectEqual(5, displayWidth("hello"));
+    try std.testing.expectEqual(0, byteAtCol("hello", 0));
+    try std.testing.expectEqual(2, byteAtCol("hello", 2));
+    try std.testing.expectEqual(5, byteAtCol("hello", 5));
+    try std.testing.expectEqual(5, byteAtCol("hello", 99));
     try std.testing.expectEqualStrings("llo", "hello"[byteAtCol("hello", 2)..]);
 }
 
 test "displayWidth wide glyph" {
     // U+4E00 CJK ideograph → 2 columns under codepointWidth.
     const wide = "\u{4e00}";
-    try std.testing.expectEqual(@as(usize, 2), displayWidth(wide));
-    try std.testing.expectEqual(@as(usize, 0), byteAtCol(wide, 0));
+    try std.testing.expectEqual(2, displayWidth(wide));
+    try std.testing.expectEqual(0, byteAtCol(wide, 0));
     // Column 1 is the second half of the wide cell → skip past the glyph.
     try std.testing.expectEqual(wide.len, byteAtCol(wide, 1));
     try std.testing.expectEqual(wide.len, byteAtCol(wide, 2));
@@ -745,7 +745,7 @@ test "present failure discards write buffer and does not commit back" {
     try std.testing.expectError(error.BrokenPipe, screen.present(&t));
 
     // Primary bug: partial escape stream must not remain queued for the next present.
-    try std.testing.expectEqual(@as(usize, 0), t.write_len);
+    try std.testing.expectEqual(0, t.write_len);
 
     // Back must not look "presented" when the terminal never got the frame.
     try std.testing.expect(screen.back[0].eql(back0));
@@ -759,7 +759,7 @@ test "present failure discards write buffer and does not commit back" {
     t.fd = live.write;
 
     try screen.present(&t);
-    try std.testing.expectEqual(@as(usize, 0), t.write_len);
+    try std.testing.expectEqual(0, t.write_len);
     try std.testing.expect(screen.front[0].eql(screen.back[0]));
     try std.testing.expect(!screen.dirty_all);
 }

@@ -261,7 +261,7 @@ test "readWithTimeout infinite wait does not clear winch" {
 
     var buf: [1]u8 = undefined;
     const n = try readWithTimeout(&t, &buf, -1);
-    try std.testing.expectEqual(@as(usize, 0), n);
+    try std.testing.expectEqual(0, n);
     // After wake, flag must still be observable so poll can takeWinch → .resize.
     try std.testing.expect(t.peekWinch());
 }
