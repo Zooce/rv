@@ -9,9 +9,14 @@ const store = @import("store");
 const view = @import("view");
 const diff = @import("diff");
 
-/// Display target for a live comment, or null if it has no usable side/line.
+/// Display target for a live comment. Path-only (file) comments have no side/line.
+/// Null when resolved, or when a line comment has no usable side/line.
 pub fn loc(c: store.Comment) ?view.CommentLoc {
     if (c.state != .open) return null;
+    if (c.old_line == null and c.new_line == null) {
+        if (c.side != null) return null;
+        return .{ .path = c.path };
+    }
     if (c.side) |s| {
         switch (s) {
             .old => if (c.old_line) |n| return .{ .path = c.path, .side = .old, .line = n },
@@ -50,12 +55,13 @@ const Rank = struct {
 fn rankOf(c: store.Comment, i: usize, rows: []const view.row.Row) ?Rank {
     const found = loc(c) orelse return null;
     const row = view.rowForComment(rows, found) orelse return null;
+    const side: u1 = if (found.side) |s| switch (s) {
+        .old => 0,
+        .new => 1,
+    } else 0;
     return .{
         .row = row,
-        .side = switch (found.side) {
-            .old => 0,
-            .new => 1,
-        },
+        .side = side,
         .i = i,
     };
 }
@@ -205,7 +211,7 @@ fn remapAnchorFromLine(ln: diff.Line, side: store.Side) ?RemapAnchor {
 }
 
 /// New path+line for `c` in `dest`, or null if this comment is not on `src_file`
-/// / the chosen hunk, or the line is gone.
+/// / the chosen hunk, or the line is gone. Path-only (file) comments stay as-is.
 fn destAnchor(
     c: store.Comment,
     src_file: *const diff.File,
@@ -214,6 +220,7 @@ fn destAnchor(
 ) ?RemapAnchor {
     if (c.state != .open) return null;
     if (!std.mem.eql(u8, c.path, src_file.displayPath())) return null;
+    if (c.old_line == null and c.new_line == null) return null;
     const hi = hunk_i orelse blk: {
         for (src_file.hunks, 0..) |h, i| {
             if (commentLineIndex(c, h) != null) break :blk i;
@@ -282,6 +289,7 @@ fn hitsHunk(c: store.Comment, hunk: diff.Hunk) bool {
 }
 
 /// Live comment on `file`, and on `hunk_i` when that index is set.
+/// Path-only (file) comments match whole-file (`hunk_i == null`) only.
 pub fn matches(c: store.Comment, file: *const diff.File, hunk_i: ?usize) bool {
     if (c.state != .open) return false;
     if (!std.mem.eql(u8, c.path, file.displayPath())) return false;
@@ -289,6 +297,7 @@ pub fn matches(c: store.Comment, file: *const diff.File, hunk_i: ?usize) bool {
         if (hi >= file.hunks.len) return false;
         return hitsHunk(c, file.hunks[hi]);
     }
+    if (c.old_line == null and c.new_line == null) return true;
     for (file.hunks) |hunk| {
         if (hitsHunk(c, hunk)) return true;
     }
@@ -350,8 +359,8 @@ test "loc open sides context missing resolved" {
         .body = "x",
     }).?;
     try testing.expectEqualStrings("f", old_loc.path);
-    try testing.expectEqual(.old, old_loc.side);
-    try testing.expectEqual(2, old_loc.line);
+    try testing.expectEqual(.old, old_loc.side.?);
+    try testing.expectEqual(2, old_loc.line.?);
 
     const new_loc = loc(.{
         .id = "1",
@@ -360,8 +369,8 @@ test "loc open sides context missing resolved" {
         .side = .new,
         .body = "x",
     }).?;
-    try testing.expectEqual(.new, new_loc.side);
-    try testing.expectEqual(3, new_loc.line);
+    try testing.expectEqual(.new, new_loc.side.?);
+    try testing.expectEqual(3, new_loc.line.?);
 
     const ctx = loc(.{
         .id = "1",
@@ -371,8 +380,8 @@ test "loc open sides context missing resolved" {
         .side = .context,
         .body = "x",
     }).?;
-    try testing.expectEqual(.new, ctx.side);
-    try testing.expectEqual(4, ctx.line);
+    try testing.expectEqual(.new, ctx.side.?);
+    try testing.expectEqual(4, ctx.line.?);
 
     const ctx_old = loc(.{
         .id = "1",
@@ -381,8 +390,8 @@ test "loc open sides context missing resolved" {
         .side = .context,
         .body = "x",
     }).?;
-    try testing.expectEqual(.old, ctx_old.side);
-    try testing.expectEqual(5, ctx_old.line);
+    try testing.expectEqual(.old, ctx_old.side.?);
+    try testing.expectEqual(5, ctx_old.line.?);
 
     try testing.expect(loc(.{
         .id = "1",
@@ -406,8 +415,8 @@ test "loc open sides context missing resolved" {
         .new_line = 2,
         .body = "x",
     }).?;
-    try testing.expectEqual(.new, implied_new.side);
-    try testing.expectEqual(2, implied_new.line);
+    try testing.expectEqual(.new, implied_new.side.?);
+    try testing.expectEqual(2, implied_new.line.?);
 
     const implied_old = loc(.{
         .id = "1",
@@ -415,8 +424,24 @@ test "loc open sides context missing resolved" {
         .old_line = 8,
         .body = "x",
     }).?;
-    try testing.expectEqual(.old, implied_old.side);
-    try testing.expectEqual(8, implied_old.line);
+    try testing.expectEqual(.old, implied_old.side.?);
+    try testing.expectEqual(8, implied_old.line.?);
+
+    const file_loc = loc(.{
+        .id = "1",
+        .path = "f",
+        .body = "x",
+    }).?;
+    try testing.expectEqualStrings("f", file_loc.path);
+    try testing.expect(file_loc.side == null);
+    try testing.expect(file_loc.line == null);
+
+    try testing.expect(loc(.{
+        .id = "1",
+        .path = "f",
+        .body = "x",
+        .state = .resolved,
+    }) == null);
 }
 
 test "next prev display order wrap skip missing" {
@@ -616,6 +641,71 @@ test "destAnchor maps the commented line, not a neighbor hunk" {
     try testing.expect(destAnchor(on_add, src_file, &dest_other, 0) == null);
 }
 
+test "path-only comments stay path-only on remap" {
+    const src_txt =
+        \\diff --git a/a.zig b/a.zig
+        \\--- a/a.zig
+        \\+++ b/a.zig
+        \\@@ -1 +1 @@
+        \\-old
+        \\+new
+    ;
+    const dest_txt =
+        \\diff --git a/a.zig b/a.zig
+        \\--- a/a.zig
+        \\+++ b/a.zig
+        \\@@ -20 +20 @@
+        \\-old
+        \\+new
+    ;
+    const dest_gone =
+        \\diff --git a/b.zig b/b.zig
+        \\--- a/b.zig
+        \\+++ b/b.zig
+        \\@@ -1 +1 @@
+        \\-x
+        \\+y
+    ;
+
+    var src = try diff.parsePieces(testing.allocator, &.{
+        .{ .text = src_txt, .group = .unstaged },
+    });
+    defer src.deinit();
+    const src_file = &src.files[0];
+    const file_c = store.Comment{ .id = "1", .path = "a.zig", .body = "file" };
+
+    var dest_eq = try diff.parsePieces(testing.allocator, &.{
+        .{ .text = dest_txt, .group = .staged },
+    });
+    defer dest_eq.deinit();
+    try testing.expect(destAnchor(file_c, src_file, &dest_eq, null) == null);
+    try testing.expect(destAnchor(file_c, src_file, &dest_eq, 0) == null);
+
+    var dest_other = try diff.parsePieces(testing.allocator, &.{
+        .{ .text = dest_gone, .group = .staged },
+    });
+    defer dest_other.deinit();
+    try testing.expect(destAnchor(file_c, src_file, &dest_other, null) == null);
+
+    var review = try store.initEmpty(testing.allocator, "t");
+    defer review.deinit();
+    _ = try review.addOpen("a.zig", null, null, null, "file");
+    _ = try review.addOpen("a.zig", null, 1, .new, "line");
+
+    var priors: std.ArrayList(AnchorSnap) = .empty;
+    defer priors.deinit(testing.allocator);
+    try remapMatching(&review, src_file, &dest_eq, null, testing.allocator, &priors);
+
+    const kept = review.find("1").?;
+    try testing.expect(kept.old_line == null);
+    try testing.expect(kept.new_line == null);
+    try testing.expect(kept.side == null);
+    const mapped = review.find("2").?;
+    try testing.expect(mapped.old_line == null);
+    try testing.expectEqual(20, mapped.new_line.?);
+    try testing.expectEqual(store.Side.new, mapped.side.?);
+}
+
 test "matches this group's hunk lines" {
     const hunks = [_]diff.Hunk{
         .{ .old_start = 10, .old_count = 3, .new_start = 12, .new_count = 4 },
@@ -649,4 +739,93 @@ test "matches this group's hunk lines" {
     try testing.expect(matches(hit_new, &file, null));
     try testing.expect(matches(hit_second, &file, null));
     try testing.expect(!matches(other_line, &file, null));
+
+    const file_c = store.Comment{ .id = "7", .path = "a.zig", .body = "file" };
+    const resolved_file = store.Comment{
+        .id = "8",
+        .path = "a.zig",
+        .body = "file",
+        .state = .resolved,
+    };
+    const file_other = store.Comment{ .id = "9", .path = "b.zig", .body = "file" };
+    try testing.expect(matches(file_c, &file, null));
+    try testing.expect(!matches(file_c, &file, 0));
+    try testing.expect(!matches(resolved_file, &file, null));
+    try testing.expect(!matches(file_other, &file, null));
+
+    const empty = diff.File{ .new_path = "pic.png", .is_binary = true };
+    const bin_c = store.Comment{ .id = "10", .path = "pic.png", .body = "file" };
+    try testing.expect(matches(bin_c, &empty, null));
+    try testing.expect(!matches(bin_c, &empty, 0));
+}
+
+test "atSide file header is path-only" {
+    const fixture =
+        \\diff --git a/f b/f
+        \\--- a/f
+        \\+++ b/f
+        \\@@ -1 +1 @@
+        \\-old
+        \\+new
+    ;
+    var d = try diff.parse(testing.allocator, fixture);
+    defer d.deinit();
+    const rows = try view.row.flatten(testing.allocator, &d);
+    defer testing.allocator.free(rows);
+    const empty: []const view.layout.SbsSlot = &.{};
+
+    var review = try store.initEmpty(testing.allocator, "t");
+    defer review.deinit();
+    _ = try review.addOpen("f", null, null, null, "file");
+    _ = try review.addOpen("f", null, 1, .new, "line");
+
+    const found = atSide(&review, rows, empty, .unified, 0, .new).?;
+    try testing.expectEqualStrings("f", found.anchor.path);
+    try testing.expect(found.anchor.old_line == null);
+    try testing.expect(found.anchor.new_line == null);
+    try testing.expectEqual(0, found.idx.?);
+
+    const old_side = atSide(&review, rows, empty, .unified, 0, .old).?;
+    try testing.expect(old_side.anchor.old_line == null);
+    try testing.expect(old_side.anchor.new_line == null);
+    try testing.expectEqual(0, old_side.idx.?);
+
+    const line = atSide(&review, rows, empty, .unified, 3, .new).?;
+    try testing.expectEqual(1, line.anchor.new_line.?);
+    try testing.expectEqual(1, line.idx.?);
+
+    try testing.expect(atSide(&review, rows, empty, .unified, 1, .new) == null);
+    try testing.expect(atSide(&review, rows, empty, .unified, 1, .old) == null);
+}
+
+test "next prev file comment lands on header" {
+    const fixture =
+        \\diff --git a/f b/f
+        \\--- a/f
+        \\+++ b/f
+        \\@@ -1 +1 @@
+        \\-old
+        \\+new
+    ;
+    var d = try diff.parse(testing.allocator, fixture);
+    defer d.deinit();
+    const rows = try view.row.flatten(testing.allocator, &d);
+    defer testing.allocator.free(rows);
+
+    var review = try store.initEmpty(testing.allocator, "t");
+    defer review.deinit();
+    _ = try review.addOpen("f", null, 1, .new, "line");
+    _ = try review.addOpen("f", null, null, null, "file");
+
+    const n0 = next(&review, rows, 0).?;
+    try testing.expectEqual(3, n0.row);
+    try testing.expect(!n0.wrapped);
+
+    const n1 = next(&review, rows, 3).?;
+    try testing.expectEqual(0, n1.row);
+    try testing.expect(n1.wrapped);
+
+    const p0 = prev(&review, rows, 1).?;
+    try testing.expectEqual(0, p0.row);
+    try testing.expect(!p0.wrapped);
 }

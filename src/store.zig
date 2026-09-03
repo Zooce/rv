@@ -42,11 +42,19 @@ pub const Review = struct {
     }
 
     /// First live comment in store order at this path matching the given line(s).
+    /// `firstAt(path, null, null)` matches only path-only (file) rows. A lookup
+    /// with any line number never hits a file comment.
     pub fn firstAt(self: *const Review, path: []const u8, old_line: ?u32, new_line: ?u32) ?usize {
+        const want_file = old_line == null and new_line == null;
         for (self.comments.items, 0..) |c, i| {
             if (c.state != .open) continue;
             if (!std.mem.eql(u8, c.path, path)) continue;
-            if (lineMatch(c.old_line, old_line) or lineMatch(c.new_line, new_line)) return i;
+            const file_comment = c.old_line == null and c.new_line == null;
+            if (want_file) {
+                if (file_comment) return i;
+            } else if (!file_comment) {
+                if (lineMatch(c.old_line, old_line) or lineMatch(c.new_line, new_line)) return i;
+            }
         }
         return null;
     }
@@ -348,6 +356,23 @@ test "firstAt store order and opposite side" {
 
     try review.remove(&.{"1"});
     try testing.expectEqual(1, review.firstAt("f.zig", null, 10).?);
+}
+
+test "firstAt path-only is not a line" {
+    var review = try initEmpty(testing.allocator, default_review_id);
+    defer review.deinit();
+    _ = try review.addOpen("f.zig", null, null, null, "file");
+    _ = try review.addOpen("f.zig", null, 10, .new, "line");
+    _ = try review.addOpen("f.zig", null, null, null, "file second");
+
+    try testing.expectEqual(0, review.firstAt("f.zig", null, null).?);
+    try testing.expectEqual(1, review.firstAt("f.zig", null, 10).?);
+    try testing.expect(review.firstAt("f.zig", 10, null) == null);
+    try testing.expect(review.firstAt("g.zig", null, null) == null);
+
+    try review.remove(&.{"1"});
+    try testing.expectEqual(1, review.firstAt("f.zig", null, null).?);
+    try testing.expectEqual(0, review.firstAt("f.zig", null, 10).?);
 }
 
 test "setBody overwrites body only" {

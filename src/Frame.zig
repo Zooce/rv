@@ -280,7 +280,7 @@ pub fn paint(
             // Sticky file path under the title bar (hunk headers scroll with body).
             if (sticky.file_idx) |fi| {
                 if (screen_y < content_bottom) {
-                    const text = formatRow(&line_buf, rows[fi], false);
+                    const text = formatRow(&line_buf, rows[fi], rowMarked(rows[fi], review));
                     const st = if (fi == cur) pal.file_cur else pal.file;
                     fillRow(scr, screen_y, st);
                     putRowHint(scr, screen_y, text, indexHintForRow(fi, hint_file, hint_hunk, hint_section, hint_group), st);
@@ -316,7 +316,7 @@ pub fn paint(
 
             if (sticky.file_idx) |fi| {
                 if (screen_y < content_bottom) {
-                    const text = formatRow(&line_buf, rows[fi], false);
+                    const text = formatRow(&line_buf, rows[fi], rowMarked(rows[fi], review));
                     const st = if (fi == cur) pal.file_cur else pal.file;
                     fillRow(scr, screen_y, st);
                     putRowHint(scr, screen_y, text, indexHintForRow(fi, hint_file, hint_hunk, hint_section, hint_group), st);
@@ -329,7 +329,7 @@ pub fn paint(
                 switch (sbs_slots[si]) {
                     .header => |ri| {
                         const is_cur = ri == cur;
-                        const text = formatRow(&line_buf, rows[ri], false);
+                        const text = formatRow(&line_buf, rows[ri], rowMarked(rows[ri], review));
                         const st = pal.rowStyle(rows[ri], is_cur);
                         if (rows[ri] == .section_header) {
                             scr.fillRect(.{ .x = 0, .y = screen_y, .w = scr.cols, .h = 1 }, '─', st);
@@ -420,6 +420,7 @@ fn rowMarked(row: view.row.Row, review: *const store.Review) bool {
             .meta => false,
             else => review.firstAt(ln.path, ln.old_no, ln.new_no) != null,
         },
+        .file_header => |fh| review.firstAt(fh.path, null, null) != null,
         else => false,
     };
 }
@@ -470,7 +471,8 @@ fn formatFooter(
 }
 
 /// Format one row. Line rows: 2-char gutter (`*` if marked else space, then
-/// pad/`\` for meta). Add/delete use background color, not `+/-` markers.
+/// pad/`\` for meta). File headers: `*` in the leading gutter when marked.
+/// Add/delete use background color, not `+/-` markers.
 pub fn formatRow(buf: []u8, row: view.row.Row, marked: bool) []const u8 {
     return switch (row) {
         .section_header => |g| bufPrintTrunc(buf, "── {s} ", .{switch (g) {
@@ -478,10 +480,12 @@ pub fn formatRow(buf: []u8, row: view.row.Row, marked: bool) []const u8 {
             .untracked => "Untracked",
             .staged => "Staged",
         }}),
-        .file_header => |fh| if (fh.is_binary)
-            bufPrintTrunc(buf, " {s}  (binary)", .{fh.path})
-        else
-            bufPrintTrunc(buf, " {s}", .{fh.path}),
+        .file_header => |fh| blk: {
+            const prefix: []const u8 = if (marked) "* " else " ";
+            if (fh.is_binary)
+                break :blk bufPrintTrunc(buf, "{s}{s}  (binary)", .{ prefix, fh.path });
+            break :blk bufPrintTrunc(buf, "{s}{s}", .{ prefix, fh.path });
+        },
         .hunk_header => |hh| blk: {
             const oc = hh.old_count orelse 1;
             const nc = hh.new_count orelse 1;
@@ -604,4 +608,37 @@ fn putPaneStr(scr: *tui.Screen, x: u16, y: u16, pane_w: u16, text: []const u8, s
     if (pane_w == 0) return;
     const end = tui.screen.byteAtCol(text, pane_w);
     scr.putStr(x, y, text[0..end], style, null);
+}
+
+const testing = std.testing;
+
+test "formatRow file header marked" {
+    var buf: [64]u8 = undefined;
+    const row: view.row.Row = .{ .file_header = .{ .path = "a.zig", .is_binary = false } };
+    try testing.expectEqualStrings(" a.zig", formatRow(&buf, row, false));
+    try testing.expectEqualStrings("* a.zig", formatRow(&buf, row, true));
+    const bin: view.row.Row = .{ .file_header = .{ .path = "pic.png", .is_binary = true } };
+    try testing.expectEqualStrings(" pic.png  (binary)", formatRow(&buf, bin, false));
+    try testing.expectEqualStrings("* pic.png  (binary)", formatRow(&buf, bin, true));
+}
+
+test "rowMarked file header is not a line" {
+    var review = try store.initEmpty(testing.allocator, "t");
+    defer review.deinit();
+    _ = try review.addOpen("f", null, null, null, "file");
+    _ = try review.addOpen("f", null, 1, .new, "line");
+
+    const fh: view.row.Row = .{ .file_header = .{ .path = "f", .is_binary = false } };
+    const other: view.row.Row = .{ .file_header = .{ .path = "g", .is_binary = false } };
+    const line: view.row.Row = .{ .line = .{ .kind = .add, .text = "x", .path = "f", .new_no = 1 } };
+    try testing.expect(rowMarked(fh, &review));
+    try testing.expect(rowMarked(line, &review));
+    try testing.expect(!rowMarked(other, &review));
+    try testing.expect(!rowMarked(.{ .section_header = .unstaged }, &review));
+
+    var lines_only = try store.initEmpty(testing.allocator, "t");
+    defer lines_only.deinit();
+    _ = try lines_only.addOpen("f", null, 1, .new, "line");
+    try testing.expect(!rowMarked(fh, &lines_only));
+    try testing.expect(rowMarked(line, &lines_only));
 }

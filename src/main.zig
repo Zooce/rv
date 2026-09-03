@@ -876,6 +876,7 @@ pub const Draft = struct {
     }
 
     /// Open the comment box on `want` at `cursor`. Missing side: silent no-op.
+    /// File header: both sides open the file comment (no missing-side).
     /// Existing comment: pre-fill the first in store order; caret at end. None: create.
     /// Returns true when the box opened.
     fn begin(
@@ -901,7 +902,9 @@ pub const Draft = struct {
     }
 
     pub fn titleBar(self: *const Draft) []const u8 {
-        return switch (sideForAnchor(self.anchor)) {
+        const side = sideForAnchor(self.anchor) orelse
+            return "rv  create/edit file  Enter save  Esc cancel  ↑↓ scroll";
+        return switch (side) {
             .new => "rv  create/edit new  Enter save  Esc cancel  ↑↓ scroll",
             .old => "rv  create/edit old  Enter save  Esc cancel  ↑↓ scroll",
             .context => "rv  create/edit  Enter save  Esc cancel  ↑↓ scroll",
@@ -1300,7 +1303,9 @@ fn ensureListCursorVisible(scroll: *usize, cursor: usize, view_h: usize, n: usiz
 }
 
 /// Comment side implied by which line numbers the anchor has.
-fn sideForAnchor(a: view.row.Anchor) store.Side {
+/// Path-only (file) anchors have no side.
+fn sideForAnchor(a: view.row.Anchor) ?store.Side {
+    if (a.old_line == null and a.new_line == null) return null;
     if (a.old_line != null and a.new_line != null) return .context;
     if (a.new_line != null) return .new;
     return .old;
@@ -1343,7 +1348,10 @@ fn dismissAt(
         return;
     };
     const idx = found.idx orelse {
-        note.set("no comment on this side");
+        if (found.anchor.old_line == null and found.anchor.new_line == null)
+            note.set("no comment on this file")
+        else
+            note.set("no comment on this side");
         return;
     };
     const saved = review.comments.items[idx];
@@ -1432,16 +1440,20 @@ const CommentList = struct {
 
     fn formatLineCol(buf: []u8, c: store.Comment) []const u8 {
         const found = comments.loc(c) orelse return "-";
-        return switch (found.side) {
-            .old => Frame.bufPrintTrunc(buf, "-{d}", .{found.line}),
-            .new => Frame.bufPrintTrunc(buf, "+{d}", .{found.line}),
+        const side = found.side orelse return "-";
+        const line = found.line orelse return "-";
+        return switch (side) {
+            .old => Frame.bufPrintTrunc(buf, "-{d}", .{line}),
+            .new => Frame.bufPrintTrunc(buf, "+{d}", .{line}),
         };
     }
 
     fn formatLine(buf: []u8, c: store.Comment) []const u8 {
         var line_col_buf: [16]u8 = undefined;
         const line_col = formatLineCol(&line_col_buf, c);
-        const side: []const u8 = if (c.side) |s| switch (s) {
+        const side: []const u8 = if (c.old_line == null and c.new_line == null)
+            "file"
+        else if (c.side) |s| switch (s) {
             .old => "old",
             .new => "new",
             .context => "ctx",
@@ -1728,4 +1740,75 @@ test "indexHintForRow section all" {
     );
     try std.testing.expectEqualStrings("", Frame.indexHintForRow(1, null, null, 0, .unstaged));
     try std.testing.expectEqualStrings("", Frame.indexHintForRow(0, null, null, null, .unstaged));
+}
+
+test "draft titleBar file vs line" {
+    var draft: Draft = .{};
+    draft.anchor = .{ .path = "f", .old_line = null, .new_line = null };
+    try std.testing.expectEqualStrings(
+        "rv  create/edit file  Enter save  Esc cancel  ↑↓ scroll",
+        draft.titleBar(),
+    );
+    draft.anchor = .{ .path = "f", .old_line = null, .new_line = 1 };
+    try std.testing.expectEqualStrings(
+        "rv  create/edit new  Enter save  Esc cancel  ↑↓ scroll",
+        draft.titleBar(),
+    );
+    draft.anchor = .{ .path = "f", .old_line = 1, .new_line = null };
+    try std.testing.expectEqualStrings(
+        "rv  create/edit old  Enter save  Esc cancel  ↑↓ scroll",
+        draft.titleBar(),
+    );
+}
+
+test "comment list file row has no line" {
+    var buf: [128]u8 = undefined;
+    try std.testing.expectEqualStrings(
+        "1  a.zig  file  -  note",
+        CommentList.formatLine(&buf, .{ .id = "1", .path = "a.zig", .body = "note" }),
+    );
+    try std.testing.expectEqualStrings(
+        "2  a.zig  new  +10  x",
+        CommentList.formatLine(&buf, .{
+            .id = "2",
+            .path = "a.zig",
+            .new_line = 10,
+            .side = .new,
+            .body = "x",
+        }),
+    );
+}
+
+test "draft begin on file header" {
+    const fixture =
+        \\diff --git a/f b/f
+        \\--- a/f
+        \\+++ b/f
+        \\@@ -1 +1 @@
+        \\-old
+        \\+new
+    ;
+    var d = try diff.parse(std.testing.allocator, fixture);
+    defer d.deinit();
+    const rows = try view.row.flatten(std.testing.allocator, &d);
+    defer std.testing.allocator.free(rows);
+    const empty: []const view.layout.SbsSlot = &.{};
+
+    var review = try store.initEmpty(std.testing.allocator, "t");
+    defer review.deinit();
+    var draft: Draft = .{};
+    defer draft.buf.deinit(std.testing.allocator);
+
+    try std.testing.expect(try draft.begin(&review, std.testing.allocator, rows, empty, .unified, 0, .new));
+    try std.testing.expectEqualStrings("f", draft.anchor.path);
+    try std.testing.expect(draft.anchor.old_line == null);
+    try std.testing.expect(draft.anchor.new_line == null);
+    try std.testing.expect(draft.edit_id == null);
+
+    try std.testing.expect(!try draft.begin(&review, std.testing.allocator, rows, empty, .unified, 1, .new));
+
+    _ = try review.addOpen("f", null, null, null, "hello");
+    try std.testing.expect(try draft.begin(&review, std.testing.allocator, rows, empty, .unified, 0, .old));
+    try std.testing.expectEqualStrings("hello", draft.buf.items);
+    try std.testing.expect(draft.edit_id != null);
 }
