@@ -9,7 +9,8 @@
 //! `r` reload the loaded diff, `q` quit).
 //! Diff layout defaults to side-by-side when the terminal is wide enough;
 //! falls back to unified when narrow. `t` toggles session preference
-//! (explicit unified stays unified even when wide).
+//! (explicit unified stays unified even when wide). `#` toggles line numbers
+//! (on by default).
 //! Error paths never enter raw / alt-screen mode. An empty model still
 //! opens the TUI; the footer shows the load source (`HEAD · empty`).
 //!
@@ -357,7 +358,7 @@ fn runTui(alloc: std.mem.Allocator, io: std.Io, source: cli.Source) !u8 {
                                         }
                                     }
                                 } else if (viewport.handleKey(.{ .char = c }, size.cols, diff_view.rows, diff_view.sbs_slots) == .handled) {
-                                    // j/k/h/l/0/$/J/K/[/]/{/}/t
+                                    // j/k/h/l/0/$/J/K/[/]/{/}/t/#
                                 } else if (c == 'q' or c == 'Q') {
                                     running = false;
                                 } else if (c == '?') {
@@ -1181,13 +1182,20 @@ pub const Viewport = struct {
     col_scroll: usize = 0,
     /// Prefer side-by-side; auto-unified when narrow. `t` flips session preference.
     layout_pref: view.layout.LayoutPref = .side_by_side,
+    /// Line numbers in the body gutter. `#` flips. Default on.
+    show_line_numbers: bool = true,
 
-    /// Columns available for horizontal pan: full width (unified) or one pane (SBS).
-    fn panViewportCols(self: *const Viewport, cols: u16) u16 {
-        return switch (view.layout.effectiveLayout(self.layout_pref, cols)) {
+    /// Columns available for horizontal pan: text area after the sticky gutter.
+    fn panViewportCols(self: *const Viewport, cols: u16, rows: []const view.row.Row) u16 {
+        const layout = view.layout.effectiveLayout(self.layout_pref, cols);
+        const full: u16 = switch (layout) {
             .unified => cols,
             .side_by_side => view.layout.sbsPaneWidths(cols).left_w,
         };
+        const num_w = if (self.show_line_numbers) Frame.lineNumberWidth(rows) else 0;
+        const gw = Frame.lineGutterCols(num_w, layout);
+        const gw_u16: u16 = std.math.cast(u16, gw) orelse std.math.maxInt(u16);
+        return full -| gw_u16;
     }
 
     /// Horizontal pan step: about a quarter of the pan viewport (at least 1).
@@ -1212,8 +1220,8 @@ pub const Viewport = struct {
         };
     }
 
-    fn panLeft(self: *Viewport, cols: u16) void {
-        const step = panStep(self.panViewportCols(cols));
+    fn panLeft(self: *Viewport, cols: u16, rows: []const view.row.Row) void {
+        const step = panStep(self.panViewportCols(cols, rows));
         self.col_scroll = if (self.col_scroll > step) self.col_scroll - step else 0;
     }
 
@@ -1228,14 +1236,14 @@ pub const Viewport = struct {
             .char => |c| switch (c) {
                 'j' => self.moveLineDown(cols, rows, slots),
                 'k' => self.moveLineUp(cols, rows, slots),
-                'h' => self.panLeft(cols),
-                'l' => self.col_scroll +%= panStep(self.panViewportCols(cols)),
+                'h' => self.panLeft(cols, rows),
+                'l' => self.col_scroll +%= panStep(self.panViewportCols(cols, rows)),
                 '0' => self.col_scroll = 0,
                 '$' => {
                     const span = view.viewport.hunkSpanAt(rows, self.cursor);
                     self.col_scroll = view.viewport.colScrollToEnd(
                         Frame.hunkMaxLineWidth(rows, span),
-                        self.panViewportCols(cols),
+                        self.panViewportCols(cols, rows),
                     );
                 },
                 'J' => self.cursor = view.nav.nextChange(rows, self.cursor),
@@ -1245,12 +1253,13 @@ pub const Viewport = struct {
                 '}' => self.cursor = view.nav.nextFileHeader(rows, self.cursor),
                 '{' => self.cursor = view.nav.prevFileHeader(rows, self.cursor),
                 't' => self.layout_pref = view.layout.toggleLayoutPref(self.layout_pref),
+                '#' => self.show_line_numbers = !self.show_line_numbers,
                 else => return .unhandled,
             },
             .down => self.moveLineDown(cols, rows, slots),
             .up => self.moveLineUp(cols, rows, slots),
-            .left => self.panLeft(cols),
-            .right => self.col_scroll +%= panStep(self.panViewportCols(cols)),
+            .left => self.panLeft(cols, rows),
+            .right => self.col_scroll +%= panStep(self.panViewportCols(cols, rows)),
             else => return .unhandled,
         }
         return .handled;
@@ -1270,7 +1279,7 @@ pub const Viewport = struct {
         self.col_scroll = view.viewport.clampColScroll(
             self.col_scroll,
             Frame.hunkMaxLineWidth(rows, pan_span),
-            self.panViewportCols(cols),
+            self.panViewportCols(cols, rows),
         );
         switch (view.layout.effectiveLayout(self.layout_pref, cols)) {
             .unified => {
@@ -1812,4 +1821,25 @@ test "draft begin on file header" {
     try std.testing.expect(try draft.begin(&review, std.testing.allocator, rows, empty, .unified, 0, .old));
     try std.testing.expectEqualStrings("hello", draft.buf.items);
     try std.testing.expect(draft.edit_id != null);
+}
+
+test "hash key toggles line numbers" {
+    var vp: Viewport = .{};
+    const rows: []const view.row.Row = &.{};
+    const slots: []const view.layout.SbsSlot = &.{};
+    try std.testing.expect(vp.show_line_numbers);
+    try std.testing.expectEqual(.handled, vp.handleKey(.{ .char = '#' }, 80, rows, slots));
+    try std.testing.expect(!vp.show_line_numbers);
+    try std.testing.expectEqual(.handled, vp.handleKey(.{ .char = '#' }, 80, rows, slots));
+    try std.testing.expect(vp.show_line_numbers);
+}
+
+test "pan viewport uses 2-char gutter when line numbers are off" {
+    var vp: Viewport = .{ .layout_pref = .unified };
+    const rows: []const view.row.Row = &.{};
+    const on = vp.panViewportCols(80, rows);
+    vp.show_line_numbers = false;
+    const off = vp.panViewportCols(80, rows);
+    try std.testing.expectEqual(74, on);
+    try std.testing.expectEqual(78, off);
 }

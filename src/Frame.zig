@@ -244,6 +244,7 @@ pub fn paint(
 
     const cur = view.row.clampCursor(viewport.cursor, rows.len);
     const layout = view.layout.effectiveLayout(viewport.layout_pref, size.cols);
+    const num_w = if (viewport.show_line_numbers) lineNumberWidth(rows) else 0;
 
     var line_buf: [512]u8 = undefined;
     // Only lines in the cursor's hunk pan; file/hunk headers never pan.
@@ -292,20 +293,35 @@ pub fn paint(
             while (i < rows.len and screen_y < content_bottom) : (i += 1) {
                 const is_cur = i == cur;
                 const marked = rowMarked(rows[i], review);
-                const text = formatRow(&line_buf, rows[i], marked);
                 const st = pal.rowStyle(rows[i], is_cur);
                 if (rows[i] == .section_header) {
                     scr.fillRect(.{ .x = 0, .y = screen_y, .w = scr.cols, .h = 1 }, '─', st);
                 } else {
                     fillRow(scr, screen_y, st);
                 }
-                const hint = indexHintForRow(i, hint_file, hint_hunk, hint_section, hint_group);
-                if (hint.len > 0) {
-                    putRowHint(scr, screen_y, text, hint, st);
-                } else {
-                    const pan = pan_span.containsBody(i);
-                    const visible = if (pan) text[tui.screen.byteAtCol(text, cs)..] else text;
-                    scr.putStr(0, screen_y, visible, st, null);
+                switch (rows[i]) {
+                    .line => putPannedBody(
+                        scr,
+                        0,
+                        screen_y,
+                        size.cols,
+                        rows[i],
+                        marked,
+                        num_w,
+                        .unified,
+                        pan_span.containsBody(i),
+                        cs,
+                        st,
+                    ),
+                    else => {
+                        const text = formatRow(&line_buf, rows[i], marked);
+                        const hint = indexHintForRow(i, hint_file, hint_hunk, hint_section, hint_group);
+                        if (hint.len > 0) {
+                            putRowHint(scr, screen_y, text, hint, st);
+                        } else {
+                            scr.putStr(0, screen_y, text, st, null);
+                        }
+                    },
                 }
                 screen_y += 1;
             }
@@ -364,18 +380,34 @@ pub fn paint(
                         fillSpan(scr, right_x, size.cols, screen_y, right_st);
 
                         if (p.left) |ri| {
-                            const marked = rowMarked(rows[ri], review);
-                            const text = formatRow(&line_buf, rows[ri], marked);
-                            const pan = pan_span.containsBody(ri);
-                            const visible = if (pan) text[tui.screen.byteAtCol(text, cs)..] else text;
-                            putPaneStr(scr, 0, screen_y, panes.left_w, visible, left_st);
+                            putPannedBody(
+                                scr,
+                                0,
+                                screen_y,
+                                panes.left_w,
+                                rows[ri],
+                                rowMarked(rows[ri], review),
+                                num_w,
+                                .old,
+                                pan_span.containsBody(ri),
+                                cs,
+                                left_st,
+                            );
                         }
                         if (p.right) |ri| {
-                            const marked = rowMarked(rows[ri], review);
-                            const text = formatRow(&line_buf, rows[ri], marked);
-                            const pan = pan_span.containsBody(ri);
-                            const visible = if (pan) text[tui.screen.byteAtCol(text, cs)..] else text;
-                            putPaneStr(scr, right_x, screen_y, panes.right_w, visible, right_st);
+                            putPannedBody(
+                                scr,
+                                right_x,
+                                screen_y,
+                                panes.right_w,
+                                rows[ri],
+                                rowMarked(rows[ri], review),
+                                num_w,
+                                .new,
+                                pan_span.containsBody(ri),
+                                cs,
+                                right_st,
+                            );
                         }
                     },
                 }
@@ -402,16 +434,132 @@ pub fn paint(
     }
 }
 
-/// Widest formatted **line** in the hunk body (headers excluded). 0 if empty.
+/// Widest **line text** in the hunk body (gutter excluded). 0 if empty.
 pub fn hunkMaxLineWidth(rows: []const view.row.Row, span: view.viewport.HunkSpan) usize {
     var max_w: usize = 0;
-    var line_buf: [512]u8 = undefined;
     var i = span.body_start;
     while (i < span.body_end) : (i += 1) {
-        const text = formatRow(&line_buf, rows[i], false);
-        max_w = @max(max_w, tui.screen.displayWidth(text));
+        switch (rows[i]) {
+            .line => |ln| max_w = @max(max_w, tui.screen.displayWidth(ln.text)),
+            else => {},
+        }
     }
     return max_w;
+}
+
+/// Digit columns for old/new numbers: width of the largest `old_no` / `new_no`
+/// in `rows`. At least 1 so blank fields still line up when nothing is numbered.
+pub fn lineNumberWidth(rows: []const view.row.Row) usize {
+    var max: u32 = 0;
+    for (rows) |row| {
+        switch (row) {
+            .line => |ln| {
+                if (ln.old_no) |n| max = @max(max, n);
+                if (ln.new_no) |n| max = @max(max, n);
+            },
+            else => {},
+        }
+    }
+    return decimalDigits(max);
+}
+
+const LineNumbers = enum { unified, old, new };
+
+/// Display columns for the sticky body gutter (mark, kind, numbers, trailing space).
+/// `num_w == 0` is numbers off: the original 2-char mark/kind gutter.
+pub fn lineGutterCols(num_w: usize, layout: view.layout.EffectiveLayout) usize {
+    if (num_w == 0) return 2;
+    const numbers: LineNumbers = switch (layout) {
+        .unified => .unified,
+        .side_by_side => .old,
+    };
+    return 2 + numberFieldCols(num_w, numbers) + 1;
+}
+
+fn numberFieldCols(num_w: usize, numbers: LineNumbers) usize {
+    return switch (numbers) {
+        .unified => num_w + 1 + num_w,
+        .old, .new => num_w,
+    };
+}
+
+fn decimalDigits(n: u32) usize {
+    var w: usize = 1;
+    var x = n;
+    while (x >= 10) {
+        x /= 10;
+        w += 1;
+    }
+    return w;
+}
+
+fn writePadded(dest: []u8, n: ?u32) void {
+    @memset(dest, ' ');
+    const v = n orelse return;
+    var tmp: [10]u8 = undefined;
+    const s = std.fmt.bufPrint(&tmp, "{d}", .{v}) catch return;
+    if (s.len > dest.len) {
+        @memcpy(dest, s[s.len - dest.len ..]);
+        return;
+    }
+    @memcpy(dest[dest.len - s.len ..], s);
+}
+
+fn formatBodyGutter(buf: []u8, row: view.row.Row, marked: bool, num_w: usize, numbers: LineNumbers) []const u8 {
+    const ln = switch (row) {
+        .line => |l| l,
+        else => return buf[0..0],
+    };
+    const total: usize = if (num_w == 0) 2 else 2 + numberFieldCols(num_w, numbers) + 1;
+    if (buf.len < total) return buf[0..0];
+    @memset(buf[0..total], ' ');
+    buf[0] = if (marked) '*' else ' ';
+    buf[1] = switch (ln.kind) {
+        .meta => '\\',
+        .context, .add, .delete => ' ',
+    };
+    if (num_w == 0) return buf[0..total];
+    var pos: usize = 2;
+    switch (numbers) {
+        .unified => {
+            writePadded(buf[pos .. pos + num_w], ln.old_no);
+            pos += num_w;
+            buf[pos] = ' ';
+            pos += 1;
+            writePadded(buf[pos .. pos + num_w], ln.new_no);
+        },
+        .old => writePadded(buf[pos .. pos + num_w], ln.old_no),
+        .new => writePadded(buf[pos .. pos + num_w], ln.new_no),
+    }
+    return buf[0..total];
+}
+
+/// Gutter (mark + numbers) at `x`; only `ln.text` pans.
+fn putPannedBody(
+    scr: *tui.Screen,
+    x: u16,
+    y: u16,
+    pane_w: u16,
+    row: view.row.Row,
+    marked: bool,
+    num_w: usize,
+    numbers: LineNumbers,
+    pan: bool,
+    col_scroll: usize,
+    style: tui.Style,
+) void {
+    const ln = switch (row) {
+        .line => |l| l,
+        else => return,
+    };
+    var gbuf: [32]u8 = undefined;
+    const gutter = formatBodyGutter(&gbuf, row, marked, num_w, numbers);
+    const gw_usize = tui.screen.displayWidth(gutter);
+    const gw: u16 = std.math.cast(u16, gw_usize) orelse pane_w;
+    const text = ln.text;
+    const visible = if (pan) text[tui.screen.byteAtCol(text, col_scroll)..] else text;
+    if (pane_w > 0) putPaneStr(scr, x, y, @min(gw, pane_w), gutter, style);
+    if (pane_w > gw) putPaneStr(scr, x +| gw, y, pane_w - gw, visible, style);
 }
 
 fn rowMarked(row: view.row.Row, review: *const store.Review) bool {
@@ -674,4 +822,127 @@ test "rowMarked file header is not a line" {
     _ = try lines_only.addOpen("f", null, 1, .new, "line");
     try testing.expect(!rowMarked(fh, &lines_only));
     try testing.expect(rowMarked(line, &lines_only));
+}
+
+test "lineNumberWidth is max digits and at least 1" {
+    try testing.expectEqual(1, lineNumberWidth(&.{}));
+    const headers: []const view.row.Row = &.{
+        .{ .file_header = .{ .path = "f", .is_binary = false } },
+    };
+    try testing.expectEqual(1, lineNumberWidth(headers));
+    const mixed: []const view.row.Row = &.{
+        .{ .line = .{ .kind = .context, .text = "a", .path = "f", .old_no = 9, .new_no = 9 } },
+        .{ .line = .{ .kind = .add, .text = "b", .path = "f", .new_no = 10 } },
+    };
+    try testing.expectEqual(2, lineNumberWidth(mixed));
+    const wide: []const view.row.Row = &.{
+        .{ .line = .{ .kind = .delete, .text = "c", .path = "f", .old_no = 100 } },
+    };
+    try testing.expectEqual(3, lineNumberWidth(wide));
+}
+
+test "lineGutterCols numbers on and off" {
+    try testing.expectEqual(8, lineGutterCols(2, .unified));
+    try testing.expectEqual(5, lineGutterCols(2, .side_by_side));
+    try testing.expectEqual(2, lineGutterCols(0, .unified));
+    try testing.expectEqual(2, lineGutterCols(0, .side_by_side));
+}
+
+test "formatBodyGutter unified sbs meta and off" {
+    var buf: [32]u8 = undefined;
+    const ctx: view.row.Row = .{ .line = .{
+        .kind = .context,
+        .text = "hello",
+        .path = "f",
+        .old_no = 10,
+        .new_no = 11,
+    } };
+    const del: view.row.Row = .{ .line = .{
+        .kind = .delete,
+        .text = "gone",
+        .path = "f",
+        .old_no = 12,
+    } };
+    const add: view.row.Row = .{ .line = .{
+        .kind = .add,
+        .text = "new",
+        .path = "f",
+        .new_no = 13,
+    } };
+    const meta: view.row.Row = .{ .line = .{
+        .kind = .meta,
+        .text = "No newline at end of file",
+        .path = "f",
+    } };
+    const hunk: view.row.Row = .{ .hunk_header = .{
+        .old_start = 1,
+        .old_count = 1,
+        .new_start = 1,
+        .new_count = 1,
+        .section = "",
+    } };
+
+    try testing.expectEqualStrings("  10 11 ", formatBodyGutter(&buf, ctx, false, 2, .unified));
+    try testing.expectEqualStrings("* 10 11 ", formatBodyGutter(&buf, ctx, true, 2, .unified));
+    try testing.expectEqualStrings("  12    ", formatBodyGutter(&buf, del, false, 2, .unified));
+    try testing.expectEqualStrings("     13 ", formatBodyGutter(&buf, add, false, 2, .unified));
+    try testing.expectEqualStrings(" \\      ", formatBodyGutter(&buf, meta, false, 2, .unified));
+    try testing.expectEqualStrings("  12 ", formatBodyGutter(&buf, del, false, 2, .old));
+    try testing.expectEqualStrings("  13 ", formatBodyGutter(&buf, add, false, 2, .new));
+    try testing.expectEqualStrings("     ", formatBodyGutter(&buf, add, false, 2, .old));
+    try testing.expectEqualStrings("  ", formatBodyGutter(&buf, ctx, false, 0, .unified));
+    try testing.expectEqualStrings("* ", formatBodyGutter(&buf, ctx, true, 0, .unified));
+    try testing.expectEqualStrings(" \\", formatBodyGutter(&buf, meta, false, 0, .unified));
+    try testing.expectEqualStrings("", formatBodyGutter(&buf, hunk, false, 2, .unified));
+    try testing.expectEqualStrings("  hello", formatRow(&buf, ctx, false));
+    try testing.expectEqualStrings(" @@ -1,1 +1,1 @@", formatRow(&buf, hunk, false));
+}
+
+test "hunkMaxLineWidth is text only" {
+    const rows: []const view.row.Row = &.{
+        .{ .hunk_header = .{
+            .old_start = 1,
+            .old_count = 1,
+            .new_start = 1,
+            .new_count = 1,
+            .section = "",
+        } },
+        .{ .line = .{ .kind = .context, .text = "hello", .path = "f", .old_no = 1, .new_no = 1 } },
+    };
+    const span = view.viewport.HunkSpan{ .header = 0, .body_start = 1, .body_end = 2 };
+    try testing.expectEqual(5, hunkMaxLineWidth(rows, span));
+}
+
+test "putPannedBody pans text and leaves gutter" {
+    const row: view.row.Row = .{ .line = .{
+        .kind = .context,
+        .text = "ABCDEFGHIJ",
+        .path = "f",
+        .old_no = 1,
+        .new_no = 2,
+    } };
+    const st = tui.Style{};
+    var scr = try tui.Screen.init(testing.allocator, .{ .cols = 20, .rows = 1 });
+    defer scr.deinit();
+
+    scr.clear();
+    putPannedBody(&scr, 0, 0, 20, row, false, 1, .unified, false, 0, st);
+    try testing.expectEqual(' ', scr.getCell(0, 0).char);
+    try testing.expectEqual('1', scr.getCell(2, 0).char);
+    try testing.expectEqual('2', scr.getCell(4, 0).char);
+    try testing.expectEqual('A', scr.getCell(6, 0).char);
+
+    scr.clear();
+    putPannedBody(&scr, 0, 0, 20, row, false, 1, .unified, true, 3, st);
+    try testing.expectEqual(' ', scr.getCell(0, 0).char);
+    try testing.expectEqual('1', scr.getCell(2, 0).char);
+    try testing.expectEqual('2', scr.getCell(4, 0).char);
+    try testing.expectEqual('D', scr.getCell(6, 0).char);
+    try testing.expectEqual('E', scr.getCell(7, 0).char);
+
+    scr.clear();
+    putPannedBody(&scr, 0, 0, 20, row, true, 0, .unified, true, 2, st);
+    try testing.expectEqual('*', scr.getCell(0, 0).char);
+    try testing.expectEqual(' ', scr.getCell(1, 0).char);
+    try testing.expectEqual('C', scr.getCell(2, 0).char);
 }

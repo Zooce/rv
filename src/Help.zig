@@ -44,6 +44,7 @@ const rows = [_]Row{
     .blank,
     .{ .group = "Session" },
     .{ .item = .{ .key = "t", .label = "layout" } },
+    .{ .item = .{ .key = "#", .label = "line numbers" } },
     .{ .item = .{ .key = "r", .label = "reload" } },
     .{ .item = .{ .key = "?", .label = "this help" } },
     .{ .item = .{ .key = "q", .label = "quit" } },
@@ -178,7 +179,7 @@ test "help catalog includes normal bindings" {
     const required = [_][]const u8{
         "j/k",     "h/l",     "0/$", "J/K", "[/]", "{/}", "(/)", "/", "n/N",
         "Space f", "Space l", "Space Space", "Space S", "Space d", "Space x", "i", "I", "d", "D",
-        "t",       "r",       "?",           "q",
+        "t",       "#",       "r",           "?", "q",
     };
     for (required) |token| {
         var found = false;
