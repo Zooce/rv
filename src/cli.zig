@@ -45,8 +45,8 @@ pub const Source = union(enum) {
     range: []const u8,
 };
 
-/// Status-strip text for `source`. `empty` is whether the loaded model has
-/// no display rows. Local is `HEAD` (`git diff HEAD`); an explicit range
+/// Status-strip text for `source`. `empty` is a clean worktree (no local
+/// changes), not an approved-only hide. Local is `HEAD`; an explicit range
 /// stays the user-supplied string even if empty.
 pub fn sourceLabel(source: Source, empty: bool) []const u8 {
     return switch (source) {

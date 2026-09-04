@@ -4,7 +4,8 @@
 //! comments → TUI (title bar is a short hint; `?` opens help). Keys: `j`/`k`,
 //! `h`/`l` pan, `0`/`$` col home/end, `[`/`]` hunk, `{`/`}` file header,
 //! `(`/`)` prev/next comment, `/` text search, `n`/`N` next/prev match,
-//! `Space` `f` file list, `Space` `l` comment list, `i`/`c`/`a`/`Enter`
+//! `Space` `f` file list, `Space` `l` comment list, `Space` `a` approve (local),
+//! `i`/`c`/`a`/`Enter`
 //! create or edit new, `I`/`C`/`A` old, `d` dismiss new, `D` dismiss old,
 //! `r` reload the loaded diff, `q` quit).
 //! Diff layout defaults to side-by-side when the terminal is wide enough;
@@ -12,7 +13,9 @@
 //! (explicit unified stays unified even when wide). `#` toggles line numbers
 //! (on by default).
 //! Error paths never enter raw / alt-screen mode. An empty model still
-//! opens the TUI; the footer shows the load source (`HEAD · empty`).
+//! opens the TUI; the footer shows the load source (`HEAD · empty` when
+//! the worktree is clean, `HEAD · N approved` when every local change is
+//! hidden).
 //!
 //! With a git range arg: load `git diff <range>` as written → same TUI.
 //! With a subcommand: headless CLI (`status`, `list`, `show`, `resolve`,
@@ -47,11 +50,13 @@
 //! deleted only on success. Staged rows are no-ops (unstage first). Range
 //! loads ignore those chords. An unmatched `Space` leader is dropped; the
 //! next key is handled as normal
-//! (`Space` then `d` still dismisses on a range load). Git failure opens
+//! (`Space` then `d` still dismisses on a range load). Local `Space` `a`
+//! approves the hunk, the file in this group, or the whole section (no
+//! confirm) and hides it; range loads ignore that chord. Git failure opens
 //! a centered overlay with git’s error; Enter or Esc dismisses. The list
-//! is unchanged. Local load paints stage/unstage chords on the current
-//! section, file, and hunk rows; unstaged/untracked file and hunk rows
-//! also show discard chords (no hints on a range load).
+//! is unchanged. Local load paints stage/unstage and `Space` `a` chords on
+//! the current section, file, and hunk rows; unstaged/untracked file and
+//! hunk rows also show discard chords (no hints on a range load).
 //!
 //! Comment list: `Space` then `l` opens a centered overlay of live comments
 //! (same store as `rv list`). `j`/`k` move; Enter jumps with the same landing
@@ -75,6 +80,7 @@ const cli = @import("cli");
 const comment_input = @import("comment_input");
 const Help = @import("Help");
 const Frame = @import("Frame.zig");
+const approve = @import("approve");
 
 pub fn main(init: std.process.Init) !u8 {
     const alloc = init.gpa;
@@ -110,9 +116,12 @@ fn runTui(alloc: std.mem.Allocator, io: std.Io, source: cli.Source) !u8 {
             return 1;
         };
         errdefer parsed.deinit();
-        const parsed_flat = try view.row.flatten(alloc, &parsed);
-        errdefer alloc.free(parsed_flat);
-        break :blk try DiffView.build(alloc, parsed, parsed_flat, &folds);
+        const vis = flattenSource(alloc, io, source, &parsed) catch |err| {
+            std.debug.print("rv: {s}\n", .{approvedLoadMessage(err)});
+            return 1;
+        };
+        errdefer alloc.free(vis.rows);
+        break :blk try DiffView.build(alloc, parsed, vis.rows, &folds, vis.approved_n);
     };
     defer diff_view.deinit(alloc);
 
@@ -163,10 +172,11 @@ fn runTui(alloc: std.mem.Allocator, io: std.Io, source: cli.Source) !u8 {
     var focus: Focus = .normal;
     // `Space` leader: next key may be `f` (file list), `l` (comment list),
     // `Space` (stage/unstage current file or hunk, or the group on a
-    // section header), `S` (containing file from a hunk), `d` (discard
-    // current file or hunk), or `x` (discard containing file from a hunk).
+    // section header), `S` (containing file from a hunk), `a` (approve
+    // current file, hunk, or group), `d` (discard current file or hunk),
+    // or `x` (discard containing file from a hunk).
     // Cleared on that next key. Unmatched leader is dropped; on a range
-    // load `Space` then `d` still dismisses.
+    // load `Space` then `d` still dismisses. `Space` `a` is a no-op.
     var leader_pending: bool = false;
     // `z` leader: next key may be `a` (toggle fold), `M` (collapse all
     // files), or `R` (expand all). Unmatched `z` is dropped; the second
@@ -372,6 +382,15 @@ fn runTui(alloc: std.mem.Allocator, io: std.Io, source: cli.Source) !u8 {
                                             focus = .discard_confirm;
                                         }
                                     }
+                                } else if (after_leader and c == 'a') {
+                                    try applyApprove(
+                                        alloc,
+                                        io,
+                                        source,
+                                        &diff_view,
+                                        &viewport.cursor,
+                                        &frame.note,
+                                    );
                                 } else if (after_z and c == 'a') {
                                     diff_view.toggleFold(alloc, &viewport.cursor) catch frame.note.set("out of memory");
                                 } else if (after_z and c == 'M') {
@@ -482,16 +501,18 @@ fn runTui(alloc: std.mem.Allocator, io: std.Io, source: cli.Source) !u8 {
     return 0;
 }
 
-/// Parsed diff, full flatten, and the visible rows the TUI walks. `folds`
+/// Parsed diff, flatten the TUI walks, and the fold-visible subset. `folds`
 /// is borrowed session state (not owned). Reload builds another and swaps it in.
 pub const DiffView = struct {
     diff: diff.Diff,
-    /// Full flatten. Fold rebuild walks this; `rows` is the visible subset.
+    /// Flatten fold rebuild walks. Local load omits approved hunks.
     flat: []view.row.Row,
     /// Visible rows (paint, nav, git targeting). Strings borrow from `diff`.
     rows: []view.row.Row,
     sbs_slots: []view.layout.SbsSlot,
     folds: *view.fold.Set,
+    /// Live approved identities still in `diff` after prune. 0 on range loads.
+    approved_n: usize,
 
     fn maybeInit(
         alloc: std.mem.Allocator,
@@ -507,13 +528,13 @@ pub const DiffView = struct {
             note.set(git.errorMessage(err));
             return null;
         };
-        const new_flat = view.row.flatten(alloc, &new_diff) catch {
+        const vis = flattenSource(alloc, io, source, &new_diff) catch |err| {
             new_diff.deinit();
-            note.set("out of memory");
+            note.set(approvedLoadMessage(err));
             return null;
         };
-        return build(alloc, new_diff, new_flat, folds) catch {
-            alloc.free(new_flat);
+        return build(alloc, new_diff, vis.rows, folds, vis.approved_n) catch {
+            alloc.free(vis.rows);
             new_diff.deinit();
             note.set("out of memory");
             return null;
@@ -525,6 +546,7 @@ pub const DiffView = struct {
         parsed: diff.Diff,
         flat: []view.row.Row,
         folds: *view.fold.Set,
+        approved_n: usize,
     ) std.mem.Allocator.Error!DiffView {
         const rows = try view.fold.visibleRows(alloc, flat, folds);
         errdefer alloc.free(rows);
@@ -536,6 +558,7 @@ pub const DiffView = struct {
             .rows = rows,
             .sbs_slots = sbs,
             .folds = folds,
+            .approved_n = approved_n,
         };
     }
 
@@ -590,7 +613,46 @@ pub const DiffView = struct {
         }
         cursor.* = view.fold.visibleIndex(self.flat, self.folds, flatten_i);
     }
+
+    fn replaceFlat(
+        self: *DiffView,
+        alloc: std.mem.Allocator,
+        new_flat: []view.row.Row,
+        approved_n: usize,
+    ) std.mem.Allocator.Error!void {
+        const new_rows = try view.fold.visibleRows(alloc, new_flat, self.folds);
+        errdefer alloc.free(new_rows);
+        const new_sbs = try view.layout.pairSideBySide(alloc, new_rows);
+        alloc.free(self.rows);
+        alloc.free(self.flat);
+        alloc.free(self.sbs_slots);
+        self.flat = new_flat;
+        self.rows = new_rows;
+        self.sbs_slots = new_sbs;
+        self.approved_n = approved_n;
+        self.folds.prune(alloc, new_flat);
+    }
 };
+
+fn flattenSource(
+    alloc: std.mem.Allocator,
+    io: std.Io,
+    source: cli.Source,
+    d: *const diff.Diff,
+) approve.LoadError!approve.Visible {
+    return switch (source) {
+        .local => approve.loadVisible(alloc, io, .cwd(), d),
+        .range => .{ .rows = try view.row.flatten(alloc, d), .approved_n = 0 },
+    };
+}
+
+fn approvedLoadMessage(err: approve.LoadError) []const u8 {
+    return switch (err) {
+        error.OutOfMemory => "out of memory",
+        error.InvalidJson, error.InvalidHash => "invalid .rv approved JSON",
+        else => "failed to load .rv approved store",
+    };
+}
 
 /// Re-run the startup load. On success, replace the live DiffView and restore
 /// the cursor to the same path+line. On failure, leave the previous list and
@@ -612,6 +674,84 @@ fn reloadDiff(
     diff_view.deinit(alloc);
     diff_view.* = loaded;
     cursor.* = new_cursor;
+}
+
+/// `Space` `a`: approve the hunk, file-in-group, or section at the cursor
+/// (local only; range is a no-op). Save, hide, restore onto the neighbor
+/// change (same rule as staging a row away). Does not mutate git.
+fn applyApprove(
+    alloc: std.mem.Allocator,
+    io: std.Io,
+    source: cli.Source,
+    diff_view: *DiffView,
+    cursor: *usize,
+    note: *StatusNote,
+) std.mem.Allocator.Error!void {
+    if (source != .local) return;
+    const rows = diff_view.rows;
+    const root: std.Io.Dir = .cwd();
+    var approved = approve.load(alloc, io, root) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => {
+            note.set(approvedLoadMessage(err));
+            return;
+        },
+    };
+    defer approved.deinit();
+
+    var group_mark: ?git.GroupNeighborMark = null;
+    var hunk_mark: ?git.NeighborMark = null;
+    if (git.groupSpanAt(rows, cursor.*)) |span| {
+        group_mark = git.groupNeighborMark(rows, span);
+        try approved.appendGroup(alloc, io, root, &diff_view.diff, span.group);
+    } else if (git.indexTargetAt(rows, cursor.*, false)) |target| {
+        hunk_mark = git.neighborMark(rows, target);
+        const file = groupedFile(&diff_view.diff, target.path, target.group) orelse return;
+        if (target.hunk_i != null) {
+            const hh = switch (rows[target.first]) {
+                .hunk_header => |h| h,
+                else => return,
+            };
+            const hi = approve.hunkAt(file.*, hh.old_start, hh.new_start) orelse return;
+            try approved.append(file.displayPath(), approve.fingerprintHunk(file.hunks[hi]));
+        } else {
+            try approved.appendFile(alloc, io, root, file.*);
+        }
+    } else return;
+
+    const live = try approve.collectLive(alloc, io, root, &diff_view.diff);
+    defer alloc.free(live);
+    try approved.prune(alloc, live);
+    approve.save(&approved, alloc, io, root) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => {
+            note.set("failed to save .rv approved store");
+            return;
+        },
+    };
+
+    const new_flat = try approve.hide(alloc, &diff_view.diff, &approved, io, root);
+    const restored: usize = if (group_mark) |m|
+        git.restoreGroupNeighbor(new_flat, m)
+    else if (hunk_mark) |m|
+        git.restoreNeighbor(new_flat, m)
+    else
+        0;
+    diff_view.replaceFlat(alloc, new_flat, approved.entries.items.len) catch {
+        alloc.free(new_flat);
+        note.set("out of memory");
+        return;
+    };
+    cursor.* = view.fold.visibleIndex(diff_view.flat, diff_view.folds, restored);
+}
+
+fn groupedFile(d: *const diff.Diff, path: []const u8, group: diff.Group) ?*const diff.File {
+    for (d.files) |*f| {
+        const g = f.group orelse continue;
+        if (g != group) continue;
+        if (std.mem.eql(u8, f.displayPath(), path)) return f;
+    }
+    return null;
 }
 
 /// Stage, unstage, or discard the current file or hunk (local source only).
@@ -723,7 +863,7 @@ fn commitApply(
     };
     if (result.snapshot) |snap| {
         const new_cursor = view.fold.visibleIndex(snap.rows, diff_view.folds, snap.cursor);
-        if (DiffView.build(alloc, snap.diff, snap.rows, diff_view.folds)) |loaded| {
+        if (DiffView.build(alloc, snap.diff, snap.rows, diff_view.folds, snap.approved_n)) |loaded| {
             diff_view.deinit(alloc);
             diff_view.* = loaded;
             cursor.* = new_cursor;

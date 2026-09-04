@@ -43,6 +43,7 @@ const rows = [_]Row{
     .{ .group = "Local review" },
     .{ .item = .{ .key = "sections", .label = "Unstaged, Untracked, Staged" } },
     .{ .item = .{ .key = "Space Space", .label = "stage / unstage file, hunk, or group" } },
+    .{ .item = .{ .key = "Space a", .label = "approve hunk, file, or group" } },
     .{ .item = .{ .key = "Space S", .label = "file from hunk (until Ctrl)" } },
     .{ .item = .{ .key = "Space d", .label = "discard file or hunk" } },
     .{ .item = .{ .key = "Space x", .label = "discard file from hunk (until Ctrl)" } },
@@ -183,7 +184,7 @@ fn overlayRect(cols: u16, rows_n: u16, n: usize) tui.Rect {
 test "help catalog includes normal bindings" {
     const required = [_][]const u8{
         "j/k",     "h/l",     "0/$", "J/K", "[/]", "{/}", "(/)", "za", "zM", "zR", "/", "n/N",
-        "Space f", "Space l", "Space Space", "Space S", "Space d", "Space x", "i", "I", "d", "D",
+        "Space f", "Space l", "Space Space", "Space a", "Space S", "Space d", "Space x", "i", "I", "d", "D",
         "t",       "#",       "r",           "?", "q",
     };
     for (required) |token| {

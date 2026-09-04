@@ -421,7 +421,15 @@ pub fn paint(
                 scr.putStr(1, footer_y, status_note, pal.footer, null);
             } else {
                 const st = view.nav.statusAt(rows, cur);
-                const footer_text = formatFooter(&line_buf, st, review.openCount(), viewport.layout_pref, size.cols, source);
+                const footer_text = formatFooter(
+                    &line_buf,
+                    st,
+                    review.openCount(),
+                    viewport.layout_pref,
+                    size.cols,
+                    source,
+                    diff_view.approved_n,
+                );
                 scr.putStr(1, footer_y, footer_text, pal.footer, null);
             }
             scr.hideCursor();
@@ -589,10 +597,16 @@ fn formatFooter(
     layout_pref: view.layout.LayoutPref,
     cols: u16,
     source: cli.Source,
+    approved_n: usize,
 ) []const u8 {
-    const src = cli.sourceLabel(source, st.row_n == 0);
+    if (st.row_n == 0) {
+        if (source == .local and approved_n > 0) {
+            return bufPrintTrunc(buf, "HEAD · {d} approved", .{approved_n});
+        }
+        return cli.sourceLabel(source, true);
+    }
+    const src = cli.sourceLabel(source, false);
     const mode = layoutFooterLabel(layout_pref, cols);
-    if (st.row_n == 0) return src;
     if (st.hunk_n == 0) {
         return bufPrintTrunc(buf, "{s}  {s}  {d}/{d}  {d} open  {s}", .{
             src,
@@ -713,6 +727,26 @@ pub fn indexHintForRow(ri: usize, file_i: ?usize, hunk_i: ?usize, section_i: ?us
     return "";
 }
 
+/// `Space a` labels on the current section, file, or hunk header. Empty on
+/// other rows, range loads (`group == null`), and the file header while the
+/// cursor is in a hunk (file-from-hunk approve is not bound).
+pub fn approveHintForRow(ri: usize, file_i: ?usize, hunk_i: ?usize, section_i: ?usize, group: ?diff.Group) []const u8 {
+    if (group == null) return "";
+    if (section_i) |si| {
+        if (ri == si) return "Approve All (Space a)";
+    }
+    if (file_i) |fi| {
+        if (ri == fi) {
+            if (hunk_i != null) return "";
+            return "Approve File (Space a)";
+        }
+    }
+    if (hunk_i) |hi| {
+        if (ri == hi) return "Approve Hunk (Space a)";
+    }
+    return "";
+}
+
 /// `Fold (za)` / `Unfold (za)` on a foldable file or hunk header. Empty on
 /// sections, body lines, and headers that cannot fold.
 pub fn foldHintForRow(folds: *const view.fold.Set, rows: []const view.row.Row, ri: usize) []const u8 {
@@ -744,9 +778,22 @@ fn headerHint(
 ) []const u8 {
     const fold = if (show_fold) foldHintForRow(folds, rows, ri) else "";
     const git = indexHintForRow(ri, file_i, hunk_i, section_i, group);
-    if (fold.len == 0) return git;
-    if (git.len == 0) return fold;
-    return std.fmt.bufPrint(buf, "{s}  {s}", .{ fold, git }) catch fold;
+    const approve = approveHintForRow(ri, file_i, hunk_i, section_i, group);
+    return joinHintParts(buf, fold, git, approve);
+}
+
+fn joinHintParts(buf: []u8, a: []const u8, b: []const u8, c: []const u8) []const u8 {
+    if (a.len == 0) {
+        if (b.len == 0) return c;
+        if (c.len == 0) return b;
+        return std.fmt.bufPrint(buf, "{s}  {s}", .{ b, c }) catch b;
+    }
+    if (b.len == 0) {
+        if (c.len == 0) return a;
+        return std.fmt.bufPrint(buf, "{s}  {s}", .{ a, c }) catch a;
+    }
+    if (c.len == 0) return std.fmt.bufPrint(buf, "{s}  {s}", .{ a, b }) catch a;
+    return std.fmt.bufPrint(buf, "{s}  {s}  {s}", .{ a, b, c }) catch a;
 }
 
 /// Path/header on the left; `hint` right-aligned with a one-column gap.
@@ -1049,11 +1096,51 @@ test "headerHint prepends fold to git hint" {
     var buf: [160]u8 = undefined;
     const file_i: usize = 1;
     try testing.expectEqualStrings(
-        "Fold (za)  Stage File (Space Space)  Discard File (Space d)",
+        "Fold (za)  Stage File (Space Space)  Discard File (Space d)  Approve File (Space a)",
         headerHint(&buf, &folds, rows, file_i, file_i, null, null, .unstaged, true),
     );
     try testing.expectEqualStrings(
-        "Stage File (Space Space)  Discard File (Space d)",
+        "Stage File (Space Space)  Discard File (Space d)  Approve File (Space a)",
         headerHint(&buf, &folds, rows, file_i, file_i, null, null, .unstaged, false),
+    );
+}
+
+test "approveHintForRow file hunk section and file-from-hunk" {
+    try testing.expectEqualStrings(
+        "Approve All (Space a)",
+        approveHintForRow(0, null, null, 0, .unstaged),
+    );
+    try testing.expectEqualStrings(
+        "Approve File (Space a)",
+        approveHintForRow(1, 1, null, null, .staged),
+    );
+    try testing.expectEqualStrings(
+        "Approve Hunk (Space a)",
+        approveHintForRow(2, 1, 2, null, .unstaged),
+    );
+    try testing.expectEqualStrings("", approveHintForRow(1, 1, 2, null, .unstaged));
+    try testing.expectEqualStrings("", approveHintForRow(0, null, null, 0, null));
+}
+
+test "formatFooter approved-only is not a clean worktree" {
+    var buf: [64]u8 = undefined;
+    const empty = view.nav.Status{
+        .path = "",
+        .hunk_i = 0,
+        .hunk_n = 0,
+        .row_i = 0,
+        .row_n = 0,
+    };
+    try testing.expectEqualStrings(
+        "HEAD · empty",
+        formatFooter(&buf, empty, 0, .side_by_side, 80, .local, 0),
+    );
+    try testing.expectEqualStrings(
+        "HEAD · 2 approved",
+        formatFooter(&buf, empty, 0, .side_by_side, 80, .local, 2),
+    );
+    try testing.expectEqualStrings(
+        "main...HEAD",
+        formatFooter(&buf, empty, 0, .side_by_side, 80, .{ .range = "main...HEAD" }, 3),
     );
 }

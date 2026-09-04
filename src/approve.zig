@@ -8,12 +8,17 @@
 //! `save` is atomic. A live hunk/file is approved when `take` consumes a yet-unused
 //! entry with the same path+hash. `unapprove` removes one match; `prune` drops
 //! entries with no live match. Group is not part of identity.
+//!
+//! Local load hides consumed identities from the flatten: drop approved hunks
+//! (and their lines), drop a file header with nothing left, drop an empty
+//! section. Hunk-less files hash worktree bytes; unreadable files stay visible.
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 const ArenaAllocator = std.heap.ArenaAllocator;
 const Io = std.Io;
 const diff = @import("diff");
+const view = @import("view");
 const Sha256 = std.crypto.hash.sha2.Sha256;
 
 pub const Hash = [Sha256.digest_length]u8;
@@ -112,6 +117,46 @@ pub const Approved = struct {
             if (!used[i]) _ = self.entries.orderedRemove(i);
         }
     }
+
+    /// Append identities in `file` that are not already in the store.
+    pub fn appendFile(
+        self: *Approved,
+        alloc: Allocator,
+        io: Io,
+        root: Io.Dir,
+        file: diff.File,
+    ) Allocator.Error!void {
+        const used = try alloc.alloc(bool, self.entries.items.len);
+        defer alloc.free(used);
+        @memset(used, false);
+        const path = file.displayPath();
+        if (file.hunks.len == 0) {
+            if (hunklessHash(alloc, io, root, file)) |hash| {
+                if (!self.take(used, path, hash)) try self.append(path, hash);
+            }
+            return;
+        }
+        for (file.hunks) |h| {
+            const hash = fingerprintHunk(h);
+            if (!self.take(used, path, hash)) try self.append(path, hash);
+        }
+    }
+
+    /// Append unapproved identities for every file in `group`.
+    pub fn appendGroup(
+        self: *Approved,
+        alloc: Allocator,
+        io: Io,
+        root: Io.Dir,
+        d: *const diff.Diff,
+        group: diff.Group,
+    ) Allocator.Error!void {
+        for (d.files) |f| {
+            const g = f.group orelse continue;
+            if (g != group) continue;
+            try self.appendFile(alloc, io, root, f);
+        }
+    }
 };
 
 pub const LoadError = error{ InvalidJson, InvalidHash } ||
@@ -196,6 +241,153 @@ fn stringify(self: *const Approved, alloc: Allocator) Allocator.Error![]u8 {
     std.json.Stringify.value(wire, .{ .whitespace = .indent_2 }, &out.writer) catch return error.OutOfMemory;
     out.writer.writeByte('\n') catch return error.OutOfMemory;
     return try out.toOwnedSlice();
+}
+
+const hunkless_max = 8 * 1024 * 1024;
+
+/// Worktree bytes for a hunk-less file, or `null` if missing/unreadable/too big.
+fn hunklessHash(alloc: Allocator, io: Io, root: Io.Dir, file: diff.File) ?Hash {
+    const bytes = root.readFileAlloc(io, file.displayPath(), alloc, .limited(hunkless_max)) catch return null;
+    defer alloc.free(bytes);
+    return fingerprintFile(bytes);
+}
+
+/// Live `{path, hash}` in flatten file/hunk order. Paths borrow from `d`.
+/// Hunk-less files that cannot be read are omitted.
+pub fn collectLive(alloc: Allocator, io: Io, root: Io.Dir, d: *const diff.Diff) Allocator.Error![]Entry {
+    var list: std.ArrayList(Entry) = .empty;
+    errdefer list.deinit(alloc);
+    for (d.files) |f| {
+        const path = f.displayPath();
+        if (f.hunks.len == 0) {
+            if (hunklessHash(alloc, io, root, f)) |hash| {
+                try list.append(alloc, .{ .path = path, .hash = hash });
+            }
+            continue;
+        }
+        for (f.hunks) |h| {
+            try list.append(alloc, .{ .path = path, .hash = fingerprintHunk(h) });
+        }
+    }
+    return try list.toOwnedSlice(alloc);
+}
+
+/// Flatten `d` without identities `approved.take` consumes. Same row shape as
+/// `view.row.flatten` for what remains. `root` is the worktree for hunk-less
+/// hashes.
+pub fn hide(
+    alloc: Allocator,
+    d: *const diff.Diff,
+    approved: *const Approved,
+    io: Io,
+    root: Io.Dir,
+) Allocator.Error![]view.row.Row {
+    const used = try alloc.alloc(bool, approved.entries.items.len);
+    defer alloc.free(used);
+    @memset(used, false);
+
+    var rows: std.ArrayList(view.row.Row) = .empty;
+    errdefer rows.deinit(alloc);
+    var prev_group: ?diff.Group = null;
+
+    for (d.files) |f| {
+        const path = f.displayPath();
+        if (f.hunks.len == 0) {
+            const keep = if (hunklessHash(alloc, io, root, f)) |hash|
+                !approved.take(used, path, hash)
+            else
+                true;
+            if (!keep) continue;
+            try appendFileHeader(alloc, &rows, f, &prev_group);
+            continue;
+        }
+
+        const keep_hunk = try alloc.alloc(bool, f.hunks.len);
+        defer alloc.free(keep_hunk);
+        var keep_file = false;
+        for (f.hunks, 0..) |h, i| {
+            keep_hunk[i] = !approved.take(used, path, fingerprintHunk(h));
+            if (keep_hunk[i]) keep_file = true;
+        }
+        if (!keep_file) continue;
+
+        try appendFileHeader(alloc, &rows, f, &prev_group);
+        for (f.hunks, keep_hunk) |h, keep| {
+            if (!keep) continue;
+            try rows.append(alloc, .{ .hunk_header = .{
+                .old_start = h.old_start,
+                .old_count = h.old_count,
+                .new_start = h.new_start,
+                .new_count = h.new_count,
+                .section = h.section,
+                .group = f.group,
+            } });
+            for (h.lines) |ln| {
+                try rows.append(alloc, .{ .line = .{
+                    .kind = ln.kind,
+                    .text = ln.text,
+                    .path = path,
+                    .old_no = ln.old_no,
+                    .new_no = ln.new_no,
+                } });
+            }
+        }
+    }
+    return try rows.toOwnedSlice(alloc);
+}
+
+fn appendFileHeader(
+    alloc: Allocator,
+    rows: *std.ArrayList(view.row.Row),
+    f: diff.File,
+    prev_group: *?diff.Group,
+) Allocator.Error!void {
+    if (f.group) |g| {
+        if (prev_group.* == null or prev_group.*.? != g) {
+            try rows.append(alloc, .{ .section_header = g });
+            prev_group.* = g;
+        }
+    }
+    try rows.append(alloc, .{ .file_header = .{
+        .path = f.displayPath(),
+        .is_binary = f.is_binary,
+        .group = f.group,
+        .old_path = f.old_path,
+        .new_path = f.new_path,
+    } });
+}
+
+/// Unapproved flatten plus how many store entries remain after prune.
+pub const Visible = struct {
+    rows: []view.row.Row,
+    approved_n: usize,
+};
+
+/// 0-based hunk in `file` with these `@@` starts, or `null` if none.
+pub fn hunkAt(file: diff.File, old_start: u32, new_start: u32) ?usize {
+    for (file.hunks, 0..) |h, i| {
+        if (h.old_start == old_start and h.new_start == new_start) return i;
+    }
+    return null;
+}
+
+/// Load `.rv/approved.json`, prune against `d`, persist if the set shrank,
+/// flatten without approved hunks. `approved_n` is remaining live matches.
+pub fn loadVisible(alloc: Allocator, io: Io, root: Io.Dir, d: *const diff.Diff) LoadError!Visible {
+    var approved = try load(alloc, io, root);
+    defer approved.deinit();
+    const live = try collectLive(alloc, io, root, d);
+    defer alloc.free(live);
+    const before = approved.entries.items.len;
+    try approved.prune(alloc, live);
+    if (approved.entries.items.len != before) {
+        save(&approved, alloc, io, root) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            else => {},
+        };
+    }
+    const rows = try hide(alloc, d, &approved, io, root);
+    return .{ .rows = rows, .approved_n = approved.entries.items.len };
 }
 
 const testing = std.testing;
@@ -563,4 +755,231 @@ test "group is unused; path change does not match" {
 
     used[0] = false;
     try testing.expect(!approved.take(&used, "renamed.txt", hash));
+}
+
+fn twoHunkDiff(alloc: Allocator) !diff.Diff {
+    const txt =
+        \\diff --git a/f.txt b/f.txt
+        \\--- a/f.txt
+        \\+++ b/f.txt
+        \\@@ -1 +1 @@
+        \\-old
+        \\+new
+        \\@@ -10 +10 @@
+        \\-old2
+        \\+new2
+    ;
+    var d = try diff.parse(alloc, txt);
+    errdefer d.deinit();
+    try testing.expectEqual(1, d.files.len);
+    try testing.expectEqual(2, d.files[0].hunks.len);
+    return d;
+}
+
+fn threeGroupDiff(alloc: Allocator) !diff.Diff {
+    const unstaged_txt =
+        \\diff --git a/a b/a
+        \\--- a/a
+        \\+++ b/a
+        \\@@ -1 +1 @@
+        \\-old
+        \\+new
+    ;
+    const untracked_txt =
+        \\diff --git a/u b/u
+        \\new file mode 100644
+        \\--- /dev/null
+        \\+++ b/u
+        \\@@ -0,0 +1 @@
+        \\+hi
+    ;
+    const staged_txt =
+        \\diff --git a/a b/a
+        \\--- a/a
+        \\+++ b/a
+        \\@@ -1 +1,2 @@
+        \\ same
+        \\+staged
+    ;
+    return try diff.parsePieces(alloc, &.{
+        .{ .text = unstaged_txt, .group = .unstaged },
+        .{ .text = untracked_txt, .group = .untracked },
+        .{ .text = staged_txt, .group = .staged },
+    });
+}
+
+test "hide with empty store matches flatten" {
+    const io = testing.io;
+    var d = try twoHunkDiff(testing.allocator);
+    defer d.deinit();
+    var approved = initEmpty(testing.allocator);
+    defer approved.deinit();
+    const hidden = try hide(testing.allocator, &d, &approved, io, .cwd());
+    defer testing.allocator.free(hidden);
+    const full = try view.row.flatten(testing.allocator, &d);
+    defer testing.allocator.free(full);
+    try testing.expectEqual(full.len, hidden.len);
+    for (full, hidden) |a, b| {
+        try testing.expectEqual(std.meta.activeTag(a), std.meta.activeTag(b));
+    }
+}
+
+test "hide one hunk keeps the file and the other hunk" {
+    const io = testing.io;
+    var d = try twoHunkDiff(testing.allocator);
+    defer d.deinit();
+    var approved = initEmpty(testing.allocator);
+    defer approved.deinit();
+    try approved.append(d.files[0].displayPath(), fingerprintHunk(d.files[0].hunks[0]));
+    const hidden = try hide(testing.allocator, &d, &approved, io, .cwd());
+    defer testing.allocator.free(hidden);
+    try testing.expectEqual(4, hidden.len);
+    try testing.expect(hidden[0] == .file_header);
+    try testing.expect(hidden[1] == .hunk_header);
+    try testing.expectEqual(d.files[0].hunks[1].old_start, hidden[1].hunk_header.old_start);
+    try testing.expect(hidden[2] == .line);
+    try testing.expectEqualStrings("old2", hidden[2].line.text);
+    try testing.expect(hidden[3] == .line);
+    try testing.expectEqualStrings("new2", hidden[3].line.text);
+}
+
+test "hide all hunks of a file drops the file header" {
+    const io = testing.io;
+    var d = try twoHunkDiff(testing.allocator);
+    defer d.deinit();
+    var approved = initEmpty(testing.allocator);
+    defer approved.deinit();
+    try approved.append(d.files[0].displayPath(), fingerprintHunk(d.files[0].hunks[0]));
+    try approved.append(d.files[0].displayPath(), fingerprintHunk(d.files[0].hunks[1]));
+    const hidden = try hide(testing.allocator, &d, &approved, io, .cwd());
+    defer testing.allocator.free(hidden);
+    try testing.expectEqual(0, hidden.len);
+}
+
+test "hide drops an empty section and keeps a mixed file" {
+    const io = testing.io;
+    var d = try threeGroupDiff(testing.allocator);
+    defer d.deinit();
+    var approved = initEmpty(testing.allocator);
+    defer approved.deinit();
+    try approved.append("a", fingerprintHunk(d.files[0].hunks[0]));
+    try approved.append("u", fingerprintHunk(d.files[1].hunks[0]));
+    const hidden = try hide(testing.allocator, &d, &approved, io, .cwd());
+    defer testing.allocator.free(hidden);
+    try testing.expect(hidden[0] == .section_header);
+    try testing.expectEqual(diff.Group.staged, hidden[0].section_header);
+    try testing.expect(hidden[1] == .file_header);
+    try testing.expectEqualStrings("a", hidden[1].file_header.path);
+    try testing.expect(hidden[2] == .hunk_header);
+}
+
+test "one store entry hides the first matching live hunk only" {
+    const io = testing.io;
+    const txt =
+        \\diff --git a/f.txt b/f.txt
+        \\--- a/f.txt
+        \\+++ b/f.txt
+        \\@@ -1 +1 @@
+        \\-old
+        \\+new
+    ;
+    var d = try diff.parsePieces(testing.allocator, &.{
+        .{ .text = txt, .group = .unstaged },
+        .{ .text = txt, .group = .staged },
+    });
+    defer d.deinit();
+    var approved = initEmpty(testing.allocator);
+    defer approved.deinit();
+    try approved.append("f.txt", fingerprintHunk(d.files[0].hunks[0]));
+    const hidden = try hide(testing.allocator, &d, &approved, io, .cwd());
+    defer testing.allocator.free(hidden);
+    try testing.expect(hidden[0] == .section_header);
+    try testing.expectEqual(diff.Group.staged, hidden[0].section_header);
+    try testing.expect(hidden[1] == .file_header);
+}
+
+test "hide hunk-less file when worktree bytes match" {
+    if (builtin.os.tag == .wasi) return;
+    const io = testing.io;
+    const alloc = testing.allocator;
+    var tmp = try IsolatedTmp.init(alloc, io);
+    defer tmp.deinit(alloc, io);
+    try tmp.write(io, "pic.png", "abc");
+    const binary =
+        \\diff --git a/pic.png b/pic.png
+        \\Binary files a/pic.png and b/pic.png differ
+    ;
+    var d = try diff.parse(alloc, binary);
+    defer d.deinit();
+    var approved = initEmpty(alloc);
+    defer approved.deinit();
+    try approved.append("pic.png", fingerprintFile("abc"));
+    const hidden = try hide(alloc, &d, &approved, io, tmp.dir);
+    defer alloc.free(hidden);
+    try testing.expectEqual(0, hidden.len);
+}
+
+test "loadVisible prunes stale identities and reports approved_n" {
+    if (builtin.os.tag == .wasi) return;
+    const io = testing.io;
+    const alloc = testing.allocator;
+    var tmp = try IsolatedTmp.init(alloc, io);
+    defer tmp.deinit(alloc, io);
+
+    var d = try twoHunkDiff(alloc);
+    defer d.deinit();
+    const path = d.files[0].displayPath();
+    var approved = initEmpty(alloc);
+    defer approved.deinit();
+    try approved.append(path, fingerprintHunk(d.files[0].hunks[0]));
+    try approved.append("gone.txt", fingerprintFile("x"));
+    try save(&approved, alloc, io, tmp.dir);
+
+    const vis = try loadVisible(alloc, io, tmp.dir, &d);
+    defer alloc.free(vis.rows);
+    try testing.expectEqual(1, vis.approved_n);
+    try testing.expectEqual(4, vis.rows.len);
+    try testing.expect(vis.rows[0] == .file_header);
+
+    var reloaded = try load(alloc, io, tmp.dir);
+    defer reloaded.deinit();
+    try testing.expectEqual(1, reloaded.entries.items.len);
+    try testing.expectEqualStrings(path, reloaded.entries.items[0].path);
+}
+
+test "hunkAt matches @@ starts" {
+    var d = try twoHunkDiff(testing.allocator);
+    defer d.deinit();
+    const f = d.files[0];
+    try testing.expectEqual(0, hunkAt(f, f.hunks[0].old_start, f.hunks[0].new_start).?);
+    try testing.expectEqual(1, hunkAt(f, f.hunks[1].old_start, f.hunks[1].new_start).?);
+    try testing.expect(hunkAt(f, 99, 99) == null);
+}
+
+test "appendFile skips stored hunks and hide drops the rest" {
+    const io = testing.io;
+    var d = try twoHunkDiff(testing.allocator);
+    defer d.deinit();
+    var approved = initEmpty(testing.allocator);
+    defer approved.deinit();
+    try approved.append(d.files[0].displayPath(), fingerprintHunk(d.files[0].hunks[0]));
+    try approved.appendFile(testing.allocator, io, .cwd(), d.files[0]);
+    try testing.expectEqual(2, approved.entries.items.len);
+    const hidden = try hide(testing.allocator, &d, &approved, io, .cwd());
+    defer testing.allocator.free(hidden);
+    try testing.expectEqual(0, hidden.len);
+}
+
+test "appendGroup approves one group only" {
+    const io = testing.io;
+    var d = try threeGroupDiff(testing.allocator);
+    defer d.deinit();
+    var approved = initEmpty(testing.allocator);
+    defer approved.deinit();
+    try approved.appendGroup(testing.allocator, io, .cwd(), &d, .unstaged);
+    try testing.expectEqual(1, approved.entries.items.len);
+    const hidden = try hide(testing.allocator, &d, &approved, io, .cwd());
+    defer testing.allocator.free(hidden);
+    try testing.expect(hidden[0] == .section_header);
+    try testing.expectEqual(diff.Group.untracked, hidden[0].section_header);
 }

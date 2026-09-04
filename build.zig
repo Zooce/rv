@@ -98,6 +98,7 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
         .imports = &.{
             .{ .name = "diff", .module = diff_mod },
+            .{ .name = "view", .module = view_mod },
             .{ .name = "isolated_tmp", .module = isolated_tmp_mod },
         },
     });
@@ -126,6 +127,7 @@ pub fn build(b: *std.Build) void {
     // Cursor apply remaps live comments after a successful mutate.
     git_mod.addImport("store", store_mod);
     git_mod.addImport("comments", comments_mod);
+    git_mod.addImport("approve", approve_mod);
 
     // Bundled agent skill install (MVP-2.5).
     const install_skill_mod = b.addModule("install_skill", .{
@@ -165,6 +167,7 @@ pub fn build(b: *std.Build) void {
                 .{ .name = "cli", .module = cli_mod },
                 .{ .name = "comment_input", .module = comment_input_mod },
                 .{ .name = "Help", .module = help_mod },
+                .{ .name = "approve", .module = approve_mod },
             },
         }),
     });
@@ -260,6 +263,7 @@ pub fn build(b: *std.Build) void {
                 .{ .name = "cli", .module = cli_mod },
                 .{ .name = "comment_input", .module = comment_input_mod },
                 .{ .name = "Help", .module = help_mod },
+                .{ .name = "approve", .module = approve_mod },
             },
         }),
     });

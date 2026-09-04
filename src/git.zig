@@ -60,8 +60,9 @@
 //! or group to mutate. Neighbor marks restore the cursor after that span is
 //! gone. Rows answer structure and geometry; these types are not a view API.
 //!
-//! `applyAtCursor` / `applyGroupAtCursor` run `mutate`, reload the local diff,
-//! restore the cursor, and call comment remap (and discard comment delete).
+//! `applyAtCursor` / `applyGroupAtCursor` run `mutate`, reload the local diff
+//! (hiding approved hunks), restore the cursor, and call comment remap (and
+//! discard comment delete).
 //! `discardTargetAt` is the allowed discard; staged is a no-op. `stagePlan` /
 //! `confirmNext` are what the app loop dispatches. Overlay paint stays in the
 //! TUI.
@@ -78,6 +79,7 @@ const diff = @import("diff");
 const view = @import("view");
 const store = @import("store");
 const comments = @import("comments");
+const approve = @import("approve");
 const Allocator = std.mem.Allocator;
 const Io = std.Io;
 
@@ -477,7 +479,7 @@ pub fn discardHasComments(
 ) bool {
     const target = discardTargetAt(rows, cursor, whole_file) orelse return false;
     const file = fileForTarget(d, target) orelse return false;
-    return comments.hasMatching(review, file, target.hunk_i);
+    return comments.hasMatching(review, file, diffHunkIndex(file, rows, target));
 }
 
 /// What stage/unstage at `cursor` should do. Section header (when not
@@ -528,6 +530,17 @@ pub fn confirmNext(
     };
 }
 
+/// Diff hunk index for a hunk `target` (match `@@` starts on the row). `null`
+/// when the target is the whole file or the header is gone from `rows`.
+fn diffHunkIndex(file: *const diff.File, rows: []const view.row.Row, target: IndexTarget) ?usize {
+    if (target.hunk_i == null) return null;
+    if (target.first >= rows.len) return null;
+    return switch (rows[target.first]) {
+        .hunk_header => |hh| approve.hunkAt(file.*, hh.old_start, hh.new_start),
+        else => null,
+    };
+}
+
 /// Parsed file matching `target`. `null` when path/group is missing or the hunk is out of range.
 fn fileForTarget(d: *const diff.Diff, target: IndexTarget) ?*const diff.File {
     for (d.files) |*f| {
@@ -545,11 +558,13 @@ fn fileForTarget(d: *const diff.Diff, target: IndexTarget) ?*const diff.File {
 pub const MutationKind = enum { stage_unstage, discard };
 
 /// Local diff, rows, and restored cursor after a successful mutate.
-/// Caller owns `diff` and `rows`.
+/// Caller owns `diff` and `rows`. `approved_n` is live approved identities
+/// still in `diff` after prune (0 when the store could not be loaded).
 pub const Snapshot = struct {
     diff: diff.Diff,
     rows: []view.row.Row,
     cursor: usize,
+    approved_n: usize = 0,
 
     pub fn deinit(self: Snapshot, alloc: Allocator) void {
         alloc.free(self.rows);
@@ -590,6 +605,8 @@ pub fn applyAtCursor(
 ) Allocator.Error!MutationStatus {
     const target = indexTargetAt(rows, cursor, whole_file) orelse return .noop;
     const file = fileForTarget(d, target) orelse return .noop;
+    const diff_hunk_i = diffHunkIndex(file, rows, target);
+    if (target.hunk_i != null and diff_hunk_i == null) return .noop;
     const action: Action = switch (kind) {
         .stage_unstage => switch (target.group) {
             .unstaged, .untracked => .stage,
@@ -606,15 +623,15 @@ pub fn applyAtCursor(
     var saved: std.ArrayList(comments.RemoveSnap) = .empty;
     defer saved.deinit(alloc);
     if (delete_comments and kind == .discard) {
-        try comments.collectMatching(review, file, target.hunk_i, alloc, &ids, &saved);
+        try comments.collectMatching(review, file, diff_hunk_i, alloc, &ids, &saved);
     }
     var fail: []u8 = &.{};
     mutate(alloc, io, cwd, .{
         .action = action,
         .path = file.displayPath(),
         .group = target.group,
-        .hunk = if (target.hunk_i) |hi| &file.hunks[hi] else null,
-        .file = if (target.hunk_i != null) file else null,
+        .hunk = if (diff_hunk_i) |hi| &file.hunks[hi] else null,
+        .file = if (diff_hunk_i != null) file else null,
         .fail_output = &fail,
     }) catch |err| switch (err) {
         error.OutOfMemory => {
@@ -645,7 +662,7 @@ pub fn applyAtCursor(
     if (kind == .stage_unstage) {
         var priors: std.ArrayList(comments.AnchorSnap) = .empty;
         defer priors.deinit(alloc);
-        try comments.remapMatching(review, file, &new_diff, target.hunk_i, alloc, &priors);
+        try comments.remapMatching(review, file, &new_diff, diff_hunk_i, alloc, &priors);
         if (!saveCommentRemap(review, alloc, io, priors.items)) save_failed = true;
     }
 
@@ -655,6 +672,7 @@ pub fn applyAtCursor(
             .diff = new_diff,
             .rows = new_rows,
             .cursor = new_cursor,
+            .approved_n = reloaded.approved_n,
         },
         .save_failed = save_failed,
     } };
@@ -723,6 +741,7 @@ pub fn applyGroupAtCursor(
             .diff = new_diff,
             .rows = new_rows,
             .cursor = new_cursor,
+            .approved_n = loaded.approved_n,
         };
         group_save_failed = save_failed;
     } else |err| {
@@ -745,13 +764,38 @@ fn failMessage(alloc: Allocator, fail: []const u8, err: Error) Allocator.Error![
     return try alloc.dupe(u8, errorMessage(err));
 }
 
-fn reloadLocal(alloc: Allocator, io: Io, cwd: std.process.Child.Cwd) Error!struct { diff: diff.Diff, rows: []view.row.Row } {
+fn reloadLocal(alloc: Allocator, io: Io, cwd: std.process.Child.Cwd) Error!struct {
+    diff: diff.Diff,
+    rows: []view.row.Row,
+    approved_n: usize,
+} {
     var new_diff = try loadDefaultDiffCwd(alloc, io, cwd);
-    const new_rows = view.row.flatten(alloc, &new_diff) catch {
-        new_diff.deinit();
-        return error.OutOfMemory;
+    errdefer new_diff.deinit();
+    const vis = visibleLocal(alloc, io, cwd, &new_diff) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => {
+            const new_rows = view.row.flatten(alloc, &new_diff) catch return error.OutOfMemory;
+            return .{ .diff = new_diff, .rows = new_rows, .approved_n = 0 };
+        },
     };
-    return .{ .diff = new_diff, .rows = new_rows };
+    return .{ .diff = new_diff, .rows = vis.rows, .approved_n = vis.approved_n };
+}
+
+fn visibleLocal(
+    alloc: Allocator,
+    io: Io,
+    cwd: std.process.Child.Cwd,
+    d: *const diff.Diff,
+) approve.LoadError!approve.Visible {
+    switch (cwd) {
+        .inherit => return approve.loadVisible(alloc, io, .cwd(), d),
+        .path => |p| {
+            const dir = try Io.Dir.openDirAbsolute(io, p, .{});
+            defer dir.close(io);
+            return approve.loadVisible(alloc, io, dir, d);
+        },
+        .dir => |dir| return approve.loadVisible(alloc, io, dir, d),
+    }
 }
 
 fn removeMatchingComments(

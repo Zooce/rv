@@ -82,7 +82,7 @@ Not a multi-user code-review platform. Not a GitHub replacement. A **personal re
 | Branch vs base (e.g. `rv main...HEAD`) | MVP |
 | Arbitrary patches | Later |
 
-**Default invocation:** bare `rv` reviews local changes only (staged, unstaged, and untracked). The TUI groups those under labeled **Unstaged**, **Untracked**, and **Staged** sections (empty groups omitted). A clean worktree opens an empty review. Branch and other diffs are opt-in: `rv <range>` (for example `rv main...HEAD`) and have no section headers. The TUI footer shows the git range (`HEAD` for local, `HEAD · empty` when the worktree is clean, or the range you passed).
+**Default invocation:** bare `rv` reviews local changes only (staged, unstaged, and untracked). The TUI groups those under labeled **Unstaged**, **Untracked**, and **Staged** sections (empty groups omitted). A clean worktree opens an empty review. Approved local hunks are omitted from the walk; when every remaining change is approved the footer is `HEAD · N approved`, not `HEAD · empty`. Branch and other diffs are opt-in: `rv <range>` (for example `rv main...HEAD`) and have no section headers. The TUI footer shows the git range (`HEAD` for local, `HEAD · empty` when the worktree is clean, `HEAD · N approved` when the tree is dirty but nothing unapproved remains, or the range you passed).
 
 ### Navigation and selection (keyboard-first)
 
@@ -106,6 +106,7 @@ Not a multi-user code-review platform. Not a GitHub replacement. A **personal re
 | `Space` `S` | **Stage or unstage the containing file** while the cursor is in a hunk. Local only. Temporary stand-in until Ctrl bindings exist. |
 | `Space` `d` | **Discard** the current file (on a file header) or hunk (in a hunk). Local unstaged/untracked only. Always confirms (`No` selected first; `yes` proceeds). If the target has live comments, a second overlay asks to delete them (`Yes` selected; `no` keeps them). Git discard runs first; comments are deleted only on success. Staged rows are no-ops (unstage first). Range loads ignore this chord. Far-right hints name the chord on unstaged/untracked rows. Git failure: same overlay as stage/unstage. |
 | `Space` `x` | **Discard the containing file** while the cursor is in a hunk. Local only. Temporary stand-in until Ctrl bindings exist. |
+| `Space` `a` | **Approve** the current hunk (hunk header or line), remaining hunks of the file in this group (file header), or the whole group (section header). No confirm. Local only. Hides those rows from the walk. Far-right hints name the chord on the current section, file, and hunk rows. Range loads ignore this chord and show no hints. |
 | `?` | **Help** — centered overlay with the grouped key catalog (motion, search, comments, session, prompts). The title bar is a short hint; this is the full list. `j`/`k` (and arrows) scroll when it does not fit. `?` or Esc closes. `q` still quits. From a file or comment list, `?` replaces the list with help. While commenting or searching, `?` inserts a question mark. |
 | `i` / `c` / `a` / `Enter` | Create or edit the comment on **new** (right pane in side-by-side, or the current `+` / context line in unified). Open a box **below the cursor**. Same action; pick the muscle memory you prefer. |
 | `I` / `C` / `A` | Create or edit the comment on **old** (left pane in side-by-side, or the current `-` / context line in unified). Missing side does nothing. |
@@ -213,8 +214,9 @@ $ grok   # or claude - agent implements a feature
 $ rv     # local changes only (empty when the worktree is clean)
          # j/k line; h/l col; [/] hunks; za/zM/zR folds; (/) comments; / text; Space f files
          # Space l comments; Space Space stage/unstage file, hunk, or group (local)
-         # Space S file from hunk (until Ctrl); Space d discard file or hunk
-         # Space x discard file from hunk (until Ctrl); i/c/a/Enter -> create or edit new
+         # Space a approve hunk, file, or group (local); Space S file from hunk (until Ctrl)
+         # Space d discard file or hunk; Space x discard file from hunk (until Ctrl)
+         # i/c/a/Enter -> create or edit new
          # I/C/A -> old; d dismiss new; D dismiss old; r reload; ? help
 
 $ rv export -o .rv/review.md   # or stdout / JSON
@@ -231,7 +233,7 @@ $ rv                         # confirm, leave more, continue
 
 1. **Clean and simple** - enjoyable to use every day; no cluttered "IDE in the terminal."
 2. **Performance** - no slop. Instant open on large diffs is a requirement, not a nice-to-have.
-3. **Vim / Helix-like keybindings** - `j`/`k` move a **highlighted current line** (not merely scroll); `h`/`l` move by column; `[`/`]` jump hunks; `(`/`)` jump comments; `/` search diff text; `Space` `f` list changed files (overlay); `Space` `l` list comments (overlay); `?` help (overlay); `i`/`c`/`a`/`Enter` create or edit on new, `I`/`C`/`A` on old (box below the cursor); `d`/`D` dismiss new/old; `Space` `Space` stage/unstage file, hunk, or group (local); `Space` `d` / `Space` `x` discard (local, confirm).
+3. **Vim / Helix-like keybindings** - `j`/`k` move a **highlighted current line** (not merely scroll); `h`/`l` move by column; `[`/`]` jump hunks; `(`/`)` jump comments; `/` search diff text; `Space` `f` list changed files (overlay); `Space` `l` list comments (overlay); `?` help (overlay); `i`/`c`/`a`/`Enter` create or edit on new, `I`/`C`/`A` on old (box below the cursor); `d`/`D` dismiss new/old; `Space` `Space` stage/unstage file, hunk, or group (local); `Space` `a` approve hunk, file, or group (local); `Space` `d` / `Space` `x` discard (local, confirm).
 4. **Diff-first layout** - files and hunks from the *change set*, not a full project tree.
 5. **Precise selection** - comments must attach to the exact span you care about, including overlapping ranges.
 6. **Mouse optional** - never required to place or target a comment.
