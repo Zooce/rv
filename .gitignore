@@ -9,3 +9,6 @@ zig-out/
 
 # Local review store (product data; not source)
 .rv/
+
+# Personal goals
+.goal/
