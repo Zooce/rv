@@ -482,9 +482,11 @@ pub fn formatRow(buf: []u8, row: view.row.Row, marked: bool) []const u8 {
         }}),
         .file_header => |fh| blk: {
             const prefix: []const u8 = if (marked) "* " else " ";
+            var path_buf: [512]u8 = undefined;
+            const path = view.row.fileHeaderPathLabel(fh, &path_buf);
             if (fh.is_binary)
-                break :blk bufPrintTrunc(buf, "{s}{s}  (binary)", .{ prefix, fh.path });
-            break :blk bufPrintTrunc(buf, "{s}{s}", .{ prefix, fh.path });
+                break :blk bufPrintTrunc(buf, "{s}{s}  (binary)", .{ prefix, path });
+            break :blk bufPrintTrunc(buf, "{s}{s}", .{ prefix, path });
         },
         .hunk_header => |hh| blk: {
             const oc = hh.old_count orelse 1;
@@ -620,6 +622,37 @@ test "formatRow file header marked" {
     const bin: view.row.Row = .{ .file_header = .{ .path = "pic.png", .is_binary = true } };
     try testing.expectEqualStrings(" pic.png  (binary)", formatRow(&buf, bin, false));
     try testing.expectEqualStrings("* pic.png  (binary)", formatRow(&buf, bin, true));
+}
+
+test "formatRow file header rename" {
+    var buf: [64]u8 = undefined;
+    const renamed: view.row.Row = .{ .file_header = .{
+        .path = "new_name.txt",
+        .is_binary = false,
+        .old_path = "old_name.txt",
+        .new_path = "new_name.txt",
+    } };
+    try testing.expectEqualStrings(" old_name.txt -> new_name.txt", formatRow(&buf, renamed, false));
+    try testing.expectEqualStrings("* old_name.txt -> new_name.txt", formatRow(&buf, renamed, true));
+    const bin_renamed: view.row.Row = .{ .file_header = .{
+        .path = "new.png",
+        .is_binary = true,
+        .old_path = "old.png",
+        .new_path = "new.png",
+    } };
+    try testing.expectEqualStrings(" old.png -> new.png  (binary)", formatRow(&buf, bin_renamed, false));
+    const added: view.row.Row = .{ .file_header = .{
+        .path = "new.txt",
+        .is_binary = false,
+        .new_path = "new.txt",
+    } };
+    try testing.expectEqualStrings(" new.txt", formatRow(&buf, added, false));
+    const deleted: view.row.Row = .{ .file_header = .{
+        .path = "gone.txt",
+        .is_binary = false,
+        .old_path = "gone.txt",
+    } };
+    try testing.expectEqualStrings(" gone.txt", formatRow(&buf, deleted, false));
 }
 
 test "rowMarked file header is not a line" {

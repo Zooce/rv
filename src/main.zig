@@ -1647,6 +1647,7 @@ const FileList = struct {
         else
             inner;
         const start = self.scroll;
+        var path_buf: [512]u8 = undefined;
         var row: u16 = 0;
         while (row < inner.h) : (row += 1) {
             const idx = start + row;
@@ -1654,7 +1655,7 @@ const FileList = struct {
             const y = inner.y + row;
             const st = if (idx == self.cursor) row_cur else panel_bg;
             scr.fillRect(.{ .x = inner.x, .y = y, .w = inner.w, .h = 1 }, ' ', st);
-            const path = rows[items[idx]].file_header.path;
+            const path = view.row.fileHeaderPathLabel(rows[items[idx]].file_header, &path_buf);
             scr.putStr(inner.x, y, path, st, text_area);
         }
         if (show_bar) {

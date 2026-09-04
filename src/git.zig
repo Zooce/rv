@@ -4,11 +4,11 @@
 //!
 //! Three groups, in this order, each file tagged (`diff.File.group`):
 //!
-//! 1. **unstaged** — `git diff` (worktree vs index)
+//! 1. **unstaged** — `git diff --find-renames` (worktree vs index)
 //! 2. **untracked** — `git ls-files --others --exclude-standard`, each path
 //!    turned into a new-file unified diff via
 //!    `git diff --no-index -- /dev/null <path>`
-//! 3. **staged** — `git diff --cached` (index vs HEAD)
+//! 3. **staged** — `git diff --find-renames --cached` (index vs HEAD)
 //!
 //! Empty groups are omitted. A path with both staged and unstaged hunks
 //! appears twice (unstaged remainder, then later the staged hunks).
@@ -23,9 +23,9 @@
 //!
 //! ## Explicit range
 //!
-//! `loadRangeDiff` runs `git diff <range>` with the range string as written
-//! (no `...` / `..` rewrite). Untracked files are not appended. An empty
-//! result is an empty `Diff`. Invalid range is `GitFailed`.
+//! `loadRangeDiff` runs `git diff --find-renames <range>` with the range
+//! string as written (no `...` / `..` rewrite). Untracked files are not
+//! appended. An empty result is an empty `Diff`. Invalid range is `GitFailed`.
 //!
 //! ## Empty diffs
 //!
@@ -116,8 +116,8 @@ pub fn loadDefaultDiffCwd(alloc: Allocator, io: Io, cwd: std.process.Child.Cwd) 
     defer if (staged) |s| alloc.free(s);
 
     if (try revExists(alloc, io, cwd, "HEAD")) {
-        unstaged = try git(alloc, io, cwd, .{ .argv = &.{ "git", "diff" } });
-        staged = try git(alloc, io, cwd, .{ .argv = &.{ "git", "diff", "--cached" } });
+        unstaged = try git(alloc, io, cwd, .{ .argv = &.{ "git", "diff", "--find-renames" } });
+        staged = try git(alloc, io, cwd, .{ .argv = &.{ "git", "diff", "--find-renames", "--cached" } });
     }
 
     return try diff.parsePieces(alloc, &.{
@@ -127,11 +127,11 @@ pub fn loadDefaultDiffCwd(alloc: Allocator, io: Io, cwd: std.process.Child.Cwd) 
     });
 }
 
-/// Load `git diff <range>`. `range` is passed through as written (no
-/// `...` / `..` rewrite). Pass `.inherit` for the process cwd.
+/// Load `git diff --find-renames <range>`. `range` is passed through as
+/// written (no `...` / `..` rewrite). Pass `.inherit` for the process cwd.
 pub fn loadRangeDiff(alloc: Allocator, io: Io, cwd: std.process.Child.Cwd, range: []const u8) Error!diff.Diff {
     try ensureInsideWorkTree(alloc, io, cwd);
-    const out = try git(alloc, io, cwd, .{ .argv = &.{ "git", "diff", range } });
+    const out = try git(alloc, io, cwd, .{ .argv = &.{ "git", "diff", "--find-renames", range } });
     defer alloc.free(out);
     return try diff.parse(alloc, out);
 }
@@ -1328,6 +1328,46 @@ test "range does not append untracked files" {
 
     try testing.expectEqual(1, d.files.len);
     try expectHasDisplayPath(d, "feature-only.txt");
+}
+
+test "load finds rename when diff.renames is false" {
+    if (builtin.os.tag == .wasi) return error.SkipZigTest;
+
+    const io = testing.io;
+    const alloc = testing.allocator;
+    var tmp = try IsolatedTmp.init(alloc, io);
+    defer tmp.deinit(alloc, io);
+    const cwd = tmp.cwd();
+
+    try initTestRepo(alloc, io, cwd);
+    try expectGitOk(alloc, io, cwd, &.{ "git", "config", "diff.renames", "false" });
+    try tmp.write(io, "old_name.txt", "hello\n");
+    try expectGitOk(alloc, io, cwd, &.{ "git", "add", "old_name.txt" });
+    try expectGitOk(alloc, io, cwd, &.{ "git", "commit", "-m", "init" });
+    try expectGitOk(alloc, io, cwd, &.{ "git", "mv", "old_name.txt", "new_name.txt" });
+
+    {
+        var d = try loadDefaultDiffCwd(alloc, io, cwd);
+        defer d.deinit();
+        try testing.expectEqual(1, d.files.len);
+        const f = try findFile(d, "new_name.txt", .staged);
+        try testing.expectEqualStrings("old_name.txt", f.old_path.?);
+        try testing.expectEqualStrings("new_name.txt", f.new_path.?);
+        const rows = try view.row.flatten(alloc, &d);
+        defer alloc.free(rows);
+        var buf: [64]u8 = undefined;
+        try testing.expectEqualStrings(
+            "old_name.txt -> new_name.txt",
+            view.row.fileHeaderPathLabel(rows[1].file_header, &buf),
+        );
+    }
+
+    try expectGitOk(alloc, io, cwd, &.{ "git", "commit", "-m", "rename" });
+    var ranged = try loadRangeDiff(alloc, io, cwd, "HEAD~1...HEAD");
+    defer ranged.deinit();
+    try testing.expectEqual(1, ranged.files.len);
+    try testing.expectEqualStrings("old_name.txt", ranged.files[0].old_path.?);
+    try testing.expectEqualStrings("new_name.txt", ranged.files[0].new_path.?);
 }
 
 test "invalid range: GitFailed" {

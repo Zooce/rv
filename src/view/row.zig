@@ -5,16 +5,22 @@ const std = @import("std");
 const diff = @import("diff");
 const Allocator = std.mem.Allocator;
 
+/// File-header payload. `path` is identity (`File.displayPath()`). `old_path`
+/// / `new_path` are borrowed from `Diff.File` (`null` on a `/dev/null` side).
+pub const FileHeader = struct {
+    path: []const u8,
+    is_binary: bool,
+    group: ?diff.Group = null,
+    old_path: ?[]const u8 = null,
+    new_path: ?[]const u8 = null,
+};
+
 /// One renderable row in the review list. String slices borrow from the
 /// parent `Diff` arena (or are static); free only the row slice itself.
 pub const Row = union(enum) {
     /// Group divider. Local load only.
     section_header: diff.Group,
-    file_header: struct {
-        path: []const u8,
-        is_binary: bool,
-        group: ?diff.Group = null,
-    },
+    file_header: FileHeader,
     hunk_header: struct {
         old_start: u32,
         old_count: ?u32,
@@ -64,6 +70,8 @@ pub fn flatten(alloc: Allocator, d: *const diff.Diff) Allocator.Error![]Row {
             .path = f.displayPath(),
             .is_binary = f.is_binary,
             .group = f.group,
+            .old_path = f.old_path,
+            .new_path = f.new_path,
         } });
         for (f.hunks) |h| {
             try rows.append(alloc, .{ .hunk_header = .{
@@ -129,11 +137,20 @@ pub fn searchText(row: Row) ?[]const u8 {
 
 /// Path string for a `.file_header` row, or `null` on non-header rows.
 /// Lands on the file header itself (not the first body/change line).
+/// Identity path (`displayPath()`), not the `old -> new` file-line label.
 pub fn searchPath(row: Row) ?[]const u8 {
     return switch (row) {
         .file_header => |fh| fh.path,
         .hunk_header, .line, .section_header => null,
     };
+}
+
+/// File-line path: `old -> new` when both sides exist and differ, else `path`.
+pub fn fileHeaderPathLabel(fh: FileHeader, buf: []u8) []const u8 {
+    const old = fh.old_path orelse return fh.path;
+    const newp = fh.new_path orelse return fh.path;
+    if (std.mem.eql(u8, old, newp)) return fh.path;
+    return std.fmt.bufPrint(buf, "{s} -> {s}", .{ old, newp }) catch fh.path;
 }
 
 /// Case-sensitive substring match against `searchText` for this row.
@@ -143,11 +160,24 @@ pub fn rowMatches(row: Row, query: []const u8) bool {
     return std.mem.indexOf(u8, t, query) != null;
 }
 
-/// Case-sensitive substring match against `searchPath` for this row.
+/// Case-sensitive substring match against a file-header path. Hits identity
+/// `path`, `old_path`, `new_path`, and the `old -> new` file-line label.
 pub fn rowPathMatches(row: Row, query: []const u8) bool {
     if (query.len == 0) return false;
-    const t = searchPath(row) orelse return false;
-    return std.mem.indexOf(u8, t, query) != null;
+    switch (row) {
+        .file_header => |fh| {
+            var buf: [512]u8 = undefined;
+            if (std.mem.indexOf(u8, fileHeaderPathLabel(fh, &buf), query) != null) return true;
+            if (fh.old_path) |old| {
+                if (std.mem.indexOf(u8, old, query) != null) return true;
+            }
+            if (fh.new_path) |newp| {
+                if (std.mem.indexOf(u8, newp, query) != null) return true;
+            }
+            return false;
+        },
+        .hunk_header, .line, .section_header => return false,
+    }
 }
 
 const testing = std.testing;
@@ -338,4 +368,138 @@ test "searchPath is file headers only" {
     try testing.expect(!rowPathMatches(rows[2], "app/main"));
     try testing.expect(!rowPathMatches(rows[2], "oldMain"));
     try testing.expect(!rowPathMatches(rows[0], ""));
+}
+
+test "flatten rename keeps identity path and both sides" {
+    const fixture =
+        \\diff --git a/old_name.txt b/new_name.txt
+        \\similarity index 95%
+        \\rename from old_name.txt
+        \\rename to new_name.txt
+        \\--- a/old_name.txt
+        \\+++ b/new_name.txt
+        \\@@ -1 +1 @@
+        \\-a
+        \\+b
+    ;
+    var d = try diff.parse(testing.allocator, fixture);
+    defer d.deinit();
+    const rows = try flatten(testing.allocator, &d);
+    defer testing.allocator.free(rows);
+
+    try testing.expect(rows[0] == .file_header);
+    try testing.expectEqualStrings("new_name.txt", rows[0].file_header.path);
+    try testing.expectEqualStrings("old_name.txt", rows[0].file_header.old_path.?);
+    try testing.expectEqualStrings("new_name.txt", rows[0].file_header.new_path.?);
+    try testing.expectEqualStrings("new_name.txt", rows[2].line.path);
+}
+
+test "flatten 100% rename is header only with both paths" {
+    const fixture =
+        \\diff --git a/old_name.txt b/new_name.txt
+        \\similarity index 100%
+        \\rename from old_name.txt
+        \\rename to new_name.txt
+    ;
+    var d = try diff.parse(testing.allocator, fixture);
+    defer d.deinit();
+    const rows = try flatten(testing.allocator, &d);
+    defer testing.allocator.free(rows);
+
+    try testing.expectEqual(1, rows.len);
+    try testing.expectEqualStrings("new_name.txt", rows[0].file_header.path);
+    try testing.expectEqualStrings("old_name.txt", rows[0].file_header.old_path.?);
+    try testing.expectEqualStrings("new_name.txt", rows[0].file_header.new_path.?);
+}
+
+test "flatten add and delete keep a single side" {
+    const add_txt =
+        \\diff --git a/new.txt b/new.txt
+        \\new file mode 100644
+        \\--- /dev/null
+        \\+++ b/new.txt
+        \\@@ -0,0 +1 @@
+        \\+hi
+    ;
+    const del_txt =
+        \\diff --git a/gone.txt b/gone.txt
+        \\deleted file mode 100644
+        \\--- a/gone.txt
+        \\+++ /dev/null
+        \\@@ -1 +0,0 @@
+        \\-bye
+    ;
+    var added = try diff.parse(testing.allocator, add_txt);
+    defer added.deinit();
+    const add_rows = try flatten(testing.allocator, &added);
+    defer testing.allocator.free(add_rows);
+    try testing.expect(add_rows[0].file_header.old_path == null);
+    try testing.expectEqualStrings("new.txt", add_rows[0].file_header.new_path.?);
+    try testing.expectEqualStrings("new.txt", add_rows[0].file_header.path);
+
+    var deleted = try diff.parse(testing.allocator, del_txt);
+    defer deleted.deinit();
+    const del_rows = try flatten(testing.allocator, &deleted);
+    defer testing.allocator.free(del_rows);
+    try testing.expectEqualStrings("gone.txt", del_rows[0].file_header.old_path.?);
+    try testing.expect(del_rows[0].file_header.new_path == null);
+    try testing.expectEqualStrings("gone.txt", del_rows[0].file_header.path);
+}
+
+test "fileHeaderPathLabel rename vs single path" {
+    var buf: [64]u8 = undefined;
+    const renamed: FileHeader = .{
+        .path = "new_name.txt",
+        .is_binary = false,
+        .old_path = "old_name.txt",
+        .new_path = "new_name.txt",
+    };
+    try testing.expectEqualStrings("old_name.txt -> new_name.txt", fileHeaderPathLabel(renamed, &buf));
+
+    const same: FileHeader = .{
+        .path = "a.zig",
+        .is_binary = false,
+        .old_path = "a.zig",
+        .new_path = "a.zig",
+    };
+    try testing.expectEqualStrings("a.zig", fileHeaderPathLabel(same, &buf));
+
+    const added: FileHeader = .{
+        .path = "new.txt",
+        .is_binary = false,
+        .new_path = "new.txt",
+    };
+    try testing.expectEqualStrings("new.txt", fileHeaderPathLabel(added, &buf));
+
+    const deleted: FileHeader = .{
+        .path = "gone.txt",
+        .is_binary = false,
+        .old_path = "gone.txt",
+    };
+    try testing.expectEqualStrings("gone.txt", fileHeaderPathLabel(deleted, &buf));
+}
+
+test "rowPathMatches rename hits old new and label" {
+    const fixture =
+        \\diff --git a/old_name.txt b/new_name.txt
+        \\similarity index 95%
+        \\rename from old_name.txt
+        \\rename to new_name.txt
+        \\--- a/old_name.txt
+        \\+++ b/new_name.txt
+        \\@@ -1 +1 @@
+        \\-oldBody
+        \\+newBody
+    ;
+    var d = try diff.parse(testing.allocator, fixture);
+    defer d.deinit();
+    const rows = try flatten(testing.allocator, &d);
+    defer testing.allocator.free(rows);
+
+    try testing.expectEqualStrings("new_name.txt", searchPath(rows[0]).?);
+    try testing.expect(rowPathMatches(rows[0], "old_name"));
+    try testing.expect(rowPathMatches(rows[0], "new_name"));
+    try testing.expect(rowPathMatches(rows[0], "old_name.txt -> new_name.txt"));
+    try testing.expect(!rowPathMatches(rows[0], "oldBody"));
+    try testing.expect(!rowPathMatches(rows[2], "old_name"));
 }
