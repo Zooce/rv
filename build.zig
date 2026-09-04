@@ -91,6 +91,17 @@ pub fn build(b: *std.Build) void {
         },
     });
 
+    // Hunk/file fingerprints and `.rv/approved.json` (goal #125).
+    const approve_mod = b.addModule("approve", .{
+        .root_source_file = b.path("src/approve.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{
+            .{ .name = "diff", .module = diff_mod },
+            .{ .name = "isolated_tmp", .module = isolated_tmp_mod },
+        },
+    });
+
     // Comment model + `.rv/reviews/` JSON store (MVP-1).
     const store_mod = b.addModule("store", .{
         .root_source_file = b.path("src/store.zig"),
@@ -209,6 +220,11 @@ pub fn build(b: *std.Build) void {
     });
     const run_help_tests = b.addRunArtifact(help_tests);
 
+    const approve_tests = b.addTest(.{
+        .root_module = approve_mod,
+    });
+    const run_approve_tests = b.addRunArtifact(approve_tests);
+
     const store_tests = b.addTest(.{
         .root_module = store_mod,
     });
@@ -249,13 +265,14 @@ pub fn build(b: *std.Build) void {
     });
     const run_main_tests = b.addRunArtifact(main_tests);
 
-    const test_step = b.step("test", "Run unit tests (TUI + diff + git + view + comment_input + Help + store + comments + cli + install_skill + main)");
+    const test_step = b.step("test", "Run unit tests (TUI + diff + git + view + comment_input + Help + approve + store + comments + cli + install_skill + main)");
     test_step.dependOn(&run_tui_tests.step);
     test_step.dependOn(&run_diff_tests.step);
     test_step.dependOn(&run_git_tests.step);
     test_step.dependOn(&run_view_tests.step);
     test_step.dependOn(&run_comment_input_tests.step);
     test_step.dependOn(&run_help_tests.step);
+    test_step.dependOn(&run_approve_tests.step);
     test_step.dependOn(&run_store_tests.step);
     test_step.dependOn(&run_comments_tests.step);
     test_step.dependOn(&run_cli_tests.step);
