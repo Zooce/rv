@@ -24,6 +24,11 @@ const rows = [_]Row{
     .{ .item = .{ .key = "{/}", .label = "file header" } },
     .{ .item = .{ .key = "(/)", .label = "prev / next comment" } },
     .blank,
+    .{ .group = "Folds" },
+    .{ .item = .{ .key = "za", .label = "toggle fold at cursor" } },
+    .{ .item = .{ .key = "zM", .label = "collapse all files" } },
+    .{ .item = .{ .key = "zR", .label = "expand all" } },
+    .blank,
     .{ .group = "Search" },
     .{ .item = .{ .key = "/", .label = "text in the diff" } },
     .{ .item = .{ .key = "n/N", .label = "next / prev match" } },
@@ -177,7 +182,7 @@ fn overlayRect(cols: u16, rows_n: u16, n: usize) tui.Rect {
 
 test "help catalog includes normal bindings" {
     const required = [_][]const u8{
-        "j/k",     "h/l",     "0/$", "J/K", "[/]", "{/}", "(/)", "/", "n/N",
+        "j/k",     "h/l",     "0/$", "J/K", "[/]", "{/}", "(/)", "za", "zM", "zR", "/", "n/N",
         "Space f", "Space l", "Space Space", "Space S", "Space d", "Space x", "i", "I", "d", "D",
         "t",       "#",       "r",           "?", "q",
     };

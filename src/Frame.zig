@@ -273,6 +273,8 @@ pub fn paint(
         rows[si].section_header
     else
         null;
+    const show_fold = focus == .normal and rows.len > 0;
+    var hint_buf: [160]u8 = undefined;
 
     switch (layout) {
         .unified => {
@@ -284,7 +286,7 @@ pub fn paint(
                     const text = formatRow(&line_buf, rows[fi], rowMarked(rows[fi], review));
                     const st = if (fi == cur) pal.file_cur else pal.file;
                     fillRow(scr, screen_y, st);
-                    putRowHint(scr, screen_y, text, indexHintForRow(fi, hint_file, hint_hunk, hint_section, hint_group), st);
+                    putRowHint(scr, screen_y, text, headerHint(&hint_buf, diff_view.folds, rows, fi, hint_file, hint_hunk, hint_section, hint_group, show_fold), st);
                     screen_y += 1;
                 }
             }
@@ -315,12 +317,7 @@ pub fn paint(
                     ),
                     else => {
                         const text = formatRow(&line_buf, rows[i], marked);
-                        const hint = indexHintForRow(i, hint_file, hint_hunk, hint_section, hint_group);
-                        if (hint.len > 0) {
-                            putRowHint(scr, screen_y, text, hint, st);
-                        } else {
-                            scr.putStr(0, screen_y, text, st, null);
-                        }
+                        putRowHint(scr, screen_y, text, headerHint(&hint_buf, diff_view.folds, rows, i, hint_file, hint_hunk, hint_section, hint_group, show_fold), st);
                     },
                 }
                 screen_y += 1;
@@ -335,7 +332,7 @@ pub fn paint(
                     const text = formatRow(&line_buf, rows[fi], rowMarked(rows[fi], review));
                     const st = if (fi == cur) pal.file_cur else pal.file;
                     fillRow(scr, screen_y, st);
-                    putRowHint(scr, screen_y, text, indexHintForRow(fi, hint_file, hint_hunk, hint_section, hint_group), st);
+                    putRowHint(scr, screen_y, text, headerHint(&hint_buf, diff_view.folds, rows, fi, hint_file, hint_hunk, hint_section, hint_group, show_fold), st);
                     screen_y += 1;
                 }
             }
@@ -352,7 +349,7 @@ pub fn paint(
                         } else {
                             fillRow(scr, screen_y, st);
                         }
-                        putRowHint(scr, screen_y, text, indexHintForRow(ri, hint_file, hint_hunk, hint_section, hint_group), st);
+                        putRowHint(scr, screen_y, text, headerHint(&hint_buf, diff_view.folds, rows, ri, hint_file, hint_hunk, hint_section, hint_group, show_fold), st);
                     },
                     .pair => |p| {
                         // Whole slot is current when the cursor sits on either pane
@@ -716,6 +713,42 @@ pub fn indexHintForRow(ri: usize, file_i: ?usize, hunk_i: ?usize, section_i: ?us
     return "";
 }
 
+/// `Fold (za)` / `Unfold (za)` on a foldable file or hunk header. Empty on
+/// sections, body lines, and headers that cannot fold.
+pub fn foldHintForRow(folds: *const view.fold.Set, rows: []const view.row.Row, ri: usize) []const u8 {
+    if (ri >= rows.len) return "";
+    switch (rows[ri]) {
+        .file_header, .hunk_header => {},
+        .line, .section_header => return "",
+    }
+    const target = folds.targetAt(rows, ri) orelse return "";
+    return switch (target) {
+        .file => |f| if (folds.containsFile(f.path, f.group)) "Unfold (za)" else "Fold (za)",
+        .hunk => |h| if (folds.containsHunk(h.path, h.group, h.old_start, h.new_start))
+            "Unfold (za)"
+        else
+            "Fold (za)",
+    };
+}
+
+fn headerHint(
+    buf: []u8,
+    folds: *const view.fold.Set,
+    rows: []const view.row.Row,
+    ri: usize,
+    file_i: ?usize,
+    hunk_i: ?usize,
+    section_i: ?usize,
+    group: ?diff.Group,
+    show_fold: bool,
+) []const u8 {
+    const fold = if (show_fold) foldHintForRow(folds, rows, ri) else "";
+    const git = indexHintForRow(ri, file_i, hunk_i, section_i, group);
+    if (fold.len == 0) return git;
+    if (git.len == 0) return fold;
+    return std.fmt.bufPrint(buf, "{s}  {s}", .{ fold, git }) catch fold;
+}
+
 /// Path/header on the left; `hint` right-aligned with a one-column gap.
 /// Skips the hint when it would not leave that gap. Hint is dim on `style`.
 fn putRowHint(scr: *tui.Screen, y: u16, text: []const u8, hint: []const u8, style: tui.Style) void {
@@ -945,4 +978,82 @@ test "putPannedBody pans text and leaves gutter" {
     try testing.expectEqual('*', scr.getCell(0, 0).char);
     try testing.expectEqual(' ', scr.getCell(1, 0).char);
     try testing.expectEqual('C', scr.getCell(2, 0).char);
+}
+
+test "foldHintForRow file and hunk" {
+    const fixture =
+        \\diff --git a/f b/f
+        \\--- a/f
+        \\+++ b/f
+        \\@@ -1 +1 @@
+        \\-old
+        \\+new
+        \\@@ -10 +10 @@
+        \\-old2
+        \\+new2
+    ;
+    var d = try diff.parse(testing.allocator, fixture);
+    defer d.deinit();
+    const rows = try view.row.flatten(testing.allocator, &d);
+    defer testing.allocator.free(rows);
+    var folds: view.fold.Set = .{};
+    defer folds.deinit(testing.allocator);
+
+    try testing.expectEqualStrings("Fold (za)", foldHintForRow(&folds, rows, 0));
+    try testing.expectEqualStrings("Fold (za)", foldHintForRow(&folds, rows, 1));
+    try testing.expectEqualStrings("", foldHintForRow(&folds, rows, 2));
+
+    try folds.toggle(testing.allocator, folds.targetAt(rows, 1).?);
+    const vis_hunk = try view.fold.visibleRows(testing.allocator, rows, &folds);
+    defer testing.allocator.free(vis_hunk);
+    try testing.expectEqualStrings("Unfold (za)", foldHintForRow(&folds, vis_hunk, 1));
+    try testing.expectEqualStrings("Fold (za)", foldHintForRow(&folds, vis_hunk, 0));
+
+    try folds.toggle(testing.allocator, folds.targetAt(vis_hunk, 0).?);
+    const vis_file = try view.fold.visibleRows(testing.allocator, rows, &folds);
+    defer testing.allocator.free(vis_file);
+    try testing.expectEqualStrings("Unfold (za)", foldHintForRow(&folds, vis_file, 0));
+}
+
+test "foldHintForRow skips hunk-less file" {
+    const fixture =
+        \\diff --git a/pic.png b/pic.png
+        \\Binary files a/pic.png and b/pic.png differ
+    ;
+    var d = try diff.parse(testing.allocator, fixture);
+    defer d.deinit();
+    const rows = try view.row.flatten(testing.allocator, &d);
+    defer testing.allocator.free(rows);
+    var folds: view.fold.Set = .{};
+    defer folds.deinit(testing.allocator);
+    try testing.expectEqualStrings("", foldHintForRow(&folds, rows, 0));
+}
+
+test "headerHint prepends fold to git hint" {
+    const fixture =
+        \\diff --git a/f b/f
+        \\--- a/f
+        \\+++ b/f
+        \\@@ -1 +1 @@
+        \\-old
+        \\+new
+    ;
+    var d = try diff.parsePieces(testing.allocator, &.{
+        .{ .text = fixture, .group = .unstaged },
+    });
+    defer d.deinit();
+    const rows = try view.row.flatten(testing.allocator, &d);
+    defer testing.allocator.free(rows);
+    var folds: view.fold.Set = .{};
+    defer folds.deinit(testing.allocator);
+    var buf: [160]u8 = undefined;
+    const file_i: usize = 1;
+    try testing.expectEqualStrings(
+        "Fold (za)  Stage File (Space Space)  Discard File (Space d)",
+        headerHint(&buf, &folds, rows, file_i, file_i, null, null, .unstaged, true),
+    );
+    try testing.expectEqualStrings(
+        "Stage File (Space Space)  Discard File (Space d)",
+        headerHint(&buf, &folds, rows, file_i, file_i, null, null, .unstaged, false),
+    );
 }

@@ -99,6 +99,8 @@ pub fn main(init: std.process.Init) !u8 {
 
 fn runTui(alloc: std.mem.Allocator, io: std.Io, source: cli.Source) !u8 {
     // Load before any TTY setup so error paths never touch the terminal.
+    var folds: view.fold.Set = .{};
+    defer folds.deinit(alloc);
     var diff_view: DiffView = blk: {
         var parsed = switch (source) {
             .local => git.loadDefaultDiff(alloc, io),
@@ -108,10 +110,9 @@ fn runTui(alloc: std.mem.Allocator, io: std.Io, source: cli.Source) !u8 {
             return 1;
         };
         errdefer parsed.deinit();
-        const parsed_rows = try view.row.flatten(alloc, &parsed);
-        errdefer alloc.free(parsed_rows);
-        const parsed_sbs = try view.layout.pairSideBySide(alloc, parsed_rows);
-        break :blk .{ .diff = parsed, .rows = parsed_rows, .sbs_slots = parsed_sbs };
+        const parsed_flat = try view.row.flatten(alloc, &parsed);
+        errdefer alloc.free(parsed_flat);
+        break :blk try DiffView.build(alloc, parsed, parsed_flat, &folds);
     };
     defer diff_view.deinit(alloc);
 
@@ -167,6 +168,10 @@ fn runTui(alloc: std.mem.Allocator, io: std.Io, source: cli.Source) !u8 {
     // Cleared on that next key. Unmatched leader is dropped; on a range
     // load `Space` then `d` still dismisses.
     var leader_pending: bool = false;
+    // `z` leader: next key may be `a` (toggle fold), `M` (collapse all
+    // files), or `R` (expand all). Unmatched `z` is dropped; the second
+    // key is handled as usual.
+    var z_pending: bool = false;
     var discard_confirm: DiscardConfirm = .{};
     var draft: Draft = .{};
     defer draft.buf.deinit(alloc);
@@ -206,13 +211,21 @@ fn runTui(alloc: std.mem.Allocator, io: std.Io, source: cli.Source) !u8 {
                         },
                         .open => {},
                     },
-                    .searching => switch (try search.handleKey(alloc, key, diff_view.rows, viewport.cursor)) {
+                    .searching => switch (try search.handleKey(
+                        alloc,
+                        key,
+                        diff_view.flat,
+                        view.fold.flattenIndex(diff_view.flat, diff_view.folds, viewport.cursor),
+                    )) {
                         .closed => focus = .normal,
                         .quit => running = false,
                         .jump => |hit| {
-                            viewport.cursor = hit.index;
                             focus = .normal;
-                            if (hit.wrapped) frame.note.set("search wrapped");
+                            if (diff_view.reveal(alloc, &viewport.cursor, hit.index)) |_| {
+                                if (hit.wrapped) frame.note.set("search wrapped");
+                            } else |_| {
+                                frame.note.set("out of memory");
+                            }
                         },
                         .missing => {
                             focus = .normal;
@@ -220,7 +233,7 @@ fn runTui(alloc: std.mem.Allocator, io: std.Io, source: cli.Source) !u8 {
                         },
                         .open => {},
                     },
-                    .listing => switch (comment_list.handleKey(key, diff_view.rows)) {
+                    .listing => switch (comment_list.handleKey(key, diff_view.flat)) {
                         .closed => focus = .normal,
                         .quit => running = false,
                         .help => {
@@ -228,8 +241,8 @@ fn runTui(alloc: std.mem.Allocator, io: std.Io, source: cli.Source) !u8 {
                             focus = .helping;
                         },
                         .jump => |row| {
-                            viewport.cursor = row;
                             focus = .normal;
+                            diff_view.reveal(alloc, &viewport.cursor, row) catch frame.note.set("out of memory");
                         },
                         .missing => frame.note.set("comment not in this diff"),
                         .open => {},
@@ -301,7 +314,9 @@ fn runTui(alloc: std.mem.Allocator, io: std.Io, source: cli.Source) !u8 {
                     },
                     .normal => {
                         const after_leader = leader_pending;
+                        const after_z = z_pending;
                         leader_pending = false;
+                        z_pending = false;
                         const layout = view.layout.effectiveLayout(viewport.layout_pref, size.cols);
                         switch (key) {
                             .char => |c| {
@@ -357,6 +372,12 @@ fn runTui(alloc: std.mem.Allocator, io: std.Io, source: cli.Source) !u8 {
                                             focus = .discard_confirm;
                                         }
                                     }
+                                } else if (after_z and c == 'a') {
+                                    diff_view.toggleFold(alloc, &viewport.cursor) catch frame.note.set("out of memory");
+                                } else if (after_z and c == 'M') {
+                                    diff_view.collapseAllFiles(alloc, &viewport.cursor) catch frame.note.set("out of memory");
+                                } else if (after_z and c == 'R') {
+                                    diff_view.expandAll(alloc, &viewport.cursor) catch frame.note.set("out of memory");
                                 } else if (viewport.handleKey(.{ .char = c }, size.cols, diff_view.rows, diff_view.sbs_slots) == .handled) {
                                     // j/k/h/l/0/$/J/K/[/]/{/}/t/#
                                 } else if (c == 'q' or c == 'Q') {
@@ -366,32 +387,42 @@ fn runTui(alloc: std.mem.Allocator, io: std.Io, source: cli.Source) !u8 {
                                     focus = .helping;
                                 } else if (c == ' ') {
                                     leader_pending = true;
+                                } else if (c == 'z') {
+                                    z_pending = true;
                                 } else if (c == '/') {
                                     search.buf.clearRetainingCapacity();
                                     search.caret = 0;
                                     focus = .searching;
                                 } else if (c == 'n') {
-                                    switch (search.next(diff_view.rows, viewport.cursor)) {
+                                    const flat_cur = view.fold.flattenIndex(diff_view.flat, diff_view.folds, viewport.cursor);
+                                    switch (search.next(diff_view.flat, flat_cur)) {
                                         .none => {},
                                         .missing => frame.note.set("Pattern not found"),
                                         .hit => |hit| {
-                                            viewport.cursor = hit.index;
-                                            if (hit.wrapped) frame.note.set("search wrapped");
+                                            if (diff_view.reveal(alloc, &viewport.cursor, hit.index)) |_| {
+                                                if (hit.wrapped) frame.note.set("search wrapped");
+                                            } else |_| {
+                                                frame.note.set("out of memory");
+                                            }
                                         },
                                     }
                                 } else if (c == 'N') {
-                                    switch (search.prev(diff_view.rows, viewport.cursor)) {
+                                    const flat_cur = view.fold.flattenIndex(diff_view.flat, diff_view.folds, viewport.cursor);
+                                    switch (search.prev(diff_view.flat, flat_cur)) {
                                         .none => {},
                                         .missing => frame.note.set("Pattern not found"),
                                         .hit => |hit| {
-                                            viewport.cursor = hit.index;
-                                            if (hit.wrapped) frame.note.set("search wrapped");
+                                            if (diff_view.reveal(alloc, &viewport.cursor, hit.index)) |_| {
+                                                if (hit.wrapped) frame.note.set("search wrapped");
+                                            } else |_| {
+                                                frame.note.set("out of memory");
+                                            }
                                         },
                                     }
                                 } else if (c == ')') {
-                                    jumpLiveComment(&review, diff_view.rows, &viewport.cursor, &frame.note, .next);
+                                    jumpLiveComment(&review, &diff_view, alloc, &viewport.cursor, &frame.note, .next);
                                 } else if (c == '(') {
-                                    jumpLiveComment(&review, diff_view.rows, &viewport.cursor, &frame.note, .prev);
+                                    jumpLiveComment(&review, &diff_view, alloc, &viewport.cursor, &frame.note, .prev);
                                 } else if (c == 'r') {
                                     reloadDiff(alloc, io, source, &diff_view, &viewport.cursor, &frame.note);
                                 } else if (c == 'i' or c == 'c' or c == 'a') {
@@ -451,18 +482,23 @@ fn runTui(alloc: std.mem.Allocator, io: std.Io, source: cli.Source) !u8 {
     return 0;
 }
 
-/// Parsed diff plus flatten rows and side-by-side slots. The TUI holds one
-/// as the live list; reload builds another and swaps it in.
+/// Parsed diff, full flatten, and the visible rows the TUI walks. `folds`
+/// is borrowed session state (not owned). Reload builds another and swaps it in.
 pub const DiffView = struct {
     diff: diff.Diff,
+    /// Full flatten. Fold rebuild walks this; `rows` is the visible subset.
+    flat: []view.row.Row,
+    /// Visible rows (paint, nav, git targeting). Strings borrow from `diff`.
     rows: []view.row.Row,
     sbs_slots: []view.layout.SbsSlot,
+    folds: *view.fold.Set,
 
     fn maybeInit(
         alloc: std.mem.Allocator,
         io: std.Io,
         source: cli.Source,
         note: *StatusNote,
+        folds: *view.fold.Set,
     ) ?DiffView {
         var new_diff = switch (source) {
             .local => git.loadDefaultDiff(alloc, io),
@@ -471,25 +507,88 @@ pub const DiffView = struct {
             note.set(git.errorMessage(err));
             return null;
         };
-        const new_rows = view.row.flatten(alloc, &new_diff) catch {
+        const new_flat = view.row.flatten(alloc, &new_diff) catch {
             new_diff.deinit();
             note.set("out of memory");
             return null;
         };
-        const new_sbs = view.layout.pairSideBySide(alloc, new_rows) catch {
-            alloc.free(new_rows);
+        return build(alloc, new_diff, new_flat, folds) catch {
+            alloc.free(new_flat);
             new_diff.deinit();
             note.set("out of memory");
             return null;
         };
-        return .{ .diff = new_diff, .rows = new_rows, .sbs_slots = new_sbs };
+    }
+
+    fn build(
+        alloc: std.mem.Allocator,
+        parsed: diff.Diff,
+        flat: []view.row.Row,
+        folds: *view.fold.Set,
+    ) std.mem.Allocator.Error!DiffView {
+        const rows = try view.fold.visibleRows(alloc, flat, folds);
+        errdefer alloc.free(rows);
+        const sbs = try view.layout.pairSideBySide(alloc, rows);
+        folds.prune(alloc, flat);
+        return .{
+            .diff = parsed,
+            .flat = flat,
+            .rows = rows,
+            .sbs_slots = sbs,
+            .folds = folds,
+        };
     }
 
     fn deinit(self: DiffView, alloc: std.mem.Allocator) void {
         alloc.free(self.rows);
+        alloc.free(self.flat);
         alloc.free(self.sbs_slots);
         var parsed = self.diff;
         parsed.deinit();
+    }
+
+    fn rebuildVisible(self: *DiffView, alloc: std.mem.Allocator) std.mem.Allocator.Error!void {
+        const new_rows = try view.fold.visibleRows(alloc, self.flat, self.folds);
+        errdefer alloc.free(new_rows);
+        const new_sbs = try view.layout.pairSideBySide(alloc, new_rows);
+        alloc.free(self.rows);
+        alloc.free(self.sbs_slots);
+        self.rows = new_rows;
+        self.sbs_slots = new_sbs;
+    }
+
+    fn toggleFold(self: *DiffView, alloc: std.mem.Allocator, cursor: *usize) std.mem.Allocator.Error!void {
+        const target = self.folds.targetAt(self.rows, cursor.*) orelse return;
+        try self.folds.toggle(alloc, target);
+        errdefer {
+            self.folds.toggle(alloc, target) catch {};
+        }
+        try self.rebuildVisible(alloc);
+        cursor.* = view.fold.cursorForTarget(self.rows, target);
+    }
+
+    fn collapseAllFiles(self: *DiffView, alloc: std.mem.Allocator, cursor: *usize) std.mem.Allocator.Error!void {
+        const n = self.folds.files.items.len;
+        const flat_cur = view.fold.flattenIndex(self.flat, self.folds, cursor.*);
+        try self.folds.collapseAllFiles(alloc, self.flat);
+        if (self.folds.files.items.len == n) return;
+        try self.rebuildVisible(alloc);
+        cursor.* = view.fold.visibleIndex(self.flat, self.folds, flat_cur);
+    }
+
+    fn expandAll(self: *DiffView, alloc: std.mem.Allocator, cursor: *usize) std.mem.Allocator.Error!void {
+        if (self.folds.files.items.len == 0 and self.folds.hunks.items.len == 0) return;
+        const flat_cur = view.fold.flattenIndex(self.flat, self.folds, cursor.*);
+        self.folds.expandAll(alloc);
+        try self.rebuildVisible(alloc);
+        cursor.* = view.fold.visibleIndex(self.flat, self.folds, flat_cur);
+    }
+
+    fn reveal(self: *DiffView, alloc: std.mem.Allocator, cursor: *usize, flatten_i: usize) std.mem.Allocator.Error!void {
+        if (try self.folds.expandTo(alloc, self.flat, flatten_i)) {
+            try self.rebuildVisible(alloc);
+        }
+        cursor.* = view.fold.visibleIndex(self.flat, self.folds, flatten_i);
     }
 };
 
@@ -505,7 +604,7 @@ fn reloadDiff(
     cursor: *usize,
     note: *StatusNote,
 ) void {
-    const loaded = DiffView.maybeInit(alloc, io, source, note) orelse return;
+    const loaded = DiffView.maybeInit(alloc, io, source, note, diff_view.folds) orelse return;
     const new_cursor: usize = blk: {
         const mark = view.nav.cursorMarkAt(diff_view.rows, cursor.*);
         break :blk if (mark) |m| view.nav.restoreCursor(loaded.rows, m) else 0;
@@ -623,11 +722,11 @@ fn commitApply(
         .result => |r| r,
     };
     if (result.snapshot) |snap| {
-        if (view.layout.pairSideBySide(alloc, snap.rows)) |new_sbs| {
-            const loaded: DiffView = .{ .diff = snap.diff, .rows = snap.rows, .sbs_slots = new_sbs };
+        const new_cursor = view.fold.visibleIndex(snap.rows, diff_view.folds, snap.cursor);
+        if (DiffView.build(alloc, snap.diff, snap.rows, diff_view.folds)) |loaded| {
             diff_view.deinit(alloc);
             diff_view.* = loaded;
-            cursor.* = snap.cursor;
+            cursor.* = new_cursor;
         } else |_| {
             snap.deinit(alloc);
             note.set("out of memory");
@@ -1322,18 +1421,23 @@ fn sideForAnchor(a: view.row.Anchor) ?store.Side {
 
 fn jumpLiveComment(
     review: *const store.Review,
-    rows: []const view.row.Row,
+    diff_view: *DiffView,
+    alloc: std.mem.Allocator,
     cursor: *usize,
     note: *StatusNote,
     comptime toward: enum { next, prev },
 ) void {
+    const flat_cur = view.fold.flattenIndex(diff_view.flat, diff_view.folds, cursor.*);
     const hit = switch (toward) {
-        .next => comments.next(review, rows, cursor.*),
-        .prev => comments.prev(review, rows, cursor.*),
+        .next => comments.next(review, diff_view.flat, flat_cur),
+        .prev => comments.prev(review, diff_view.flat, flat_cur),
     };
     if (hit) |h| {
-        cursor.* = h.row;
-        if (h.wrapped) note.set("comment wrapped");
+        if (diff_view.reveal(alloc, cursor, h.row)) |_| {
+            if (h.wrapped) note.set("comment wrapped");
+        } else |_| {
+            note.set("out of memory");
+        }
     } else {
         note.set("no comments");
     }

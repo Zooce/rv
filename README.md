@@ -95,8 +95,11 @@ Not a multi-user code-review platform. Not a GitHub replacement. A **personal re
 | `j` / `k` | Move the **current line** down / up (highlighted). Viewport follows so the cursor stays visible. |
 | `h` / `l` | Move **left / right** on the current line (column cursor for char-range comments). |
 | `[` / `]` | Jump to the **previous / next hunk**. |
-| `(` / `)` | Jump to the **previous / next live comment**. Cursor goes to that comment’s side (old line or new line). Wraps; no comments stays put with a footer note. |
-| `/` | **Search the diff text** — incremental find across the loaded changeset (like vim `/`). `n` / `N` next / previous match. |
+| `za` | **Toggle fold** at the cursor. Hunk header or line: hide/show that hunk’s body (`@@` stays). File header: hide/show its hunks (per-hunk folds kept). No-op on a section, binary / hunk-less file, or empty list. Far-right `Fold (za)` / `Unfold (za)` on headers that can fold. |
+| `zM` | **Collapse all files** (headers only). |
+| `zR` | **Expand everything**. |
+| `(` / `)` | Jump to the **previous / next live comment**. Cursor goes to that comment’s side (old line or new line). Wraps; no comments stays put with a footer note. Landing expands folds so the row is visible. |
+| `/` | **Search the diff text** — body lines in the loaded changeset, including folded hunks (like vim `/`). Enter jumps to the first match and expands folds so the row is visible. `n` / `N` next / previous match. |
 | `Space` `f` | **List files** — floating overlay on the still-painted diff. One row per changed file (flatten order). `j`/`k` move; Enter jumps to that **file header** and closes. Esc closes without moving the cursor. `q` still quits. Empty diff: empty overlay. Opens on the file under the cursor when there is one. |
 | `Space` `l` | **List comments** — floating overlay on the still-painted diff (same live board as `rv list`). `j`/`k` move; Enter jumps to that comment’s side (same landing as `(`/`)`) and closes the overlay. Esc closes without moving the cursor. `q` still quits. Empty board: empty overlay. A row whose path/line is gone from the flatten: footer note, stay in the list. Read-only: edit or dismiss after jumping. |
 | `Space` `Space` | **Stage or unstage** the current file (on a file header) or hunk (in a hunk), or **the whole group** on an Unstaged / Untracked / Staged section header. Group action always confirms (`No` selected first; `yes` proceeds). Local review only. Far-right hints on the current section, file, and hunk rows name the action and chord. Range loads (`rv main...HEAD`) ignore this chord and show no hints. Git failure: centered overlay; Enter or Esc dismisses. If some files in a group already mutated, the list reloads to match git, then the overlay opens. |
@@ -208,7 +211,7 @@ $ rv install-skill             # once per machine (or after upgrade)
 $ grok   # or claude - agent implements a feature
 
 $ rv     # local changes only (empty when the worktree is clean)
-         # j/k line; h/l col; [/] hunks; (/) comments; / text; Space f files
+         # j/k line; h/l col; [/] hunks; za/zM/zR folds; (/) comments; / text; Space f files
          # Space l comments; Space Space stage/unstage file, hunk, or group (local)
          # Space S file from hunk (until Ctrl); Space d discard file or hunk
          # Space x discard file from hunk (until Ctrl); i/c/a/Enter -> create or edit new
