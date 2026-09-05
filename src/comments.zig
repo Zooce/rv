@@ -498,6 +498,34 @@ test "next prev display order wrap skip missing" {
     try testing.expect(p2.wrapped);
 }
 
+test "next on truncated rows skips a comment on an omitted hunk" {
+    const fixture =
+        \\diff --git a/f b/f
+        \\--- a/f
+        \\+++ b/f
+        \\@@ -1 +1 @@
+        \\-old
+        \\+new
+        \\@@ -10 +10 @@
+        \\-old2
+        \\+new2
+    ;
+    var d = try diff.parse(testing.allocator, fixture);
+    defer d.deinit();
+    const full = try view.row.flatten(testing.allocator, &d);
+    defer testing.allocator.free(full);
+    // Omit the first hunk (file + @@ -1 body); keep @@ -10 and its lines.
+    const hidden = full[4..];
+
+    var review = try store.initEmpty(testing.allocator, "t");
+    defer review.deinit();
+    _ = try review.addOpen("f", null, 1, .new, "on first hunk");
+    _ = try review.addOpen("f", null, 10, .new, "on second hunk");
+
+    try testing.expectEqual(view.rowForComment(hidden, .{ .path = "f", .side = .new, .line = 10 }).?, next(&review, hidden, 0).?.row);
+    try testing.expectEqual(view.rowForComment(full, .{ .path = "f", .side = .new, .line = 1 }).?, next(&review, full, 0).?.row);
+}
+
 test "next same row is one stop then later row" {
     const fixture =
         \\diff --git a/f b/f

@@ -3,7 +3,7 @@
 //! With no args: load local-only git diff → flatten rows → load `.rv`
 //! comments → TUI (title bar is a short hint; `?` opens help). Keys: `j`/`k`,
 //! `h`/`l` pan, `0`/`$` col home/end, `[`/`]` hunk, `{`/`}` file header,
-//! `(`/`)` prev/next comment, `/` text search, `n`/`N` next/prev match,
+//! `(`/`)` prev/next comment (unapproves a hidden hunk if needed), `/` text search, `n`/`N` next/prev match,
 //! `Space` `f` file list, `Space` `l` comment list, `Space` `A` approved list
 //! (local; Enter unapproves and jumps), `Space` `a` approve (local),
 //! `i`/`c`/`a`/`Enter`
@@ -63,9 +63,10 @@
 //!
 //! Comment list: `Space` then `l` opens a centered overlay of live comments
 //! (same store as `rv list`). `j`/`k` move; Enter jumps with the same landing
-//! as `(`/`)` and closes the overlay. Esc closes without moving the cursor.
-//! A row whose path/line is gone from the flatten stays in the list and shows
-//! a footer note. `q` still quits.
+//! as `(`/`)` and closes the overlay. A live comment on an approved hunk
+//! unapproves that hunk, rebuilds, and lands (same as `(`/`)`). Esc closes
+//! without moving the cursor. A row whose path/line is gone from the live
+//! diff stays in the list and shows a footer note. `q` still quits.
 //!
 //! Approved list: `Space` then `A` opens a centered overlay of live approved
 //! identities (flatten order). Local only. `j`/`k` move; Enter removes one
@@ -266,6 +267,18 @@ fn runTui(alloc: std.mem.Allocator, io: std.Io, source: cli.Source) !u8 {
                         .jump => |row| {
                             focus = .normal;
                             diff_view.reveal(alloc, &viewport.cursor, row) catch frame.note.set("out of memory");
+                        },
+                        .hidden => |loc| {
+                            focus = .normal;
+                            _ = try landComment(
+                                alloc,
+                                io,
+                                source,
+                                &diff_view,
+                                &viewport.cursor,
+                                &frame.note,
+                                loc,
+                            );
                         },
                         .missing => frame.note.set("comment not in this diff"),
                         .open => {},
@@ -488,9 +501,9 @@ fn runTui(alloc: std.mem.Allocator, io: std.Io, source: cli.Source) !u8 {
                                         },
                                     }
                                 } else if (c == ')') {
-                                    jumpLiveComment(&review, &diff_view, alloc, &viewport.cursor, &frame.note, .next);
+                                    try jumpLiveComment(&review, &diff_view, alloc, io, source, &viewport.cursor, &frame.note, .next);
                                 } else if (c == '(') {
-                                    jumpLiveComment(&review, &diff_view, alloc, &viewport.cursor, &frame.note, .prev);
+                                    try jumpLiveComment(&review, &diff_view, alloc, io, source, &viewport.cursor, &frame.note, .prev);
                                 } else if (c == 'r') {
                                     reloadDiff(alloc, io, source, &diff_view, &viewport.cursor, &frame.note);
                                 } else if (c == 'i' or c == 'c' or c == 'a') {
@@ -797,6 +810,48 @@ fn applyApprove(
     cursor.* = view.fold.visibleIndex(diff_view.flat, diff_view.folds, restored);
 }
 
+/// Drop one matching store entry, prune, save, replace the hidden flatten.
+/// Local only. False when nothing changed (`note` set on load/save failure).
+fn unapproveRebuild(
+    alloc: std.mem.Allocator,
+    io: std.Io,
+    source: cli.Source,
+    diff_view: *DiffView,
+    note: *StatusNote,
+    item: approve.Hidden,
+) std.mem.Allocator.Error!bool {
+    if (source != .local) return false;
+    const root: std.Io.Dir = .cwd();
+    var approved = approve.load(alloc, io, root) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => {
+            note.set(approvedLoadMessage(err));
+            return false;
+        },
+    };
+    defer approved.deinit();
+    approved.unapprove(item.path, item.hash) catch return false;
+
+    const live = try approve.collectLive(alloc, io, root, &diff_view.diff);
+    defer alloc.free(live);
+    try approved.prune(alloc, live);
+    approve.save(&approved, alloc, io, root) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => {
+            note.set("failed to save .rv approved store");
+            return false;
+        },
+    };
+
+    const new_flat = try approve.hide(alloc, &diff_view.diff, &approved, io, root);
+    diff_view.replaceFlat(alloc, new_flat, approved.entries.items.len) catch {
+        alloc.free(new_flat);
+        note.set("out of memory");
+        return false;
+    };
+    return true;
+}
+
 /// Enter on the approved list: drop one matching store entry, hide again,
 /// jump to the restored row. Local only.
 fn applyUnapprove(
@@ -808,42 +863,14 @@ fn applyUnapprove(
     note: *StatusNote,
     item: approve.Hidden,
 ) std.mem.Allocator.Error!void {
-    if (source != .local) return;
-    const root: std.Io.Dir = .cwd();
-    var approved = approve.load(alloc, io, root) catch |err| switch (err) {
-        error.OutOfMemory => return error.OutOfMemory,
-        else => {
-            note.set(approvedLoadMessage(err));
-            return;
-        },
-    };
-    defer approved.deinit();
-    approved.unapprove(item.path, item.hash) catch return;
-
-    const live = try approve.collectLive(alloc, io, root, &diff_view.diff);
-    defer alloc.free(live);
-    try approved.prune(alloc, live);
-    approve.save(&approved, alloc, io, root) catch |err| switch (err) {
-        error.OutOfMemory => return error.OutOfMemory,
-        else => {
-            note.set("failed to save .rv approved store");
-            return;
-        },
-    };
-
-    const new_flat = try approve.hide(alloc, &diff_view.diff, &approved, io, root);
+    if (!try unapproveRebuild(alloc, io, source, diff_view, note, item)) return;
     const jump = approve.rowForIdentity(
-        new_flat,
+        diff_view.flat,
         &diff_view.diff,
         item.path,
         item.hash,
         item.kind,
     ) orelse 0;
-    diff_view.replaceFlat(alloc, new_flat, approved.entries.items.len) catch {
-        alloc.free(new_flat);
-        note.set("out of memory");
-        return;
-    };
     diff_view.reveal(alloc, cursor, jump) catch note.set("out of memory");
 }
 
@@ -1661,27 +1688,145 @@ fn sideForAnchor(a: view.row.Anchor) ?store.Side {
     return .old;
 }
 
+fn locFromRow(row: view.row.Row) ?view.CommentLoc {
+    return switch (row) {
+        .file_header => |fh| .{ .path = fh.path },
+        .line => |ln| blk: {
+            if (ln.new_no) |n| break :blk .{ .path = ln.path, .side = .new, .line = n };
+            if (ln.old_no) |n| break :blk .{ .path = ln.path, .side = .old, .line = n };
+            break :blk null;
+        },
+        .hunk_header, .section_header => null,
+    };
+}
+
+fn rowEql(a: view.row.Row, b: view.row.Row) bool {
+    if (std.meta.activeTag(a) != std.meta.activeTag(b)) return false;
+    switch (a) {
+        .section_header => |g| return g == b.section_header,
+        .file_header => |fh| {
+            const other = b.file_header;
+            return fh.group == other.group and std.mem.eql(u8, fh.path, other.path);
+        },
+        .hunk_header => |hh| {
+            const other = b.hunk_header;
+            return hh.group == other.group and hh.old_start == other.old_start and hh.new_start == other.new_start;
+        },
+        .line => |ln| {
+            const other = b.line;
+            return ln.kind == other.kind and ln.old_no == other.old_no and ln.new_no == other.new_no and
+                std.mem.eql(u8, ln.path, other.path) and std.mem.eql(u8, ln.text, other.text);
+        },
+    }
+}
+
+/// Hidden flatten is a subsequence of the unfiltered flatten. Map a hidden
+/// index onto that full list for comment next/prev.
+fn fullIndexOfHidden(full: []const view.row.Row, hidden: []const view.row.Row, hidden_i: usize) usize {
+    if (hidden.len == 0 or full.len == 0) return 0;
+    const want = view.row.clampCursor(hidden_i, hidden.len);
+    var h: usize = 0;
+    for (full, 0..) |row, f| {
+        if (h >= hidden.len) break;
+        if (!rowEql(row, hidden[h])) continue;
+        if (h == want) return f;
+        h += 1;
+    }
+    return 0;
+}
+
+/// Land on `loc`. If that row is hidden because its hunk is approved, unapprove
+/// one matching store entry, rebuild, then land. False when the path/line is
+/// gone from the live diff (footer note) or reveal/save failed.
+fn landComment(
+    alloc: std.mem.Allocator,
+    io: std.Io,
+    source: cli.Source,
+    diff_view: *DiffView,
+    cursor: *usize,
+    note: *StatusNote,
+    loc: view.CommentLoc,
+) std.mem.Allocator.Error!bool {
+    if (view.rowForComment(diff_view.flat, loc)) |row| {
+        if (diff_view.reveal(alloc, cursor, row)) |_| {
+            return true;
+        } else |_| {
+            note.set("out of memory");
+            return false;
+        }
+    }
+    if (source != .local) {
+        note.set("comment not in this diff");
+        return false;
+    }
+    const full = view.row.flatten(alloc, &diff_view.diff) catch {
+        note.set("out of memory");
+        return false;
+    };
+    defer alloc.free(full);
+    const full_row = view.rowForComment(full, loc) orelse {
+        note.set("comment not in this diff");
+        return false;
+    };
+    const item = approve.identityAtRow(alloc, &diff_view.diff, io, .cwd(), full, full_row) orelse {
+        note.set("comment not in this diff");
+        return false;
+    };
+    if (!try unapproveRebuild(alloc, io, source, diff_view, note, item)) return false;
+    const row = view.rowForComment(diff_view.flat, loc) orelse {
+        note.set("comment not in this diff");
+        return false;
+    };
+    if (diff_view.reveal(alloc, cursor, row)) |_| {
+        return true;
+    } else |_| {
+        note.set("out of memory");
+        return false;
+    }
+}
+
 fn jumpLiveComment(
     review: *const store.Review,
     diff_view: *DiffView,
     alloc: std.mem.Allocator,
+    io: std.Io,
+    source: cli.Source,
     cursor: *usize,
     note: *StatusNote,
     comptime toward: enum { next, prev },
-) void {
-    const flat_cur = view.fold.flattenIndex(diff_view.flat, diff_view.folds, cursor.*);
-    const hit = switch (toward) {
-        .next => comments.next(review, diff_view.flat, flat_cur),
-        .prev => comments.prev(review, diff_view.flat, flat_cur),
-    };
-    if (hit) |h| {
-        if (diff_view.reveal(alloc, cursor, h.row)) |_| {
-            if (h.wrapped) note.set("comment wrapped");
-        } else |_| {
+) std.mem.Allocator.Error!void {
+    var full_buf: ?[]view.row.Row = null;
+    defer if (full_buf) |owned| alloc.free(owned);
+
+    const walk_rows: []const view.row.Row = blk: {
+        if (diff_view.approved_n == 0) break :blk diff_view.flat;
+        const owned = view.row.flatten(alloc, &diff_view.diff) catch {
             note.set("out of memory");
-        }
-    } else {
+            return;
+        };
+        full_buf = owned;
+        break :blk owned;
+    };
+
+    const hidden_cur = view.fold.flattenIndex(diff_view.flat, diff_view.folds, cursor.*);
+    const walk_cur = if (diff_view.approved_n == 0)
+        hidden_cur
+    else
+        fullIndexOfHidden(walk_rows, diff_view.flat, hidden_cur);
+
+    const hit = switch (toward) {
+        .next => comments.next(review, walk_rows, walk_cur),
+        .prev => comments.prev(review, walk_rows, walk_cur),
+    } orelse {
         note.set("no comments");
+        return;
+    };
+    const loc = locFromRow(walk_rows[hit.row]) orelse {
+        note.set("no comments");
+        return;
+    };
+    if (try landComment(alloc, io, source, diff_view, cursor, note, loc)) {
+        if (hit.wrapped) note.set("comment wrapped");
     }
 }
 
@@ -1745,6 +1890,7 @@ const CommentList = struct {
         quit,
         help,
         jump: usize,
+        hidden: view.CommentLoc,
         missing,
     };
 
@@ -1769,8 +1915,8 @@ const CommentList = struct {
             .enter => {
                 if (self.cursor >= self.items.items.len) return .open;
                 const loc = comments.loc(self.items.items[self.cursor]) orelse return .missing;
-                const idx = view.rowForComment(rows, loc) orelse return .missing;
-                return .{ .jump = idx };
+                if (view.rowForComment(rows, loc)) |idx| return .{ .jump = idx };
+                return .{ .hidden = loc };
             },
             .char => |c| {
                 if (c == 'q' or c == 'Q') return .quit;
@@ -2387,4 +2533,116 @@ test "pan viewport uses 2-char gutter when line numbers are off" {
     const off = vp.panViewportCols(80, rows);
     try std.testing.expectEqual(74, on);
     try std.testing.expectEqual(78, off);
+}
+
+test "file list omits a fully approved file and keeps a mixed file" {
+    const alloc = std.testing.allocator;
+    const io = std.testing.io;
+    const txt =
+        \\diff --git a/mixed.txt b/mixed.txt
+        \\--- a/mixed.txt
+        \\+++ b/mixed.txt
+        \\@@ -1 +1 @@
+        \\-old
+        \\+new
+        \\@@ -10 +10 @@
+        \\-old2
+        \\+new2
+        \\diff --git a/gone.txt b/gone.txt
+        \\--- a/gone.txt
+        \\+++ b/gone.txt
+        \\@@ -1 +1 @@
+        \\-goneold
+        \\+gonenew
+    ;
+    var d = try diff.parse(alloc, txt);
+    defer d.deinit();
+    var approved = approve.initEmpty(alloc);
+    defer approved.deinit();
+    try approved.append("mixed.txt", approve.fingerprintHunk(d.files[0].hunks[0]));
+    try approved.append("gone.txt", approve.fingerprintHunk(d.files[1].hunks[0]));
+    const hidden = try approve.hide(alloc, &d, &approved, io, .cwd());
+    defer alloc.free(hidden);
+
+    var list: FileList = .{};
+    defer list.items.deinit(alloc);
+    try list.load(alloc, hidden, null);
+    try std.testing.expectEqual(1, list.items.items.len);
+    try std.testing.expectEqualStrings("mixed.txt", hidden[list.items.items[0]].file_header.path);
+}
+
+test "comment list Enter on a hidden loc is hidden not missing" {
+    const alloc = std.testing.allocator;
+    const io = std.testing.io;
+    var d = try diff.parse(alloc,
+        \\diff --git a/f.txt b/f.txt
+        \\--- a/f.txt
+        \\+++ b/f.txt
+        \\@@ -1 +1 @@
+        \\-old
+        \\+new
+        \\@@ -10 +10 @@
+        \\-old2
+        \\+new2
+    );
+    defer d.deinit();
+    const full = try view.row.flatten(alloc, &d);
+    defer alloc.free(full);
+    var approved = approve.initEmpty(alloc);
+    defer approved.deinit();
+    try approved.append("f.txt", approve.fingerprintHunk(d.files[0].hunks[0]));
+    const hidden = try approve.hide(alloc, &d, &approved, io, .cwd());
+    defer alloc.free(hidden);
+
+    var list: CommentList = .{};
+    defer list.items.deinit(alloc);
+    try list.load(alloc, &.{.{
+        .id = "1",
+        .path = "f.txt",
+        .new_line = 1,
+        .side = .new,
+        .body = "on hidden hunk",
+    }});
+    switch (list.handleKey(.enter, hidden)) {
+        .hidden => |loc| {
+            try std.testing.expectEqualStrings("f.txt", loc.path);
+            try std.testing.expectEqual(.new, loc.side.?);
+            try std.testing.expectEqual(1, loc.line.?);
+        },
+        else => try std.testing.expect(false),
+    }
+    switch (list.handleKey(.enter, full)) {
+        .jump => |row| try std.testing.expectEqual(view.rowForComment(full, .{
+            .path = "f.txt",
+            .side = .new,
+            .line = 1,
+        }).?, row),
+        else => try std.testing.expect(false),
+    }
+}
+
+test "fullIndexOfHidden maps the remaining hunk onto the full flatten" {
+    const alloc = std.testing.allocator;
+    const io = std.testing.io;
+    var d = try diff.parse(alloc,
+        \\diff --git a/f.txt b/f.txt
+        \\--- a/f.txt
+        \\+++ b/f.txt
+        \\@@ -1 +1 @@
+        \\-old
+        \\+new
+        \\@@ -10 +10 @@
+        \\-old2
+        \\+new2
+    );
+    defer d.deinit();
+    const full = try view.row.flatten(alloc, &d);
+    defer alloc.free(full);
+    var approved = approve.initEmpty(alloc);
+    defer approved.deinit();
+    try approved.append("f.txt", approve.fingerprintHunk(d.files[0].hunks[0]));
+    const hidden = try approve.hide(alloc, &d, &approved, io, .cwd());
+    defer alloc.free(hidden);
+    try std.testing.expectEqual(0, fullIndexOfHidden(full, hidden, 0));
+    try std.testing.expectEqual(4, fullIndexOfHidden(full, hidden, 1));
 }

@@ -22,7 +22,7 @@ const rows = [_]Row{
     .{ .item = .{ .key = "J/K", .label = "next / prev change" } },
     .{ .item = .{ .key = "[/]", .label = "hunk header" } },
     .{ .item = .{ .key = "{/}", .label = "file header" } },
-    .{ .item = .{ .key = "(/)", .label = "prev / next comment" } },
+    .{ .item = .{ .key = "(/)", .label = "prev / next comment (unapproves if needed)" } },
     .blank,
     .{ .group = "Folds" },
     .{ .item = .{ .key = "za", .label = "toggle fold at cursor" } },
