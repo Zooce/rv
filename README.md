@@ -95,11 +95,8 @@ Not a multi-user code-review platform. Not a GitHub replacement. A **personal re
 | `j` / `k` | Move the **current line** down / up (highlighted). Viewport follows so the cursor stays visible. |
 | `h` / `l` | Move **left / right** on the current line (column cursor for char-range comments). |
 | `[` / `]` | Jump to the **previous / next hunk**. |
-| `za` | **Toggle fold** at the cursor. Hunk header or line: hide/show that hunk’s body (`@@` stays). File header: hide/show its hunks (per-hunk folds kept). No-op on a section, binary / hunk-less file, or empty list. Far-right `Fold (za)` / `Unfold (za)` on headers that can fold. |
-| `zM` | **Collapse all files** (headers only). |
-| `zR` | **Expand everything**. |
-| `(` / `)` | Jump to the **previous / next live comment**. Cursor goes to that comment’s side (old line or new line). Wraps; no comments stays put with a footer note. Landing expands folds so the row is visible. A comment on an approved hunk unapproves that hunk first (same for `Space` `c` Enter). |
-| `/` | **Search the diff text** — body lines in the loaded changeset, including folded hunks (like vim `/`). Enter jumps to the first match and expands folds so the row is visible. `n` / `N` next / previous match. |
+| `(` / `)` | Jump to the **previous / next live comment**. Cursor goes to that comment’s side (old line or new line). Wraps; no comments stays put with a footer note. A comment on an approved hunk unapproves that hunk first (same for `Space` `c` Enter). |
+| `/` | **Search the diff text** — body lines in the loaded changeset (like vim `/`). Enter jumps to the first match. `n` / `N` next / previous match. |
 | `Space` `f` | **List files** — floating overlay on the still-painted diff. One row per changed file (flatten order). `j`/`k` move; Enter jumps to that **file header** and closes. Esc closes without moving the cursor. `q` still quits. Empty diff: empty overlay. Opens on the file under the cursor when there is one. |
 | `Space` `c` | **List comments** — floating overlay on the still-painted diff (same live board as `rv list`). `j`/`k` move; Enter jumps to that comment’s side (same landing as `(`/`)`) and closes the overlay. Esc closes without moving the cursor. `q` still quits. Empty board: empty overlay. A row whose path/line is gone from the live diff: footer note, stay in the list. Read-only: edit or dismiss after jumping. |
 | `Space` `a` | **List approved hunks** — floating overlay on the still-painted diff (local only). One row per live approved identity (flatten order): path, git group, short hunk preview (or binary / hunk-less placeholder). `j`/`k` move; Enter unapproves that identity, rebuilds the main list, jumps to the restored row, and closes. Esc closes without changing approval. `q` still quits. Empty set: empty overlay. Opens on an approved identity in the file under the cursor when there is one. Range loads ignore this chord. |
@@ -217,7 +214,7 @@ $ rv install-skill             # once per machine (or after upgrade)
 $ grok   # or claude - agent implements a feature
 
 $ rv     # local changes only (empty when the worktree is clean)
-         # j/k line; h/l col; [/] hunks; za/zM/zR folds; (/) comments; / text; Space f files
+         # j/k line; h/l col; [/] hunks; (/) comments; / text; Space f files
          # Space c comments; Space a approved (local, Enter unapproves)
          # gs/gu/gd hunk git; gS/gU/gD file git (local); a/A approve hunk/file (local)
          # i/c/Enter -> create or edit new

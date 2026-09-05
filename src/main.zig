@@ -51,7 +51,7 @@
 //! `no` keeps them). Git discard runs first; comments are deleted only on
 //! success. Staged `gd`/`gD` are no-ops (unstage first). Range loads ignore
 //! git and approve keys. Exactly one leader at a time (`Space` lists, `g`
-//! git, `z` folds); an unmatched leader is dropped and the next key is
+//! git); an unmatched leader is dropped and the next key is
 //! handled as usual. Local `a` approves the current hunk; `A` approves the
 //! remaining hunks of that file in this group (from a hunk or the file
 //! header; no-op on a section). No confirm. Range loads ignore `a`/`A`.
@@ -114,8 +114,6 @@ pub fn main(init: std.process.Init) !u8 {
 
 fn runTui(alloc: std.mem.Allocator, io: std.Io, source: cli.Source) !u8 {
     // Load before any TTY setup so error paths never touch the terminal.
-    var folds: view.fold.Set = .{};
-    defer folds.deinit(alloc);
     var diff_view: DiffView = blk: {
         var parsed = switch (source) {
             .local => git.loadDefaultDiff(alloc, io),
@@ -130,7 +128,7 @@ fn runTui(alloc: std.mem.Allocator, io: std.Io, source: cli.Source) !u8 {
             return 1;
         };
         errdefer alloc.free(vis.rows);
-        break :blk try DiffView.build(alloc, parsed, vis.rows, &folds, vis.approved_n);
+        break :blk try DiffView.build(alloc, parsed, vis.rows, vis.approved_n);
     };
     defer diff_view.deinit(alloc);
 
@@ -180,10 +178,9 @@ fn runTui(alloc: std.mem.Allocator, io: std.Io, source: cli.Source) !u8 {
     // Exactly one focus; cannot help, comment, search, and list at once.
     var focus: Focus = .normal;
     // Exactly one leader: `Space` lists (`f` files, `c` comments, `a`
-    // approved), `g` git (`s`/`u`/`d` hunk, `S`/`U`/`D` file), `z` folds
-    // (`a` toggle, `M` collapse all, `R` expand all). Cleared on the next
-    // key. Unmatched is dropped; the second key is handled as usual.
-    const Leader = enum { none, lists, git, folds };
+    // approved), `g` git (`s`/`u`/`d` hunk, `S`/`U`/`D` file). Cleared on the
+    // next key. Unmatched is dropped; the second key is handled as usual.
+    const Leader = enum { none, lists, git };
     var leader: Leader = .none;
     var discard_confirm: DiscardConfirm = .{};
     var draft: Draft = .{};
@@ -229,18 +226,15 @@ fn runTui(alloc: std.mem.Allocator, io: std.Io, source: cli.Source) !u8 {
                     .searching => switch (try search.handleKey(
                         alloc,
                         key,
-                        diff_view.flat,
-                        view.fold.flattenIndex(diff_view.flat, diff_view.folds, viewport.cursor),
+                        diff_view.rows,
+                        viewport.cursor,
                     )) {
                         .closed => focus = .normal,
                         .quit => running = false,
                         .jump => |hit| {
                             focus = .normal;
-                            if (diff_view.reveal(alloc, &viewport.cursor, hit.index)) |_| {
-                                if (hit.wrapped) frame.note.set("search wrapped");
-                            } else |_| {
-                                frame.note.set("out of memory");
-                            }
+                            viewport.cursor = hit.index;
+                            if (hit.wrapped) frame.note.set("search wrapped");
                         },
                         .missing => {
                             focus = .normal;
@@ -248,7 +242,7 @@ fn runTui(alloc: std.mem.Allocator, io: std.Io, source: cli.Source) !u8 {
                         },
                         .open => {},
                     },
-                    .listing => switch (comment_list.handleKey(key, diff_view.flat)) {
+                    .listing => switch (comment_list.handleKey(key, diff_view.rows)) {
                         .closed => focus = .normal,
                         .quit => running = false,
                         .help => {
@@ -257,7 +251,7 @@ fn runTui(alloc: std.mem.Allocator, io: std.Io, source: cli.Source) !u8 {
                         },
                         .jump => |row| {
                             focus = .normal;
-                            diff_view.reveal(alloc, &viewport.cursor, row) catch frame.note.set("out of memory");
+                            viewport.cursor = row;
                         },
                         .hidden => |loc| {
                             focus = .normal;
@@ -447,12 +441,6 @@ fn runTui(alloc: std.mem.Allocator, io: std.Io, source: cli.Source) !u8 {
                                     );
                                 } else if (pending == .git and c == 'D') {
                                     beginGitDiscard(source, diff_view.rows, viewport.cursor, &discard_confirm, &focus, true);
-                                } else if (pending == .folds and c == 'a') {
-                                    diff_view.toggleFold(alloc, &viewport.cursor) catch frame.note.set("out of memory");
-                                } else if (pending == .folds and c == 'M') {
-                                    diff_view.collapseAllFiles(alloc, &viewport.cursor) catch frame.note.set("out of memory");
-                                } else if (pending == .folds and c == 'R') {
-                                    diff_view.expandAll(alloc, &viewport.cursor) catch frame.note.set("out of memory");
                                 } else if (viewport.handleKey(.{ .char = c }, size.cols, diff_view.rows, diff_view.sbs_slots) == .handled) {
                                     // j/k/h/l/0/$/J/K/[/]/{/}/t/#
                                 } else if (c == 'q' or c == 'Q') {
@@ -464,36 +452,26 @@ fn runTui(alloc: std.mem.Allocator, io: std.Io, source: cli.Source) !u8 {
                                     leader = .lists;
                                 } else if (c == 'g') {
                                     leader = .git;
-                                } else if (c == 'z') {
-                                    leader = .folds;
                                 } else if (c == '/') {
                                     search.buf.clearRetainingCapacity();
                                     search.caret = 0;
                                     focus = .searching;
                                 } else if (c == 'n') {
-                                    const flat_cur = view.fold.flattenIndex(diff_view.flat, diff_view.folds, viewport.cursor);
-                                    switch (search.next(diff_view.flat, flat_cur)) {
+                                    switch (search.next(diff_view.rows, viewport.cursor)) {
                                         .none => {},
                                         .missing => frame.note.set("Pattern not found"),
                                         .hit => |hit| {
-                                            if (diff_view.reveal(alloc, &viewport.cursor, hit.index)) |_| {
-                                                if (hit.wrapped) frame.note.set("search wrapped");
-                                            } else |_| {
-                                                frame.note.set("out of memory");
-                                            }
+                                            viewport.cursor = hit.index;
+                                            if (hit.wrapped) frame.note.set("search wrapped");
                                         },
                                     }
                                 } else if (c == 'N') {
-                                    const flat_cur = view.fold.flattenIndex(diff_view.flat, diff_view.folds, viewport.cursor);
-                                    switch (search.prev(diff_view.flat, flat_cur)) {
+                                    switch (search.prev(diff_view.rows, viewport.cursor)) {
                                         .none => {},
                                         .missing => frame.note.set("Pattern not found"),
                                         .hit => |hit| {
-                                            if (diff_view.reveal(alloc, &viewport.cursor, hit.index)) |_| {
-                                                if (hit.wrapped) frame.note.set("search wrapped");
-                                            } else |_| {
-                                                frame.note.set("out of memory");
-                                            }
+                                            viewport.cursor = hit.index;
+                                            if (hit.wrapped) frame.note.set("search wrapped");
                                         },
                                     }
                                 } else if (c == ')') {
@@ -582,16 +560,13 @@ fn runTui(alloc: std.mem.Allocator, io: std.Io, source: cli.Source) !u8 {
     return 0;
 }
 
-/// Parsed diff, flatten the TUI walks, and the fold-visible subset. `folds`
-/// is borrowed session state (not owned). Reload builds another and swaps it in.
+/// Parsed diff and the flatten the TUI walks. Local load omits approved hunks.
+/// Reload builds another and swaps it in.
 pub const DiffView = struct {
     diff: diff.Diff,
-    /// Flatten fold rebuild walks. Local load omits approved hunks.
-    flat: []view.row.Row,
-    /// Visible rows (paint, nav, git targeting). Strings borrow from `diff`.
+    /// Flatten rows (paint, nav, git targeting). Strings borrow from `diff`.
     rows: []view.row.Row,
     sbs_slots: []view.layout.SbsSlot,
-    folds: *view.fold.Set,
     /// Live approved identities still in `diff` after prune. 0 on range loads.
     approved_n: usize,
 
@@ -600,7 +575,6 @@ pub const DiffView = struct {
         io: std.Io,
         source: cli.Source,
         note: *StatusNote,
-        folds: *view.fold.Set,
     ) ?DiffView {
         var new_diff = switch (source) {
             .local => git.loadDefaultDiff(alloc, io),
@@ -614,7 +588,7 @@ pub const DiffView = struct {
             note.set(approvedLoadMessage(err));
             return null;
         };
-        return build(alloc, new_diff, vis.rows, folds, vis.approved_n) catch {
+        return build(alloc, new_diff, vis.rows, vis.approved_n) catch {
             alloc.free(vis.rows);
             new_diff.deinit();
             note.set("out of memory");
@@ -625,93 +599,37 @@ pub const DiffView = struct {
     fn build(
         alloc: std.mem.Allocator,
         parsed: diff.Diff,
-        flat: []view.row.Row,
-        folds: *view.fold.Set,
+        rows: []view.row.Row,
         approved_n: usize,
     ) std.mem.Allocator.Error!DiffView {
-        const rows = try view.fold.visibleRows(alloc, flat, folds);
-        errdefer alloc.free(rows);
         const sbs = try view.layout.pairSideBySide(alloc, rows);
-        folds.prune(alloc, flat);
         return .{
             .diff = parsed,
-            .flat = flat,
             .rows = rows,
             .sbs_slots = sbs,
-            .folds = folds,
             .approved_n = approved_n,
         };
     }
 
     fn deinit(self: DiffView, alloc: std.mem.Allocator) void {
         alloc.free(self.rows);
-        alloc.free(self.flat);
         alloc.free(self.sbs_slots);
         var parsed = self.diff;
         parsed.deinit();
     }
 
-    fn rebuildVisible(self: *DiffView, alloc: std.mem.Allocator) std.mem.Allocator.Error!void {
-        const new_rows = try view.fold.visibleRows(alloc, self.flat, self.folds);
-        errdefer alloc.free(new_rows);
-        const new_sbs = try view.layout.pairSideBySide(alloc, new_rows);
-        alloc.free(self.rows);
-        alloc.free(self.sbs_slots);
-        self.rows = new_rows;
-        self.sbs_slots = new_sbs;
-    }
-
-    fn toggleFold(self: *DiffView, alloc: std.mem.Allocator, cursor: *usize) std.mem.Allocator.Error!void {
-        const target = self.folds.targetAt(self.rows, cursor.*) orelse return;
-        try self.folds.toggle(alloc, target);
-        errdefer {
-            self.folds.toggle(alloc, target) catch {};
-        }
-        try self.rebuildVisible(alloc);
-        cursor.* = view.fold.cursorForTarget(self.rows, target);
-    }
-
-    fn collapseAllFiles(self: *DiffView, alloc: std.mem.Allocator, cursor: *usize) std.mem.Allocator.Error!void {
-        const n = self.folds.files.items.len;
-        const flat_cur = view.fold.flattenIndex(self.flat, self.folds, cursor.*);
-        try self.folds.collapseAllFiles(alloc, self.flat);
-        if (self.folds.files.items.len == n) return;
-        try self.rebuildVisible(alloc);
-        cursor.* = view.fold.visibleIndex(self.flat, self.folds, flat_cur);
-    }
-
-    fn expandAll(self: *DiffView, alloc: std.mem.Allocator, cursor: *usize) std.mem.Allocator.Error!void {
-        if (self.folds.files.items.len == 0 and self.folds.hunks.items.len == 0) return;
-        const flat_cur = view.fold.flattenIndex(self.flat, self.folds, cursor.*);
-        self.folds.expandAll(alloc);
-        try self.rebuildVisible(alloc);
-        cursor.* = view.fold.visibleIndex(self.flat, self.folds, flat_cur);
-    }
-
-    fn reveal(self: *DiffView, alloc: std.mem.Allocator, cursor: *usize, flatten_i: usize) std.mem.Allocator.Error!void {
-        if (try self.folds.expandTo(alloc, self.flat, flatten_i)) {
-            try self.rebuildVisible(alloc);
-        }
-        cursor.* = view.fold.visibleIndex(self.flat, self.folds, flatten_i);
-    }
-
-    fn replaceFlat(
+    fn replaceRows(
         self: *DiffView,
         alloc: std.mem.Allocator,
-        new_flat: []view.row.Row,
+        new_rows: []view.row.Row,
         approved_n: usize,
     ) std.mem.Allocator.Error!void {
-        const new_rows = try view.fold.visibleRows(alloc, new_flat, self.folds);
-        errdefer alloc.free(new_rows);
         const new_sbs = try view.layout.pairSideBySide(alloc, new_rows);
         alloc.free(self.rows);
-        alloc.free(self.flat);
         alloc.free(self.sbs_slots);
-        self.flat = new_flat;
         self.rows = new_rows;
         self.sbs_slots = new_sbs;
         self.approved_n = approved_n;
-        self.folds.prune(alloc, new_flat);
     }
 };
 
@@ -747,7 +665,7 @@ fn reloadDiff(
     cursor: *usize,
     note: *StatusNote,
 ) void {
-    const loaded = DiffView.maybeInit(alloc, io, source, note, diff_view.folds) orelse return;
+    const loaded = DiffView.maybeInit(alloc, io, source, note) orelse return;
     const new_cursor: usize = blk: {
         const mark = view.nav.cursorMarkAt(diff_view.rows, cursor.*);
         break :blk if (mark) |m| view.nav.restoreCursor(loaded.rows, m) else 0;
@@ -809,17 +727,17 @@ fn applyApprove(
         },
     };
 
-    const new_flat = try approve.hide(alloc, &diff_view.diff, &approved, io, root);
+    const new_rows = try approve.hide(alloc, &diff_view.diff, &approved, io, root);
     const restored: usize = if (hunk_mark) |m|
-        git.restoreNeighbor(new_flat, m)
+        git.restoreNeighbor(new_rows, m)
     else
         0;
-    diff_view.replaceFlat(alloc, new_flat, approved.entries.items.len) catch {
-        alloc.free(new_flat);
+    diff_view.replaceRows(alloc, new_rows, approved.entries.items.len) catch {
+        alloc.free(new_rows);
         note.set("out of memory");
         return;
     };
-    cursor.* = view.fold.visibleIndex(diff_view.flat, diff_view.folds, restored);
+    cursor.* = restored;
 }
 
 /// Drop one matching store entry, prune, save, replace the hidden flatten.
@@ -855,9 +773,9 @@ fn unapproveRebuild(
         },
     };
 
-    const new_flat = try approve.hide(alloc, &diff_view.diff, &approved, io, root);
-    diff_view.replaceFlat(alloc, new_flat, approved.entries.items.len) catch {
-        alloc.free(new_flat);
+    const new_rows = try approve.hide(alloc, &diff_view.diff, &approved, io, root);
+    diff_view.replaceRows(alloc, new_rows, approved.entries.items.len) catch {
+        alloc.free(new_rows);
         note.set("out of memory");
         return false;
     };
@@ -877,13 +795,13 @@ fn applyUnapprove(
 ) std.mem.Allocator.Error!void {
     if (!try unapproveRebuild(alloc, io, source, diff_view, note, item)) return;
     const jump = approve.rowForIdentity(
-        diff_view.flat,
+        diff_view.rows,
         &diff_view.diff,
         item.path,
         item.hash,
         item.kind,
     ) orelse 0;
-    diff_view.reveal(alloc, cursor, jump) catch note.set("out of memory");
+    cursor.* = jump;
 }
 
 fn groupedFile(d: *const diff.Diff, path: []const u8, group: diff.Group) ?*const diff.File {
@@ -1020,11 +938,10 @@ fn commitApply(
         .result => |r| r,
     };
     if (result.snapshot) |snap| {
-        const new_cursor = view.fold.visibleIndex(snap.rows, diff_view.folds, snap.cursor);
-        if (DiffView.build(alloc, snap.diff, snap.rows, diff_view.folds, snap.approved_n)) |loaded| {
+        if (DiffView.build(alloc, snap.diff, snap.rows, snap.approved_n)) |loaded| {
             diff_view.deinit(alloc);
             diff_view.* = loaded;
-            cursor.* = new_cursor;
+            cursor.* = snap.cursor;
         } else |_| {
             snap.deinit(alloc);
             note.set("out of memory");
@@ -1765,7 +1682,7 @@ fn fullIndexOfHidden(full: []const view.row.Row, hidden: []const view.row.Row, h
 
 /// Land on `loc`. If that row is hidden because its hunk is approved, unapprove
 /// one matching store entry, rebuild, then land. False when the path/line is
-/// gone from the live diff (footer note) or reveal/save failed.
+/// gone from the live diff (footer note) or save failed.
 fn landComment(
     alloc: std.mem.Allocator,
     io: std.Io,
@@ -1775,13 +1692,9 @@ fn landComment(
     note: *StatusNote,
     loc: view.CommentLoc,
 ) std.mem.Allocator.Error!bool {
-    if (view.rowForComment(diff_view.flat, loc)) |row| {
-        if (diff_view.reveal(alloc, cursor, row)) |_| {
-            return true;
-        } else |_| {
-            note.set("out of memory");
-            return false;
-        }
+    if (view.rowForComment(diff_view.rows, loc)) |row| {
+        cursor.* = row;
+        return true;
     }
     if (source != .local) {
         note.set("comment not in this diff");
@@ -1801,16 +1714,12 @@ fn landComment(
         return false;
     };
     if (!try unapproveRebuild(alloc, io, source, diff_view, note, item)) return false;
-    const row = view.rowForComment(diff_view.flat, loc) orelse {
+    const row = view.rowForComment(diff_view.rows, loc) orelse {
         note.set("comment not in this diff");
         return false;
     };
-    if (diff_view.reveal(alloc, cursor, row)) |_| {
-        return true;
-    } else |_| {
-        note.set("out of memory");
-        return false;
-    }
+    cursor.* = row;
+    return true;
 }
 
 fn jumpLiveComment(
@@ -1827,7 +1736,7 @@ fn jumpLiveComment(
     defer if (full_buf) |owned| alloc.free(owned);
 
     const walk_rows: []const view.row.Row = blk: {
-        if (diff_view.approved_n == 0) break :blk diff_view.flat;
+        if (diff_view.approved_n == 0) break :blk diff_view.rows;
         const owned = view.row.flatten(alloc, &diff_view.diff) catch {
             note.set("out of memory");
             return;
@@ -1836,11 +1745,10 @@ fn jumpLiveComment(
         break :blk owned;
     };
 
-    const hidden_cur = view.fold.flattenIndex(diff_view.flat, diff_view.folds, cursor.*);
     const walk_cur = if (diff_view.approved_n == 0)
-        hidden_cur
+        cursor.*
     else
-        fullIndexOfHidden(walk_rows, diff_view.flat, hidden_cur);
+        fullIndexOfHidden(walk_rows, diff_view.rows, cursor.*);
 
     const hit = switch (toward) {
         .next => comments.next(review, walk_rows, walk_cur),
