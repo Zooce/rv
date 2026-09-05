@@ -4,10 +4,11 @@
 //! comments → TUI (title bar is a short hint; `?` opens help). Keys: `j`/`k`,
 //! `h`/`l` pan, `0`/`$` col home/end, `[`/`]` hunk, `{`/`}` file header,
 //! `(`/`)` prev/next comment (unapproves a hidden hunk if needed), `/` text search, `n`/`N` next/prev match,
-//! `Space` `f` file list, `Space` `l` comment list, `Space` `A` approved list
-//! (local; Enter unapproves and jumps), `Space` `a` approve (local),
-//! `i`/`c`/`a`/`Enter`
-//! create or edit new, `I`/`C`/`A` old, `d` dismiss new, `D` dismiss old,
+//! `Space` `f` file list, `Space` `c` comment list, `Space` `a` approved list
+//! (local; Enter unapproves and jumps), `gs`/`gu`/`gd` hunk git and `gS`/`gU`/`gD`
+//! file git (local), `a`/`A` approve hunk/file (local),
+//! `i`/`c`/`Enter`
+//! create or edit new, `I`/`C` old, `d` dismiss new, `D` dismiss old,
 //! `r` reload the loaded diff, `q` quit).
 //! Diff layout defaults to side-by-side when the terminal is wide enough;
 //! falls back to unified when narrow. `t` toggles session preference
@@ -38,37 +39,34 @@
 //! paths (flatten order). `j`/`k` move; Enter jumps to that file header and
 //! closes. Esc closes without moving the cursor. `q` still quits. Empty
 //! diff: empty overlay. Opens on the file under the cursor when there is
-//! one. Local only: `Space` `Space` stages or unstages the current file
-//! (on a file header), hunk (in a hunk), or whole group (on a section
-//! header; always confirms); `Space` `S` does the containing file from a
-//! hunk. After a successful stage/unstage, live comments on the target
-//! keep the same file, side, and line (line numbers updated if the
-//! reloaded diff numbers that line differently). `Space` `d` discards the current file or hunk;
-//! `Space` `x` discards the containing file from a hunk (stand-in until
-//! Ctrl). Discard always confirms (`No` selected; `yes` proceeds). If the
-//! target has live comments, a second overlay asks to delete them (`Yes`
-//! selected; `no` keeps them). Git discard runs first; comments are
-//! deleted only on success. Staged rows are no-ops (unstage first). Range
-//! loads ignore those chords. An unmatched `Space` leader is dropped; the
-//! next key is handled as normal
-//! (`Space` then `d` still dismisses on a range load). Local `Space` `A`
-//! opens the approved-hunk list (Enter unapproves one and jumps); range
-//! loads ignore that chord. Local `Space` `a`
-//! approves the hunk, the file in this group, or the whole section (no
-//! confirm) and hides it; range loads ignore that chord. Git failure opens
-//! a centered overlay with git’s error; Enter or Esc dismisses. The list
-//! is unchanged. Local load paints stage/unstage and `Space` `a` chords on
-//! the current section, file, and hunk rows; unstaged/untracked file and
-//! hunk rows also show discard chords (no hints on a range load).
+//! one. Local only: `g` then `s`/`u`/`d` stages, unstages, or discards the
+//! current hunk; `S`/`U`/`D` do the containing file (file header or inside
+//! that file). Hunk chords are no-ops on a file header; all six are no-ops
+//! on a section. Stage and unstage are separate keys (already-staged `gs`/`gS`
+//! and not-staged `gu`/`gU` are no-ops). After a successful stage/unstage,
+//! live comments on the target keep the same file, side, and line (line
+//! numbers updated if the reloaded diff numbers that line differently).
+//! Discard always confirms (`No` selected; `yes` proceeds). If the target
+//! has live comments, a second overlay asks to delete them (`Yes` selected;
+//! `no` keeps them). Git discard runs first; comments are deleted only on
+//! success. Staged `gd`/`gD` are no-ops (unstage first). Range loads ignore
+//! git and approve keys. Exactly one leader at a time (`Space` lists, `g`
+//! git, `z` folds); an unmatched leader is dropped and the next key is
+//! handled as usual. Local `a` approves the current hunk; `A` approves the
+//! remaining hunks of that file in this group (from a hunk or the file
+//! header; no-op on a section). No confirm. Range loads ignore `a`/`A`.
+//! Git failure opens a centered overlay with git’s error; Enter or Esc
+//! dismisses. The list is unchanged. Local load paints git and approve
+//! chords on the current file and hunk rows (no hints on a range load).
 //!
-//! Comment list: `Space` then `l` opens a centered overlay of live comments
+//! Comment list: `Space` then `c` opens a centered overlay of live comments
 //! (same store as `rv list`). `j`/`k` move; Enter jumps with the same landing
 //! as `(`/`)` and closes the overlay. A live comment on an approved hunk
 //! unapproves that hunk, rebuilds, and lands (same as `(`/`)`). Esc closes
 //! without moving the cursor. A row whose path/line is gone from the live
 //! diff stays in the list and shows a footer note. `q` still quits.
 //!
-//! Approved list: `Space` then `A` opens a centered overlay of live approved
+//! Approved list: `Space` then `a` opens a centered overlay of live approved
 //! identities (flatten order). Local only. `j`/`k` move; Enter removes one
 //! matching store entry, rebuilds the main list, jumps to that row, and
 //! closes. Esc closes without changing approval. Empty set: empty overlay.
@@ -181,19 +179,12 @@ fn runTui(alloc: std.mem.Allocator, io: std.Io, source: cli.Source) !u8 {
     var running = true;
     // Exactly one focus; cannot help, comment, search, and list at once.
     var focus: Focus = .normal;
-    // `Space` leader: next key may be `f` (file list), `l` (comment list),
-    // `A` (approved list, local), `Space` (stage/unstage current file or
-    // hunk, or the group on a section header), `S` (containing file from a
-    // hunk), `a` (approve current file, hunk, or group), `d` (discard
-    // current file or hunk), or `x` (discard containing file from a hunk).
-    // Cleared on that next key. Unmatched leader is dropped; on a range
-    // load `Space` then `d` still dismisses. `Space` `a` and `Space` `A`
-    // are no-ops.
-    var leader_pending: bool = false;
-    // `z` leader: next key may be `a` (toggle fold), `M` (collapse all
-    // files), or `R` (expand all). Unmatched `z` is dropped; the second
-    // key is handled as usual.
-    var z_pending: bool = false;
+    // Exactly one leader: `Space` lists (`f` files, `c` comments, `a`
+    // approved), `g` git (`s`/`u`/`d` hunk, `S`/`U`/`D` file), `z` folds
+    // (`a` toggle, `M` collapse all, `R` expand all). Cleared on the next
+    // key. Unmatched is dropped; the second key is handled as usual.
+    const Leader = enum { none, lists, git, folds };
+    var leader: Leader = .none;
     var discard_confirm: DiscardConfirm = .{};
     var draft: Draft = .{};
     defer draft.buf.deinit(alloc);
@@ -370,20 +361,18 @@ fn runTui(alloc: std.mem.Allocator, io: std.Io, source: cli.Source) !u8 {
                         .open => {},
                     },
                     .normal => {
-                        const after_leader = leader_pending;
-                        const after_z = z_pending;
-                        leader_pending = false;
-                        z_pending = false;
+                        const pending = leader;
+                        leader = .none;
                         const layout = view.layout.effectiveLayout(viewport.layout_pref, size.cols);
                         switch (key) {
                             .char => |c| {
-                                if (after_leader and c == 'f') {
+                                if (pending == .lists and c == 'f') {
                                     try file_list.load(alloc, diff_view.rows, view.nav.currentFileStart(diff_view.rows, viewport.cursor));
                                     focus = .files;
-                                } else if (after_leader and c == 'l') {
+                                } else if (pending == .lists and c == 'c') {
                                     try comment_list.load(alloc, review.comments.items);
                                     focus = .listing;
-                                } else if (after_leader and c == 'A') {
+                                } else if (pending == .lists and c == 'a') {
                                     if (source == .local) {
                                         if (approved_list.load(
                                             alloc,
@@ -398,8 +387,8 @@ fn runTui(alloc: std.mem.Allocator, io: std.Io, source: cli.Source) !u8 {
                                             else => frame.note.set(approvedLoadMessage(err)),
                                         }
                                     }
-                                } else if (after_leader and c == ' ') {
-                                    try dispatchStage(
+                                } else if (pending == .git and c == 's') {
+                                    try dispatchGitIndex(
                                         alloc,
                                         io,
                                         source,
@@ -409,55 +398,60 @@ fn runTui(alloc: std.mem.Allocator, io: std.Io, source: cli.Source) !u8 {
                                         &focus,
                                         &failure,
                                         &review,
-                                        &discard_confirm,
                                         false,
+                                        true,
                                     );
-                                } else if (after_leader and c == 'S') {
-                                    if (view.nav.currentHunkInFile(diff_view.rows, viewport.cursor) != null) {
-                                        try dispatchStage(
-                                            alloc,
-                                            io,
-                                            source,
-                                            &diff_view,
-                                            &viewport.cursor,
-                                            &frame.note,
-                                            &focus,
-                                            &failure,
-                                            &review,
-                                            &discard_confirm,
-                                            true,
-                                        );
-                                    }
-                                } else if (after_leader and c == 'd') {
-                                    if (source == .local) {
-                                        if (git.discardTargetAt(diff_view.rows, viewport.cursor, false) != null) {
-                                            discard_confirm = .{ .whole_file = false, .yes = false, .comments = false };
-                                            focus = .discard_confirm;
-                                        }
-                                    } else {
-                                        dismissAt(&review, alloc, io, diff_view.rows, diff_view.sbs_slots, layout, viewport.cursor, .new, &frame.note);
-                                    }
-                                } else if (after_leader and c == 'x') {
-                                    if (source == .local and view.nav.currentHunkInFile(diff_view.rows, viewport.cursor) != null) {
-                                        if (git.discardTargetAt(diff_view.rows, viewport.cursor, true) != null) {
-                                            discard_confirm = .{ .whole_file = true, .yes = false, .comments = false };
-                                            focus = .discard_confirm;
-                                        }
-                                    }
-                                } else if (after_leader and c == 'a') {
-                                    try applyApprove(
+                                } else if (pending == .git and c == 'u') {
+                                    try dispatchGitIndex(
                                         alloc,
                                         io,
                                         source,
                                         &diff_view,
                                         &viewport.cursor,
                                         &frame.note,
+                                        &focus,
+                                        &failure,
+                                        &review,
+                                        false,
+                                        false,
                                     );
-                                } else if (after_z and c == 'a') {
+                                } else if (pending == .git and c == 'd') {
+                                    beginGitDiscard(source, diff_view.rows, viewport.cursor, &discard_confirm, &focus, false);
+                                } else if (pending == .git and c == 'S') {
+                                    try dispatchGitIndex(
+                                        alloc,
+                                        io,
+                                        source,
+                                        &diff_view,
+                                        &viewport.cursor,
+                                        &frame.note,
+                                        &focus,
+                                        &failure,
+                                        &review,
+                                        true,
+                                        true,
+                                    );
+                                } else if (pending == .git and c == 'U') {
+                                    try dispatchGitIndex(
+                                        alloc,
+                                        io,
+                                        source,
+                                        &diff_view,
+                                        &viewport.cursor,
+                                        &frame.note,
+                                        &focus,
+                                        &failure,
+                                        &review,
+                                        true,
+                                        false,
+                                    );
+                                } else if (pending == .git and c == 'D') {
+                                    beginGitDiscard(source, diff_view.rows, viewport.cursor, &discard_confirm, &focus, true);
+                                } else if (pending == .folds and c == 'a') {
                                     diff_view.toggleFold(alloc, &viewport.cursor) catch frame.note.set("out of memory");
-                                } else if (after_z and c == 'M') {
+                                } else if (pending == .folds and c == 'M') {
                                     diff_view.collapseAllFiles(alloc, &viewport.cursor) catch frame.note.set("out of memory");
-                                } else if (after_z and c == 'R') {
+                                } else if (pending == .folds and c == 'R') {
                                     diff_view.expandAll(alloc, &viewport.cursor) catch frame.note.set("out of memory");
                                 } else if (viewport.handleKey(.{ .char = c }, size.cols, diff_view.rows, diff_view.sbs_slots) == .handled) {
                                     // j/k/h/l/0/$/J/K/[/]/{/}/t/#
@@ -467,9 +461,11 @@ fn runTui(alloc: std.mem.Allocator, io: std.Io, source: cli.Source) !u8 {
                                     help.scroll = 0;
                                     focus = .helping;
                                 } else if (c == ' ') {
-                                    leader_pending = true;
+                                    leader = .lists;
+                                } else if (c == 'g') {
+                                    leader = .git;
                                 } else if (c == 'z') {
-                                    z_pending = true;
+                                    leader = .folds;
                                 } else if (c == '/') {
                                     search.buf.clearRetainingCapacity();
                                     search.caret = 0;
@@ -506,14 +502,34 @@ fn runTui(alloc: std.mem.Allocator, io: std.Io, source: cli.Source) !u8 {
                                     try jumpLiveComment(&review, &diff_view, alloc, io, source, &viewport.cursor, &frame.note, .prev);
                                 } else if (c == 'r') {
                                     reloadDiff(alloc, io, source, &diff_view, &viewport.cursor, &frame.note);
-                                } else if (c == 'i' or c == 'c' or c == 'a') {
+                                } else if (c == 'i' or c == 'c') {
                                     if (try draft.begin(&review, alloc, diff_view.rows, diff_view.sbs_slots, layout, viewport.cursor, .new)) {
                                         focus = .commenting;
                                     }
-                                } else if (c == 'I' or c == 'C' or c == 'A') {
+                                } else if (c == 'I' or c == 'C') {
                                     if (try draft.begin(&review, alloc, diff_view.rows, diff_view.sbs_slots, layout, viewport.cursor, .old)) {
                                         focus = .commenting;
                                     }
+                                } else if (c == 'a') {
+                                    try applyApprove(
+                                        alloc,
+                                        io,
+                                        source,
+                                        &diff_view,
+                                        &viewport.cursor,
+                                        &frame.note,
+                                        false,
+                                    );
+                                } else if (c == 'A') {
+                                    try applyApprove(
+                                        alloc,
+                                        io,
+                                        source,
+                                        &diff_view,
+                                        &viewport.cursor,
+                                        &frame.note,
+                                        true,
+                                    );
                                 } else if (c == 'd') {
                                     dismissAt(&review, alloc, io, diff_view.rows, diff_view.sbs_slots, layout, viewport.cursor, .new, &frame.note);
                                 } else if (c == 'D') {
@@ -741,9 +757,11 @@ fn reloadDiff(
     cursor.* = new_cursor;
 }
 
-/// `Space` `a`: approve the hunk, file-in-group, or section at the cursor
-/// (local only; range is a no-op). Save, hide, restore onto the neighbor
-/// change (same rule as staging a row away). Does not mutate git.
+/// Approve the hunk (`whole_file == false`, requires a hunk) or the remaining
+/// hunks of that file in this group (`true`, from a hunk or the file header).
+/// Local only. No-op on a section, on a file header for hunk approve, and
+/// when the source is a range. Save, hide, restore onto the neighbor change
+/// (same rule as staging a row away). Does not mutate git.
 fn applyApprove(
     alloc: std.mem.Allocator,
     io: std.Io,
@@ -751,9 +769,13 @@ fn applyApprove(
     diff_view: *DiffView,
     cursor: *usize,
     note: *StatusNote,
+    whole_file: bool,
 ) std.mem.Allocator.Error!void {
     if (source != .local) return;
     const rows = diff_view.rows;
+    const target = git.indexTargetAt(rows, cursor.*, whole_file) orelse return;
+    if (!whole_file and target.hunk_i == null) return;
+    const file = groupedFile(&diff_view.diff, target.path, target.group) orelse return;
     const root: std.Io.Dir = .cwd();
     var approved = approve.load(alloc, io, root) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
@@ -764,25 +786,17 @@ fn applyApprove(
     };
     defer approved.deinit();
 
-    var group_mark: ?git.GroupNeighborMark = null;
-    var hunk_mark: ?git.NeighborMark = null;
-    if (git.groupSpanAt(rows, cursor.*)) |span| {
-        group_mark = git.groupNeighborMark(rows, span);
-        try approved.appendGroup(alloc, io, root, &diff_view.diff, span.group);
-    } else if (git.indexTargetAt(rows, cursor.*, false)) |target| {
-        hunk_mark = git.neighborMark(rows, target);
-        const file = groupedFile(&diff_view.diff, target.path, target.group) orelse return;
-        if (target.hunk_i != null) {
-            const hh = switch (rows[target.first]) {
-                .hunk_header => |h| h,
-                else => return,
-            };
-            const hi = approve.hunkAt(file.*, hh.old_start, hh.new_start) orelse return;
-            try approved.append(file.displayPath(), approve.fingerprintHunk(file.hunks[hi]));
-        } else {
-            try approved.appendFile(alloc, io, root, file.*);
-        }
-    } else return;
+    const hunk_mark = git.neighborMark(rows, target);
+    if (whole_file) {
+        try approved.appendFile(alloc, io, root, file.*);
+    } else {
+        const hh = switch (rows[target.first]) {
+            .hunk_header => |h| h,
+            else => return,
+        };
+        const hi = approve.hunkAt(file.*, hh.old_start, hh.new_start) orelse return;
+        try approved.append(file.displayPath(), approve.fingerprintHunk(file.hunks[hi]));
+    }
 
     const live = try approve.collectLive(alloc, io, root, &diff_view.diff);
     defer alloc.free(live);
@@ -796,9 +810,7 @@ fn applyApprove(
     };
 
     const new_flat = try approve.hide(alloc, &diff_view.diff, &approved, io, root);
-    const restored: usize = if (group_mark) |m|
-        git.restoreGroupNeighbor(new_flat, m)
-    else if (hunk_mark) |m|
+    const restored: usize = if (hunk_mark) |m|
         git.restoreNeighbor(new_flat, m)
     else
         0;
@@ -884,8 +896,8 @@ fn groupedFile(d: *const diff.Diff, path: []const u8, group: diff.Group) ?*const
 }
 
 /// Stage, unstage, or discard the current file or hunk (local source only).
-/// `Space` `Space` / `Space` `d` use `whole_file == false` (file header →
-/// file, hunk → hunk); `Space` `S` / `Space` `x` pass `true` from a hunk.
+/// Hunk chords (`gs`/`gu`/`gd`) pass `whole_file == false` and require a
+/// hunk; file chords (`gS`/`gU`/`gD`) pass `true`.
 fn applyIndex(
     alloc: std.mem.Allocator,
     io: std.Io,
@@ -939,8 +951,10 @@ fn applyGroupIndex(
     ));
 }
 
-/// Stage/unstage at the cursor: group confirm overlay, or apply the file/hunk.
-fn dispatchStage(
+/// Stage (`stage`) or unstage (`!stage`) the hunk or file at the cursor.
+/// Hunk chords require a hunk (no-op on a file header). Already-staged
+/// stage and not-staged unstage are no-ops. Local only.
+fn dispatchGitIndex(
     alloc: std.mem.Allocator,
     io: std.Io,
     source: cli.Source,
@@ -950,30 +964,45 @@ fn dispatchStage(
     focus: *Focus,
     failure: *Failure,
     review: *store.Review,
-    discard: *DiscardConfirm,
     whole_file: bool,
+    stage: bool,
 ) std.mem.Allocator.Error!void {
-    switch (git.stagePlan(diff_view.rows, cursor.*, whole_file)) {
-        .none => {},
-        .group => |g| {
-            discard.* = .{ .kind = .group, .group = g, .yes = false };
-            focus.* = .discard_confirm;
-        },
-        .cursor => try applyIndex(
-            alloc,
-            io,
-            source,
-            diff_view,
-            cursor,
-            note,
-            focus,
-            failure,
-            review,
-            whole_file,
-            .stage_unstage,
-            false,
-        ),
-    }
+    const target = git.indexTargetAt(diff_view.rows, cursor.*, whole_file) orelse return;
+    if (!whole_file and target.hunk_i == null) return;
+    if (stage) {
+        if (target.group == .staged) return;
+    } else if (target.group != .staged) return;
+    try applyIndex(
+        alloc,
+        io,
+        source,
+        diff_view,
+        cursor,
+        note,
+        focus,
+        failure,
+        review,
+        whole_file,
+        .stage_unstage,
+        false,
+    );
+}
+
+/// Open the discard confirm for the hunk or file at the cursor. Hunk
+/// discard requires a hunk. Staged and range loads are no-ops.
+fn beginGitDiscard(
+    source: cli.Source,
+    rows: []const view.row.Row,
+    cursor: usize,
+    discard: *DiscardConfirm,
+    focus: *Focus,
+    whole_file: bool,
+) void {
+    if (source != .local) return;
+    const target = git.discardTargetAt(rows, cursor, whole_file) orelse return;
+    if (!whole_file and target.hunk_i == null) return;
+    discard.* = .{ .whole_file = whole_file, .yes = false, .comments = false };
+    focus.* = .discard_confirm;
 }
 
 /// Map a mutation result onto the live DiffView, status note, and git-error overlay.
@@ -1016,11 +1045,10 @@ fn commitApply(
 /// file list, approved list, help, git error overlay, or discard confirm.
 pub const Focus = enum { normal, commenting, searching, listing, files, approved, helping, git_error, discard_confirm };
 
-/// Confirm overlay for discard (`Space` `d` / `Space` `x`) and for group
-/// stage/unstage (`Space` `Space` on a section header). `yes` is the
-/// selected choice. Opens with **No** selected (Enter does not apply).
-/// Discard: if the target has live comments, `comments` is the second
-/// overlay and defaults to **Yes** (delete).
+/// Confirm overlay for discard (`gd` / `gD`). `yes` is the selected
+/// choice. Opens with **No** selected (Enter does not apply). Discard:
+/// if the target has live comments, `comments` is the second overlay
+/// and defaults to **Yes** (delete).
 pub const DiscardConfirm = struct {
     const Result = union(enum) {
         open,
@@ -1882,7 +1910,7 @@ fn listOverlayRect(cols: u16, rows: u16, n: usize) tui.Rect {
     return tui.Rect.centered(cols, rows, want_w, want_h);
 }
 
-/// Comment-list overlay (`Space` `l`): snapshot of live comments, cursor, keys, and paint.
+/// Comment-list overlay (`Space` `c`): snapshot of live comments, cursor, keys, and paint.
 const CommentList = struct {
     const Result = union(enum) {
         open,
@@ -2173,7 +2201,7 @@ const FileList = struct {
     }
 };
 
-/// Approved-list overlay (`Space` `A`): snapshot of live approved identities,
+/// Approved-list overlay (`Space` `a`): snapshot of live approved identities,
 /// cursor, keys, and paint. Enter unapproves one matching store entry.
 const ApprovedList = struct {
     const Result = union(enum) {
@@ -2390,19 +2418,10 @@ const Failure = struct {
     }
 };
 
-test "indexHintForRow section all" {
-    try std.testing.expectEqualStrings(
-        "Stage All (Space Space)",
-        Frame.indexHintForRow(0, null, null, 0, .unstaged),
-    );
-    try std.testing.expectEqualStrings(
-        "Stage All (Space Space)",
-        Frame.indexHintForRow(0, null, null, 0, .untracked),
-    );
-    try std.testing.expectEqualStrings(
-        "Unstage All (Space Space)",
-        Frame.indexHintForRow(0, null, null, 0, .staged),
-    );
+test "indexHintForRow section has no git hint" {
+    try std.testing.expectEqualStrings("", Frame.indexHintForRow(0, null, null, 0, .unstaged));
+    try std.testing.expectEqualStrings("", Frame.indexHintForRow(0, null, null, 0, .untracked));
+    try std.testing.expectEqualStrings("", Frame.indexHintForRow(0, null, null, 0, .staged));
     try std.testing.expectEqualStrings("", Frame.indexHintForRow(1, null, null, 0, .unstaged));
     try std.testing.expectEqualStrings("", Frame.indexHintForRow(0, null, null, null, .unstaged));
 }

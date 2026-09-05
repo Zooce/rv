@@ -98,23 +98,22 @@ Not a multi-user code-review platform. Not a GitHub replacement. A **personal re
 | `za` | **Toggle fold** at the cursor. Hunk header or line: hide/show that hunk’s body (`@@` stays). File header: hide/show its hunks (per-hunk folds kept). No-op on a section, binary / hunk-less file, or empty list. Far-right `Fold (za)` / `Unfold (za)` on headers that can fold. |
 | `zM` | **Collapse all files** (headers only). |
 | `zR` | **Expand everything**. |
-| `(` / `)` | Jump to the **previous / next live comment**. Cursor goes to that comment’s side (old line or new line). Wraps; no comments stays put with a footer note. Landing expands folds so the row is visible. A comment on an approved hunk unapproves that hunk first (same for `Space` `l` Enter). |
+| `(` / `)` | Jump to the **previous / next live comment**. Cursor goes to that comment’s side (old line or new line). Wraps; no comments stays put with a footer note. Landing expands folds so the row is visible. A comment on an approved hunk unapproves that hunk first (same for `Space` `c` Enter). |
 | `/` | **Search the diff text** — body lines in the loaded changeset, including folded hunks (like vim `/`). Enter jumps to the first match and expands folds so the row is visible. `n` / `N` next / previous match. |
 | `Space` `f` | **List files** — floating overlay on the still-painted diff. One row per changed file (flatten order). `j`/`k` move; Enter jumps to that **file header** and closes. Esc closes without moving the cursor. `q` still quits. Empty diff: empty overlay. Opens on the file under the cursor when there is one. |
-| `Space` `l` | **List comments** — floating overlay on the still-painted diff (same live board as `rv list`). `j`/`k` move; Enter jumps to that comment’s side (same landing as `(`/`)`) and closes the overlay. Esc closes without moving the cursor. `q` still quits. Empty board: empty overlay. A row whose path/line is gone from the live diff: footer note, stay in the list. Read-only: edit or dismiss after jumping. |
-| `Space` `A` | **List approved hunks** — floating overlay on the still-painted diff (local only). One row per live approved identity (flatten order): path, git group, short hunk preview (or binary / hunk-less placeholder). `j`/`k` move; Enter unapproves that identity, rebuilds the main list, jumps to the restored row, and closes. Esc closes without changing approval. `q` still quits. Empty set: empty overlay. Opens on an approved identity in the file under the cursor when there is one. Range loads ignore this chord. |
-| `Space` `Space` | **Stage or unstage** the current file (on a file header) or hunk (in a hunk), or **the whole group** on an Unstaged / Untracked / Staged section header. Group action always confirms (`No` selected first; `yes` proceeds). Local review only. Far-right hints on the current section, file, and hunk rows name the action and chord. Range loads (`rv main...HEAD`) ignore this chord and show no hints. Git failure: centered overlay; Enter or Esc dismisses. If some files in a group already mutated, the list reloads to match git, then the overlay opens. |
-| `Space` `S` | **Stage or unstage the containing file** while the cursor is in a hunk. Local only. Temporary stand-in until Ctrl bindings exist. |
-| `Space` `d` | **Discard** the current file (on a file header) or hunk (in a hunk). Local unstaged/untracked only. Always confirms (`No` selected first; `yes` proceeds). If the target has live comments, a second overlay asks to delete them (`Yes` selected; `no` keeps them). Git discard runs first; comments are deleted only on success. Staged rows are no-ops (unstage first). Range loads ignore this chord. Far-right hints name the chord on unstaged/untracked rows. Git failure: same overlay as stage/unstage. |
-| `Space` `x` | **Discard the containing file** while the cursor is in a hunk. Local only. Temporary stand-in until Ctrl bindings exist. |
-| `Space` `a` | **Approve** the current hunk (hunk header or line), remaining hunks of the file in this group (file header), or the whole group (section header). No confirm. Local only. Hides those rows from the walk. Far-right hints name the chord on the current section, file, and hunk rows. Range loads ignore this chord and show no hints. |
+| `Space` `c` | **List comments** — floating overlay on the still-painted diff (same live board as `rv list`). `j`/`k` move; Enter jumps to that comment’s side (same landing as `(`/`)`) and closes the overlay. Esc closes without moving the cursor. `q` still quits. Empty board: empty overlay. A row whose path/line is gone from the live diff: footer note, stay in the list. Read-only: edit or dismiss after jumping. |
+| `Space` `a` | **List approved hunks** — floating overlay on the still-painted diff (local only). One row per live approved identity (flatten order): path, git group, short hunk preview (or binary / hunk-less placeholder). `j`/`k` move; Enter unapproves that identity, rebuilds the main list, jumps to the restored row, and closes. Esc closes without changing approval. `q` still quits. Empty set: empty overlay. Opens on an approved identity in the file under the cursor when there is one. Range loads ignore this chord. |
+| `g` `s` / `g` `u` / `g` `d` | **Stage / unstage / discard** the current hunk (header or inside the hunk). Local only. Hunk chords are no-ops on a file header or section. Stage and unstage are separate keys (already-staged `gs` and not-staged `gu` are no-ops). Discard is unstaged/untracked only and always confirms (`No` selected first; `yes` proceeds). If the target has live comments, a second overlay asks to delete them (`Yes` selected; `no` keeps them). Git discard runs first; comments are deleted only on success. Staged `gd` is a no-op (unstage first). Range loads ignore git keys. Far-right hints on the hunk header name these chords (discard only when unstaged/untracked). Git failure: centered overlay; Enter or Esc dismisses. |
+| `g` `S` / `g` `U` / `g` `D` | **Stage / unstage / discard** the containing file (file header or inside that file). Local only. No-op on a section. Same stage/unstage and discard rules as the hunk chords. Far-right hints on the file header (including sticky) name these chords. |
+| `a` | **Approve** the current hunk (header or inside the hunk). No confirm. Local only. No-op on a file header or section. Hides those rows from the walk. Far-right hints name `a` on the hunk header. Range loads ignore this key. |
+| `A` | **Approve** the remaining hunks of that file in this group (from a hunk or the file header). No confirm. Local only. No-op on a section. Far-right hints name `A` on the file header (including sticky). Range loads ignore this key. |
 | `?` | **Help** — centered overlay with the grouped key catalog (motion, search, comments, session, prompts). The title bar is a short hint; this is the full list. `j`/`k` (and arrows) scroll when it does not fit. `?` or Esc closes. `q` still quits. From a file, comment, or approved list, `?` replaces the list with help. While commenting or searching, `?` inserts a question mark. |
-| `i` / `c` / `a` / `Enter` | Create or edit the comment on **new** (right pane in side-by-side, or the current `+` / context line in unified). Open a box **below the cursor**. Same action; pick the muscle memory you prefer. |
-| `I` / `C` / `A` | Create or edit the comment on **old** (left pane in side-by-side, or the current `-` / context line in unified). Missing side does nothing. |
+| `i` / `c` / `Enter` | Create or edit the comment on **new** (right pane in side-by-side, or the current `+` / context line in unified). Open a box **below the cursor**. Same action; pick the muscle memory you prefer. |
+| `I` / `C` | Create or edit the comment on **old** (left pane in side-by-side, or the current `-` / context line in unified). Missing side does nothing. |
 | `d` | Dismiss the comment on **new** (right) at the cursor. Gone from the board; no confirm. |
 | `D` | Dismiss the comment on **old** (left). Missing side or no comment there: footer note; does not take the other pane. |
 | `r` | **Reload** the loaded diff from the same source (re-runs the startup git load). Comments in `.rv` stay. Failed reload keeps the previous view and shows a footer error. Not bound while typing a comment (or in search / a list overlay). |
-| (later) | Page/half-page scroll, more `Space` leader maps — same vocabulary |
+| (later) | Page/half-page scroll, more leader maps — same vocabulary |
 
 Contrast with tools where `j`/`k` only pan the view and comment placement needs a mouse: in `rv`, **where the cursor is is where the comment goes.**
 
@@ -124,15 +123,15 @@ Contrast with tools where `j`/`k` only pan the view and comment placement needs 
 
 #### File list
 
-`Space` `f` is a list overlay, not a search prompt — same pattern as `Space` `l`. It opens a centered overlay so the diff stays visible in the margins. Rows are flatten order: one display path per file header. Opening inside a file selects that file.
+`Space` `f` is a list overlay, not a search prompt — same pattern as `Space` `c`. It opens a centered overlay so the diff stays visible in the margins. Rows are flatten order: one display path per file header. Opening inside a file selects that file.
 
 #### Comment list
 
-`Space` `l` is the in-session board, not a search prompt. It opens a centered overlay so the diff stays visible in the margins. Rows are store order: id, path, side (`old` / `new` / `ctx`), line (`-N` / `+N`), body preview. Creating or dismissing a comment shows up the next time you open the list.
+`Space` `c` is the in-session board, not a search prompt. It opens a centered overlay so the diff stays visible in the margins. Rows are store order: id, path, side (`old` / `new` / `ctx`), line (`-N` / `+N`), body preview. Creating or dismissing a comment shows up the next time you open the list.
 
 #### Approved list
 
-`Space` `A` is a list overlay, not a search prompt — same pattern as `Space` `f` and `Space` `l`. Local review only; range loads ignore it. Rows are flatten order: one live approved identity per row (path, current git group, short hunk preview). Enter unapproves that identity and jumps to the restored row. There is no peek without unapproving.
+`Space` `a` is a list overlay, not a search prompt — same pattern as `Space` `f` and `Space` `c`. Local review only; range loads ignore it. Rows are flatten order: one live approved identity per row (path, current git group, short hunk preview). Enter unapproves that identity and jumps to the restored row. There is no peek without unapproving.
 
 #### Comment mode
 
@@ -143,18 +142,18 @@ j/k           # land the current-line highlight on the code you care about
 h/l           # optional: set start column
 / query       # find text in the diff; n/N walk matches
 Space f       # list changed files; j/k; Enter jump; Esc close
-Space l       # list comments; j/k; Enter jump; Esc close
-Space A       # list approved hunks; j/k; Enter unapprove and jump; Esc close
+Space c       # list comments; j/k; Enter jump; Esc close
+Space a       # list approved hunks; j/k; Enter unapprove and jump; Esc close
 ?             # help overlay; ? or Esc close
 v or V        # optional: start character- or line-wise range (vim-flavored)
 j/k h/l       # extend the selection (overlapping ranges allowed later)
-i | c | a | Enter   # create or edit new (right / +)
-I | C | A           # create or edit old (left / -)
+i | c | Enter       # create or edit new (right / +)
+I | C               # create or edit old (left / -)
               # type the note; Esc cancel; Ctrl-S or equivalent save
 ```
 
 - Anchor for a plain open is the **current line** (and column if set). With an active visual selection, the box attaches to that **range**.
-- `i` / `c` / `a` / `Enter` create or edit on new; `I` / `C` / `A` on old. Same box; no `e`. Pick the muscle memory you prefer.
+- `i` / `c` / `Enter` create or edit on new; `I` / `C` on old. Same box; no `e`. Pick the muscle memory you prefer.
 - **Current line** is always visible as a clear highlight (not just a scroll offset).
 - **Mouse** may still scroll or click to move the cursor for people who want it; it must never be the only way to place a note.
 - Hunk jumps (`[`/`]`) move both focus and cursor to a sensible line in the target hunk (e.g. first changed line).
@@ -219,11 +218,10 @@ $ grok   # or claude - agent implements a feature
 
 $ rv     # local changes only (empty when the worktree is clean)
          # j/k line; h/l col; [/] hunks; za/zM/zR folds; (/) comments; / text; Space f files
-         # Space l comments; Space A approved (local, Enter unapproves); Space Space stage/unstage
-         # Space a approve hunk, file, or group (local); Space S file from hunk (until Ctrl)
-         # Space d discard file or hunk; Space x discard file from hunk (until Ctrl)
-         # i/c/a/Enter -> create or edit new
-         # I/C/A -> old; d dismiss new; D dismiss old; r reload; ? help
+         # Space c comments; Space a approved (local, Enter unapproves)
+         # gs/gu/gd hunk git; gS/gU/gD file git (local); a/A approve hunk/file (local)
+         # i/c/Enter -> create or edit new
+         # I/C -> old; d dismiss new; D dismiss old; r reload; ? help
 
 $ rv export -o .rv/review.md   # or stdout / JSON
 # agent already knows the skill: address rv comments
@@ -239,7 +237,7 @@ $ rv                         # confirm, leave more, continue
 
 1. **Clean and simple** - enjoyable to use every day; no cluttered "IDE in the terminal."
 2. **Performance** - no slop. Instant open on large diffs is a requirement, not a nice-to-have.
-3. **Vim / Helix-like keybindings** - `j`/`k` move a **highlighted current line** (not merely scroll); `h`/`l` move by column; `[`/`]` jump hunks; `(`/`)` jump comments; `/` search diff text; `Space` `f` list changed files (overlay); `Space` `l` list comments (overlay); `Space` `A` list approved hunks (overlay, local; Enter unapproves and jumps); `?` help (overlay); `i`/`c`/`a`/`Enter` create or edit on new, `I`/`C`/`A` on old (box below the cursor); `d`/`D` dismiss new/old; `Space` `Space` stage/unstage file, hunk, or group (local); `Space` `a` approve hunk, file, or group (local); `Space` `d` / `Space` `x` discard (local, confirm).
+3. **Vim / Helix-like keybindings** - `j`/`k` move a **highlighted current line** (not merely scroll); `h`/`l` move by column; `[`/`]` jump hunks; `(`/`)` jump comments; `/` search diff text; `Space` `f` list changed files (overlay); `Space` `c` list comments (overlay); `Space` `a` list approved hunks (overlay, local; Enter unapproves and jumps); `?` help (overlay); `i`/`c`/`Enter` create or edit on new, `I`/`C` on old (box below the cursor); `d`/`D` dismiss new/old; `gs`/`gu`/`gd` stage/unstage/discard hunk and `gS`/`gU`/`gD` the file (local); `a`/`A` approve hunk/file (local).
 4. **Diff-first layout** - files and hunks from the *change set*, not a full project tree.
 5. **Precise selection** - comments must attach to the exact span you care about, including overlapping ranges.
 6. **Mouse optional** - never required to place or target a comment.

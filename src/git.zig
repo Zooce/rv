@@ -213,7 +213,7 @@ pub fn mutate(alloc: Allocator, io: Io, cwd: std.process.Child.Cwd, opts: Mutate
 }
 
 /// File or hunk to stage/unstage at `cursor`. `path` borrows from `rows`.
-/// `whole_file` selects the containing file (`Space S` / `Space x` from a hunk). On a file
+/// `whole_file` selects the containing file (`gS` / `gU` / `gD`). On a file
 /// header, the target is always the file. `null` on empty lists, section
 /// headers, and untagged (range) rows.
 pub const IndexTarget = struct {

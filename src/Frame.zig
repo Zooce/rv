@@ -683,12 +683,11 @@ pub fn bufPrintTrunc(buf: []u8, comptime fmt: []const u8, args: anytype) []const
     };
 }
 
-/// Index labels for the current section/file/hunk rows. Empty when `ri` is
-/// not one of those rows. Section row says All (`Space Space`). File row
-/// always says File (`Space S` / `Space x` while the cursor is in a hunk,
-/// otherwise `Space Space` / `Space d`). Hunk row always says Hunk
-/// (`Space Space` / `Space d`). Verb follows the file’s (or section’s)
-/// group. Discard chords only on unstaged/untracked file and hunk rows.
+/// Git labels for the current file/hunk header. Empty on other rows, section
+/// rows, and range loads. File row always says File (`gS`/`gU`/`gD`), including
+/// the sticky file header while the cursor is in a hunk of that file. Hunk row
+/// always says Hunk (`gs`/`gu`/`gd`). Verb follows the file’s group. Discard
+/// chords only on unstaged/untracked file and hunk rows.
 pub fn indexHintForRow(ri: usize, file_i: ?usize, hunk_i: ?usize, section_i: ?usize, group: ?diff.Group) []const u8 {
     const g = group orelse return "";
     const stage = switch (g) {
@@ -696,54 +695,40 @@ pub fn indexHintForRow(ri: usize, file_i: ?usize, hunk_i: ?usize, section_i: ?us
         .staged => false,
     };
     if (section_i) |si| {
-        if (ri == si) {
-            return if (stage)
-                "Stage All (Space Space)"
-            else
-                "Unstage All (Space Space)";
-        }
+        if (ri == si) return "";
     }
     if (file_i) |fi| {
         if (ri == fi) {
-            if (hunk_i != null) {
-                return if (stage)
-                    "Stage File (Space S)  Discard File (Space x)"
-                else
-                    "Unstage File (Space S)";
-            }
             return if (stage)
-                "Stage File (Space Space)  Discard File (Space d)"
+                "Stage File (gS)  Discard File (gD)"
             else
-                "Unstage File (Space Space)";
+                "Unstage File (gU)";
         }
     }
     if (hunk_i) |hi| {
         if (ri == hi) {
             return if (stage)
-                "Stage Hunk (Space Space)  Discard Hunk (Space d)"
+                "Stage Hunk (gs)  Discard Hunk (gd)"
             else
-                "Unstage Hunk (Space Space)";
+                "Unstage Hunk (gu)";
         }
     }
     return "";
 }
 
-/// `Space a` labels on the current section, file, or hunk header. Empty on
-/// other rows, range loads (`group == null`), and the file header while the
-/// cursor is in a hunk (file-from-hunk approve is not bound).
+/// Approve labels on the current file or hunk header. Empty on other rows,
+/// section rows, and range loads (`group == null`). File row always says `A`,
+/// including the sticky file header while the cursor is in a hunk.
 pub fn approveHintForRow(ri: usize, file_i: ?usize, hunk_i: ?usize, section_i: ?usize, group: ?diff.Group) []const u8 {
     if (group == null) return "";
     if (section_i) |si| {
-        if (ri == si) return "Approve All (Space a)";
+        if (ri == si) return "";
     }
     if (file_i) |fi| {
-        if (ri == fi) {
-            if (hunk_i != null) return "";
-            return "Approve File (Space a)";
-        }
+        if (ri == fi) return "Approve File (A)";
     }
     if (hunk_i) |hi| {
-        if (ri == hi) return "Approve Hunk (Space a)";
+        if (ri == hi) return "Approve Hunk (a)";
     }
     return "";
 }
@@ -1097,29 +1082,49 @@ test "headerHint prepends fold to git hint" {
     var buf: [160]u8 = undefined;
     const file_i: usize = 1;
     try testing.expectEqualStrings(
-        "Fold (za)  Stage File (Space Space)  Discard File (Space d)  Approve File (Space a)",
+        "Fold (za)  Stage File (gS)  Discard File (gD)  Approve File (A)",
         headerHint(&buf, &folds, rows, file_i, file_i, null, null, .unstaged, true),
     );
     try testing.expectEqualStrings(
-        "Stage File (Space Space)  Discard File (Space d)  Approve File (Space a)",
+        "Stage File (gS)  Discard File (gD)  Approve File (A)",
         headerHint(&buf, &folds, rows, file_i, file_i, null, null, .unstaged, false),
     );
 }
 
-test "approveHintForRow file hunk section and file-from-hunk" {
+test "indexHintForRow file hunk and sticky file" {
     try testing.expectEqualStrings(
-        "Approve All (Space a)",
-        approveHintForRow(0, null, null, 0, .unstaged),
+        "Stage File (gS)  Discard File (gD)",
+        indexHintForRow(1, 1, null, null, .unstaged),
     );
     try testing.expectEqualStrings(
-        "Approve File (Space a)",
+        "Stage File (gS)  Discard File (gD)",
+        indexHintForRow(1, 1, 2, null, .unstaged),
+    );
+    try testing.expectEqualStrings(
+        "Unstage File (gU)",
+        indexHintForRow(1, 1, 2, null, .staged),
+    );
+    try testing.expectEqualStrings(
+        "Stage Hunk (gs)  Discard Hunk (gd)",
+        indexHintForRow(2, 1, 2, null, .unstaged),
+    );
+    try testing.expectEqualStrings(
+        "Unstage Hunk (gu)",
+        indexHintForRow(2, 1, 2, null, .staged),
+    );
+}
+
+test "approveHintForRow file hunk section and sticky file" {
+    try testing.expectEqualStrings("", approveHintForRow(0, null, null, 0, .unstaged));
+    try testing.expectEqualStrings(
+        "Approve File (A)",
         approveHintForRow(1, 1, null, null, .staged),
     );
     try testing.expectEqualStrings(
-        "Approve Hunk (Space a)",
+        "Approve Hunk (a)",
         approveHintForRow(2, 1, 2, null, .unstaged),
     );
-    try testing.expectEqualStrings("", approveHintForRow(1, 1, 2, null, .unstaged));
+    try testing.expectEqualStrings("Approve File (A)", approveHintForRow(1, 1, 2, null, .unstaged));
     try testing.expectEqualStrings("", approveHintForRow(0, null, null, 0, null));
 }
 
