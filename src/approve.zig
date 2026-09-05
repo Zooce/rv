@@ -272,6 +272,112 @@ pub fn collectLive(alloc: Allocator, io: Io, root: Io.Dir, d: *const diff.Diff) 
     return try list.toOwnedSlice(alloc);
 }
 
+/// One live identity the store currently consumes. Slices borrow from `d`.
+pub const Hidden = struct {
+    pub const Kind = enum { hunk, binary, file };
+
+    path: []const u8,
+    hash: Hash,
+    group: ?diff.Group,
+    kind: Kind,
+    /// First add/delete line, or empty (binary / hunk-less / context-only).
+    preview: []const u8,
+};
+
+/// Live identities `approved.take` consumes, flatten order (group, file, hunk).
+pub fn collectApproved(
+    alloc: Allocator,
+    io: Io,
+    root: Io.Dir,
+    d: *const diff.Diff,
+    approved: *const Approved,
+) Allocator.Error![]Hidden {
+    const used = try alloc.alloc(bool, approved.entries.items.len);
+    defer alloc.free(used);
+    @memset(used, false);
+
+    var list: std.ArrayList(Hidden) = .empty;
+    errdefer list.deinit(alloc);
+    for (d.files) |f| {
+        const path = f.displayPath();
+        if (f.hunks.len == 0) {
+            const hash = hunklessHash(alloc, io, root, f) orelse continue;
+            if (!approved.take(used, path, hash)) continue;
+            try list.append(alloc, .{
+                .path = path,
+                .hash = hash,
+                .group = f.group,
+                .kind = if (f.is_binary) .binary else .file,
+                .preview = "",
+            });
+            continue;
+        }
+        for (f.hunks) |h| {
+            const hash = fingerprintHunk(h);
+            if (!approved.take(used, path, hash)) continue;
+            var preview: []const u8 = "";
+            for (h.lines) |ln| {
+                switch (ln.kind) {
+                    .add, .delete => {
+                        preview = ln.text;
+                        break;
+                    },
+                    .context, .meta => {},
+                }
+            }
+            try list.append(alloc, .{
+                .path = path,
+                .hash = hash,
+                .group = f.group,
+                .kind = .hunk,
+                .preview = preview,
+            });
+        }
+    }
+    return try list.toOwnedSlice(alloc);
+}
+
+/// First flatten row of this identity (hunk header, or file header if hunk-less).
+pub fn rowForIdentity(
+    rows: []const view.row.Row,
+    d: *const diff.Diff,
+    path: []const u8,
+    hash: Hash,
+    kind: Hidden.Kind,
+) ?usize {
+    var cur_path: []const u8 = "";
+    var cur_group: ?diff.Group = null;
+    for (rows, 0..) |item, i| {
+        switch (item) {
+            .file_header => |fh| {
+                cur_path = fh.path;
+                cur_group = fh.group;
+                if (kind == .hunk) continue;
+                if (!std.mem.eql(u8, fh.path, path)) continue;
+                const file = fileAt(d, fh.path, fh.group) orelse continue;
+                if (file.hunks.len == 0) return i;
+            },
+            .hunk_header => |hh| {
+                if (kind != .hunk) continue;
+                if (!std.mem.eql(u8, cur_path, path)) continue;
+                const file = fileAt(d, cur_path, cur_group) orelse continue;
+                const hi = hunkAt(file.*, hh.old_start, hh.new_start) orelse continue;
+                if (std.mem.eql(u8, &fingerprintHunk(file.hunks[hi]), &hash)) return i;
+            },
+            .section_header, .line => {},
+        }
+    }
+    return null;
+}
+
+fn fileAt(d: *const diff.Diff, path: []const u8, group: ?diff.Group) ?*const diff.File {
+    for (d.files) |*f| {
+        if (f.group != group) continue;
+        if (std.mem.eql(u8, f.displayPath(), path)) return f;
+    }
+    return null;
+}
+
 /// Flatten `d` without identities `approved.take` consumes. Same row shape as
 /// `view.row.flatten` for what remains. `root` is the worktree for hunk-less
 /// hashes.
@@ -982,4 +1088,147 @@ test "appendGroup approves one group only" {
     defer testing.allocator.free(hidden);
     try testing.expect(hidden[0] == .section_header);
     try testing.expectEqual(diff.Group.untracked, hidden[0].section_header);
+}
+
+test "collectApproved empty store is empty" {
+    const io = testing.io;
+    var d = try twoHunkDiff(testing.allocator);
+    defer d.deinit();
+    var approved = initEmpty(testing.allocator);
+    defer approved.deinit();
+    const items = try collectApproved(testing.allocator, io, .cwd(), &d, &approved);
+    defer testing.allocator.free(items);
+    try testing.expectEqual(0, items.len);
+}
+
+test "collectApproved flatten order is group then file then hunk" {
+    const io = testing.io;
+    var d = try threeGroupDiff(testing.allocator);
+    defer d.deinit();
+    var approved = initEmpty(testing.allocator);
+    defer approved.deinit();
+    try approved.append("a", fingerprintHunk(d.files[0].hunks[0]));
+    try approved.append("u", fingerprintHunk(d.files[1].hunks[0]));
+    try approved.append("a", fingerprintHunk(d.files[2].hunks[0]));
+    const items = try collectApproved(testing.allocator, io, .cwd(), &d, &approved);
+    defer testing.allocator.free(items);
+    try testing.expectEqual(3, items.len);
+    try testing.expectEqualStrings("a", items[0].path);
+    try testing.expectEqual(diff.Group.unstaged, items[0].group.?);
+    try testing.expectEqual(Hidden.Kind.hunk, items[0].kind);
+    try testing.expectEqualStrings("old", items[0].preview);
+    try testing.expectEqualStrings("u", items[1].path);
+    try testing.expectEqual(diff.Group.untracked, items[1].group.?);
+    try testing.expectEqualStrings("hi", items[1].preview);
+    try testing.expectEqualStrings("a", items[2].path);
+    try testing.expectEqual(diff.Group.staged, items[2].group.?);
+    try testing.expectEqualStrings("staged", items[2].preview);
+}
+
+test "collectApproved identical hunks are a multiset" {
+    const io = testing.io;
+    const txt =
+        \\diff --git a/f.txt b/f.txt
+        \\--- a/f.txt
+        \\+++ b/f.txt
+        \\@@ -1 +1 @@
+        \\-a
+        \\+b
+        \\@@ -10 +10 @@
+        \\-a
+        \\+b
+    ;
+    var d = try diff.parse(testing.allocator, txt);
+    defer d.deinit();
+    const path = d.files[0].displayPath();
+    const hash = fingerprintHunk(d.files[0].hunks[0]);
+    var approved = initEmpty(testing.allocator);
+    defer approved.deinit();
+    try approved.append(path, hash);
+    {
+        const items = try collectApproved(testing.allocator, io, .cwd(), &d, &approved);
+        defer testing.allocator.free(items);
+        try testing.expectEqual(1, items.len);
+    }
+    try approved.append(path, hash);
+    const items = try collectApproved(testing.allocator, io, .cwd(), &d, &approved);
+    defer testing.allocator.free(items);
+    try testing.expectEqual(2, items.len);
+    try testing.expectEqual(items[0].hash, items[1].hash);
+    try testing.expectEqualStrings("a", items[0].preview);
+}
+
+test "rowForIdentity after unapprove restores one hunk and leaves the other hidden" {
+    const io = testing.io;
+    const alloc = testing.allocator;
+    var d = try twoHunkDiff(alloc);
+    defer d.deinit();
+    const path = d.files[0].displayPath();
+    const h0 = fingerprintHunk(d.files[0].hunks[0]);
+    const h1 = fingerprintHunk(d.files[0].hunks[1]);
+    var approved = initEmpty(alloc);
+    defer approved.deinit();
+    try approved.append(path, h0);
+    try approved.append(path, h1);
+    try approved.unapprove(path, h0);
+    const rows = try hide(alloc, &d, &approved, io, .cwd());
+    defer alloc.free(rows);
+    try testing.expectEqual(4, rows.len);
+    try testing.expectEqual(1, rowForIdentity(rows, &d, path, h0, .hunk).?);
+    try testing.expect(rowForIdentity(rows, &d, path, h1, .hunk) == null);
+}
+
+test "rowForIdentity identical hunks: unapprove restores the unmatched live hunk" {
+    const io = testing.io;
+    const alloc = testing.allocator;
+    const txt =
+        \\diff --git a/f.txt b/f.txt
+        \\--- a/f.txt
+        \\+++ b/f.txt
+        \\@@ -1 +1 @@
+        \\-a
+        \\+b
+        \\@@ -10 +10 @@
+        \\-a
+        \\+b
+    ;
+    var d = try diff.parse(alloc, txt);
+    defer d.deinit();
+    const path = d.files[0].displayPath();
+    const hash = fingerprintHunk(d.files[0].hunks[0]);
+    var approved = initEmpty(alloc);
+    defer approved.deinit();
+    try approved.append(path, hash);
+    try approved.append(path, hash);
+    try approved.unapprove(path, hash);
+    const rows = try hide(alloc, &d, &approved, io, .cwd());
+    defer alloc.free(rows);
+    try testing.expectEqual(4, rows.len);
+    try testing.expectEqual(1, rowForIdentity(rows, &d, path, hash, .hunk).?);
+    // Remaining store entry still consumes the first live match.
+    try testing.expectEqual(d.files[0].hunks[1].old_start, rows[1].hunk_header.old_start);
+}
+
+test "collectApproved hunk-less binary" {
+    if (builtin.os.tag == .wasi) return;
+    const io = testing.io;
+    const alloc = testing.allocator;
+    var tmp = try IsolatedTmp.init(alloc, io);
+    defer tmp.deinit(alloc, io);
+    try tmp.write(io, "pic.png", "abc");
+    const binary =
+        \\diff --git a/pic.png b/pic.png
+        \\Binary files a/pic.png and b/pic.png differ
+    ;
+    var d = try diff.parse(alloc, binary);
+    defer d.deinit();
+    var approved = initEmpty(alloc);
+    defer approved.deinit();
+    try approved.append("pic.png", fingerprintFile("abc"));
+    const items = try collectApproved(alloc, io, tmp.dir, &d, &approved);
+    defer alloc.free(items);
+    try testing.expectEqual(1, items.len);
+    try testing.expectEqualStrings("pic.png", items[0].path);
+    try testing.expectEqual(Hidden.Kind.binary, items[0].kind);
+    try testing.expectEqualStrings("", items[0].preview);
 }

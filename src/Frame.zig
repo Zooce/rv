@@ -218,6 +218,7 @@ pub fn paint(
             .searching => "rv  search  Enter jump  Esc cancel",
             .listing => "rv  comments  j/k move  Enter jump  Esc close  q quit",
             .files => "rv  files  j/k move  Enter jump  Esc close  q quit",
+            .approved => "rv  approved  j/k move  Enter unapprove  Esc close  q quit",
             .helping => "rv  help  j/k  Esc/? close  q quit",
             .git_error => "rv  git error  Enter/Esc close  q quit",
             .discard_confirm => discard.titleBar(),

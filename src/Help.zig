@@ -34,6 +34,7 @@ const rows = [_]Row{
     .{ .item = .{ .key = "n/N", .label = "next / prev match" } },
     .{ .item = .{ .key = "Space f", .label = "file list" } },
     .{ .item = .{ .key = "Space l", .label = "comment list" } },
+    .{ .item = .{ .key = "Space A", .label = "approved list" } },
     .blank,
     .{ .group = "Comments" },
     .{ .item = .{ .key = "i/c/a/Enter", .label = "create / edit new" } },
@@ -59,6 +60,7 @@ const rows = [_]Row{
     .{ .item = .{ .key = "comment", .label = "Enter save · Esc cancel · arrows move" } },
     .{ .item = .{ .key = "search", .label = "Enter jump · Esc cancel" } },
     .{ .item = .{ .key = "list", .label = "j/k move · Enter jump · Esc close" } },
+    .{ .item = .{ .key = "approved", .label = "Enter unapprove · jump · Esc close" } },
     .{ .item = .{ .key = "discard", .label = "No/yes · comments no/Yes · Esc cancel" } },
 };
 
@@ -184,8 +186,8 @@ fn overlayRect(cols: u16, rows_n: u16, n: usize) tui.Rect {
 test "help catalog includes normal bindings" {
     const required = [_][]const u8{
         "j/k",     "h/l",     "0/$", "J/K", "[/]", "{/}", "(/)", "za", "zM", "zR", "/", "n/N",
-        "Space f", "Space l", "Space Space", "Space a", "Space S", "Space d", "Space x", "i", "I", "d", "D",
-        "t",       "#",       "r",           "?", "q",
+        "Space f", "Space l", "Space A", "Space Space", "Space a", "Space S", "Space d", "Space x", "i", "I", "d", "D",
+        "t",       "#",       "r",           "?", "q", "approved",
     };
     for (required) |token| {
         var found = false;

@@ -4,7 +4,8 @@
 //! comments → TUI (title bar is a short hint; `?` opens help). Keys: `j`/`k`,
 //! `h`/`l` pan, `0`/`$` col home/end, `[`/`]` hunk, `{`/`}` file header,
 //! `(`/`)` prev/next comment, `/` text search, `n`/`N` next/prev match,
-//! `Space` `f` file list, `Space` `l` comment list, `Space` `a` approve (local),
+//! `Space` `f` file list, `Space` `l` comment list, `Space` `A` approved list
+//! (local; Enter unapproves and jumps), `Space` `a` approve (local),
 //! `i`/`c`/`a`/`Enter`
 //! create or edit new, `I`/`C`/`A` old, `d` dismiss new, `D` dismiss old,
 //! `r` reload the loaded diff, `q` quit).
@@ -50,7 +51,9 @@
 //! deleted only on success. Staged rows are no-ops (unstage first). Range
 //! loads ignore those chords. An unmatched `Space` leader is dropped; the
 //! next key is handled as normal
-//! (`Space` then `d` still dismisses on a range load). Local `Space` `a`
+//! (`Space` then `d` still dismisses on a range load). Local `Space` `A`
+//! opens the approved-hunk list (Enter unapproves one and jumps); range
+//! loads ignore that chord. Local `Space` `a`
 //! approves the hunk, the file in this group, or the whole section (no
 //! confirm) and hides it; range loads ignore that chord. Git failure opens
 //! a centered overlay with git’s error; Enter or Esc dismisses. The list
@@ -64,7 +67,14 @@
 //! A row whose path/line is gone from the flatten stays in the list and shows
 //! a footer note. `q` still quits.
 //!
-//! Help: `?` in normal (or from a list overlay) opens a centered overlay
+//! Approved list: `Space` then `A` opens a centered overlay of live approved
+//! identities (flatten order). Local only. `j`/`k` move; Enter removes one
+//! matching store entry, rebuilds the main list, jumps to that row, and
+//! closes. Esc closes without changing approval. Empty set: empty overlay.
+//! Opens on an approved identity in the file under the cursor when there is
+//! one; otherwise the first row. `q` still quits.
+//!
+//! Help: `?` in normal (or from a file, comment, or approved list) opens a centered overlay
 //! with the grouped key catalog. `j`/`k` scroll when it does not fit. `?` or
 //! Esc closes; `q` still quits. Other keys are ignored. While commenting or
 //! searching, `?` inserts a question mark. The title bar is a short hint.
@@ -171,12 +181,13 @@ fn runTui(alloc: std.mem.Allocator, io: std.Io, source: cli.Source) !u8 {
     // Exactly one focus; cannot help, comment, search, and list at once.
     var focus: Focus = .normal;
     // `Space` leader: next key may be `f` (file list), `l` (comment list),
-    // `Space` (stage/unstage current file or hunk, or the group on a
-    // section header), `S` (containing file from a hunk), `a` (approve
-    // current file, hunk, or group), `d` (discard current file or hunk),
-    // or `x` (discard containing file from a hunk).
+    // `A` (approved list, local), `Space` (stage/unstage current file or
+    // hunk, or the group on a section header), `S` (containing file from a
+    // hunk), `a` (approve current file, hunk, or group), `d` (discard
+    // current file or hunk), or `x` (discard containing file from a hunk).
     // Cleared on that next key. Unmatched leader is dropped; on a range
-    // load `Space` then `d` still dismisses. `Space` `a` is a no-op.
+    // load `Space` then `d` still dismisses. `Space` `a` and `Space` `A`
+    // are no-ops.
     var leader_pending: bool = false;
     // `z` leader: next key may be `a` (toggle fold), `M` (collapse all
     // files), or `R` (expand all). Unmatched `z` is dropped; the second
@@ -192,6 +203,8 @@ fn runTui(alloc: std.mem.Allocator, io: std.Io, source: cli.Source) !u8 {
     defer comment_list.items.deinit(alloc);
     var file_list: FileList = .{};
     defer file_list.items.deinit(alloc);
+    var approved_list: ApprovedList = .{};
+    defer approved_list.items.deinit(alloc);
     var help: Help = .{};
     var frame: Frame = .{};
     var failure: Failure = .{};
@@ -270,6 +283,27 @@ fn runTui(alloc: std.mem.Allocator, io: std.Io, source: cli.Source) !u8 {
                         },
                         .open => {},
                     },
+                    .approved => switch (approved_list.handleKey(key)) {
+                        .closed => focus = .normal,
+                        .quit => running = false,
+                        .help => {
+                            help.scroll = 0;
+                            focus = .helping;
+                        },
+                        .unapprove => |idx| {
+                            focus = .normal;
+                            try applyUnapprove(
+                                alloc,
+                                io,
+                                source,
+                                &diff_view,
+                                &viewport.cursor,
+                                &frame.note,
+                                approved_list.items.items[idx],
+                            );
+                        },
+                        .open => {},
+                    },
                     .git_error => switch (failure.handleKey(key)) {
                         .closed => focus = .normal,
                         .quit => running = false,
@@ -336,6 +370,21 @@ fn runTui(alloc: std.mem.Allocator, io: std.Io, source: cli.Source) !u8 {
                                 } else if (after_leader and c == 'l') {
                                     try comment_list.load(alloc, review.comments.items);
                                     focus = .listing;
+                                } else if (after_leader and c == 'A') {
+                                    if (source == .local) {
+                                        if (approved_list.load(
+                                            alloc,
+                                            io,
+                                            &diff_view.diff,
+                                            diff_view.rows,
+                                            viewport.cursor,
+                                        )) |_| {
+                                            focus = .approved;
+                                        } else |err| switch (err) {
+                                            error.OutOfMemory => return err,
+                                            else => frame.note.set(approvedLoadMessage(err)),
+                                        }
+                                    }
                                 } else if (after_leader and c == ' ') {
                                     try dispatchStage(
                                         alloc,
@@ -486,6 +535,9 @@ fn runTui(alloc: std.mem.Allocator, io: std.Io, source: cli.Source) !u8 {
                 scr.hideCursor();
             } else if (focus == .listing) {
                 comment_list.paint(&scr, size);
+                scr.hideCursor();
+            } else if (focus == .approved) {
+                approved_list.paint(&scr, size);
                 scr.hideCursor();
             } else if (focus == .discard_confirm) {
                 discard_confirm.paint(&scr, size, diff_view.rows, viewport.cursor);
@@ -745,6 +797,56 @@ fn applyApprove(
     cursor.* = view.fold.visibleIndex(diff_view.flat, diff_view.folds, restored);
 }
 
+/// Enter on the approved list: drop one matching store entry, hide again,
+/// jump to the restored row. Local only.
+fn applyUnapprove(
+    alloc: std.mem.Allocator,
+    io: std.Io,
+    source: cli.Source,
+    diff_view: *DiffView,
+    cursor: *usize,
+    note: *StatusNote,
+    item: approve.Hidden,
+) std.mem.Allocator.Error!void {
+    if (source != .local) return;
+    const root: std.Io.Dir = .cwd();
+    var approved = approve.load(alloc, io, root) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => {
+            note.set(approvedLoadMessage(err));
+            return;
+        },
+    };
+    defer approved.deinit();
+    approved.unapprove(item.path, item.hash) catch return;
+
+    const live = try approve.collectLive(alloc, io, root, &diff_view.diff);
+    defer alloc.free(live);
+    try approved.prune(alloc, live);
+    approve.save(&approved, alloc, io, root) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => {
+            note.set("failed to save .rv approved store");
+            return;
+        },
+    };
+
+    const new_flat = try approve.hide(alloc, &diff_view.diff, &approved, io, root);
+    const jump = approve.rowForIdentity(
+        new_flat,
+        &diff_view.diff,
+        item.path,
+        item.hash,
+        item.kind,
+    ) orelse 0;
+    diff_view.replaceFlat(alloc, new_flat, approved.entries.items.len) catch {
+        alloc.free(new_flat);
+        note.set("out of memory");
+        return;
+    };
+    diff_view.reveal(alloc, cursor, jump) catch note.set("out of memory");
+}
+
 fn groupedFile(d: *const diff.Diff, path: []const u8, group: diff.Group) ?*const diff.File {
     for (d.files) |*f| {
         const g = f.group orelse continue;
@@ -884,8 +986,8 @@ fn commitApply(
 }
 
 /// Key ownership: normal nav, comment draft, `/` search prompt, comment list,
-/// file list, help, git error overlay, or discard confirm.
-pub const Focus = enum { normal, commenting, searching, listing, files, helping, git_error, discard_confirm };
+/// file list, approved list, help, git error overlay, or discard confirm.
+pub const Focus = enum { normal, commenting, searching, listing, files, approved, helping, git_error, discard_confirm };
 
 /// Confirm overlay for discard (`Space` `d` / `Space` `x`) and for group
 /// stage/unstage (`Space` `Space` on a section header). `yes` is the
@@ -1925,6 +2027,169 @@ const FileList = struct {
     }
 };
 
+/// Approved-list overlay (`Space` `A`): snapshot of live approved identities,
+/// cursor, keys, and paint. Enter unapproves one matching store entry.
+const ApprovedList = struct {
+    const Result = union(enum) {
+        open,
+        closed,
+        quit,
+        help,
+        unapprove: usize,
+    };
+
+    items: std.ArrayList(approve.Hidden) = .empty,
+    cursor: usize = 0,
+    scroll: usize = 0,
+
+    fn load(
+        self: *ApprovedList,
+        alloc: std.mem.Allocator,
+        io: std.Io,
+        d: *const diff.Diff,
+        rows: []const view.row.Row,
+        cursor: usize,
+    ) approve.LoadError!void {
+        self.items.clearRetainingCapacity();
+        var approved = try approve.load(alloc, io, .cwd());
+        defer approved.deinit();
+        const hidden = try approve.collectApproved(alloc, io, .cwd(), d, &approved);
+        defer alloc.free(hidden);
+        try self.items.appendSlice(alloc, hidden);
+        self.cursor = 0;
+        self.scroll = 0;
+        if (rows.len == 0) return;
+        const cur = view.row.clampCursor(cursor, rows.len);
+        if (rows[cur] == .section_header) return;
+        const start = view.nav.currentFileStart(rows, cur) orelse return;
+        const fh = rows[start].file_header;
+        for (self.items.items, 0..) |item, n| {
+            if (!std.mem.eql(u8, item.path, fh.path)) continue;
+            if (item.group != fh.group) continue;
+            self.cursor = n;
+            break;
+        }
+    }
+
+    fn handleKey(self: *ApprovedList, key: tui.Key) Result {
+        switch (key) {
+            .esc => return .closed,
+            .enter => {
+                if (self.cursor < self.items.items.len) return .{ .unapprove = self.cursor };
+            },
+            .char => |c| {
+                if (c == 'q' or c == 'Q') return .quit;
+                if (c == '?') return .help;
+                if (c == 'j') {
+                    if (self.cursor + 1 < self.items.items.len) self.cursor += 1;
+                } else if (c == 'k') {
+                    if (self.cursor > 0) self.cursor -= 1;
+                }
+            },
+            .down => {
+                if (self.cursor + 1 < self.items.items.len) self.cursor += 1;
+            },
+            .up => {
+                if (self.cursor > 0) self.cursor -= 1;
+            },
+            .ctrl_c => return .quit,
+            else => {},
+        }
+        return .open;
+    }
+
+    fn formatLine(buf: []u8, item: approve.Hidden) []const u8 {
+        const group: []const u8 = if (item.group) |g| switch (g) {
+            .unstaged => "Unstaged",
+            .untracked => "Untracked",
+            .staged => "Staged",
+        } else "-";
+        const preview: []const u8 = switch (item.kind) {
+            .hunk => if (item.preview.len > 0) item.preview else "hunk",
+            .binary => "binary",
+            .file => "file",
+        };
+        const prefix = Frame.bufPrintTrunc(buf, "{s}  {s}  ", .{ item.path, group });
+        var i: usize = 0;
+        const rest = buf[prefix.len..];
+        for (preview) |b| {
+            if (i >= rest.len) break;
+            rest[i] = if (b == '\n' or b == '\r') ' ' else b;
+            i += 1;
+        }
+        return buf[0 .. prefix.len + i];
+    }
+
+    fn paint(self: *ApprovedList, scr: *tui.Screen, size: tui.Size) void {
+        const bg = tui.Color{ .rgb = .{ .r = 0x12, .g = 0x12, .b = 0x14 } };
+        const fg = tui.Color{ .rgb = .{ .r = 0xd0, .g = 0xd0, .b = 0xd0 } };
+        const panel_bg = tui.Style{ .fg = fg, .bg = bg };
+        const panel_frame = tui.Style{
+            .fg = .{ .rgb = .{ .r = 0x5d, .g = 0x81, .b = 0xb7 } },
+            .bg = bg,
+            .bold = true,
+        };
+        const row_cur = tui.Style{
+            .fg = fg,
+            .bg = .{ .rgb = .{ .r = 0x2a, .g = 0x2a, .b = 0x30 } },
+            .bold = true,
+        };
+        const bar_track = tui.Style{
+            .fg = .{ .rgb = .{ .r = 0x6a, .g = 0x7a, .b = 0x9a } },
+            .bg = bg,
+            .dim = true,
+        };
+        const bar_thumb = tui.Style{
+            .fg = .{ .rgb = .{ .r = 0xee, .g = 0xee, .b = 0xee } },
+            .bg = .{ .rgb = .{ .r = 0x4a, .g = 0x6a, .b = 0x9a } },
+            .bold = true,
+        };
+
+        const items = self.items.items;
+        const panel = listOverlayRect(size.cols, size.rows, items.len);
+        scr.fillRect(panel, ' ', panel_bg);
+        scr.drawBox(panel, panel_frame);
+        const inner = panel.inset(1);
+        if (panel.h > 0 and panel.w > 2) {
+            scr.putStr(panel.x + 2, panel.y, " approved ", panel_frame, panel);
+        }
+        ensureListCursorVisible(&self.scroll, self.cursor, inner.h, items.len);
+        if (inner.h == 0 or inner.w == 0) return;
+        if (items.len == 0) {
+            scr.putStr(inner.x, inner.y, "no approved", panel_bg, inner);
+            return;
+        }
+        const show_bar = items.len > inner.h;
+        const text_area = if (show_bar)
+            tui.Rect{ .x = inner.x, .y = inner.y, .w = inner.w -| 2, .h = inner.h }
+        else
+            inner;
+        const start = self.scroll;
+        var line_buf: [512]u8 = undefined;
+        var row: u16 = 0;
+        while (row < inner.h) : (row += 1) {
+            const idx = start + row;
+            if (idx >= items.len) break;
+            const y = inner.y + row;
+            const st = if (idx == self.cursor) row_cur else panel_bg;
+            scr.fillRect(.{ .x = inner.x, .y = y, .w = inner.w, .h = 1 }, ' ', st);
+            const text = formatLine(&line_buf, items[idx]);
+            scr.putStr(inner.x, y, text, st, text_area);
+        }
+        if (show_bar) {
+            const bar_x: u16 = inner.x + inner.w - 1;
+            const thumb = comment_input.scrollbarThumb(items.len, inner.h, start, inner.h);
+            var br: u16 = 0;
+            while (br < inner.h) : (br += 1) {
+                const in_thumb = br >= thumb.start and br < thumb.start + thumb.len;
+                const st = if (in_thumb) bar_thumb else bar_track;
+                const ch: u21 = if (in_thumb) '█' else '│';
+                scr.setCell(bar_x, inner.y + br, .{ .char = ch, .width = 1, .style = st });
+            }
+        }
+    }
+};
+
 /// Dismissible error overlay: message text, keys, and paint.
 const Failure = struct {
     const Result = enum { open, closed, quit };
@@ -2031,6 +2296,42 @@ test "comment list file row has no line" {
             .body = "x",
         }),
     );
+}
+
+test "approved list row shows path group preview" {
+    var buf: [128]u8 = undefined;
+    try std.testing.expectEqualStrings(
+        "a.zig  Unstaged  hello",
+        ApprovedList.formatLine(&buf, .{
+            .path = "a.zig",
+            .hash = @splat(0),
+            .group = .unstaged,
+            .kind = .hunk,
+            .preview = "hello",
+        }),
+    );
+    try std.testing.expectEqualStrings(
+        "bin.dat  Staged  binary",
+        ApprovedList.formatLine(&buf, .{
+            .path = "bin.dat",
+            .hash = @splat(0),
+            .group = .staged,
+            .kind = .binary,
+            .preview = "",
+        }),
+    );
+}
+
+test "approved list row truncates a long preview" {
+    var buf: [24]u8 = undefined;
+    const line = ApprovedList.formatLine(&buf, .{
+        .path = "a",
+        .hash = @splat(0),
+        .group = .unstaged,
+        .kind = .hunk,
+        .preview = "this preview is definitely too long for the buffer",
+    });
+    try std.testing.expectEqualStrings("a  Unstaged  this previe", line);
 }
 
 test "draft begin on file header" {
