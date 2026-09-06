@@ -494,6 +494,7 @@ pub fn hide(
                 .new_count = h.new_count,
                 .section = h.section,
                 .group = f.group,
+                .can_grow = h.can_grow,
             } });
             for (h.lines) |ln| {
                 try rows.append(alloc, .{ .line = .{

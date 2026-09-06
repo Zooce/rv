@@ -40,6 +40,14 @@
 //! `File.group` is the local-load bucket (unstaged / untracked / staged).
 //! `parse` leaves it `null`. `parsePieces` sets it per piece. Range diffs
 //! stay untagged.
+//!
+//! ## Expand
+//!
+//! `Diff.expandHunk` widens one hunk by `expand_amount` context lines on each
+//! side, using caller-supplied file text for the surviving side (new path
+//! when present, else old). Neighbors in that file that the new window meets
+//! or overlaps merge into one hunk. Expansion lives in the in-memory `Diff`
+//! until the caller reloads.
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
@@ -85,6 +93,8 @@ pub const Hunk = struct {
     /// Stable 0-based index among **all** hunks in the parent `Diff`
     /// (navigation later: next/prev hunk).
     index: usize = 0,
+    /// False after expand has reached both file bounds (the `e` hint hides).
+    can_grow: bool = true,
 };
 
 /// Local default-load bucket. `null` on raw `parse` and range diffs.
@@ -102,7 +112,7 @@ pub const File = struct {
     /// Path from `+++` / `rename to` / `diff --git` new side.
     /// `null` when the file was deleted (`/dev/null` new side).
     new_path: ?[]const u8 = null,
-    hunks: []const Hunk = &.{},
+    hunks: []Hunk = &.{},
     /// True when the section looked binary. Still listed so callers can show
     /// a placeholder even when there are no textual hunks.
     is_binary: bool = false,
@@ -120,7 +130,7 @@ pub const File = struct {
 /// Parsed unified diff. Owns all nested data via an arena.
 pub const Diff = struct {
     arena: ArenaAllocator,
-    files: []const File = &.{},
+    files: []File = &.{},
     /// Total number of hunks across all files (same as max `Hunk.index` + 1).
     hunk_count: usize = 0,
 
@@ -129,7 +139,283 @@ pub const Diff = struct {
         self.arena.deinit();
         self.* = undefined;
     }
+
+    /// Grow hunk `hunk_i` of `file_i` by `expand_amount` context lines above
+    /// and below. `file_text` is the surviving side and is copied into the
+    /// arena; the slice is not retained. Repeatable. No-op on a binary file,
+    /// a missing hunk, or when the hunk already sits at both file bounds.
+    pub fn expandHunk(
+        self: *Diff,
+        file_i: usize,
+        hunk_i: usize,
+        file_text: []const u8,
+    ) Allocator.Error!ExpandResult {
+        // No file, no textual hunk, or a binary placeholder: nothing to grow.
+        if (file_i >= self.files.len) return .noop;
+        const file = &self.files[file_i];
+        if (file.is_binary or hunk_i >= file.hunks.len) return .noop;
+
+        // Surviving side is the new file when it exists, else the old file.
+        const alloc = self.arena.allocator();
+        const file_lines = try splitLines(alloc, file_text);
+        const file_n: u32 = std.math.cast(u32, file_lines.len) orelse std.math.maxInt(u32);
+        const side: ExpandSide = if (file.new_path != null) .new else .old;
+
+        const cur = file.hunks[hunk_i];
+        const start = hunkSideStart(cur, side);
+        const end = hunkSideEnd(cur, side);
+        const other_start = hunkSideStart(cur, if (side == .new) .old else .new);
+
+        // Grow by `expand_amount` on each side, clamped to the file and so
+        // the other side's line numbers stay at least 1 when that side exists.
+        const room = growSides(start, end, other_start, file_n);
+        if (room.up == 0 and room.down == 0) {
+            file.hunks[hunk_i].can_grow = false;
+            return .noop;
+        }
+        const up = room.up;
+        const down = room.down;
+
+        const want_start = start - up;
+        const want_end = end + down;
+
+        // Neighbors in this file whose range meets or overlaps that window.
+        var first = hunk_i;
+        var last = hunk_i;
+        for (file.hunks, 0..) |h, i| {
+            const hs = hunkSideStart(h, side);
+            const he = hunkSideEnd(h, side);
+            if (he == 0 and hs == 0) continue;
+            if (want_start <= he +| 1 and hs <= want_end +| 1) {
+                first = @min(first, i);
+                last = @max(last, i);
+            }
+        }
+
+        // Result span is the window unioned with every included hunk.
+        const lo = file.hunks[first];
+        const hi = file.hunks[last];
+        const result_start = @min(want_start, hunkSideStart(lo, side));
+        const result_end = @max(want_end, hunkSideEnd(hi, side));
+
+        // Prefix context, each included hunk (gap-filled), then suffix context.
+        var lines: std.ArrayList(Line) = .empty;
+        const lo_start = hunkSideStart(lo, side);
+        if (result_start > 0 and result_start < lo_start) {
+            try appendContextLines(
+                alloc,
+                &lines,
+                file_lines,
+                result_start,
+                lo_start - 1,
+                side,
+                lo.old_start,
+                lo.new_start,
+            );
+        }
+        try lines.appendSlice(alloc, lo.lines);
+        var prev = lo;
+        var i = first + 1;
+        while (i <= last) : (i += 1) {
+            const h = file.hunks[i];
+            const gap_from = hunkSideEnd(prev, side) +| 1;
+            const gap_to = hunkSideStart(h, side);
+            if (gap_to > 0 and gap_from > 0 and gap_from < gap_to) {
+                try appendContextLines(
+                    alloc,
+                    &lines,
+                    file_lines,
+                    gap_from,
+                    gap_to - 1,
+                    side,
+                    hunkSideEnd(prev, .old),
+                    hunkSideEnd(prev, .new),
+                );
+            }
+            try lines.appendSlice(alloc, h.lines);
+            prev = h;
+        }
+        const prev_end = hunkSideEnd(prev, side);
+        if (prev_end > 0 and result_end > prev_end) {
+            try appendContextLines(
+                alloc,
+                &lines,
+                file_lines,
+                prev_end + 1,
+                result_end,
+                side,
+                hunkSideEnd(prev, .old),
+                hunkSideEnd(prev, .new),
+            );
+        }
+
+        // @@ starts follow the result span; counts are retallied from the lines.
+        const counts = lineCounts(lines.items);
+        const old_start: u32 = switch (side) {
+            .old => result_start,
+            .new => pairLine(result_start, lo.new_start, lo.old_start) orelse lo.old_start,
+        };
+        const new_start: u32 = switch (side) {
+            .new => result_start,
+            .old => pairLine(result_start, lo.old_start, lo.new_start) orelse lo.new_start,
+        };
+        const other_after = if (side == .new) old_start else new_start;
+        const after = growSides(result_start, result_end, other_after, file_n);
+        const merged: Hunk = .{
+            .old_start = old_start,
+            .old_count = counts.old,
+            .new_start = new_start,
+            .new_count = counts.new,
+            .section = lo.section,
+            .lines = try lines.toOwnedSlice(alloc),
+            .index = lo.index,
+            .can_grow = after.up > 0 or after.down > 0,
+        };
+
+        // Replace the included hunks with the one merged hunk; reindex globally.
+        const new_len = file.hunks.len - (last - first);
+        const new_hunks = try alloc.alloc(Hunk, new_len);
+        var out_i: usize = 0;
+        for (file.hunks, 0..) |h, hi_i| {
+            if (hi_i < first or hi_i > last) {
+                new_hunks[out_i] = h;
+                out_i += 1;
+            } else if (hi_i == first) {
+                new_hunks[out_i] = merged;
+                out_i += 1;
+            }
+        }
+        file.hunks = new_hunks;
+        self.reindex();
+        return .expanded;
+    }
+
+    fn reindex(self: *Diff) void {
+        var n: usize = 0;
+        for (self.files) |*f| {
+            for (f.hunks) |*h| {
+                h.index = n;
+                n += 1;
+            }
+        }
+        self.hunk_count = n;
+    }
 };
+
+/// How many context lines `Diff.expandHunk` adds on each side per call.
+pub const expand_amount: u32 = 8;
+
+pub const ExpandResult = enum { expanded, noop };
+
+const ExpandSide = enum { old, new };
+
+fn growSides(start: u32, end: u32, other_start: u32, file_n: u32) struct { up: u32, down: u32 } {
+    var up: u32 = 0;
+    if (start > 1) {
+        up = @min(expand_amount, start - 1);
+        if (other_start > 1) {
+            up = @min(up, other_start - 1);
+        } else if (other_start != 0) {
+            up = 0;
+        }
+    }
+    var down: u32 = 0;
+    if (end > 0 and end < file_n) {
+        down = @min(expand_amount, file_n - end);
+    }
+    return .{ .up = up, .down = down };
+}
+
+fn hunkSideStart(h: Hunk, side: ExpandSide) u32 {
+    return switch (side) {
+        .old => h.old_start,
+        .new => h.new_start,
+    };
+}
+
+fn hunkSideCount(h: Hunk, side: ExpandSide) u32 {
+    const c = switch (side) {
+        .old => h.old_count,
+        .new => h.new_count,
+    };
+    return c orelse 1;
+}
+
+fn hunkSideEnd(h: Hunk, side: ExpandSide) u32 {
+    const count = hunkSideCount(h, side);
+    if (count == 0) return 0;
+    return hunkSideStart(h, side) + count - 1;
+}
+
+fn pairLine(n: u32, n_ref: u32, other_ref: u32) ?u32 {
+    if (n == 0 or n_ref == 0 or other_ref == 0) return null;
+    if (n >= n_ref) return other_ref + (n - n_ref);
+    const back = n_ref - n;
+    if (other_ref <= back) return null;
+    return other_ref - back;
+}
+
+fn lineCounts(lines: []const Line) struct { old: u32, new: u32 } {
+    var old: u32 = 0;
+    var new: u32 = 0;
+    for (lines) |ln| {
+        switch (ln.kind) {
+            .context => {
+                if (ln.old_no != null) old += 1;
+                if (ln.new_no != null) new += 1;
+            },
+            .delete => old += 1,
+            .add => new += 1,
+            .meta => {},
+        }
+    }
+    return .{ .old = old, .new = new };
+}
+
+fn splitLines(alloc: Allocator, text: []const u8) Allocator.Error![][]const u8 {
+    if (text.len == 0) {
+        const empty: [][]const u8 = &.{};
+        return empty;
+    }
+    var lines: std.ArrayList([]const u8) = .empty;
+    var it = std.mem.splitScalar(u8, text, '\n');
+    while (it.next()) |raw| {
+        try lines.append(alloc, stripCr(raw));
+    }
+    if (lines.items.len > 0 and text[text.len - 1] == '\n') {
+        _ = lines.pop();
+    }
+    return try lines.toOwnedSlice(alloc);
+}
+
+fn appendContextLines(
+    alloc: Allocator,
+    out: *std.ArrayList(Line),
+    file_lines: []const []const u8,
+    from: u32,
+    to: u32,
+    side: ExpandSide,
+    old_ref: u32,
+    new_ref: u32,
+) Allocator.Error!void {
+    if (from == 0 or to == 0 or from > to) return;
+    var n = from;
+    while (n <= to) : (n += 1) {
+        if (n - 1 >= file_lines.len) break;
+        try out.append(alloc, .{
+            .kind = .context,
+            .text = try alloc.dupe(u8, file_lines[n - 1]),
+            .old_no = switch (side) {
+                .old => n,
+                .new => pairLine(n, new_ref, old_ref),
+            },
+            .new_no = switch (side) {
+                .new => n,
+                .old => pairLine(n, old_ref, new_ref),
+            },
+        });
+    }
+}
 
 pub const ParseError = error{
     /// Hunk header started with `@@` but could not be parsed.
@@ -1025,4 +1311,106 @@ test "CRLF line endings" {
     });
     try expectLine(h.lines[0], .{ .kind = .delete, .text = "old", .old_no = 1, .new_no = null });
     try expectLine(h.lines[1], .{ .kind = .add, .text = "new", .old_no = null, .new_no = 1 });
+}
+
+test "expandHunk grows context and merges a nearby hunk" {
+    // Two git -U3 hunks in a 20-line file. Each @@ is "old start,count + new
+    // start,count"; space = context, - = old only, + = new only. Hunk 1 is
+    // lines 2–8, hunk 2 is 13–19, four-line gap (9–12). One expand (8/side)
+    // fills the gap and merges; add/delete lines stay put.
+    const fixture =
+        \\diff --git a/f.txt b/f.txt
+        \\--- a/f.txt
+        \\+++ b/f.txt
+        \\@@ -2,7 +2,7 @@
+        \\ bravo
+        \\ charlie
+        \\ delta
+        \\-EPSILON_OLD
+        \\+EPSILON_NEW
+        \\ foxtrot
+        \\ golf
+        \\ hotel
+        \\@@ -13,7 +13,7 @@
+        \\ mike
+        \\ november
+        \\ oscar
+        \\-PAPA_OLD
+        \\+PAPA_NEW
+        \\ quebec
+        \\ romeo
+        \\ sierra
+    ;
+    const new_file =
+        \\alpha
+        \\bravo
+        \\charlie
+        \\delta
+        \\EPSILON_NEW
+        \\foxtrot
+        \\golf
+        \\hotel
+        \\india
+        \\juliet
+        \\kilo
+        \\lima
+        \\mike
+        \\november
+        \\oscar
+        \\PAPA_NEW
+        \\quebec
+        \\romeo
+        \\sierra
+        \\tango
+        \\
+    ;
+
+    var d = try parse(testing.allocator, fixture);
+    defer d.deinit();
+
+    try testing.expectEqual(2, d.hunk_count);
+    try testing.expectEqual(.expanded, try d.expandHunk(0, 0, new_file));
+    try testing.expectEqual(1, d.hunk_count);
+    try testing.expectEqual(1, d.files[0].hunks.len);
+
+    // Merged hunk: line 1 through 19, both edits intact, gap now context.
+    const h = d.files[0].hunks[0];
+    try expectHunkMeta(h, .{
+        .index = 0,
+        .old_start = 1,
+        .old_count = 19,
+        .new_start = 1,
+        .new_count = 19,
+        .section = "",
+        .line_count = 21,
+    });
+    try expectLine(h.lines[0], .{ .kind = .context, .text = "alpha", .old_no = 1, .new_no = 1 });
+    try expectLine(h.lines[4], .{ .kind = .delete, .text = "EPSILON_OLD", .old_no = 5, .new_no = null });
+    try expectLine(h.lines[5], .{ .kind = .add, .text = "EPSILON_NEW", .old_no = null, .new_no = 5 });
+    try expectLine(h.lines[9], .{ .kind = .context, .text = "india", .old_no = 9, .new_no = 9 });
+    try expectLine(h.lines[16], .{ .kind = .delete, .text = "PAPA_OLD", .old_no = 16, .new_no = null });
+    try expectLine(h.lines[17], .{ .kind = .add, .text = "PAPA_NEW", .old_no = null, .new_no = 16 });
+    try expectLine(h.lines[20], .{ .kind = .context, .text = "sierra", .old_no = 19, .new_no = 19 });
+    try testing.expect(h.can_grow);
+
+    // Second expand takes the last file line; a third is already at the edge.
+    try testing.expectEqual(.expanded, try d.expandHunk(0, 0, new_file));
+    try expectHunkMeta(d.files[0].hunks[0], .{
+        .index = 0,
+        .old_start = 1,
+        .old_count = 20,
+        .new_start = 1,
+        .new_count = 20,
+        .section = "",
+        .line_count = 22,
+    });
+    try expectLine(d.files[0].hunks[0].lines[21], .{
+        .kind = .context,
+        .text = "tango",
+        .old_no = 20,
+        .new_no = 20,
+    });
+    try testing.expect(!d.files[0].hunks[0].can_grow);
+    try testing.expectEqual(.noop, try d.expandHunk(0, 0, new_file));
+    try testing.expect(!d.files[0].hunks[0].can_grow);
 }

@@ -109,6 +109,7 @@ Not a multi-user code-review platform. Not a GitHub replacement. A **personal re
 | `I` / `C` | Create or edit the comment on **old** (left pane in side-by-side, or the current `-` / context line in unified). Missing side does nothing. |
 | `d` | Dismiss the comment on **new** (right) at the cursor. Gone from the board; no confirm. |
 | `D` | Dismiss the comment on **old** (left). Missing side or no comment there: footer note; does not take the other pane. |
+| `e` | **Expand** the current hunk by 8 lines of context above and below (repeatable, clamped to the file). Neighbor hunks in the same file and git group merge when they meet. Far-right hint `Expand (e)` on a hunk that can still grow. No-op on a file header, section, binary / hunk-less file, empty list, or when both edges already sit at the file. Not bound while commenting, searching, or in a list/help overlay. Reload (`r`) restores git’s default context. |
 | `r` | **Reload** the loaded diff from the same source (re-runs the startup git load). Comments in `.rv` stay. Failed reload keeps the previous view and shows a footer error. Not bound while typing a comment (or in search / a list overlay). |
 | (later) | Page/half-page scroll, more leader maps — same vocabulary |
 

@@ -735,7 +735,7 @@ test "path-only comments stay path-only on remap" {
 }
 
 test "matches this group's hunk lines" {
-    const hunks = [_]diff.Hunk{
+    var hunks = [_]diff.Hunk{
         .{ .old_start = 10, .old_count = 3, .new_start = 12, .new_count = 4 },
         .{ .old_start = 40, .old_count = 2, .new_start = 50, .new_count = 2 },
     };

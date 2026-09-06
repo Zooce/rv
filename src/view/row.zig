@@ -28,6 +28,7 @@ pub const Row = union(enum) {
         new_count: ?u32,
         section: []const u8,
         group: ?diff.Group = null,
+        can_grow: bool = true,
     },
     line: struct {
         kind: diff.LineKind,
@@ -81,6 +82,7 @@ pub fn flatten(alloc: Allocator, d: *const diff.Diff) Allocator.Error![]Row {
                 .new_count = h.new_count,
                 .section = h.section,
                 .group = f.group,
+                .can_grow = h.can_grow,
             } });
             for (h.lines) |ln| {
                 try rows.append(alloc, .{ .line = .{

@@ -9,7 +9,7 @@
 //! file git (local), `a`/`A` approve hunk/file (local),
 //! `i`/`c`/`Enter`
 //! create or edit new, `I`/`C` old, `d` dismiss new, `D` dismiss old,
-//! `r` reload the loaded diff, `q` quit).
+//! `e` expand the current hunk's context, `r` reload the loaded diff, `q` quit).
 //! Diff layout defaults to side-by-side when the terminal is wide enough;
 //! falls back to unified when narrow. `t` toggles session preference
 //! (explicit unified stays unified even when wide). `#` toggles line numbers
@@ -57,7 +57,11 @@
 //! header; no-op on a section). No confirm. Range loads ignore `a`/`A`.
 //! Git failure opens a centered overlay with git’s error; Enter or Esc
 //! dismisses. The list is unchanged. Local load paints git and approve
-//! chords on the current file and hunk rows (no hints on a range load).
+//! chords on the current file and hunk rows (no git/approve hints on a range
+//! load). `e` expands the current hunk’s context (local and range); a hunk
+//! that can still grow shows Expand (e) on the hunk header. Not bound while
+//! commenting, searching, or in a list/help overlay. `r` restores git’s
+//! default context.
 //!
 //! Comment list: `Space` then `c` opens a centered overlay of live comments
 //! (same store as `rv list`). `j`/`k` move; Enter jumps with the same landing
@@ -480,6 +484,15 @@ fn runTui(alloc: std.mem.Allocator, io: std.Io, source: cli.Source) !u8 {
                                     try jumpLiveComment(&review, &diff_view, alloc, io, source, &viewport.cursor, &frame.note, .prev);
                                 } else if (c == 'r') {
                                     reloadDiff(alloc, io, source, &diff_view, &viewport.cursor, &frame.note);
+                                } else if (c == 'e') {
+                                    try expandCurrentHunk(
+                                        alloc,
+                                        io,
+                                        source,
+                                        &diff_view,
+                                        &viewport.cursor,
+                                        &frame.note,
+                                    );
                                 } else if (c == 'i' or c == 'c') {
                                     if (try draft.begin(&review, alloc, diff_view.rows, diff_view.sbs_slots, layout, viewport.cursor, .new)) {
                                         focus = .commenting;
@@ -673,6 +686,95 @@ fn reloadDiff(
     diff_view.deinit(alloc);
     diff_view.* = loaded;
     cursor.* = new_cursor;
+}
+
+/// Grow the hunk under the cursor by `diff.expand_amount` context lines per
+/// side. No-op on a section, file header, binary / hunk-less file, empty
+/// list, or when the hunk already sits at both file bounds. Rebuilds the
+/// flatten from the in-memory `Diff` (does not re-run `git diff`).
+fn expandCurrentHunk(
+    alloc: std.mem.Allocator,
+    io: std.Io,
+    source: cli.Source,
+    diff_view: *DiffView,
+    cursor: *usize,
+    note: *StatusNote,
+) std.mem.Allocator.Error!void {
+    const rows = diff_view.rows;
+    const cur = view.row.clampCursor(cursor.*, rows.len);
+    const target = git.expandTargetAt(&diff_view.diff, rows, cur) orelse return;
+
+    // Snapshot the current line/hunk so we can land after the flatten grows.
+    const mark = view.nav.cursorMarkAt(rows, cur);
+    const fi_row = view.nav.currentFileStart(rows, cur) orelse return;
+    const fh = rows[fi_row].file_header;
+    const hunk_row = view.nav.currentHunkInFile(rows, cur) orelse return;
+    const hh = rows[hunk_row].hunk_header;
+
+    const range: ?[]const u8 = switch (source) {
+        .local => null,
+        .range => |r| r,
+    };
+    const file = &diff_view.diff.files[target.file_i];
+    const text = git.survivingFileText(alloc, io, .inherit, file, range) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => {
+            note.set(git.errorMessage(err));
+            return;
+        },
+    };
+    defer alloc.free(text);
+
+    switch (try diff_view.diff.expandHunk(target.file_i, target.hunk_i, text)) {
+        .noop => return,
+        .expanded => {},
+    }
+
+    // Rebuild rows from the expanded Diff; do not reload git.
+    const vis = flattenSource(alloc, io, source, &diff_view.diff) catch |err| {
+        note.set(approvedLoadMessage(err));
+        return;
+    };
+    diff_view.replaceRows(alloc, vis.rows, vis.approved_n) catch {
+        alloc.free(vis.rows);
+        note.set("out of memory");
+        return;
+    };
+    cursor.* = restoreExpandCursor(diff_view.rows, mark, fh.path, fh.group, hh.old_start, hh.new_start);
+}
+
+fn restoreExpandCursor(
+    rows: []const view.row.Row,
+    mark: ?view.nav.CursorMark,
+    path: []const u8,
+    group: ?diff.Group,
+    old_start: u32,
+    new_start: u32,
+) usize {
+    if (mark) |m| {
+        if (m.line != null) return view.nav.restoreCursor(rows, m);
+    }
+    var found: ?usize = null;
+    for (rows, 0..) |row, i| {
+        switch (row) {
+            .file_header => |fh| {
+                if (!std.mem.eql(u8, fh.path, path) or fh.group != group) continue;
+                var j = i + 1;
+                while (j < rows.len) : (j += 1) {
+                    switch (rows[j]) {
+                        .hunk_header => |hh| {
+                            if (hh.old_start <= old_start and hh.new_start <= new_start) found = j;
+                        },
+                        .file_header, .section_header => break,
+                        .line => {},
+                    }
+                }
+                if (found) |idx| return idx;
+            },
+            else => {},
+        }
+    }
+    return if (mark) |m| view.nav.restoreCursor(rows, m) else 0;
 }
 
 /// Approve the hunk (`whole_file == false`, requires a hunk) or the remaining

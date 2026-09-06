@@ -60,6 +60,13 @@
 //! or group to mutate. Neighbor marks restore the cursor after that span is
 //! gone. Rows answer structure and geometry; these types are not a view API.
 //!
+//! ## Expand
+//!
+//! `expandTargetAt` maps a flatten cursor to a file+hunk in the loaded `Diff`
+//! (local or range). `survivingFileText` is the bytes `Diff.expandHunk` needs:
+//! worktree for unstaged/untracked, index blob for staged, new-side blob for
+//! a range load; deleted files use the old side. Does not re-run `git diff`.
+//!
 //! `applyAtCursor` / `applyGroupAtCursor` run `mutate`, reload the local diff
 //! (hiding approved hunks), restore the cursor, and call comment remap (and
 //! discard comment delete).
@@ -136,6 +143,118 @@ pub fn loadRangeDiff(alloc: Allocator, io: Io, cwd: std.process.Child.Cwd, range
     const out = try git(alloc, io, cwd, .{ .argv = &.{ "git", "diff", "--find-renames", range } });
     defer alloc.free(out);
     return try diff.parse(alloc, out);
+}
+
+/// Surviving-side file bytes for expand. Caller frees.
+///
+/// Local: worktree for unstaged/untracked, `git show :path` for staged.
+/// Deleted unstaged reads the index; deleted staged reads `HEAD`.
+/// Range: new-side blob (`git show <rev>:path`), or worktree when the range
+/// is a single rev (`git diff <rev>` is vs the worktree). Deleted: old side.
+pub fn survivingFileText(
+    alloc: Allocator,
+    io: Io,
+    cwd: std.process.Child.Cwd,
+    file: *const diff.File,
+    range: ?[]const u8,
+) Error![]u8 {
+    if (range) |r| return rangeFileText(alloc, io, cwd, file, r);
+
+    // New path: worktree (unstaged/untracked) or index (staged).
+    if (file.new_path) |path| {
+        return switch (file.group orelse .unstaged) {
+            .unstaged, .untracked => readWorktreeFile(alloc, io, cwd, path),
+            .staged => gitShowPath(alloc, io, cwd, ":", path),
+        };
+    }
+    // Deleted: index still has the unstaged file; staged delete is HEAD.
+    const path = file.old_path orelse return error.GitFailed;
+    return switch (file.group orelse .unstaged) {
+        .unstaged => gitShowPath(alloc, io, cwd, ":", path),
+        .staged => gitShowPath(alloc, io, cwd, "HEAD", path),
+        .untracked => error.GitFailed,
+    };
+}
+
+fn rangeFileText(
+    alloc: Allocator,
+    io: Io,
+    cwd: std.process.Child.Cwd,
+    file: *const diff.File,
+    range: []const u8,
+) Error![]u8 {
+    const three = std.mem.indexOf(u8, range, "...");
+    const two = if (three == null) std.mem.indexOf(u8, range, "..") else null;
+    const dotted = three != null or two != null;
+
+    // New side of A..B / A...B is the right rev; a single rev is vs worktree.
+    if (file.new_path) |path| {
+        if (dotted) return gitShowPath(alloc, io, cwd, rangeRightRev(range), path);
+        return readWorktreeFile(alloc, io, cwd, path);
+    }
+    const path = file.old_path orelse return error.GitFailed;
+    if (three) |i| {
+        const left = if (range[0..i].len == 0) "HEAD" else range[0..i];
+        const right = rangeRightRev(range);
+        const mb = try git(alloc, io, cwd, .{ .argv = &.{ "git", "merge-base", left, right } });
+        defer alloc.free(mb);
+        return gitShowPath(alloc, io, cwd, std.mem.trim(u8, mb, " \t\r\n"), path);
+    }
+    if (two) |i| {
+        const left = if (range[0..i].len == 0) "HEAD" else range[0..i];
+        return gitShowPath(alloc, io, cwd, left, path);
+    }
+    return gitShowPath(alloc, io, cwd, range, path);
+}
+
+fn rangeRightRev(range: []const u8) []const u8 {
+    if (std.mem.indexOf(u8, range, "...")) |i| {
+        const rest = range[i + 3 ..];
+        return if (rest.len == 0) "HEAD" else rest;
+    }
+    if (std.mem.indexOf(u8, range, "..")) |i| {
+        const rest = range[i + 2 ..];
+        return if (rest.len == 0) "HEAD" else rest;
+    }
+    return range;
+}
+
+fn gitShowPath(
+    alloc: Allocator,
+    io: Io,
+    cwd: std.process.Child.Cwd,
+    rev: []const u8,
+    path: []const u8,
+) Error![]u8 {
+    const spec = if (std.mem.eql(u8, rev, ":"))
+        try std.fmt.allocPrint(alloc, ":{s}", .{path})
+    else
+        try std.fmt.allocPrint(alloc, "{s}:{s}", .{ rev, path });
+    defer alloc.free(spec);
+    return git(alloc, io, cwd, .{ .argv = &.{ "git", "show", spec } });
+}
+
+fn readWorktreeFile(
+    alloc: Allocator,
+    io: Io,
+    cwd: std.process.Child.Cwd,
+    path: []const u8,
+) Error![]u8 {
+    const limit: Io.Limit = .limited(8 * 1024 * 1024);
+    switch (cwd) {
+        .inherit => {
+            const dir: Io.Dir = .cwd();
+            return dir.readFileAlloc(io, path, alloc, limit) catch return error.GitFailed;
+        },
+        .path => |p| {
+            const dir = Io.Dir.openDirAbsolute(io, p, .{}) catch return error.GitFailed;
+            defer dir.close(io);
+            return dir.readFileAlloc(io, path, alloc, limit) catch return error.GitFailed;
+        },
+        .dir => |dir| {
+            return dir.readFileAlloc(io, path, alloc, limit) catch return error.GitFailed;
+        },
+    }
 }
 
 pub const Action = enum { stage, unstage, discard };
@@ -250,6 +369,31 @@ pub fn indexTargetAt(rows: []const view.row.Row, cursor: usize, whole_file: bool
         .first = hi,
         .last = rowSpanLast(rows, hi, false),
     };
+}
+
+/// File and hunk in `d` under `cursor`. `null` on empty lists, sections,
+/// file headers, binary files, and hunk-less files. Works for local and range.
+pub const ExpandTarget = struct {
+    file_i: usize,
+    hunk_i: usize,
+};
+
+pub fn expandTargetAt(d: *const diff.Diff, rows: []const view.row.Row, cursor: usize) ?ExpandTarget {
+    if (rows.len == 0) return null;
+    const cur = view.row.clampCursor(cursor, rows.len);
+    if (rows[cur] == .section_header) return null;
+    const fi_row = view.nav.currentFileStart(rows, cur) orelse return null;
+    const fh = rows[fi_row].file_header;
+    if (fh.is_binary) return null;
+    const hunk_row = view.nav.currentHunkInFile(rows, cur) orelse return null;
+    const hunk_i = hunkIndexInFile(rows, fi_row, hunk_row);
+    for (d.files, 0..) |f, file_i| {
+        if (f.group != fh.group) continue;
+        if (!std.mem.eql(u8, f.displayPath(), fh.path)) continue;
+        if (hunk_i >= f.hunks.len) return null;
+        return .{ .file_i = file_i, .hunk_i = hunk_i };
+    }
+    return null;
 }
 
 /// Remaining change to land on after the target is removed from this load.
@@ -2051,4 +2195,66 @@ test "restoreGroupNeighbor dest section file fallback and gone" {
     const rows = try view.row.flatten(testing.allocator, &d);
     defer testing.allocator.free(rows);
     try testing.expectEqual(0, restoreGroupNeighbor(rows, .{ .section = .untracked }));
+}
+
+test "expandTargetAt hunk not file or section" {
+    var fix = try threeGroupRows(testing.allocator);
+    defer fix.d.deinit();
+    defer testing.allocator.free(fix.rows);
+    const rows = fix.rows;
+
+    try testing.expect(expandTargetAt(&fix.d, rows, 0) == null);
+    try testing.expect(expandTargetAt(&fix.d, rows, 1) == null);
+    const unstaged = expandTargetAt(&fix.d, rows, 3).?;
+    try testing.expectEqual(0, unstaged.file_i);
+    try testing.expectEqual(0, unstaged.hunk_i);
+    const staged = expandTargetAt(&fix.d, rows, 12).?;
+    try testing.expectEqual(2, staged.file_i);
+    try testing.expectEqual(0, staged.hunk_i);
+
+    var range_d = try diff.parse(testing.allocator,
+        \\diff --git a/f b/f
+        \\--- a/f
+        \\+++ b/f
+        \\@@ -1 +1 @@
+        \\-old
+        \\+new
+    );
+    defer range_d.deinit();
+    const range_rows = try view.row.flatten(testing.allocator, &range_d);
+    defer testing.allocator.free(range_rows);
+    try testing.expect(expandTargetAt(&range_d, range_rows, 0) == null);
+    const in_hunk = expandTargetAt(&range_d, range_rows, 2).?;
+    try testing.expectEqual(0, in_hunk.file_i);
+    try testing.expectEqual(0, in_hunk.hunk_i);
+}
+
+test "survivingFileText unstaged is worktree, staged is index" {
+    if (builtin.os.tag == .wasi) return error.SkipZigTest;
+
+    const io = testing.io;
+    const alloc = testing.allocator;
+    var tmp = try IsolatedTmp.init(alloc, io);
+    defer tmp.deinit(alloc, io);
+    const cwd = tmp.cwd();
+
+    try initTestRepo(alloc, io, cwd);
+    try tmp.write(io, "f.txt", "base\n");
+    try expectGitOk(alloc, io, cwd, &.{ "git", "add", "f.txt" });
+    try expectGitOk(alloc, io, cwd, &.{ "git", "commit", "-m", "init" });
+    try tmp.write(io, "f.txt", "staged body\n");
+    try expectGitOk(alloc, io, cwd, &.{ "git", "add", "f.txt" });
+    try tmp.write(io, "f.txt", "worktree body\n");
+
+    var d = try loadDefaultDiffCwd(alloc, io, cwd);
+    defer d.deinit();
+
+    const unstaged = try findFile(d, "f.txt", .unstaged);
+    const staged = try findFile(d, "f.txt", .staged);
+    const wt = try survivingFileText(alloc, io, cwd, &unstaged, null);
+    defer alloc.free(wt);
+    const idx = try survivingFileText(alloc, io, cwd, &staged, null);
+    defer alloc.free(idx);
+    try testing.expectEqualStrings("worktree body\n", wt);
+    try testing.expectEqualStrings("staged body\n", idx);
 }

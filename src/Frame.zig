@@ -274,6 +274,14 @@ pub fn paint(
         rows[si].section_header
     else
         null;
+    const expand_hunk: ?usize = if (focus == .normal and rows.len > 0)
+        view.nav.currentHunkInFile(rows, cur)
+    else
+        null;
+    const expand_ok = if (expand_hunk) |hi| switch (rows[hi]) {
+        .hunk_header => |hh| hh.can_grow,
+        else => false,
+    } else false;
     var hint_buf: [160]u8 = undefined;
 
     switch (layout) {
@@ -286,7 +294,7 @@ pub fn paint(
                     const text = formatRow(&line_buf, rows[fi], rowMarked(rows[fi], review));
                     const st = if (fi == cur) pal.file_cur else pal.file;
                     fillRow(scr, screen_y, st);
-                    putRowHint(scr, screen_y, text, headerHint(&hint_buf, fi, hint_file, hint_hunk, hint_section, hint_group), st);
+                    putRowHint(scr, screen_y, text, headerHint(&hint_buf, fi, hint_file, hint_hunk, hint_section, hint_group, expand_hunk, expand_ok), st);
                     screen_y += 1;
                 }
             }
@@ -317,7 +325,7 @@ pub fn paint(
                     ),
                     else => {
                         const text = formatRow(&line_buf, rows[i], marked);
-                        putRowHint(scr, screen_y, text, headerHint(&hint_buf, i, hint_file, hint_hunk, hint_section, hint_group), st);
+                        putRowHint(scr, screen_y, text, headerHint(&hint_buf, i, hint_file, hint_hunk, hint_section, hint_group, expand_hunk, expand_ok), st);
                     },
                 }
                 screen_y += 1;
@@ -332,7 +340,7 @@ pub fn paint(
                     const text = formatRow(&line_buf, rows[fi], rowMarked(rows[fi], review));
                     const st = if (fi == cur) pal.file_cur else pal.file;
                     fillRow(scr, screen_y, st);
-                    putRowHint(scr, screen_y, text, headerHint(&hint_buf, fi, hint_file, hint_hunk, hint_section, hint_group), st);
+                    putRowHint(scr, screen_y, text, headerHint(&hint_buf, fi, hint_file, hint_hunk, hint_section, hint_group, expand_hunk, expand_ok), st);
                     screen_y += 1;
                 }
             }
@@ -349,7 +357,7 @@ pub fn paint(
                         } else {
                             fillRow(scr, screen_y, st);
                         }
-                        putRowHint(scr, screen_y, text, headerHint(&hint_buf, ri, hint_file, hint_hunk, hint_section, hint_group), st);
+                        putRowHint(scr, screen_y, text, headerHint(&hint_buf, ri, hint_file, hint_hunk, hint_section, hint_group, expand_hunk, expand_ok), st);
                     },
                     .pair => |p| {
                         // Whole slot is current when the cursor sits on either pane
@@ -732,6 +740,14 @@ pub fn approveHintForRow(ri: usize, file_i: ?usize, hunk_i: ?usize, section_i: ?
     return "";
 }
 
+/// Expand label on the current hunk header when that hunk can still grow.
+/// Empty on other rows. Local and range.
+pub fn expandHintForRow(ri: usize, hunk_i: ?usize, can_grow: bool) []const u8 {
+    const hi = hunk_i orelse return "";
+    if (ri != hi or !can_grow) return "";
+    return "Expand (e)";
+}
+
 fn headerHint(
     buf: []u8,
     ri: usize,
@@ -739,12 +755,32 @@ fn headerHint(
     hunk_i: ?usize,
     section_i: ?usize,
     group: ?diff.Group,
+    expand_hunk_i: ?usize,
+    can_grow: bool,
 ) []const u8 {
     const git = indexHintForRow(ri, file_i, hunk_i, section_i, group);
     const approve = approveHintForRow(ri, file_i, hunk_i, section_i, group);
-    if (git.len == 0) return approve;
-    if (approve.len == 0) return git;
-    return std.fmt.bufPrint(buf, "{s}  {s}", .{ git, approve }) catch git;
+    const expand = expandHintForRow(ri, expand_hunk_i, can_grow);
+    var n: usize = 0;
+    var parts: [3][]const u8 = undefined;
+    if (git.len > 0) {
+        parts[n] = git;
+        n += 1;
+    }
+    if (approve.len > 0) {
+        parts[n] = approve;
+        n += 1;
+    }
+    if (expand.len > 0) {
+        parts[n] = expand;
+        n += 1;
+    }
+    if (n == 0) return "";
+    if (n == 1) return parts[0];
+    if (n == 2) {
+        return std.fmt.bufPrint(buf, "{s}  {s}", .{ parts[0], parts[1] }) catch parts[0];
+    }
+    return std.fmt.bufPrint(buf, "{s}  {s}  {s}", .{ parts[0], parts[1], parts[2] }) catch parts[0];
 }
 
 /// Path/header on the left; `hint` right-aligned with a one-column gap.
@@ -983,8 +1019,27 @@ test "headerHint joins git and approve" {
     const file_i: usize = 1;
     try testing.expectEqualStrings(
         "Stage File (gS)  Discard File (gD)  Approve File (A)",
-        headerHint(&buf, file_i, file_i, null, null, .unstaged),
+        headerHint(&buf, file_i, file_i, null, null, .unstaged, null, false),
     );
+}
+
+test "headerHint expand on hunk that can grow" {
+    var buf: [160]u8 = undefined;
+    try testing.expectEqualStrings(
+        "Stage Hunk (gs)  Discard Hunk (gd)  Approve Hunk (a)  Expand (e)",
+        headerHint(&buf, 2, 1, 2, null, .unstaged, 2, true),
+    );
+    try testing.expectEqualStrings(
+        "Expand (e)",
+        headerHint(&buf, 2, null, null, null, null, 2, true),
+    );
+    try testing.expectEqualStrings(
+        "Stage Hunk (gs)  Discard Hunk (gd)  Approve Hunk (a)",
+        headerHint(&buf, 2, 1, 2, null, .unstaged, 2, false),
+    );
+    try testing.expectEqualStrings("", expandHintForRow(1, 2, true));
+    try testing.expectEqualStrings("Expand (e)", expandHintForRow(2, 2, true));
+    try testing.expectEqualStrings("", expandHintForRow(2, 2, false));
 }
 
 test "indexHintForRow file hunk and sticky file" {
