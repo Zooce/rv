@@ -488,6 +488,7 @@ pub fn hide(
         for (f.hunks, keep_hunk) |h, keep| {
             if (!keep) continue;
             try rows.append(alloc, .{ .hunk_header = .{
+                .path = path,
                 .old_start = h.old_start,
                 .old_count = h.old_count,
                 .new_start = h.new_start,

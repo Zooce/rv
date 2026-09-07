@@ -11,6 +11,7 @@ pub const schema_version: u32 = 1;
 
 pub const State = enum { open, resolved };
 pub const Side = enum { old, new, context };
+pub const CommentKind = enum { file, hunk, line };
 
 pub const Comment = struct {
     id: []const u8,
@@ -41,19 +42,36 @@ pub const Review = struct {
         return n;
     }
 
-    /// First live comment in store order at this path matching the given line(s).
-    /// `firstAt(path, null, null)` matches only path-only (file) rows. A lookup
-    /// with any line number never hits a file comment.
-    pub fn firstAt(self: *const Review, path: []const u8, old_line: ?u32, new_line: ?u32) ?usize {
-        const want_file = old_line == null and new_line == null;
+    /// First live comment in store order at this path for `kind`.
+    /// `.file` matches only path-only rows. `.hunk` matches only both-starts
+    /// with `side` null. `.line` matches only line comments (never file or hunk).
+    pub fn firstAt(
+        self: *const Review,
+        path: []const u8,
+        old_line: ?u32,
+        new_line: ?u32,
+        kind: CommentKind,
+    ) ?usize {
         for (self.comments.items, 0..) |c, i| {
             if (c.state != .open) continue;
             if (!std.mem.eql(u8, c.path, path)) continue;
-            const file_comment = c.old_line == null and c.new_line == null;
-            if (want_file) {
-                if (file_comment) return i;
-            } else if (!file_comment) {
-                if (lineMatch(c.old_line, old_line) or lineMatch(c.new_line, new_line)) return i;
+            switch (kind) {
+                .file => {
+                    if (c.old_line == null and c.new_line == null) return i;
+                },
+                .hunk => {
+                    const want_old = old_line orelse continue;
+                    const want_new = new_line orelse continue;
+                    if (c.side != null) continue;
+                    const o = c.old_line orelse continue;
+                    const n = c.new_line orelse continue;
+                    if (o == want_old and n == want_new) return i;
+                },
+                .line => {
+                    if (c.old_line == null and c.new_line == null) continue;
+                    if (c.old_line != null and c.new_line != null and c.side == null) continue;
+                    if (lineMatch(c.old_line, old_line) or lineMatch(c.new_line, new_line)) return i;
+                },
             }
         }
         return null;
@@ -265,8 +283,8 @@ test "addOpen firstAt and roundtrip" {
     var r = try initEmpty(testing.allocator, default_review_id);
     defer r.deinit();
     try testing.expectEqualStrings("1", try r.addOpen("a.zig", null, 10, .new, "fix"));
-    try testing.expect(r.firstAt("a.zig", null, 10) != null);
-    try testing.expect(r.firstAt("a.zig", null, 11) == null);
+    try testing.expect(r.firstAt("a.zig", null, 10, .line) != null);
+    try testing.expect(r.firstAt("a.zig", null, 11, .line) == null);
     try testing.expectEqual(1, r.openCount());
     const bad =
         \\{"version":1,"id":"current","comments":[{"id":"1","path":"f","body":"x","state":"nope"}]}
@@ -349,13 +367,13 @@ test "firstAt store order and opposite side" {
     _ = try review.addOpen("f.zig", 10, null, .old, "old");
     _ = try review.addOpen("f.zig", null, 10, .new, "new second");
 
-    try testing.expectEqual(0, review.firstAt("f.zig", null, 10).?);
-    try testing.expectEqual(1, review.firstAt("f.zig", 10, null).?);
-    try testing.expect(review.firstAt("f.zig", null, 11) == null);
-    try testing.expect(review.firstAt("g.zig", null, 10) == null);
+    try testing.expectEqual(0, review.firstAt("f.zig", null, 10, .line).?);
+    try testing.expectEqual(1, review.firstAt("f.zig", 10, null, .line).?);
+    try testing.expect(review.firstAt("f.zig", null, 11, .line) == null);
+    try testing.expect(review.firstAt("g.zig", null, 10, .line) == null);
 
     try review.remove(&.{"1"});
-    try testing.expectEqual(1, review.firstAt("f.zig", null, 10).?);
+    try testing.expectEqual(1, review.firstAt("f.zig", null, 10, .line).?);
 }
 
 test "firstAt path-only is not a line" {
@@ -365,14 +383,33 @@ test "firstAt path-only is not a line" {
     _ = try review.addOpen("f.zig", null, 10, .new, "line");
     _ = try review.addOpen("f.zig", null, null, null, "file second");
 
-    try testing.expectEqual(0, review.firstAt("f.zig", null, null).?);
-    try testing.expectEqual(1, review.firstAt("f.zig", null, 10).?);
-    try testing.expect(review.firstAt("f.zig", 10, null) == null);
-    try testing.expect(review.firstAt("g.zig", null, null) == null);
+    try testing.expectEqual(0, review.firstAt("f.zig", null, null, .file).?);
+    try testing.expectEqual(1, review.firstAt("f.zig", null, 10, .line).?);
+    try testing.expect(review.firstAt("f.zig", 10, null, .line) == null);
+    try testing.expect(review.firstAt("g.zig", null, null, .file) == null);
 
     try review.remove(&.{"1"});
-    try testing.expectEqual(1, review.firstAt("f.zig", null, null).?);
-    try testing.expectEqual(0, review.firstAt("f.zig", null, 10).?);
+    try testing.expectEqual(1, review.firstAt("f.zig", null, null, .file).?);
+    try testing.expectEqual(0, review.firstAt("f.zig", null, 10, .line).?);
+}
+
+test "firstAt hunk is not a line" {
+    var review = try initEmpty(testing.allocator, default_review_id);
+    defer review.deinit();
+    _ = try review.addOpen("f.zig", null, null, null, "file");
+    _ = try review.addOpen("f.zig", 1, 1, null, "hunk");
+    _ = try review.addOpen("f.zig", 1, 1, .context, "line both");
+
+    try testing.expectEqual(0, review.firstAt("f.zig", null, null, .file).?);
+    try testing.expectEqual(1, review.firstAt("f.zig", 1, 1, .hunk).?);
+    try testing.expectEqual(2, review.firstAt("f.zig", 1, 1, .line).?);
+    try testing.expectEqual(2, review.firstAt("f.zig", null, 1, .line).?);
+    try testing.expect(review.firstAt("f.zig", null, 1, .hunk) == null);
+    try testing.expect(review.firstAt("g.zig", 1, 1, .hunk) == null);
+
+    try review.remove(&.{"2"});
+    try testing.expectEqual(1, review.firstAt("f.zig", 1, 1, .line).?);
+    try testing.expect(review.firstAt("f.zig", 1, 1, .hunk) == null);
 }
 
 test "setBody overwrites body only" {

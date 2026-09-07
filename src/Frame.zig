@@ -598,10 +598,11 @@ fn rowMarked(row: view.row.Row, review: *const store.Review) bool {
     return switch (row) {
         .line => |ln| switch (ln.kind) {
             .meta => false,
-            else => review.firstAt(ln.path, ln.old_no, ln.new_no) != null,
+            else => review.firstAt(ln.path, ln.old_no, ln.new_no, .line) != null,
         },
-        .file_header => |fh| review.firstAt(fh.path, null, null) != null,
-        else => false,
+        .file_header => |fh| review.firstAt(fh.path, null, null, .file) != null,
+        .hunk_header => |hh| review.firstAt(hh.path, hh.old_start, hh.new_start, .hunk) != null,
+        .section_header => false,
     };
 }
 
@@ -657,7 +658,8 @@ fn formatFooter(
 }
 
 /// Format one row. Line rows: 2-char gutter (`*` if marked else space, then
-/// pad/`\` for meta). File headers: `*` in the leading gutter when marked.
+/// pad/`\` for meta). File and hunk headers: the same 2-char gutter (`*` or
+/// space, then space) so the rest of the row does not shift when marked.
 /// Add/delete use background color, not `+/-` markers.
 pub fn formatRow(buf: []u8, row: view.row.Row, marked: bool) []const u8 {
     return switch (row) {
@@ -667,7 +669,7 @@ pub fn formatRow(buf: []u8, row: view.row.Row, marked: bool) []const u8 {
             .staged => "Staged",
         }}),
         .file_header => |fh| blk: {
-            const prefix: []const u8 = if (marked) "* " else " ";
+            const prefix: []const u8 = if (marked) "* " else "  ";
             var path_buf: [512]u8 = undefined;
             const path = view.row.fileHeaderPathLabel(fh, &path_buf);
             if (fh.is_binary)
@@ -675,15 +677,16 @@ pub fn formatRow(buf: []u8, row: view.row.Row, marked: bool) []const u8 {
             break :blk bufPrintTrunc(buf, "{s}{s}", .{ prefix, path });
         },
         .hunk_header => |hh| blk: {
+            const prefix: []const u8 = if (marked) "* " else "  ";
             const oc = hh.old_count orelse 1;
             const nc = hh.new_count orelse 1;
             if (hh.section.len > 0) {
-                break :blk bufPrintTrunc(buf, " @@ -{d},{d} +{d},{d} @@ {s}", .{
-                    hh.old_start, oc, hh.new_start, nc, hh.section,
+                break :blk bufPrintTrunc(buf, "{s}@@ -{d},{d} +{d},{d} @@ {s}", .{
+                    prefix, hh.old_start, oc, hh.new_start, nc, hh.section,
                 });
             }
-            break :blk bufPrintTrunc(buf, " @@ -{d},{d} +{d},{d} @@", .{
-                hh.old_start, oc, hh.new_start, nc,
+            break :blk bufPrintTrunc(buf, "{s}@@ -{d},{d} +{d},{d} @@", .{
+                prefix, hh.old_start, oc, hh.new_start, nc,
             });
         },
         .line => |ln| blk: {
@@ -851,10 +854,10 @@ const testing = std.testing;
 test "formatRow file header marked" {
     var buf: [64]u8 = undefined;
     const row: view.row.Row = .{ .file_header = .{ .path = "a.zig", .is_binary = false } };
-    try testing.expectEqualStrings(" a.zig", formatRow(&buf, row, false));
+    try testing.expectEqualStrings("  a.zig", formatRow(&buf, row, false));
     try testing.expectEqualStrings("* a.zig", formatRow(&buf, row, true));
     const bin: view.row.Row = .{ .file_header = .{ .path = "pic.png", .is_binary = true } };
-    try testing.expectEqualStrings(" pic.png  (binary)", formatRow(&buf, bin, false));
+    try testing.expectEqualStrings("  pic.png  (binary)", formatRow(&buf, bin, false));
     try testing.expectEqualStrings("* pic.png  (binary)", formatRow(&buf, bin, true));
 }
 
@@ -866,7 +869,7 @@ test "formatRow file header rename" {
         .old_path = "old_name.txt",
         .new_path = "new_name.txt",
     } };
-    try testing.expectEqualStrings(" old_name.txt -> new_name.txt", formatRow(&buf, renamed, false));
+    try testing.expectEqualStrings("  old_name.txt -> new_name.txt", formatRow(&buf, renamed, false));
     try testing.expectEqualStrings("* old_name.txt -> new_name.txt", formatRow(&buf, renamed, true));
     const bin_renamed: view.row.Row = .{ .file_header = .{
         .path = "new.png",
@@ -874,19 +877,19 @@ test "formatRow file header rename" {
         .old_path = "old.png",
         .new_path = "new.png",
     } };
-    try testing.expectEqualStrings(" old.png -> new.png  (binary)", formatRow(&buf, bin_renamed, false));
+    try testing.expectEqualStrings("  old.png -> new.png  (binary)", formatRow(&buf, bin_renamed, false));
     const added: view.row.Row = .{ .file_header = .{
         .path = "new.txt",
         .is_binary = false,
         .new_path = "new.txt",
     } };
-    try testing.expectEqualStrings(" new.txt", formatRow(&buf, added, false));
+    try testing.expectEqualStrings("  new.txt", formatRow(&buf, added, false));
     const deleted: view.row.Row = .{ .file_header = .{
         .path = "gone.txt",
         .is_binary = false,
         .old_path = "gone.txt",
     } };
-    try testing.expectEqualStrings(" gone.txt", formatRow(&buf, deleted, false));
+    try testing.expectEqualStrings("  gone.txt", formatRow(&buf, deleted, false));
 }
 
 test "rowMarked file header is not a line" {
@@ -908,6 +911,43 @@ test "rowMarked file header is not a line" {
     _ = try lines_only.addOpen("f", null, 1, .new, "line");
     try testing.expect(!rowMarked(fh, &lines_only));
     try testing.expect(rowMarked(line, &lines_only));
+}
+
+test "rowMarked hunk is not a line" {
+    var review = try store.initEmpty(testing.allocator, "t");
+    defer review.deinit();
+    _ = try review.addOpen("f", 1, 1, null, "hunk");
+    _ = try review.addOpen("f", null, 1, .new, "line");
+
+    const hunk: view.row.Row = .{ .hunk_header = .{
+        .path = "f",
+        .old_start = 1,
+        .old_count = 1,
+        .new_start = 1,
+        .new_count = 1,
+        .section = "",
+    } };
+    const other_hunk: view.row.Row = .{ .hunk_header = .{
+        .path = "f",
+        .old_start = 10,
+        .old_count = 1,
+        .new_start = 10,
+        .new_count = 1,
+        .section = "",
+    } };
+    const fh: view.row.Row = .{ .file_header = .{ .path = "f", .is_binary = false } };
+    const line: view.row.Row = .{ .line = .{ .kind = .add, .text = "x", .path = "f", .new_no = 1 } };
+    try testing.expect(rowMarked(hunk, &review));
+    try testing.expect(!rowMarked(other_hunk, &review));
+    try testing.expect(!rowMarked(fh, &review));
+    try testing.expect(rowMarked(line, &review));
+
+    var hunk_only = try store.initEmpty(testing.allocator, "t");
+    defer hunk_only.deinit();
+    _ = try hunk_only.addOpen("f", 1, 1, null, "hunk");
+    try testing.expect(rowMarked(hunk, &hunk_only));
+    try testing.expect(!rowMarked(line, &hunk_only));
+    try testing.expect(!rowMarked(fh, &hunk_only));
 }
 
 test "lineNumberWidth is max digits and at least 1" {
@@ -961,6 +1001,7 @@ test "formatBodyGutter unified sbs meta and off" {
         .path = "f",
     } };
     const hunk: view.row.Row = .{ .hunk_header = .{
+        .path = "f",
         .old_start = 1,
         .old_count = 1,
         .new_start = 1,
@@ -981,12 +1022,14 @@ test "formatBodyGutter unified sbs meta and off" {
     try testing.expectEqualStrings(" \\", formatBodyGutter(&buf, meta, false, 0, .unified));
     try testing.expectEqualStrings("", formatBodyGutter(&buf, hunk, false, 2, .unified));
     try testing.expectEqualStrings("  hello", formatRow(&buf, ctx, false));
-    try testing.expectEqualStrings(" @@ -1,1 +1,1 @@", formatRow(&buf, hunk, false));
+    try testing.expectEqualStrings("  @@ -1,1 +1,1 @@", formatRow(&buf, hunk, false));
+    try testing.expectEqualStrings("* @@ -1,1 +1,1 @@", formatRow(&buf, hunk, true));
 }
 
 test "hunkMaxLineWidth is text only" {
     const rows: []const view.row.Row = &.{
         .{ .hunk_header = .{
+            .path = "f",
             .old_start = 1,
             .old_count = 1,
             .new_start = 1,

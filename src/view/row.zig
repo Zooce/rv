@@ -22,6 +22,8 @@ pub const Row = union(enum) {
     section_header: diff.Group,
     file_header: FileHeader,
     hunk_header: struct {
+        /// Display path of the owning file (borrowed from `Diff`).
+        path: []const u8,
         old_start: u32,
         old_count: ?u32,
         new_start: u32,
@@ -76,6 +78,7 @@ pub fn flatten(alloc: Allocator, d: *const diff.Diff) Allocator.Error![]Row {
         } });
         for (f.hunks) |h| {
             try rows.append(alloc, .{ .hunk_header = .{
+                .path = f.displayPath(),
                 .old_start = h.old_start,
                 .old_count = h.old_count,
                 .new_start = h.new_start,
@@ -211,6 +214,7 @@ test "flatten file hunk and lines" {
     try testing.expectEqualStrings("f", rows[0].file_header.path);
     try testing.expect(rows[0].file_header.group == null);
     try testing.expect(rows[1] == .hunk_header);
+    try testing.expectEqualStrings("f", rows[1].hunk_header.path);
     try testing.expect(rows[1].hunk_header.group == null);
     try testing.expect(rows[2] == .line);
     try testing.expectEqual(diff.LineKind.delete, rows[2].line.kind);
@@ -269,9 +273,11 @@ test "flatten copies file group onto headers and hunks" {
     try testing.expect(rows[7] == .hunk_header);
     try testing.expectEqual(diff.Group.unstaged, rows[1].file_header.group.?);
     try testing.expectEqual(diff.Group.unstaged, rows[2].hunk_header.group.?);
+    try testing.expectEqualStrings("a", rows[2].hunk_header.path);
     try testing.expectEqualStrings("a", rows[1].file_header.path);
     try testing.expectEqual(diff.Group.staged, rows[6].file_header.group.?);
     try testing.expectEqual(diff.Group.staged, rows[7].hunk_header.group.?);
+    try testing.expectEqualStrings("a", rows[7].hunk_header.path);
     try testing.expectEqualStrings("a", rows[6].file_header.path);
 }
 

@@ -14,10 +14,11 @@ pub const nav = @import("nav.zig");
 pub const search = @import("search.zig");
 
 /// Comment target for `want` at `cursor`, or null if that side is missing.
-/// File header: path-only (both sides the same). Unified: current row.
-/// Side-by-side: slot left (`old`) / right (`new`); file-header and one-sided
-/// body slots use the row itself. Hunk and section headers are not commentable.
-/// Line anchors carry only the chosen side’s line number.
+/// File header: path-only (both sides the same). Hunk header: both starts,
+/// no side (old and new keys are the same). Unified: current row.
+/// Side-by-side: slot left (`old`) / right (`new`); file-header, hunk-header,
+/// and one-sided body slots use the row itself. Section headers are not
+/// commentable. Line anchors carry only the chosen side’s line number.
 pub fn commentAnchor(
     rows: []const row.Row,
     slots: []const layout.SbsSlot,
@@ -49,6 +50,11 @@ pub fn commentAnchor(
             .old_line = null,
             .new_line = null,
         },
+        .hunk_header => |hh| return .{
+            .path = hh.path,
+            .old_line = hh.old_start,
+            .new_line = hh.new_start,
+        },
         else => {},
     }
     const a = row.anchorAt(rows, src) orelse return null;
@@ -67,15 +73,29 @@ pub fn commentAnchor(
 }
 
 /// Path + optional side/line of a live comment. File comments have no side/line.
+/// Hunk comments have both starts and no side/line.
 pub const CommentLoc = struct {
     path: []const u8,
     side: ?row.CommentSide = null,
     line: ?u32 = null,
+    hunk: ?struct { old_start: u32, new_start: u32 } = null,
 };
 
 /// Unified row that holds `loc`, or null if that path/side/line is not in `rows`.
-/// Path-only loc lands on the file header.
+/// Path-only loc lands on the file header. Hunk loc lands on the hunk header.
 pub fn rowForComment(rows: []const row.Row, loc: CommentLoc) ?usize {
+    if (loc.hunk) |hunk| {
+        for (rows, 0..) |item, i| {
+            switch (item) {
+                .hunk_header => |hh| {
+                    if (!std.mem.eql(u8, hh.path, loc.path)) continue;
+                    if (hh.old_start == hunk.old_start and hh.new_start == hunk.new_start) return i;
+                },
+                else => {},
+            }
+        }
+        return null;
+    }
     if (loc.line == null) {
         for (rows, 0..) |item, i| {
             switch (item) {
@@ -222,8 +242,13 @@ test "commentAnchor unified add delete context header" {
     try testing.expectEqualStrings("f", file_old.path);
     try testing.expect(file_old.old_line == null);
     try testing.expect(file_old.new_line == null);
-    try testing.expect(commentAnchor(rows, empty, .unified, 1, .new) == null);
-    try testing.expect(commentAnchor(rows, empty, .unified, 1, .old) == null);
+    const hunk_new = commentAnchor(rows, empty, .unified, 1, .new).?;
+    try testing.expectEqualStrings("f", hunk_new.path);
+    try testing.expectEqual(1, hunk_new.old_line.?);
+    try testing.expectEqual(1, hunk_new.new_line.?);
+    const hunk_old = commentAnchor(rows, empty, .unified, 1, .old).?;
+    try testing.expectEqual(1, hunk_old.old_line.?);
+    try testing.expectEqual(1, hunk_old.new_line.?);
 
     const ctx_new = commentAnchor(rows, empty, .unified, 2, .new).?;
     try testing.expectEqualStrings("f", ctx_new.path);
@@ -271,8 +296,13 @@ test "commentAnchor side-by-side pair empty pane header" {
     try testing.expectEqualStrings("f", file_old.path);
     try testing.expect(file_old.old_line == null);
     try testing.expect(file_old.new_line == null);
-    try testing.expect(commentAnchor(rows, slots, .side_by_side, 1, .new) == null);
-    try testing.expect(commentAnchor(rows, slots, .side_by_side, 1, .old) == null);
+    const hunk_new = commentAnchor(rows, slots, .side_by_side, 1, .new).?;
+    try testing.expectEqualStrings("f", hunk_new.path);
+    try testing.expectEqual(1, hunk_new.old_line.?);
+    try testing.expectEqual(1, hunk_new.new_line.?);
+    const hunk_old = commentAnchor(rows, slots, .side_by_side, 1, .old).?;
+    try testing.expectEqual(1, hunk_old.old_line.?);
+    try testing.expectEqual(1, hunk_old.new_line.?);
 
     // Cursor on the delete (slot primary) or the add (same slot) → same sides.
     const from_del_new = commentAnchor(rows, slots, .side_by_side, 2, .new).?;
@@ -452,6 +482,39 @@ test "rowForComment path-only lands on file header" {
     try testing.expectEqual(0, rowForComment(rows, .{ .path = "f" }).?);
     try testing.expect(rowForComment(rows, .{ .path = "gone" }) == null);
     try testing.expectEqual(4, rowForComment(rows, .{ .path = "f", .side = .new, .line = 2 }).?);
+}
+
+test "rowForComment hunk lands on header not body" {
+    const fixture =
+        \\diff --git a/f b/f
+        \\--- a/f
+        \\+++ b/f
+        \\@@ -1,3 +1,3 @@
+        \\ keep
+        \\-old
+        \\+new
+        \\ tail
+    ;
+    var d = try diff.parse(testing.allocator, fixture);
+    defer d.deinit();
+    const rows = try row.flatten(testing.allocator, &d);
+    defer testing.allocator.free(rows);
+    // 0 file, 1 hunk @@ -1,3 +1,3, 2 keep, 3 del, 4 add, 5 tail
+
+    try testing.expectEqual(1, rowForComment(rows, .{
+        .path = "f",
+        .hunk = .{ .old_start = 1, .new_start = 1 },
+    }).?);
+    try testing.expectEqual(2, rowForComment(rows, .{ .path = "f", .side = .old, .line = 1 }).?);
+    try testing.expectEqual(2, rowForComment(rows, .{ .path = "f", .side = .new, .line = 1 }).?);
+    try testing.expect(rowForComment(rows, .{
+        .path = "f",
+        .hunk = .{ .old_start = 99, .new_start = 1 },
+    }) == null);
+    try testing.expect(rowForComment(rows, .{
+        .path = "gone",
+        .hunk = .{ .old_start = 1, .new_start = 1 },
+    }) == null);
 }
 
 test "commentAnchor binary and section header" {

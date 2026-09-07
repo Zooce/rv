@@ -9,13 +9,22 @@ const store = @import("store");
 const view = @import("view");
 const diff = @import("diff");
 
-/// Display target for a live comment. Path-only (file) comments have no side/line.
-/// Null when resolved, or when a line comment has no usable side/line.
+/// Display target for a live comment. File: path only. Hunk: both starts, no
+/// side. Line: side + line. Null when resolved, or when the store row has no
+/// usable loc.
 pub fn loc(c: store.Comment) ?view.CommentLoc {
     if (c.state != .open) return null;
     if (c.old_line == null and c.new_line == null) {
         if (c.side != null) return null;
         return .{ .path = c.path };
+    }
+    if (c.side == null) {
+        if (c.old_line) |o| {
+            if (c.new_line) |n| return .{
+                .path = c.path,
+                .hunk = .{ .old_start = o, .new_start = n },
+            };
+        }
     }
     if (c.side) |s| {
         switch (s) {
@@ -117,7 +126,7 @@ pub const AnchorSnap = struct {
 const RemapAnchor = struct {
     old_line: ?u32,
     new_line: ?u32,
-    side: store.Side,
+    side: ?store.Side,
 };
 
 fn hunkBodyEql(a: []const diff.Line, b: []const diff.Line) bool {
@@ -164,15 +173,15 @@ fn commentLineIndex(c: store.Comment, hunk: diff.Hunk) ?usize {
     return null;
 }
 
-fn destHunkLines(
+fn destHunk(
     dest: *const diff.Diff,
     path: []const u8,
     body: []const diff.Line,
-) ?[]const diff.Line {
+) ?diff.Hunk {
     for (dest.files) |f| {
         if (!std.mem.eql(u8, f.displayPath(), path)) continue;
         for (f.hunks) |h| {
-            if (hunkBodyEql(h.lines, body)) return h.lines;
+            if (hunkBodyEql(h.lines, body)) return h;
         }
     }
     return null;
@@ -212,6 +221,8 @@ fn remapAnchorFromLine(ln: diff.Line, side: store.Side) ?RemapAnchor {
 
 /// New path+line for `c` in `dest`, or null if this comment is not on `src_file`
 /// / the chosen hunk, or the line is gone. Path-only (file) comments stay as-is.
+/// Hunk comments (both starts, `side` null) rewrite to the dest hunk’s starts
+/// and keep `side` null, or stay put when that hunk body is gone.
 fn destAnchor(
     c: store.Comment,
     src_file: *const diff.File,
@@ -221,6 +232,27 @@ fn destAnchor(
     if (c.state != .open) return null;
     if (!std.mem.eql(u8, c.path, src_file.displayPath())) return null;
     if (c.old_line == null and c.new_line == null) return null;
+    if (c.side == null) {
+        if (c.old_line) |o| {
+            if (c.new_line) |n| {
+                const hi = hunk_i orelse blk: {
+                    for (src_file.hunks, 0..) |h, i| {
+                        if (h.old_start == o and h.new_start == n) break :blk i;
+                    }
+                    return null;
+                };
+                if (hi >= src_file.hunks.len) return null;
+                const src_hunk = src_file.hunks[hi];
+                if (src_hunk.old_start != o or src_hunk.new_start != n) return null;
+                const dest_hunk = destHunk(dest, src_file.displayPath(), src_hunk.lines) orelse return null;
+                return .{
+                    .old_line = dest_hunk.old_start,
+                    .new_line = dest_hunk.new_start,
+                    .side = null,
+                };
+            }
+        }
+    }
     const hi = hunk_i orelse blk: {
         for (src_file.hunks, 0..) |h, i| {
             if (commentLineIndex(c, h) != null) break :blk i;
@@ -234,9 +266,9 @@ fn destAnchor(
     if (src_ln.kind == .meta) return null;
     const side = commentSide(c);
 
-    if (destHunkLines(dest, src_file.displayPath(), src_hunk.lines)) |dest_lines| {
-        if (line_i < dest_lines.len) {
-            const ln = dest_lines[line_i];
+    if (destHunk(dest, src_file.displayPath(), src_hunk.lines)) |dest_hunk| {
+        if (line_i < dest_hunk.lines.len) {
+            const ln = dest_hunk.lines[line_i];
             if (std.mem.eql(u8, ln.text, src_ln.text) and lineOnSide(ln, side)) {
                 return remapAnchorFromLine(ln, side);
             }
@@ -290,14 +322,19 @@ fn hitsHunk(c: store.Comment, hunk: diff.Hunk) bool {
 
 /// Live comment on `file`, and on `hunk_i` when that index is set.
 /// Path-only (file) comments match whole-file (`hunk_i == null`) only.
+/// Hunk comments (both starts, `side` null) match that hunk, and the whole file.
 pub fn matches(c: store.Comment, file: *const diff.File, hunk_i: ?usize) bool {
     if (c.state != .open) return false;
     if (!std.mem.eql(u8, c.path, file.displayPath())) return false;
+    const hunk_comment = c.old_line != null and c.new_line != null and c.side == null;
     if (hunk_i) |hi| {
         if (hi >= file.hunks.len) return false;
-        return hitsHunk(c, file.hunks[hi]);
+        const h = file.hunks[hi];
+        if (hunk_comment) return c.old_line.? == h.old_start and c.new_line.? == h.new_start;
+        return hitsHunk(c, h);
     }
     if (c.old_line == null and c.new_line == null) return true;
+    if (hunk_comment) return true;
     for (file.hunks) |hunk| {
         if (hitsHunk(c, hunk)) return true;
     }
@@ -342,9 +379,15 @@ pub fn atSide(
     want: view.row.CommentSide,
 ) ?AtSide {
     const a = view.commentAnchor(rows, slots, layout, cursor, want) orelse return null;
+    const kind: store.CommentKind = if (a.old_line == null and a.new_line == null)
+        .file
+    else if (a.old_line != null and a.new_line != null)
+        .hunk
+    else
+        .line;
     return .{
         .anchor = a,
-        .idx = review.firstAt(a.path, a.old_line, a.new_line),
+        .idx = review.firstAt(a.path, a.old_line, a.new_line, kind),
     };
 }
 
@@ -408,15 +451,18 @@ test "loc open sides context missing resolved" {
         .state = .resolved,
     }) == null);
 
-    const implied_new = loc(.{
+    const hunk_loc = loc(.{
         .id = "1",
         .path = "f",
         .old_line = 1,
         .new_line = 2,
         .body = "x",
     }).?;
-    try testing.expectEqual(.new, implied_new.side.?);
-    try testing.expectEqual(2, implied_new.line.?);
+    try testing.expectEqualStrings("f", hunk_loc.path);
+    try testing.expect(hunk_loc.side == null);
+    try testing.expect(hunk_loc.line == null);
+    try testing.expectEqual(1, hunk_loc.hunk.?.old_start);
+    try testing.expectEqual(2, hunk_loc.hunk.?.new_start);
 
     const implied_old = loc(.{
         .id = "1",
@@ -627,7 +673,7 @@ test "destAnchor maps the commented line, not a neighbor hunk" {
     const same = destAnchor(on_add, src_file, &dest_eq, 0).?;
     try testing.expect(same.old_line == null);
     try testing.expectEqual(21, same.new_line.?);
-    try testing.expectEqual(store.Side.new, same.side);
+    try testing.expectEqual(store.Side.new, same.side.?);
 
     var dest_untracked = try diff.parsePieces(testing.allocator, &.{
         .{ .text = dest_same, .group = .untracked },
@@ -635,7 +681,7 @@ test "destAnchor maps the commented line, not a neighbor hunk" {
     defer dest_untracked.deinit();
     const via_untracked = destAnchor(on_add, src_file, &dest_untracked, 0).?;
     try testing.expectEqual(21, via_untracked.new_line.?);
-    try testing.expectEqual(store.Side.new, via_untracked.side);
+    try testing.expectEqual(store.Side.new, via_untracked.side.?);
 
     const neighbor = store.Comment{
         .id = "2",
@@ -660,7 +706,7 @@ test "destAnchor maps the commented line, not a neighbor hunk" {
     const split = destAnchor(on_add, src_file, &dest_split, 0).?;
     try testing.expect(split.old_line == null);
     try testing.expectEqual(22, split.new_line.?);
-    try testing.expectEqual(store.Side.new, split.side);
+    try testing.expectEqual(store.Side.new, split.side.?);
 
     var dest_other = try diff.parsePieces(testing.allocator, &.{
         .{ .text = dest_other_hunk, .group = .staged },
@@ -734,6 +780,83 @@ test "path-only comments stay path-only on remap" {
     try testing.expectEqual(store.Side.new, mapped.side.?);
 }
 
+test "hunk comments remap starts and stay hunk" {
+    const src_txt =
+        \\diff --git a/a.zig b/a.zig
+        \\--- a/a.zig
+        \\+++ b/a.zig
+        \\@@ -1 +1 @@
+        \\-old
+        \\+new
+        \\@@ -10 +10 @@
+        \\-old2
+        \\+new2
+    ;
+    const dest_txt =
+        \\diff --git a/a.zig b/a.zig
+        \\--- a/a.zig
+        \\+++ b/a.zig
+        \\@@ -20 +20 @@
+        \\-old
+        \\+new
+        \\@@ -40 +40 @@
+        \\-old2
+        \\+new2
+    ;
+    const dest_gone =
+        \\diff --git a/a.zig b/a.zig
+        \\--- a/a.zig
+        \\+++ b/a.zig
+        \\@@ -40 +40 @@
+        \\-old2
+        \\+new2
+    ;
+
+    var src = try diff.parsePieces(testing.allocator, &.{
+        .{ .text = src_txt, .group = .unstaged },
+    });
+    defer src.deinit();
+    const src_file = &src.files[0];
+    const hunk_c = store.Comment{ .id = "1", .path = "a.zig", .old_line = 1, .new_line = 1, .body = "hunk" };
+
+    var dest_eq = try diff.parsePieces(testing.allocator, &.{
+        .{ .text = dest_txt, .group = .staged },
+    });
+    defer dest_eq.deinit();
+    const moved = destAnchor(hunk_c, src_file, &dest_eq, null).?;
+    try testing.expectEqual(20, moved.old_line.?);
+    try testing.expectEqual(20, moved.new_line.?);
+    try testing.expect(moved.side == null);
+    const moved_hunk = destAnchor(hunk_c, src_file, &dest_eq, 0).?;
+    try testing.expectEqual(20, moved_hunk.old_line.?);
+    try testing.expect(moved_hunk.side == null);
+    try testing.expect(destAnchor(hunk_c, src_file, &dest_eq, 1) == null);
+
+    var dest_other = try diff.parsePieces(testing.allocator, &.{
+        .{ .text = dest_gone, .group = .staged },
+    });
+    defer dest_other.deinit();
+    try testing.expect(destAnchor(hunk_c, src_file, &dest_other, null) == null);
+
+    var review = try store.initEmpty(testing.allocator, "t");
+    defer review.deinit();
+    _ = try review.addOpen("a.zig", 1, 1, null, "hunk");
+    _ = try review.addOpen("a.zig", null, 1, .new, "line");
+
+    var priors: std.ArrayList(AnchorSnap) = .empty;
+    defer priors.deinit(testing.allocator);
+    try remapMatching(&review, src_file, &dest_eq, null, testing.allocator, &priors);
+
+    const hunk_kept = review.find("1").?;
+    try testing.expectEqual(20, hunk_kept.old_line.?);
+    try testing.expectEqual(20, hunk_kept.new_line.?);
+    try testing.expect(hunk_kept.side == null);
+    const line_mapped = review.find("2").?;
+    try testing.expect(line_mapped.old_line == null);
+    try testing.expectEqual(20, line_mapped.new_line.?);
+    try testing.expectEqual(store.Side.new, line_mapped.side.?);
+}
+
 test "matches this group's hunk lines" {
     var hunks = [_]diff.Hunk{
         .{ .old_start = 10, .old_count = 3, .new_start = 12, .new_count = 4 },
@@ -781,13 +904,21 @@ test "matches this group's hunk lines" {
     try testing.expect(!matches(resolved_file, &file, null));
     try testing.expect(!matches(file_other, &file, null));
 
+    const hunk_c = store.Comment{ .id = "11", .path = "a.zig", .old_line = 10, .new_line = 12, .body = "hunk" };
+    const hunk_other = store.Comment{ .id = "12", .path = "a.zig", .old_line = 40, .new_line = 50, .body = "hunk2" };
+    try testing.expect(matches(hunk_c, &file, 0));
+    try testing.expect(!matches(hunk_c, &file, 1));
+    try testing.expect(matches(hunk_c, &file, null));
+    try testing.expect(matches(hunk_other, &file, 1));
+    try testing.expect(!matches(hunk_other, &file, 0));
+
     const empty = diff.File{ .new_path = "pic.png", .is_binary = true };
     const bin_c = store.Comment{ .id = "10", .path = "pic.png", .body = "file" };
     try testing.expect(matches(bin_c, &empty, null));
     try testing.expect(!matches(bin_c, &empty, 0));
 }
 
-test "atSide file header is path-only" {
+test "atSide file line and hunk" {
     const fixture =
         \\diff --git a/f b/f
         \\--- a/f
@@ -806,6 +937,7 @@ test "atSide file header is path-only" {
     defer review.deinit();
     _ = try review.addOpen("f", null, null, null, "file");
     _ = try review.addOpen("f", null, 1, .new, "line");
+    _ = try review.addOpen("f", 1, 1, null, "hunk");
 
     const found = atSide(&review, rows, empty, .unified, 0, .new).?;
     try testing.expectEqualStrings("f", found.anchor.path);
@@ -822,8 +954,15 @@ test "atSide file header is path-only" {
     try testing.expectEqual(1, line.anchor.new_line.?);
     try testing.expectEqual(1, line.idx.?);
 
-    try testing.expect(atSide(&review, rows, empty, .unified, 1, .new) == null);
-    try testing.expect(atSide(&review, rows, empty, .unified, 1, .old) == null);
+    const hunk_new = atSide(&review, rows, empty, .unified, 1, .new).?;
+    try testing.expectEqualStrings("f", hunk_new.anchor.path);
+    try testing.expectEqual(1, hunk_new.anchor.old_line.?);
+    try testing.expectEqual(1, hunk_new.anchor.new_line.?);
+    try testing.expectEqual(2, hunk_new.idx.?);
+    const hunk_old = atSide(&review, rows, empty, .unified, 1, .old).?;
+    try testing.expectEqual(1, hunk_old.anchor.old_line.?);
+    try testing.expectEqual(1, hunk_old.anchor.new_line.?);
+    try testing.expectEqual(2, hunk_old.idx.?);
 }
 
 test "next prev file comment lands on header" {
@@ -855,5 +994,41 @@ test "next prev file comment lands on header" {
 
     const p0 = prev(&review, rows, 1).?;
     try testing.expectEqual(0, p0.row);
+    try testing.expect(!p0.wrapped);
+}
+
+test "next prev hunk comment lands on header" {
+    const fixture =
+        \\diff --git a/f b/f
+        \\--- a/f
+        \\+++ b/f
+        \\@@ -1 +1 @@
+        \\-old
+        \\+new
+    ;
+    var d = try diff.parse(testing.allocator, fixture);
+    defer d.deinit();
+    const rows = try view.row.flatten(testing.allocator, &d);
+    defer testing.allocator.free(rows);
+
+    var review = try store.initEmpty(testing.allocator, "t");
+    defer review.deinit();
+    _ = try review.addOpen("f", null, 1, .new, "line");
+    _ = try review.addOpen("f", 1, 1, null, "hunk");
+
+    const n0 = next(&review, rows, 0).?;
+    try testing.expectEqual(1, n0.row);
+    try testing.expect(!n0.wrapped);
+
+    const n1 = next(&review, rows, 1).?;
+    try testing.expectEqual(3, n1.row);
+    try testing.expect(!n1.wrapped);
+
+    const n2 = next(&review, rows, 3).?;
+    try testing.expectEqual(1, n2.row);
+    try testing.expect(n2.wrapped);
+
+    const p0 = prev(&review, rows, 3).?;
+    try testing.expectEqual(1, p0.row);
     try testing.expect(!p0.wrapped);
 }
