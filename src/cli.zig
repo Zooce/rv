@@ -1,13 +1,18 @@
-//! Headless CLI for the comment store (MVP-2.2–2.5).
+//! Headless CLI for the comment store and local approved hunks/files.
 //!
-//! Subcommands: `status`, `list`, `show`, `resolve`, `export`,
-//! `install-skill`, help. No git load and no raw TTY modes. Bare `rv` and
-//! `rv <range>` launch the review TUI from `main` (`classify`).
-//! `resolve` deletes ids. There is no reopen and no list/export filter.
+//! Subcommands: `status`, `approved`, `unapprove`, `list`, `show`, `resolve`,
+//! `export`, `install-skill`, help. Comment-only commands do not load git.
+//! `status`, `approved`, and `unapprove` load the local diff (staged /
+//! unstaged / untracked). No raw TTY modes. Bare `rv` and `rv <range>`
+//! launch the review TUI from `main` (`classify`). `resolve` deletes ids.
+//! There is no reopen and no list/export filter.
 
 const std = @import("std");
 const store = @import("store");
 const install_skill = @import("install_skill");
+const git = @import("git");
+const approve = @import("approve");
+const diff = @import("diff");
 const Allocator = std.mem.Allocator;
 const Io = std.Io;
 
@@ -31,6 +36,8 @@ pub const ExportOpts = struct {
 pub const Command = union(enum) {
     help,
     status,
+    approved,
+    unapprove: []const u8,
     list,
     show: []const u8,
     resolve: []const []const u8,
@@ -74,6 +81,8 @@ pub fn classify(args: []const []const u8) error{Usage}!Launch {
 fn isCommand(s: []const u8) bool {
     return isHelp(s) or
         std.mem.eql(u8, s, "status") or
+        std.mem.eql(u8, s, "approved") or
+        std.mem.eql(u8, s, "unapprove") or
         std.mem.eql(u8, s, "list") or
         std.mem.eql(u8, s, "show") or
         std.mem.eql(u8, s, "resolve") or
@@ -92,6 +101,14 @@ pub fn parse(args: []const []const u8) error{Usage}!Command {
     if (std.mem.eql(u8, cmd, "status")) {
         if (args.len != 1) return error.Usage;
         return .status;
+    }
+    if (std.mem.eql(u8, cmd, "approved")) {
+        if (args.len != 1) return error.Usage;
+        return .approved;
+    }
+    if (std.mem.eql(u8, cmd, "unapprove")) {
+        if (args.len != 2) return error.Usage;
+        return .{ .unapprove = args[1] };
     }
     if (std.mem.eql(u8, cmd, "list")) {
         if (args.len != 1) return error.Usage;
@@ -174,7 +191,9 @@ pub const usage_text =
     \\(for example main...HEAD) opens the TUI on `git diff <range>` as written.
     \\
     \\Commands:
-    \\  status                         live comment count and store path
+    \\  status                         live comment count, approved count, and store paths
+    \\  approved                       list approved hunks and files
+    \\  unapprove <n>                  drop the nth row from that list
     \\  list                           list comments
     \\  show <id>                      print one comment
     \\  resolve <id> [id…]             delete comments
@@ -191,28 +210,29 @@ pub const usage_text =
     \\
 ;
 
-/// Run a parsed headless command.
-pub fn run(alloc: Allocator, io: Io, cmd: Command, env: Env) u8 {
+/// Run a parsed headless command against `root` (the repo directory).
+pub fn run(alloc: Allocator, io: Io, cmd: Command, env: Env, root: Io.Dir) u8 {
+    var out_buf: [4096]u8 = undefined;
+    var err_buf: [1024]u8 = undefined;
+    var out_w = std.Io.File.stdout().writer(io, &out_buf);
+    var err_w = std.Io.File.stderr().writer(io, &err_buf);
+    defer {
+        out_w.interface.flush() catch {};
+        err_w.interface.flush() catch {};
+    }
     switch (cmd) {
         .help => return cmdHelp(io),
-        .status => return cmdStatus(alloc, io),
-        .list => return cmdList(alloc, io),
-        .show => |id| return cmdShow(alloc, io, id),
-        .resolve => |ids| return cmdResolve(alloc, io, ids),
-        .@"export" => |opts| return cmdExport(alloc, io, opts),
-        .install_skill => |opts| {
-            var out_buf: [4096]u8 = undefined;
-            var err_buf: [1024]u8 = undefined;
-            var out_w = std.Io.File.stdout().writer(io, &out_buf);
-            var err_w = std.Io.File.stderr().writer(io, &err_buf);
-            const rc = install_skill.run(alloc, io, opts, env.home, env.skill_dir, .{
-                .out = &out_w.interface,
-                .err = &err_w.interface,
-            });
-            out_w.interface.flush() catch {};
-            err_w.interface.flush() catch {};
-            return rc;
-        },
+        .status => return cmdStatus(alloc, io, root, &out_w.interface, &err_w.interface),
+        .approved => return cmdApproved(alloc, io, root, &out_w.interface, &err_w.interface),
+        .unapprove => |tok| return cmdUnapprove(alloc, io, root, tok, &out_w.interface, &err_w.interface),
+        .list => return cmdList(alloc, io, root),
+        .show => |id| return cmdShow(alloc, io, root, id),
+        .resolve => |ids| return cmdResolve(alloc, io, root, ids),
+        .@"export" => |opts| return cmdExport(alloc, io, root, opts),
+        .install_skill => |opts| return install_skill.run(alloc, io, opts, env.home, env.skill_dir, .{
+            .out = &out_w.interface,
+            .err = &err_w.interface,
+        }),
     }
 }
 
@@ -225,9 +245,57 @@ fn cmdHelp(io: Io) u8 {
     return exit_success;
 }
 
-fn cmdStatus(alloc: Allocator, io: Io) u8 {
-    var review = loadReview(alloc, io) catch |err| return loadFail(err);
+/// Local diff plus live approved hunks/files (`collectApproved`). No prune/save.
+const LiveApproved = struct {
+    d: diff.Diff,
+    approved: approve.Approved,
+    items: []approve.Hidden,
+
+    fn deinit(self: *LiveApproved, alloc: Allocator) void {
+        alloc.free(self.items);
+        self.approved.deinit();
+        self.d.deinit();
+        self.* = undefined;
+    }
+};
+
+const LiveLoadError = git.Error || approve.LoadError;
+
+fn loadLiveApproved(alloc: Allocator, io: Io, root: Io.Dir) LiveLoadError!LiveApproved {
+    var d = try git.loadDefaultDiffCwd(alloc, io, .{ .dir = root });
+    errdefer d.deinit();
+    var approved = try approve.load(alloc, io, root);
+    errdefer approved.deinit();
+    const items = try approve.collectApproved(alloc, io, root, &d, &approved);
+    return .{ .d = d, .approved = approved, .items = items };
+}
+
+fn cmdFail(err_w: *std.Io.Writer, msg: []const u8) u8 {
+    err_w.print("rv: {s}\n", .{msg}) catch return writeFail();
+    err_w.flush() catch return writeFail();
+    return exit_operational;
+}
+
+fn liveLoadFail(err_w: *std.Io.Writer, err: LiveLoadError) u8 {
+    const msg: []const u8 = switch (err) {
+        error.NotARepository => git.errorMessage(error.NotARepository),
+        error.GitNotFound => git.errorMessage(error.GitNotFound),
+        error.GitFailed => git.errorMessage(error.GitFailed),
+        error.BadHunkHeader => git.errorMessage(error.BadHunkHeader),
+        error.InvalidJson, error.InvalidHash => "invalid .rv approved JSON",
+        error.OutOfMemory => "out of memory",
+        else => "failed to load .rv approved store",
+    };
+    return cmdFail(err_w, msg);
+}
+
+fn cmdStatus(alloc: Allocator, io: Io, root: Io.Dir, out: *std.Io.Writer, err_w: *std.Io.Writer) u8 {
+    var review = loadReview(alloc, io, root) catch |err| return loadFail(err);
     defer review.deinit();
+
+    // Live matches only; missing approved file is count 0. Do not prune or save.
+    var live = loadLiveApproved(alloc, io, root) catch |err| return liveLoadFail(err_w, err);
+    defer live.deinit(alloc);
 
     const rel = store.reviewRelPath(alloc, review.id) catch {
         std.debug.print("rv: out of memory\n", .{});
@@ -235,27 +303,78 @@ fn cmdStatus(alloc: Allocator, io: Io) u8 {
     };
     defer alloc.free(rel);
 
-    var buf: [1024]u8 = undefined;
-    var w = std.Io.File.stdout().writer(io, &buf);
-    const out = &w.interface;
     out.print(
         \\review: {s}
         \\store: {s}
         \\comments: {d}
+        \\approved: {d}
+        \\approved store: {s}
         \\
-    , .{ review.id, rel, review.comments.items.len }) catch {
-        std.debug.print("rv: write failed\n", .{});
-        return exit_operational;
+    , .{ review.id, rel, review.comments.items.len, live.items.len, approve.rel_path }) catch {
+        return writeFail();
     };
-    out.flush() catch {
-        std.debug.print("rv: write failed\n", .{});
-        return exit_operational;
-    };
+    out.flush() catch return writeFail();
     return exit_success;
 }
 
-fn cmdList(alloc: Allocator, io: Io) u8 {
-    var review = loadReview(alloc, io) catch |err| return loadFail(err);
+/// `n` is 1-based. Path, group, and preview match the TUI approved overlay
+/// (newlines in preview become spaces).
+fn writeApprovedLine(out: *std.Io.Writer, n: usize, item: approve.Hidden) !void {
+    try out.print("{d}  {s}  {s}  ", .{ n, item.path, item.groupLabel() });
+    try writeBodyOneLine(out, item.previewText());
+    try out.writeAll("\n");
+}
+
+fn cmdApproved(alloc: Allocator, io: Io, root: Io.Dir, out: *std.Io.Writer, err_w: *std.Io.Writer) u8 {
+    var live = loadLiveApproved(alloc, io, root) catch |err| return liveLoadFail(err_w, err);
+    defer live.deinit(alloc);
+    for (live.items, 0..) |item, i| {
+        writeApprovedLine(out, i + 1, item) catch return writeFail();
+    }
+    out.flush() catch return writeFail();
+    return exit_success;
+}
+
+fn cmdUnapprove(
+    alloc: Allocator,
+    io: Io,
+    root: Io.Dir,
+    token: []const u8,
+    out: *std.Io.Writer,
+    err_w: *std.Io.Writer,
+) u8 {
+    const n = std.fmt.parseInt(usize, token, 10) catch {
+        err_w.print("rv: not a number: {s}\n", .{token}) catch return writeFail();
+        err_w.flush() catch return writeFail();
+        return exit_operational;
+    };
+    if (n == 0) return cmdFail(err_w, "index out of range");
+
+    var live = loadLiveApproved(alloc, io, root) catch |err| return liveLoadFail(err_w, err);
+    defer live.deinit(alloc);
+    if (n > live.items.len) return cmdFail(err_w, "index out of range");
+
+    const item = live.items[n - 1];
+    live.approved.unapprove(item.path, item.hash) catch return cmdFail(err_w, "index out of range");
+
+    // Same prune+save as TUI Enter on the approved list.
+    const identities = approve.collectLive(alloc, io, root, &live.d) catch {
+        return cmdFail(err_w, "out of memory");
+    };
+    defer alloc.free(identities);
+    live.approved.prune(alloc, identities) catch return cmdFail(err_w, "out of memory");
+    approve.save(&live.approved, alloc, io, root) catch |err| switch (err) {
+        error.OutOfMemory => return cmdFail(err_w, "out of memory"),
+        else => return cmdFail(err_w, "failed to save .rv approved store"),
+    };
+
+    out.print("{d} unapproved\n", .{n}) catch return writeFail();
+    out.flush() catch return writeFail();
+    return exit_success;
+}
+
+fn cmdList(alloc: Allocator, io: Io, root: Io.Dir) u8 {
+    var review = loadReview(alloc, io, root) catch |err| return loadFail(err);
     defer review.deinit();
 
     var buf: [4096]u8 = undefined;
@@ -286,8 +405,8 @@ fn cmdList(alloc: Allocator, io: Io) u8 {
     return exit_success;
 }
 
-fn cmdShow(alloc: Allocator, io: Io, id: []const u8) u8 {
-    var review = loadReview(alloc, io) catch |err| return loadFail(err);
+fn cmdShow(alloc: Allocator, io: Io, root: Io.Dir, id: []const u8) u8 {
+    var review = loadReview(alloc, io, root) catch |err| return loadFail(err);
     defer review.deinit();
 
     const c = review.find(id) orelse {
@@ -325,8 +444,8 @@ fn cmdShow(alloc: Allocator, io: Io, id: []const u8) u8 {
 }
 
 /// Load → remove (all-or-nothing) → save → one confirmation line per id.
-fn cmdResolve(alloc: Allocator, io: Io, ids: []const []const u8) u8 {
-    var review = loadReview(alloc, io) catch |err| return loadFail(err);
+fn cmdResolve(alloc: Allocator, io: Io, root: Io.Dir, ids: []const []const u8) u8 {
+    var review = loadReview(alloc, io, root) catch |err| return loadFail(err);
     defer review.deinit();
 
     review.remove(ids) catch {
@@ -338,7 +457,7 @@ fn cmdResolve(alloc: Allocator, io: Io, ids: []const []const u8) u8 {
         return exit_operational;
     };
 
-    store.save(&review, alloc, io, .cwd()) catch {
+    store.save(&review, alloc, io, root) catch {
         std.debug.print("rv: failed to save .rv comment store\n", .{});
         return exit_operational;
     };
@@ -353,8 +472,8 @@ fn cmdResolve(alloc: Allocator, io: Io, ids: []const []const u8) u8 {
     return exit_success;
 }
 
-fn cmdExport(alloc: Allocator, io: Io, opts: ExportOpts) u8 {
-    var review = loadReview(alloc, io) catch |err| return loadFail(err);
+fn cmdExport(alloc: Allocator, io: Io, root: Io.Dir, opts: ExportOpts) u8 {
+    var review = loadReview(alloc, io, root) catch |err| return loadFail(err);
     defer review.deinit();
 
     const bytes = switch (opts.format) {
@@ -447,8 +566,8 @@ fn formatJson(alloc: Allocator, review: *const store.Review) Allocator.Error![]u
     return try out.toOwnedSlice();
 }
 
-fn loadReview(alloc: Allocator, io: Io) store.LoadError!store.Review {
-    return store.load(alloc, io, .cwd(), store.default_review_id);
+fn loadReview(alloc: Allocator, io: Io, root: Io.Dir) store.LoadError!store.Review {
+    return store.load(alloc, io, root, store.default_review_id);
 }
 
 fn loadFail(err: store.LoadError) u8 {
@@ -504,12 +623,16 @@ fn bufPrintTrunc(buf: []u8, comptime fmt: []const u8, args: anytype) []const u8 
 }
 
 const testing = std.testing;
+const builtin = @import("builtin");
+const IsolatedTmp = if (builtin.is_test) @import("isolated_tmp").IsolatedTmp else void;
 
-test "parse help status list show resolve export install-skill" {
+test "parse help status approved unapprove list show resolve export install-skill" {
     try testing.expectEqual(Command.help, try parse(&.{"help"}));
     try testing.expectEqual(Command.help, try parse(&.{"--help"}));
     try testing.expectEqual(Command.help, try parse(&.{"-h"}));
     try testing.expectEqual(Command.status, try parse(&.{"status"}));
+    try testing.expectEqual(Command.approved, try parse(&.{"approved"}));
+    try testing.expectEqualStrings("3", (try parse(&.{ "unapprove", "3" })).unapprove);
     try testing.expectEqual(Command.list, try parse(&.{"list"}));
 
     const show = try parse(&.{ "show", "3" });
@@ -548,6 +671,9 @@ test "parse usage errors" {
     try testing.expectError(error.Usage, parse(&.{}));
     try testing.expectError(error.Usage, parse(&.{"nope"}));
     try testing.expectError(error.Usage, parse(&.{ "status", "x" }));
+    try testing.expectError(error.Usage, parse(&.{ "approved", "x" }));
+    try testing.expectError(error.Usage, parse(&.{"unapprove"}));
+    try testing.expectError(error.Usage, parse(&.{ "unapprove", "1", "2" }));
     try testing.expectError(error.Usage, parse(&.{"show"}));
     try testing.expectError(error.Usage, parse(&.{ "show", "1", "2" }));
     try testing.expectError(error.Usage, parse(&.{ "list", "--open" }));
@@ -592,6 +718,14 @@ test "classify tui vs command" {
         .command => |cmd| try testing.expectEqual(Command.status, cmd),
         .tui => return error.TestUnexpectedResult,
     }
+    switch (try classify(&.{"approved"})) {
+        .command => |cmd| try testing.expectEqual(Command.approved, cmd),
+        .tui => return error.TestUnexpectedResult,
+    }
+    switch (try classify(&.{ "unapprove", "1" })) {
+        .command => |cmd| try testing.expectEqualStrings("1", cmd.unapprove),
+        .tui => return error.TestUnexpectedResult,
+    }
     switch (try classify(&.{ "export", "--format", "json" })) {
         .command => |cmd| try testing.expectEqual(ExportFormat.json, cmd.@"export".format),
         .tui => return error.TestUnexpectedResult,
@@ -603,6 +737,13 @@ test "classify tui vs command" {
     try testing.expectError(error.Usage, classify(&.{"--bogus"}));
     try testing.expectError(error.Usage, classify(&.{ "main...HEAD", "extra" }));
     try testing.expectError(error.Usage, classify(&.{""}));
+}
+
+test "usage_text names approved commands and status approved lines" {
+    try testing.expect(std.mem.indexOf(u8, usage_text, "approved") != null);
+    try testing.expect(std.mem.indexOf(u8, usage_text, "unapprove <n>") != null);
+    try testing.expect(std.mem.indexOf(u8, usage_text, "approved count") != null);
+    try testing.expect(std.mem.indexOf(u8, usage_text, "store paths") != null);
 }
 
 test "sourceLabel local and range" {
@@ -676,4 +817,325 @@ test "formatAnchor" {
         .body = "",
     });
     try testing.expectEqualStrings("a.zig:-3,+4", both);
+}
+
+fn expectGitOk(io: Io, cwd: std.process.Child.Cwd, argv: []const []const u8) !void {
+    var child = std.process.spawn(io, .{
+        .argv = argv,
+        .cwd = cwd,
+        .stdin = .ignore,
+        .stdout = .ignore,
+        .stderr = .ignore,
+    }) catch return error.TestUnexpectedResult;
+    defer child.kill(io);
+    const term = child.wait(io) catch return error.TestUnexpectedResult;
+    switch (term) {
+        .exited => |code| if (code != 0) return error.TestUnexpectedResult,
+        else => return error.TestUnexpectedResult,
+    }
+}
+
+fn initTestRepo(io: Io, cwd: std.process.Child.Cwd) !void {
+    try expectGitOk(io, cwd, &.{ "git", "init", "-b", "main" });
+    try expectGitOk(io, cwd, &.{ "git", "config", "user.email", "rv@test" });
+    try expectGitOk(io, cwd, &.{ "git", "config", "user.name", "rv test" });
+}
+
+fn captureCmd(
+    alloc: Allocator,
+    io: Io,
+    root: Io.Dir,
+    cmd: fn (Allocator, Io, Io.Dir, *std.Io.Writer, *std.Io.Writer) u8,
+) !struct { rc: u8, text: []u8, err: []u8 } {
+    var out: std.Io.Writer.Allocating = .init(alloc);
+    errdefer out.deinit();
+    var err_out: std.Io.Writer.Allocating = .init(alloc);
+    errdefer err_out.deinit();
+    const rc = cmd(alloc, io, root, &out.writer, &err_out.writer);
+    const text = try out.toOwnedSlice();
+    errdefer alloc.free(text);
+    return .{ .rc = rc, .text = text, .err = try err_out.toOwnedSlice() };
+}
+
+fn makeDirtyRepo(io: Io, tmp: IsolatedTmp) !void {
+    const cwd = tmp.cwd();
+    try initTestRepo(io, cwd);
+    try tmp.write(io, "a.txt", "one\n");
+    try expectGitOk(io, cwd, &.{ "git", "add", "a.txt" });
+    try expectGitOk(io, cwd, &.{ "git", "commit", "-m", "init" });
+    try tmp.write(io, "a.txt", "one\ntwo\n");
+}
+
+fn saveFirstHunks(alloc: Allocator, io: Io, tmp: IsolatedTmp) !void {
+    var d = try git.loadDefaultDiffCwd(alloc, io, tmp.cwd());
+    defer d.deinit();
+    var approved = approve.initEmpty(alloc);
+    defer approved.deinit();
+    for (d.files) |f| {
+        if (f.hunks.len == 0) continue;
+        try approved.append(f.displayPath(), approve.fingerprintHunk(f.hunks[0]));
+    }
+    try approve.save(&approved, alloc, io, tmp.dir);
+}
+
+fn captureUnapprove(
+    alloc: Allocator,
+    io: Io,
+    root: Io.Dir,
+    token: []const u8,
+) !struct { rc: u8, text: []u8, err: []u8 } {
+    var out: std.Io.Writer.Allocating = .init(alloc);
+    errdefer out.deinit();
+    var err_out: std.Io.Writer.Allocating = .init(alloc);
+    errdefer err_out.deinit();
+    const rc = cmdUnapprove(alloc, io, root, token, &out.writer, &err_out.writer);
+    const text = try out.toOwnedSlice();
+    errdefer alloc.free(text);
+    return .{ .rc = rc, .text = text, .err = try err_out.toOwnedSlice() };
+}
+
+test "status missing approved file is zero" {
+    if (builtin.os.tag == .wasi) return error.SkipZigTest;
+    const io = testing.io;
+    const alloc = testing.allocator;
+    var tmp = try IsolatedTmp.init(alloc, io);
+    defer tmp.deinit(alloc, io);
+    try makeDirtyRepo(io, tmp);
+
+    const got = try captureCmd(alloc, io, tmp.dir, cmdStatus);
+    defer alloc.free(got.text);
+    defer alloc.free(got.err);
+    try testing.expectEqual(exit_success, got.rc);
+    try testing.expectEqualStrings("", got.err);
+    try testing.expect(std.mem.indexOf(u8, got.text, "comments: 0") != null);
+    try testing.expect(std.mem.indexOf(u8, got.text, "approved: 0") != null);
+    try testing.expect(std.mem.indexOf(u8, got.text, "approved store: .rv/approved.json") != null);
+    try testing.expect(std.mem.indexOf(u8, got.text, "store: .rv/reviews/current.json") != null);
+}
+
+test "status live approved count matches collectApproved not raw store" {
+    if (builtin.os.tag == .wasi) return error.SkipZigTest;
+    const io = testing.io;
+    const alloc = testing.allocator;
+    var tmp = try IsolatedTmp.init(alloc, io);
+    defer tmp.deinit(alloc, io);
+    try makeDirtyRepo(io, tmp);
+
+    var d = try git.loadDefaultDiffCwd(alloc, io, tmp.cwd());
+    defer d.deinit();
+    const path = d.files[0].displayPath();
+    const hash = approve.fingerprintHunk(d.files[0].hunks[0]);
+    var approved = approve.initEmpty(alloc);
+    defer approved.deinit();
+    try approved.append(path, hash);
+    try approved.append("gone.txt", approve.fingerprintFile("stale"));
+    try approve.save(&approved, alloc, io, tmp.dir);
+
+    const got = try captureCmd(alloc, io, tmp.dir, cmdStatus);
+    defer alloc.free(got.text);
+    defer alloc.free(got.err);
+    try testing.expectEqual(exit_success, got.rc);
+    try testing.expectEqualStrings("", got.err);
+    try testing.expect(std.mem.indexOf(u8, got.text, "approved: 1") != null);
+}
+
+test "status not a git repository is operational failure" {
+    if (builtin.os.tag == .wasi) return error.SkipZigTest;
+    const io = testing.io;
+    const alloc = testing.allocator;
+    var tmp = try IsolatedTmp.init(alloc, io);
+    defer tmp.deinit(alloc, io);
+
+    const got = try captureCmd(alloc, io, tmp.dir, cmdStatus);
+    defer alloc.free(got.text);
+    defer alloc.free(got.err);
+    try testing.expectEqual(exit_operational, got.rc);
+    try testing.expectEqualStrings("rv: not a git repository (run from a work tree)\n", got.err);
+}
+
+fn hiddenLine(path: []const u8, group: ?diff.Group, kind: approve.Hidden.Kind, preview: []const u8) approve.Hidden {
+    return .{
+        .path = path,
+        .hash = @splat(0),
+        .group = group,
+        .kind = kind,
+        .preview = preview,
+    };
+}
+
+test "writeApprovedLine path group preview and placeholders" {
+    const alloc = testing.allocator;
+    var out: std.Io.Writer.Allocating = .init(alloc);
+    defer out.deinit();
+    const w = &out.writer;
+    try writeApprovedLine(w, 1, hiddenLine("a.zig", .unstaged, .hunk, "hello"));
+    try writeApprovedLine(w, 2, hiddenLine("bin.dat", .staged, .binary, ""));
+    try writeApprovedLine(w, 3, hiddenLine("keep.bin", .untracked, .file, ""));
+    try writeApprovedLine(w, 4, hiddenLine("c.zig", .unstaged, .hunk, ""));
+    try writeApprovedLine(w, 5, hiddenLine("d.zig", .unstaged, .hunk, "hello\nworld"));
+    try writeApprovedLine(w, 6, hiddenLine("e.zig", null, .hunk, "x"));
+    try w.flush();
+    try testing.expectEqualStrings(
+        \\1  a.zig  Unstaged  hello
+        \\2  bin.dat  Staged  binary
+        \\3  keep.bin  Untracked  file
+        \\4  c.zig  Unstaged  hunk
+        \\5  d.zig  Unstaged  hello world
+        \\6  e.zig  -  x
+        \\
+    , w.buffered());
+}
+
+test "approved empty store prints nothing" {
+    if (builtin.os.tag == .wasi) return error.SkipZigTest;
+    const io = testing.io;
+    const alloc = testing.allocator;
+    var tmp = try IsolatedTmp.init(alloc, io);
+    defer tmp.deinit(alloc, io);
+    try makeDirtyRepo(io, tmp);
+
+    const got = try captureCmd(alloc, io, tmp.dir, cmdApproved);
+    defer alloc.free(got.text);
+    defer alloc.free(got.err);
+    try testing.expectEqual(exit_success, got.rc);
+    try testing.expectEqualStrings("", got.err);
+    try testing.expectEqualStrings("", got.text);
+}
+
+test "approved lists live hunks and files in flatten order" {
+    if (builtin.os.tag == .wasi) return error.SkipZigTest;
+    const io = testing.io;
+    const alloc = testing.allocator;
+    var tmp = try IsolatedTmp.init(alloc, io);
+    defer tmp.deinit(alloc, io);
+    try makeDirtyRepo(io, tmp);
+    try tmp.write(io, "extra.txt", "hi\n");
+
+    var d = try git.loadDefaultDiffCwd(alloc, io, tmp.cwd());
+    defer d.deinit();
+    try testing.expectEqual(2, d.files.len);
+    try testing.expect(d.files[0].hunks.len > 0);
+    try testing.expect(d.files[1].hunks.len > 0);
+    var approved = approve.initEmpty(alloc);
+    defer approved.deinit();
+    try approved.append(d.files[0].displayPath(), approve.fingerprintHunk(d.files[0].hunks[0]));
+    try approved.append(d.files[1].displayPath(), approve.fingerprintHunk(d.files[1].hunks[0]));
+    try approved.append("gone.txt", approve.fingerprintFile("stale"));
+    try approve.save(&approved, alloc, io, tmp.dir);
+
+    const got = try captureCmd(alloc, io, tmp.dir, cmdApproved);
+    defer alloc.free(got.text);
+    defer alloc.free(got.err);
+    try testing.expectEqual(exit_success, got.rc);
+    try testing.expectEqualStrings("", got.err);
+    try testing.expect(std.mem.startsWith(u8, got.text, "1  a.txt  Unstaged  "));
+    try testing.expect(std.mem.indexOf(u8, got.text, "\n2  extra.txt  Untracked  ") != null);
+    try testing.expect(std.mem.indexOf(u8, got.text, "gone.txt") == null);
+}
+
+test "approved not a git repository is operational failure" {
+    if (builtin.os.tag == .wasi) return error.SkipZigTest;
+    const io = testing.io;
+    const alloc = testing.allocator;
+    var tmp = try IsolatedTmp.init(alloc, io);
+    defer tmp.deinit(alloc, io);
+
+    const got = try captureCmd(alloc, io, tmp.dir, cmdApproved);
+    defer alloc.free(got.text);
+    defer alloc.free(got.err);
+    try testing.expectEqual(exit_operational, got.rc);
+    try testing.expectEqualStrings("rv: not a git repository (run from a work tree)\n", got.err);
+}
+
+test "unapprove not a number or zero is operational failure" {
+    if (builtin.os.tag == .wasi) return error.SkipZigTest;
+    const io = testing.io;
+    const alloc = testing.allocator;
+    var tmp = try IsolatedTmp.init(alloc, io);
+    defer tmp.deinit(alloc, io);
+
+    const bad = try captureUnapprove(alloc, io, tmp.dir, "abc");
+    defer alloc.free(bad.text);
+    defer alloc.free(bad.err);
+    try testing.expectEqual(exit_operational, bad.rc);
+    try testing.expectEqualStrings("rv: not a number: abc\n", bad.err);
+
+    const zero = try captureUnapprove(alloc, io, tmp.dir, "0");
+    defer alloc.free(zero.text);
+    defer alloc.free(zero.err);
+    try testing.expectEqual(exit_operational, zero.rc);
+    try testing.expectEqualStrings("rv: index out of range\n", zero.err);
+}
+
+test "unapprove empty list or too-large index is operational failure" {
+    if (builtin.os.tag == .wasi) return error.SkipZigTest;
+    const io = testing.io;
+    const alloc = testing.allocator;
+    var tmp = try IsolatedTmp.init(alloc, io);
+    defer tmp.deinit(alloc, io);
+    try makeDirtyRepo(io, tmp);
+
+    const empty = try captureUnapprove(alloc, io, tmp.dir, "1");
+    defer alloc.free(empty.text);
+    defer alloc.free(empty.err);
+    try testing.expectEqual(exit_operational, empty.rc);
+    try testing.expectEqualStrings("rv: index out of range\n", empty.err);
+
+    try saveFirstHunks(alloc, io, tmp);
+    const high = try captureUnapprove(alloc, io, tmp.dir, "2");
+    defer alloc.free(high.text);
+    defer alloc.free(high.err);
+    try testing.expectEqual(exit_operational, high.rc);
+    try testing.expectEqualStrings("rv: index out of range\n", high.err);
+}
+
+test "unapprove drops the nth live row and later indexes shift" {
+    if (builtin.os.tag == .wasi) return error.SkipZigTest;
+    const io = testing.io;
+    const alloc = testing.allocator;
+    var tmp = try IsolatedTmp.init(alloc, io);
+    defer tmp.deinit(alloc, io);
+    try makeDirtyRepo(io, tmp);
+    try tmp.write(io, "extra.txt", "hi\n");
+    try saveFirstHunks(alloc, io, tmp);
+
+    const first = try captureUnapprove(alloc, io, tmp.dir, "1");
+    defer alloc.free(first.text);
+    defer alloc.free(first.err);
+    try testing.expectEqual(exit_success, first.rc);
+    try testing.expectEqualStrings("1 unapproved\n", first.text);
+    try testing.expectEqualStrings("", first.err);
+
+    const listed = try captureCmd(alloc, io, tmp.dir, cmdApproved);
+    defer alloc.free(listed.text);
+    defer alloc.free(listed.err);
+    try testing.expectEqual(exit_success, listed.rc);
+    try testing.expect(std.mem.startsWith(u8, listed.text, "1  extra.txt  Untracked  "));
+    try testing.expect(std.mem.indexOf(u8, listed.text, "\n2  ") == null);
+
+    const second = try captureUnapprove(alloc, io, tmp.dir, "1");
+    defer alloc.free(second.text);
+    defer alloc.free(second.err);
+    try testing.expectEqual(exit_success, second.rc);
+    try testing.expectEqualStrings("1 unapproved\n", second.text);
+
+    const status = try captureCmd(alloc, io, tmp.dir, cmdStatus);
+    defer alloc.free(status.text);
+    defer alloc.free(status.err);
+    try testing.expectEqual(exit_success, status.rc);
+    try testing.expect(std.mem.indexOf(u8, status.text, "approved: 0") != null);
+}
+
+test "unapprove not a git repository is operational failure" {
+    if (builtin.os.tag == .wasi) return error.SkipZigTest;
+    const io = testing.io;
+    const alloc = testing.allocator;
+    var tmp = try IsolatedTmp.init(alloc, io);
+    defer tmp.deinit(alloc, io);
+
+    const got = try captureUnapprove(alloc, io, tmp.dir, "1");
+    defer alloc.free(got.text);
+    defer alloc.free(got.err);
+    try testing.expectEqual(exit_operational, got.rc);
+    try testing.expectEqualStrings("rv: not a git repository (run from a work tree)\n", got.err);
 }

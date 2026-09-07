@@ -177,8 +177,8 @@ Lifecycle (v1): **present | gone**. Humans dismiss in the TUI (`d` / `D`); agent
 
 Built for any agent (Grok, Claude, Codex, Cursor, ...):
 
-1. **Export** - `rv export` (and friends) emit a stable, agent-readable document of comments (paths, ranges, bodies, ids). Paste, pipe, or `@`-include into a session.
-2. **CLI** - list / show / resolve (delete) comments programmatically so an agent in the repo can close the loop without GUI.
+1. **Export** - `rv export` (and friends) emit a stable, agent-readable document of comments (paths, ranges, bodies, ids). Paste, pipe, or `@`-include into a session. `list` / `export` stay comments.
+2. **CLI** - `rv status` reports comment count and live approved count. Approved hunks are hidden from the TUI walk; agents use `rv approved` / `rv unapprove` to see or restore them (not by editing `.rv/approved.json`). `list` / `show` / `resolve` stay comments.
 3. **Skill install** - `rv install-skill` wires a bundled agent skill into the agent's discovery paths so "address `rv` comments" works without re-pasting docs or hand-symlinking after every upgrade.
 4. **MCP (later)** - same operations as tools the agent can call directly.
 
@@ -221,10 +221,16 @@ $ rv     # local changes only (empty when the worktree is clean)
          # i/c/Enter -> create or edit new
          # I/C -> old; d dismiss new; D dismiss old; r reload; ? help
 
-$ rv export -o .rv/review.md   # or stdout / JSON
+$ rv status                    # comments + approved counts and store paths
+                               # approved hunks are hidden from the TUI walk
+$ rv approved                  # if approved > 0
+$ rv unapprove <n>             # only if the agent must see that hunk again
+                               # do not hand-edit .rv/approved.json
+
+$ rv export -o .rv/review.md   # or stdout / JSON; comments only
 # agent already knows the skill: address rv comments
 
-$ rv list
+$ rv list                      # comments
 $ rv resolve <id>              # deletes the id
 $ rv                         # confirm, leave more, continue
 ```
@@ -269,6 +275,7 @@ $ rv                         # confirm, leave more, continue
 
 ```text
 .rv/
+  approved.json        # local approved hunks/files (not comments)
   config.toml          # optional local overrides
   reviews/
     <review-id>.json   # comments + anchors for a review session
@@ -283,11 +290,13 @@ Exact schema is implementation detail; the README-level contract is: **stable id
 ```text
 rv                  # TUI, local changes
 rv <range>          # TUI on `git diff <range>` (e.g. main...HEAD)
+rv status           # live comment count, approved count, and store paths
+rv approved         # list approved hunks and files
+rv unapprove <n>    # drop the nth row from that list
 rv list             # list comments
 rv show <id>
 rv resolve <id> ... # delete comments
 rv export [--format md|json] [-o path]
-rv status           # live count and store path
 rv install-skill [--agent <name>] [--list] [--uninstall]
                     # install/update the bundled agent skill into
                     # known discovery paths (symlink preferred)

@@ -20,8 +20,10 @@
 //! hidden).
 //!
 //! With a git range arg: load `git diff <range>` as written → same TUI.
-//! With a subcommand: headless CLI (`status`, `list`, `show`, `resolve`,
-//! `export`, `install-skill`, help) — no git load and no raw TTY modes.
+//! With a subcommand: headless CLI (`status`, `approved`, `unapprove`, `list`,
+//! `show`, `resolve`, `export`, `install-skill`, help). Comment-only commands
+//! do not load git. `status` / `approved` / `unapprove` load the local diff.
+//! No raw TTY modes.
 //!
 //! Comment UX: soft-wrapped multi-line footer prompt (grows up to 4 rows, then
 //! scrolls with a right-edge scrollbar). Arrow keys move the caret; insert and
@@ -113,7 +115,7 @@ pub fn main(init: std.process.Init) !u8 {
                 .home = init.environ_map.get("HOME"),
                 .skill_dir = init.environ_map.get("RV_SKILL_DIR"),
             };
-            return cli.run(alloc, io, cmd, env);
+            return cli.run(alloc, io, cmd, env, .cwd());
         },
     }
 }
@@ -2363,17 +2365,8 @@ const ApprovedList = struct {
     }
 
     fn formatLine(buf: []u8, item: approve.Hidden) []const u8 {
-        const group: []const u8 = if (item.group) |g| switch (g) {
-            .unstaged => "Unstaged",
-            .untracked => "Untracked",
-            .staged => "Staged",
-        } else "-";
-        const preview: []const u8 = switch (item.kind) {
-            .hunk => if (item.preview.len > 0) item.preview else "hunk",
-            .binary => "binary",
-            .file => "file",
-        };
-        const prefix = Frame.bufPrintTrunc(buf, "{s}  {s}  ", .{ item.path, group });
+        const prefix = Frame.bufPrintTrunc(buf, "{s}  {s}  ", .{ item.path, item.groupLabel() });
+        const preview = item.previewText();
         var i: usize = 0;
         const rest = buf[prefix.len..];
         for (preview) |b| {

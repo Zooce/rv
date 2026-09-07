@@ -139,7 +139,7 @@ pub fn build(b: *std.Build) void {
         },
     });
 
-    // Headless CLI: status / list / show / export / install-skill (MVP-2.2+).
+    // Headless CLI: status / approved / unapprove / list / show / export / install-skill.
     const cli_mod = b.addModule("cli", .{
         .root_source_file = b.path("src/cli.zig"),
         .target = target,
@@ -147,6 +147,10 @@ pub fn build(b: *std.Build) void {
         .imports = &.{
             .{ .name = "store", .module = store_mod },
             .{ .name = "install_skill", .module = install_skill_mod },
+            .{ .name = "git", .module = git_mod },
+            .{ .name = "approve", .module = approve_mod },
+            .{ .name = "diff", .module = diff_mod },
+            .{ .name = "isolated_tmp", .module = isolated_tmp_mod },
         },
     });
 

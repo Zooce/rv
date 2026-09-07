@@ -276,6 +276,8 @@ pub fn collectLive(alloc: Allocator, io: Io, root: Io.Dir, d: *const diff.Diff) 
 }
 
 /// One live identity the store currently consumes. Slices borrow from `d`.
+/// The approved list (TUI overlay and `rv approved`) prints path, git group,
+/// and a short preview derived from this value.
 pub const Hidden = struct {
     pub const Kind = enum { hunk, binary, file };
 
@@ -285,6 +287,24 @@ pub const Hidden = struct {
     kind: Kind,
     /// First add/delete line, or empty (binary / hunk-less / context-only).
     preview: []const u8,
+
+    /// `Unstaged` / `Untracked` / `Staged`, or `-` when the diff has no group.
+    pub fn groupLabel(self: Hidden) []const u8 {
+        return if (self.group) |g| switch (g) {
+            .unstaged => "Unstaged",
+            .untracked => "Untracked",
+            .staged => "Staged",
+        } else "-";
+    }
+
+    /// Overlay/CLI preview: first add/delete text, or `hunk` / `binary` / `file`.
+    pub fn previewText(self: Hidden) []const u8 {
+        return switch (self.kind) {
+            .hunk => if (self.preview.len > 0) self.preview else "hunk",
+            .binary => "binary",
+            .file => "file",
+        };
+    }
 };
 
 /// Live identities `approved.take` consumes, flatten order (group, file, hunk).
