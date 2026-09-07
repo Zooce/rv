@@ -159,7 +159,7 @@ pub fn stickyHeadersSbs(
             .header => |ri| if (ri < rows.len and rows[ri] == .file_header) {
                 s.file_idx = ri;
             },
-            .pair => {},
+            .pair, .body => {},
         }
     }
     return s.clampedToHeight(content_height);
@@ -358,6 +358,29 @@ test "ensureVisibleStickySbs uses slot indices" {
     // Scroll past first file's slots; pin file A.
     const deep = ensureVisibleStickySbs(0, fix.rows.len - 1, 3, slots2, fix.rows);
     try testing.expect(deep.sticky.file_idx != null or deep.scroll == 0);
+}
+
+test "stickyHeadersSbs pins file above one-sided body" {
+    const added =
+        \\diff --git a/new.txt b/new.txt
+        \\new file mode 100644
+        \\--- /dev/null
+        \\+++ b/new.txt
+        \\@@ -0,0 +1,2 @@
+        \\+a
+        \\+b
+    ;
+    var d = try diff.parse(testing.allocator, added);
+    defer d.deinit();
+    const rows = try row.flatten(testing.allocator, &d);
+    defer testing.allocator.free(rows);
+    const slots = try layout_mod.pairSideBySide(testing.allocator, rows);
+    defer testing.allocator.free(slots);
+    try testing.expectEqual(4, slots.len);
+
+    try testing.expect(stickyHeadersSbs(slots, rows, 0, 20).file_idx == null);
+    try testing.expectEqual(0, stickyHeadersSbs(slots, rows, 2, 20).file_idx.?);
+    try testing.expectEqual(0, stickyHeadersSbs(slots, rows, 3, 20).file_idx.?);
 }
 
 /// Two-hunk fixture: file, h0, del, add, h1, del, add → indices 0..6.

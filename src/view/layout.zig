@@ -86,8 +86,10 @@ pub fn sbsPaneWidths(cols: u16) SbsPanes {
 pub const SbsSlot = union(enum) {
     /// Full-width file, hunk, or section header.
     header: usize,
-    /// Body: left pane (old) and/or right pane (new). Context uses the same
-    /// index on both sides. An empty pane is `null`.
+    /// Full-width body line of a one-sided file (no old side or no new side).
+    body: usize,
+    /// Two-pane body of a mixed file. Context uses the same index on both
+    /// sides. An empty pane is `null`.
     pair: struct {
         left: ?usize = null,
         right: ?usize = null,
@@ -96,18 +98,18 @@ pub const SbsSlot = union(enum) {
     /// True when this slot references unified row `row_idx`.
     pub fn containsRow(self: SbsSlot, row_idx: usize) bool {
         return switch (self) {
-            .header => |h| h == row_idx,
+            .header, .body => |h| h == row_idx,
             .pair => |p| (if (p.left) |L| L == row_idx else false) or
                 (if (p.right) |R| R == row_idx else false),
         };
     }
 };
 
-/// Primary unified row for cursor mapping: header index, else left, else right.
+/// Primary unified row for cursor mapping: header/body index, else left, else right.
 /// Pair slots always have at least one side set.
 pub fn sbsPrimaryRow(slot: SbsSlot) usize {
     return switch (slot) {
-        .header => |h| h,
+        .header, .body => |h| h,
         .pair => |p| p.left orelse p.right.?,
     };
 }
@@ -160,21 +162,34 @@ fn isAddLine(row: Row) bool {
 /// consecutive deletes followed by consecutive adds are zip-paired;
 /// leftover deletes or adds alone get an empty opposite pane. Context
 /// lines occupy both panes (same source row). Meta lines sit on the left
-/// pane only (v1). File/hunk headers are full-width slots.
+/// pane only (v1). File/hunk/section headers are full-width slots.
+///
+/// A file with no old side (`old_path == null`) or no new side
+/// (`new_path == null`) emits a full-width `body` slot per line instead
+/// of pairing. Mixed files (both sides, including renames) pair as above.
 ///
 /// Caller owns the returned slice (`alloc.free`). Nested indices borrow `rows`.
 pub fn pairSideBySide(alloc: Allocator, rows: []const Row) Allocator.Error![]SbsSlot {
     var out: std.ArrayList(SbsSlot) = .empty;
     errdefer out.deinit(alloc);
 
+    var one_sided = false;
     var i: usize = 0;
     while (i < rows.len) {
         switch (rows[i]) {
-            .file_header, .hunk_header, .section_header => {
+            .file_header => |fh| {
+                one_sided = fh.old_path == null or fh.new_path == null;
                 try out.append(alloc, .{ .header = i });
                 i += 1;
             },
-            .line => |ln| switch (ln.kind) {
+            .hunk_header, .section_header => {
+                try out.append(alloc, .{ .header = i });
+                i += 1;
+            },
+            .line => |ln| if (one_sided) {
+                try out.append(alloc, .{ .body = i });
+                i += 1;
+            } else switch (ln.kind) {
                 .context => {
                     try out.append(alloc, .{ .pair = .{ .left = i, .right = i } });
                     i += 1;
@@ -426,6 +441,50 @@ test "pairSideBySide pure adds and pure deletes" {
     try testing.expect(slots2[3].pair.right == null);
 }
 
+test "pairSideBySide one-sided files are full-width body" {
+    const added =
+        \\diff --git a/new.txt b/new.txt
+        \\new file mode 100644
+        \\--- /dev/null
+        \\+++ b/new.txt
+        \\@@ -0,0 +1,2 @@
+        \\+a
+        \\+b
+    ;
+    var d = try diff.parse(testing.allocator, added);
+    defer d.deinit();
+    const rows = try row_mod.flatten(testing.allocator, &d);
+    defer testing.allocator.free(rows);
+    const slots = try pairSideBySide(testing.allocator, rows);
+    defer testing.allocator.free(slots);
+
+    try testing.expectEqual(4, slots.len);
+    try testing.expectEqual(0, slots[0].header);
+    try testing.expectEqual(1, slots[1].header);
+    try testing.expectEqual(2, slots[2].body);
+    try testing.expectEqual(3, slots[3].body);
+
+    const deleted =
+        \\diff --git a/gone.txt b/gone.txt
+        \\deleted file mode 100644
+        \\--- a/gone.txt
+        \\+++ /dev/null
+        \\@@ -1,2 +0,0 @@
+        \\-a
+        \\-b
+    ;
+    var d2 = try diff.parse(testing.allocator, deleted);
+    defer d2.deinit();
+    const rows2 = try row_mod.flatten(testing.allocator, &d2);
+    defer testing.allocator.free(rows2);
+    const slots2 = try pairSideBySide(testing.allocator, rows2);
+    defer testing.allocator.free(slots2);
+
+    try testing.expectEqual(4, slots2.len);
+    try testing.expectEqual(2, slots2[2].body);
+    try testing.expectEqual(3, slots2[3].body);
+}
+
 test "pairSideBySide meta left only; slot lookup" {
     const fixture =
         \\diff --git a/f b/f
@@ -497,4 +556,50 @@ test "nextSbsCursor and prevSbsCursor step by slot" {
     try testing.expectEqual(2, prevSbsCursor(slots, rows, 3));
     try testing.expectEqual(2, prevSbsCursor(slots, rows, 4));
     try testing.expectEqual(0, prevSbsCursor(slots, rows, 0));
+}
+
+test "pairSideBySide mixed file next to one-sided stays paired" {
+    const fixture =
+        \\diff --git a/f b/f
+        \\--- a/f
+        \\+++ b/f
+        \\@@ -1 +1 @@
+        \\-old
+        \\+new
+        \\diff --git a/new.txt b/new.txt
+        \\new file mode 100644
+        \\--- /dev/null
+        \\+++ b/new.txt
+        \\@@ -0,0 +1,2 @@
+        \\+hi
+        \\+there
+        \\diff --git a/gone.txt b/gone.txt
+        \\deleted file mode 100644
+        \\--- a/gone.txt
+        \\+++ /dev/null
+        \\@@ -1 +0,0 @@
+        \\-bye
+    ;
+    var d = try diff.parse(testing.allocator, fixture);
+    defer d.deinit();
+    const rows = try row_mod.flatten(testing.allocator, &d);
+    defer testing.allocator.free(rows);
+    const slots = try pairSideBySide(testing.allocator, rows);
+    defer testing.allocator.free(slots);
+
+    // mixed: file, hunk, del|add; added: file, hunk, body, body; deleted: file, hunk, body
+    try testing.expectEqual(10, slots.len);
+    try testing.expectEqual(2, slots[2].pair.left.?);
+    try testing.expectEqual(3, slots[2].pair.right.?);
+    try testing.expectEqual(6, slots[5].body);
+    try testing.expectEqual(7, slots[6].body);
+    try testing.expectEqual(10, slots[9].body);
+
+    // Mixed pair is one step; added body walks each line.
+    try testing.expectEqual(4, nextSbsCursor(slots, rows, 2));
+    try testing.expectEqual(4, nextSbsCursor(slots, rows, 3));
+    try testing.expectEqual(7, nextSbsCursor(slots, rows, 6));
+    try testing.expectEqual(8, nextSbsCursor(slots, rows, 7));
+    try testing.expectEqual(10, nextSbsCursor(slots, rows, 10));
+    try testing.expectEqual(6, prevSbsCursor(slots, rows, 7));
 }

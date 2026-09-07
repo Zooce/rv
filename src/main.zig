@@ -1603,12 +1603,17 @@ pub const Viewport = struct {
     /// Columns available for horizontal pan: text area after the sticky gutter.
     fn panViewportCols(self: *const Viewport, cols: u16, rows: []const view.row.Row) u16 {
         const layout = view.layout.effectiveLayout(self.layout_pref, cols);
+        const one_sided = if (view.nav.currentFileStart(rows, self.cursor)) |fi| switch (rows[fi]) {
+            .file_header => |fh| fh.old_path == null or fh.new_path == null,
+            else => false,
+        } else false;
         const full: u16 = switch (layout) {
             .unified => cols,
-            .side_by_side => view.layout.sbsPaneWidths(cols).left_w,
+            .side_by_side => if (one_sided) cols else view.layout.sbsPaneWidths(cols).left_w,
         };
         const num_w = if (self.show_line_numbers) Frame.lineNumberWidth(rows) else 0;
-        const gw = Frame.lineGutterCols(num_w, layout);
+        const gw_layout: view.layout.EffectiveLayout = if (one_sided) .unified else layout;
+        const gw = Frame.lineGutterCols(num_w, gw_layout);
         const gw_u16: u16 = std.math.cast(u16, gw) orelse std.math.maxInt(u16);
         return full -| gw_u16;
     }
@@ -2562,6 +2567,48 @@ test "pan viewport uses 2-char gutter when line numbers are off" {
     const off = vp.panViewportCols(80, rows);
     try std.testing.expectEqual(74, on);
     try std.testing.expectEqual(78, off);
+}
+
+test "pan viewport one-sided side-by-side uses full width" {
+    const added =
+        \\diff --git a/new.txt b/new.txt
+        \\new file mode 100644
+        \\--- /dev/null
+        \\+++ b/new.txt
+        \\@@ -0,0 +1 @@
+        \\+hi
+    ;
+    var d = try diff.parse(std.testing.allocator, added);
+    defer d.deinit();
+    const rows = try view.row.flatten(std.testing.allocator, &d);
+    defer std.testing.allocator.free(rows);
+    const cols: u16 = 80;
+    var sbs: Viewport = .{ .layout_pref = .side_by_side, .cursor = 2 };
+    var uni: Viewport = .{ .layout_pref = .unified, .cursor = 2 };
+    try std.testing.expectEqual(uni.panViewportCols(cols, rows), sbs.panViewportCols(cols, rows));
+
+    const mixed =
+        \\diff --git a/f b/f
+        \\--- a/f
+        \\+++ b/f
+        \\@@ -1 +1 @@
+        \\-old
+        \\+new
+    ;
+    var d2 = try diff.parse(std.testing.allocator, mixed);
+    defer d2.deinit();
+    const rows2 = try view.row.flatten(std.testing.allocator, &d2);
+    defer std.testing.allocator.free(rows2);
+    sbs = .{ .layout_pref = .side_by_side, .cursor = 2 };
+    uni = .{ .layout_pref = .unified, .cursor = 2 };
+    const mixed_sbs = sbs.panViewportCols(cols, rows2);
+    const mixed_uni = uni.panViewportCols(cols, rows2);
+    try std.testing.expect(mixed_sbs < mixed_uni);
+    const left: usize = view.layout.sbsPaneWidths(cols).left_w;
+    const gw = Frame.lineGutterCols(Frame.lineNumberWidth(rows2), .side_by_side);
+    const expected: usize = left - gw;
+    const got: usize = mixed_sbs;
+    try std.testing.expectEqual(expected, got);
 }
 
 test "file list omits a fully approved file and keeps a mixed file" {

@@ -359,6 +359,25 @@ pub fn paint(
                         }
                         putRowHint(scr, screen_y, text, headerHint(&hint_buf, ri, hint_file, hint_hunk, hint_section, hint_group, expand_hunk, expand_ok), st);
                     },
+                    .body => |ri| {
+                        const is_cur = ri == cur;
+                        const marked = rowMarked(rows[ri], review);
+                        const st = pal.rowStyle(rows[ri], is_cur);
+                        fillRow(scr, screen_y, st);
+                        putPannedBody(
+                            scr,
+                            0,
+                            screen_y,
+                            size.cols,
+                            rows[ri],
+                            marked,
+                            num_w,
+                            .unified,
+                            pan_span.containsBody(ri),
+                            cs,
+                            st,
+                        );
+                    },
                     .pair => |p| {
                         // Whole slot is current when the cursor sits on either pane
                         // (paired del|add highlight together as one split row).

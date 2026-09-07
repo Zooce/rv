@@ -15,9 +15,9 @@ pub const search = @import("search.zig");
 
 /// Comment target for `want` at `cursor`, or null if that side is missing.
 /// File header: path-only (both sides the same). Unified: current row.
-/// Side-by-side: slot left (`old`) / right (`new`); file-header slots are both.
-/// Hunk and section headers are not commentable. Line anchors carry only the
-/// chosen side’s line number.
+/// Side-by-side: slot left (`old`) / right (`new`); file-header and one-sided
+/// body slots use the row itself. Hunk and section headers are not commentable.
+/// Line anchors carry only the chosen side’s line number.
 pub fn commentAnchor(
     rows: []const row.Row,
     slots: []const layout.SbsSlot,
@@ -32,7 +32,7 @@ pub fn commentAnchor(
         .side_by_side => blk: {
             const si = layout.sbsSlotForRow(slots, cur) orelse return null;
             switch (slots[si]) {
-                .header => |hi| break :blk hi,
+                .header, .body => |hi| break :blk hi,
                 .pair => |p| {
                     const pane: ?usize = switch (want) {
                         .old => p.left,
@@ -332,6 +332,56 @@ test "commentAnchor side-by-side pair empty pane header" {
     try testing.expect(commentAnchor(rows3, slots3, .side_by_side, 4, .old) == null);
 
     try testing.expect(commentAnchor(&.{}, &.{}, .side_by_side, 0, .new) == null);
+}
+
+test "commentAnchor side-by-side one-sided body" {
+    const added =
+        \\diff --git a/new.txt b/new.txt
+        \\new file mode 100644
+        \\--- /dev/null
+        \\+++ b/new.txt
+        \\@@ -0,0 +1 @@
+        \\+hi
+    ;
+    var d = try diff.parse(testing.allocator, added);
+    defer d.deinit();
+    const rows = try row.flatten(testing.allocator, &d);
+    defer testing.allocator.free(rows);
+    const slots = try layout.pairSideBySide(testing.allocator, rows);
+    defer testing.allocator.free(slots);
+    try testing.expect(slots[2] == .body);
+
+    const file = commentAnchor(rows, slots, .side_by_side, 0, .new).?;
+    try testing.expectEqualStrings("new.txt", file.path);
+    try testing.expect(file.old_line == null);
+    try testing.expect(file.new_line == null);
+    try testing.expect(commentAnchor(rows, slots, .side_by_side, 2, .old) == null);
+    const add = commentAnchor(rows, slots, .side_by_side, 2, .new).?;
+    try testing.expectEqualStrings("new.txt", add.path);
+    try testing.expectEqual(1, add.new_line.?);
+    try testing.expect(add.old_line == null);
+
+    const deleted =
+        \\diff --git a/gone.txt b/gone.txt
+        \\deleted file mode 100644
+        \\--- a/gone.txt
+        \\+++ /dev/null
+        \\@@ -1 +0,0 @@
+        \\-bye
+    ;
+    var d2 = try diff.parse(testing.allocator, deleted);
+    defer d2.deinit();
+    const rows2 = try row.flatten(testing.allocator, &d2);
+    defer testing.allocator.free(rows2);
+    const slots2 = try layout.pairSideBySide(testing.allocator, rows2);
+    defer testing.allocator.free(slots2);
+    try testing.expect(slots2[2] == .body);
+
+    try testing.expect(commentAnchor(rows2, slots2, .side_by_side, 2, .new) == null);
+    const del = commentAnchor(rows2, slots2, .side_by_side, 2, .old).?;
+    try testing.expectEqualStrings("gone.txt", del.path);
+    try testing.expectEqual(1, del.old_line.?);
+    try testing.expect(del.new_line == null);
 }
 
 test "rowForComment add delete context missing" {
