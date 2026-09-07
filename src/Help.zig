@@ -56,6 +56,7 @@ const rows = [_]Row{
     .{ .item = .{ .key = "list", .label = "j/k move · Enter jump · Esc close" } },
     .{ .item = .{ .key = "approved", .label = "Enter unapprove · jump · Esc close" } },
     .{ .item = .{ .key = "discard", .label = "No/yes · comments no/Yes · Esc cancel" } },
+    .{ .item = .{ .key = "approve", .label = "No/yes · Esc cancel" } },
 };
 
 const key_w: u16 = blk: {
@@ -181,7 +182,7 @@ test "help catalog includes normal bindings" {
     const required = [_][]const u8{
         "j/k",     "h/l",     "0/$", "J/K", "[/]", "{/}", "(/)", "/", "n/N",
         "Space f", "Space c", "Space a", "gs", "gS", "a", "A", "i", "I", "d", "D",
-        "t",       "#",       "e",           "r", "?", "q", "approved",
+        "t",       "#",       "e",           "r", "?", "q", "approved", "approve",
     };
     for (required) |token| {
         var found = false;

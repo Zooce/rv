@@ -71,8 +71,8 @@
 //! (hiding approved hunks), restore the cursor, and call comment remap (and
 //! discard comment delete).
 //! `discardTargetAt` is the allowed discard; staged is a no-op. `stagePlan` /
-//! `confirmNext` are what the app loop dispatches. Overlay paint stays in the
-//! TUI.
+//! `approveHasComments` / `confirmNext` are what the app loop dispatches.
+//! Overlay paint stays in the TUI.
 //!
 //! ## Errors
 //!
@@ -626,6 +626,22 @@ pub fn discardHasComments(
     return comments.hasMatching(review, file, diffHunkIndex(file, rows, target));
 }
 
+/// Whether approve of the cursor target should confirm because of live comments.
+/// Hunk `a` (`whole_file == false`) requires a hunk; file-header comments and
+/// other hunks do not count. File `A` matches the file header plus every hunk.
+pub fn approveHasComments(
+    review: *const store.Review,
+    d: *const diff.Diff,
+    rows: []const view.row.Row,
+    cursor: usize,
+    whole_file: bool,
+) bool {
+    const target = indexTargetAt(rows, cursor, whole_file) orelse return false;
+    if (!whole_file and target.hunk_i == null) return false;
+    const file = fileForTarget(d, target) orelse return false;
+    return comments.hasMatching(review, file, diffHunkIndex(file, rows, target));
+}
+
 /// What stage/unstage at `cursor` should do. Section header (when not
 /// `whole_file`) is a group confirm; otherwise the file or hunk under the
 /// cursor. `none` when there is no target.
@@ -643,7 +659,7 @@ pub fn stagePlan(rows: []const view.row.Row, cursor: usize, whole_file: bool) St
     return .none;
 }
 
-pub const ConfirmKind = enum { discard, group };
+pub const ConfirmKind = enum { discard, group, approve };
 
 /// Next step after the user answers a confirm overlay (`yes` is the selected
 /// choice). `comments_phase` is whether the comments question is already showing.
@@ -652,6 +668,7 @@ pub const ConfirmNext = union(enum) {
     comments,
     group,
     discard: bool,
+    approve,
 };
 
 pub fn confirmNext(
@@ -666,6 +683,7 @@ pub fn confirmNext(
 ) ConfirmNext {
     return switch (kind) {
         .group => if (yes) .group else .close,
+        .approve => if (yes) .approve else .close,
         .discard => {
             if (!comments_phase and !yes) return .close;
             if (!comments_phase and discardHasComments(review, d, rows, cursor, whole_file)) return .comments;
@@ -2257,4 +2275,71 @@ test "survivingFileText unstaged is worktree, staged is index" {
     defer alloc.free(idx);
     try testing.expectEqualStrings("worktree body\n", wt);
     try testing.expectEqualStrings("staged body\n", idx);
+}
+
+fn twoHunkUnstaged(alloc: Allocator) !struct { d: diff.Diff, rows: []view.row.Row } {
+    const txt =
+        \\diff --git a/f b/f
+        \\--- a/f
+        \\+++ b/f
+        \\@@ -1 +1 @@
+        \\-old1
+        \\+new1
+        \\@@ -10 +10 @@
+        \\-old2
+        \\+new2
+    ;
+    var d = try diff.parsePieces(alloc, &.{.{ .text = txt, .group = .unstaged }});
+    errdefer d.deinit();
+    const rows = try view.row.flatten(alloc, &d);
+    return .{ .d = d, .rows = rows };
+}
+
+test "approveHasComments hunk vs other hunk vs file" {
+    const alloc = testing.allocator;
+    var fix = try twoHunkUnstaged(alloc);
+    defer fix.d.deinit();
+    defer alloc.free(fix.rows);
+    const rows = fix.rows;
+    // 0 Unstaged, 1 file f, 2 hunk0, 3 del, 4 add, 5 hunk1, 6 del, 7 add.
+    try testing.expect(rows[2] == .hunk_header);
+    try testing.expect(rows[5] == .hunk_header);
+
+    var review = try store.initEmpty(alloc, "t");
+    defer review.deinit();
+    _ = try review.addOpen("f", null, 10, .new, "hunk1");
+
+    try testing.expect(!approveHasComments(&review, &fix.d, rows, 4, false));
+    try testing.expect(approveHasComments(&review, &fix.d, rows, 7, false));
+    try testing.expect(approveHasComments(&review, &fix.d, rows, 4, true));
+    try testing.expect(approveHasComments(&review, &fix.d, rows, 1, true));
+    try testing.expect(!approveHasComments(&review, &fix.d, rows, 1, false));
+    try testing.expect(!approveHasComments(&review, &fix.d, rows, 0, false));
+}
+
+test "approveHasComments file header does not trigger hunk a" {
+    const alloc = testing.allocator;
+    var fix = try twoHunkUnstaged(alloc);
+    defer fix.d.deinit();
+    defer alloc.free(fix.rows);
+    const rows = fix.rows;
+
+    var review = try store.initEmpty(alloc, "t");
+    defer review.deinit();
+    _ = try review.addOpen("f", null, null, null, "file");
+
+    try testing.expect(!approveHasComments(&review, &fix.d, rows, 4, false));
+    try testing.expect(!approveHasComments(&review, &fix.d, rows, 7, false));
+    try testing.expect(approveHasComments(&review, &fix.d, rows, 1, true));
+    try testing.expect(approveHasComments(&review, &fix.d, rows, 4, true));
+}
+
+test "confirmNext approve yes and no" {
+    const alloc = testing.allocator;
+    var review = try store.initEmpty(alloc, "t");
+    defer review.deinit();
+    var d = try diff.parse(alloc, "");
+    defer d.deinit();
+    try testing.expect(confirmNext(.approve, false, true, &review, &d, &.{}, 0, false) == .approve);
+    try testing.expect(confirmNext(.approve, false, false, &review, &d, &.{}, 0, false) == .close);
 }

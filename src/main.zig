@@ -54,7 +54,9 @@
 //! git); an unmatched leader is dropped and the next key is
 //! handled as usual. Local `a` approves the current hunk; `A` approves the
 //! remaining hunks of that file in this group (from a hunk or the file
-//! header; no-op on a section). No confirm. Range loads ignore `a`/`A`.
+//! header; no-op on a section). Live comments on that hunk (`a`) or on
+//! the file / any of its hunks (`A`) open a confirm (No selected; `yes`
+//! proceeds). Range loads ignore `a`/`A`.
 //! Git failure opens a centered overlay with git’s error; Enter or Esc
 //! dismisses. The list is unchanged. Local load paints git and approve
 //! chords on the current file and hunk rows (no git/approve hints on a range
@@ -352,6 +354,18 @@ fn runTui(alloc: std.mem.Allocator, io: std.Io, source: cli.Source) !u8 {
                                 delete_them,
                             );
                         },
+                        .approve => {
+                            focus = .normal;
+                            try applyApprove(
+                                alloc,
+                                io,
+                                source,
+                                &diff_view,
+                                &viewport.cursor,
+                                &frame.note,
+                                discard_confirm.whole_file,
+                            );
+                        },
                     },
                     .helping => switch (help.handleKey(key)) {
                         .closed => focus = .normal,
@@ -502,23 +516,29 @@ fn runTui(alloc: std.mem.Allocator, io: std.Io, source: cli.Source) !u8 {
                                         focus = .commenting;
                                     }
                                 } else if (c == 'a') {
-                                    try applyApprove(
+                                    try dispatchApprove(
                                         alloc,
                                         io,
                                         source,
                                         &diff_view,
                                         &viewport.cursor,
                                         &frame.note,
+                                        &review,
+                                        &discard_confirm,
+                                        &focus,
                                         false,
                                     );
                                 } else if (c == 'A') {
-                                    try applyApprove(
+                                    try dispatchApprove(
                                         alloc,
                                         io,
                                         source,
                                         &diff_view,
                                         &viewport.cursor,
                                         &frame.note,
+                                        &review,
+                                        &discard_confirm,
+                                        &focus,
                                         true,
                                     );
                                 } else if (c == 'd') {
@@ -1008,6 +1028,30 @@ fn dispatchGitIndex(
     );
 }
 
+/// Approve the hunk or remaining file hunks. Local only. Live comments on
+/// that target open a confirm (No selected); otherwise the same silent
+/// approve as today.
+fn dispatchApprove(
+    alloc: std.mem.Allocator,
+    io: std.Io,
+    source: cli.Source,
+    diff_view: *DiffView,
+    cursor: *usize,
+    note: *StatusNote,
+    review: *const store.Review,
+    confirm: *DiscardConfirm,
+    focus: *Focus,
+    whole_file: bool,
+) std.mem.Allocator.Error!void {
+    if (source != .local) return;
+    if (git.approveHasComments(review, &diff_view.diff, diff_view.rows, cursor.*, whole_file)) {
+        confirm.* = .{ .kind = .approve, .whole_file = whole_file, .yes = false, .comments = false };
+        focus.* = .discard_confirm;
+        return;
+    }
+    try applyApprove(alloc, io, source, diff_view, cursor, note, whole_file);
+}
+
 /// Open the discard confirm for the hunk or file at the cursor. Hunk
 /// discard requires a hunk. Staged and range loads are no-ops.
 fn beginGitDiscard(
@@ -1061,13 +1105,15 @@ fn commitApply(
 }
 
 /// Key ownership: normal nav, comment draft, `/` search prompt, comment list,
-/// file list, approved list, help, git error overlay, or discard confirm.
+/// file list, approved list, help, git error overlay, or confirm overlay
+/// (discard, group, or approve).
 pub const Focus = enum { normal, commenting, searching, listing, files, approved, helping, git_error, discard_confirm };
 
-/// Confirm overlay for discard (`gd` / `gD`). `yes` is the selected
-/// choice. Opens with **No** selected (Enter does not apply). Discard:
-/// if the target has live comments, `comments` is the second overlay
-/// and defaults to **Yes** (delete).
+/// Confirm overlay for discard (`gd` / `gD`), group stage/unstage, and
+/// approve (`a` / `A` when the target has live comments). `yes` is the
+/// selected choice. Opens with **No** selected (Enter does not apply).
+/// Discard: if the target has live comments, `comments` is the second
+/// overlay and defaults to **Yes** (delete).
 pub const DiscardConfirm = struct {
     const Result = union(enum) {
         open,
@@ -1075,6 +1121,7 @@ pub const DiscardConfirm = struct {
         quit,
         group,
         discard: bool,
+        approve,
     };
 
     kind: git.ConfirmKind = .discard,
@@ -1131,6 +1178,7 @@ pub const DiscardConfirm = struct {
             },
             .group => return .group,
             .discard => |delete_them| return .{ .discard = delete_them },
+            .approve => return .approve,
         }
     }
 
@@ -1157,7 +1205,8 @@ pub const DiscardConfirm = struct {
 
         var hunk_buf: [512]u8 = undefined;
         const group = self.kind == .group;
-        const hunk_text: []const u8, const path: []const u8 = if (group or self.comments)
+        const question_only = self.kind == .group or self.kind == .approve or self.comments;
+        const hunk_text: []const u8, const path: []const u8 = if (question_only)
             .{ "", "" }
         else blk: {
             const target = git.indexTargetAt(rows, cursor, self.whole_file);
@@ -1169,7 +1218,7 @@ pub const DiscardConfirm = struct {
             break :blk .{ ht, if (target) |t| t.path else "" };
         };
 
-        const content_n: u16 = if (group or self.comments)
+        const content_n: u16 = if (question_only)
             3
         else if (hunk_text.len > 0)
             4
@@ -1186,6 +1235,7 @@ pub const DiscardConfirm = struct {
                     .staged => " unstage ",
                 },
                 .discard => if (self.comments) " comments " else " discard ",
+                .approve => " approve ",
             };
             scr.putStr(panel.x + 2, panel.y, title, panel_frame, panel);
         }
@@ -1198,6 +1248,15 @@ pub const DiscardConfirm = struct {
                 .untracked => "Stage all untracked?",
                 .staged => "Unstage all staged?",
             };
+            if (row < inner.h) {
+                scr.putStr(inner.x, inner.y + row, question, panel_bg, inner);
+                row += 1;
+            }
+        } else if (self.kind == .approve) {
+            const question: []const u8 = if (self.whole_file)
+                "This file has unresolved comments. Approve anyway?"
+            else
+                "This hunk has unresolved comments. Approve anyway?";
             if (row < inner.h) {
                 scr.putStr(inner.x, inner.y + row, question, panel_bg, inner);
                 row += 1;
@@ -1233,6 +1292,7 @@ pub const DiscardConfirm = struct {
                 "rv  discard comments  no/Yes  Enter  Esc cancel  q quit"
             else
                 "rv  discard  No/yes  Enter  Esc cancel  q quit",
+            .approve => "rv  approve  No/yes  Enter  Esc cancel  q quit",
         };
     }
 
@@ -2439,6 +2499,14 @@ test "indexHintForRow section has no git hint" {
     try std.testing.expectEqualStrings("", Frame.indexHintForRow(0, null, null, 0, .staged));
     try std.testing.expectEqualStrings("", Frame.indexHintForRow(1, null, null, 0, .unstaged));
     try std.testing.expectEqualStrings("", Frame.indexHintForRow(0, null, null, null, .unstaged));
+}
+
+test "approve confirm titleBar" {
+    const c: DiscardConfirm = .{ .kind = .approve };
+    try std.testing.expectEqualStrings(
+        "rv  approve  No/yes  Enter  Esc cancel  q quit",
+        c.titleBar(),
+    );
 }
 
 test "draft titleBar file vs line" {
