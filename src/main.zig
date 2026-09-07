@@ -39,9 +39,13 @@
 //!
 //! File list: `Space` then `f` opens a centered overlay of changed-file
 //! paths (flatten order). `j`/`k` move; Enter jumps to that file header and
-//! closes. Esc closes without moving the cursor. `q` still quits. Empty
-//! diff: empty overlay. Opens on the file under the cursor when there is
-//! one. Local only: `g` then `s`/`u`/`d` stages, unstages, or discards the
+//! closes. `a`/`A` approve the remaining hunks of that file in its group
+//! (same as `A` on the file header; local only; range no-op). The overlay stays
+//! open and refreshes; a fully approved file leaves the list. Live comments
+//! on the file open the same approve confirm; Esc on that confirm returns
+//! to the list. Esc on the list closes without moving the cursor. `q` still
+//! quits. Empty diff: empty overlay. Opens on the file under the cursor
+//! when there is one. Local only: `g` then `s`/`u`/`d` stages, unstages, or discards the
 //! current hunk; `S`/`U`/`D` do the containing file (file header or inside
 //! that file). Hunk chords are no-ops on a file header; all six are no-ops
 //! on a section. Stage and unstage are separate keys (already-staged `gs`/`gS`
@@ -70,9 +74,12 @@
 //! Comment list: `Space` then `c` opens a centered overlay of live comments
 //! (same store as `rv list`). `j`/`k` move; Enter jumps with the same landing
 //! as `(`/`)` and closes the overlay. A live comment on an approved hunk
-//! unapproves that hunk, rebuilds, and lands (same as `(`/`)`). Esc closes
-//! without moving the cursor. A row whose path/line is gone from the live
-//! diff stays in the list and shows a footer note. `q` still quits.
+//! unapproves that hunk, rebuilds, and lands (same as `(`/`)`). `d`/`D`
+//! dismisses the selected comment (list stays open; cursor stays on a
+//! neighbor). `i`/`c`/`I`/`C` jump the same way as Enter and open the
+//! create-or-edit box on that comment. Esc closes without moving the
+//! cursor. A row whose path/line is gone from the live diff stays in the
+//! list and shows a footer note. `q` still quits.
 //!
 //! Approved list: `Space` then `a` opens a centered overlay of live approved
 //! identities (flatten order). Local only. `j`/`k` move; Enter removes one
@@ -257,23 +264,31 @@ fn runTui(alloc: std.mem.Allocator, io: std.Io, source: cli.Source) !u8 {
                             help.scroll = 0;
                             focus = .helping;
                         },
-                        .jump => |row| {
+                        .jump => |j| {
                             focus = .normal;
-                            viewport.cursor = row;
+                            viewport.cursor = j.row;
+                            if (j.edit) {
+                                try draft.beginComment(alloc, comment_list.items.items[comment_list.cursor]);
+                                focus = .commenting;
+                            }
                         },
-                        .hidden => |loc| {
+                        .hidden => |h| {
                             focus = .normal;
-                            _ = try landComment(
+                            if (try landComment(
                                 alloc,
                                 io,
                                 source,
                                 &diff_view,
                                 &viewport.cursor,
                                 &frame.note,
-                                loc,
-                            );
+                                h.loc,
+                            ) and h.edit) {
+                                try draft.beginComment(alloc, comment_list.items.items[comment_list.cursor]);
+                                focus = .commenting;
+                            }
                         },
                         .missing => frame.note.set("comment not in this diff"),
+                        .dismiss => try applyListDismiss(alloc, io, &review, &comment_list, &frame.note),
                         .open => {},
                     },
                     .files => switch (file_list.handleKey(key)) {
@@ -287,6 +302,18 @@ fn runTui(alloc: std.mem.Allocator, io: std.Io, source: cli.Source) !u8 {
                             viewport.cursor = row;
                             focus = .normal;
                         },
+                        .approve => try applyListApprove(
+                            alloc,
+                            io,
+                            source,
+                            &diff_view,
+                            &viewport.cursor,
+                            &frame.note,
+                            &review,
+                            &discard_confirm,
+                            &focus,
+                            &file_list,
+                        ),
                         .open => {},
                     },
                     .approved => switch (approved_list.handleKey(key)) {
@@ -322,7 +349,7 @@ fn runTui(alloc: std.mem.Allocator, io: std.Io, source: cli.Source) !u8 {
                         diff_view.rows,
                         viewport.cursor,
                     )) {
-                        .closed => focus = .normal,
+                        .closed => focus = if (discard_confirm.return_to_files) .files else .normal,
                         .quit => running = false,
                         .open => {},
                         .group => {
@@ -357,7 +384,6 @@ fn runTui(alloc: std.mem.Allocator, io: std.Io, source: cli.Source) !u8 {
                             );
                         },
                         .approve => {
-                            focus = .normal;
                             try applyApprove(
                                 alloc,
                                 io,
@@ -367,6 +393,12 @@ fn runTui(alloc: std.mem.Allocator, io: std.Io, source: cli.Source) !u8 {
                                 &frame.note,
                                 discard_confirm.whole_file,
                             );
+                            if (discard_confirm.return_to_files) {
+                                try file_list.reload(alloc, diff_view.rows, file_list.cursor);
+                                focus = .files;
+                            } else {
+                                focus = .normal;
+                            }
                         },
                     },
                     .helping => switch (help.handleKey(key)) {
@@ -1131,6 +1163,9 @@ pub const DiscardConfirm = struct {
     whole_file: bool = false,
     yes: bool = false,
     comments: bool = false,
+    /// Approve confirm opened from the file list: Esc or a successful yes
+    /// returns to that overlay (refreshed after yes).
+    return_to_files: bool = false,
 
     fn handleKey(
         self: *DiscardConfirm,
@@ -1369,15 +1404,23 @@ pub const Draft = struct {
         want: view.row.CommentSide,
     ) std.mem.Allocator.Error!bool {
         const found = comments.atSide(review, rows, slots, layout, cursor, want) orelse return false;
+        if (found.idx) |idx| {
+            try self.beginComment(alloc, review.comments.items[idx]);
+            return true;
+        }
         self.clear();
         self.anchor = found.anchor;
-        if (found.idx) |idx| {
-            const c = review.comments.items[idx];
-            try self.buf.appendSlice(alloc, c.body);
-            self.caret = self.buf.items.len;
-            self.edit_id = c.id;
-        }
         return true;
+    }
+
+    /// Open the comment box on an existing store row (list edit, or `begin`
+    /// when that loc already has a comment).
+    fn beginComment(self: *Draft, alloc: std.mem.Allocator, c: store.Comment) std.mem.Allocator.Error!void {
+        self.clear();
+        self.anchor = .{ .path = c.path, .old_line = c.old_line, .new_line = c.new_line };
+        try self.buf.appendSlice(alloc, c.body);
+        self.caret = self.buf.items.len;
+        self.edit_id = c.id;
     }
 
     pub fn titleBar(self: *const Draft) []const u8 {
@@ -1969,15 +2012,80 @@ fn dismissAt(
             note.set("no comment on this side");
         return;
     };
+    _ = dismissById(review, alloc, io, review.comments.items[idx].id, note);
+}
+
+/// Delete `id` and save. True when the store dropped it. Not found: false,
+/// store unchanged. Save failure puts the comment back and sets the note.
+fn dismissById(
+    review: *store.Review,
+    alloc: std.mem.Allocator,
+    io: std.Io,
+    id: []const u8,
+    note: *StatusNote,
+) bool {
+    const idx = blk: {
+        for (review.comments.items, 0..) |c, i| {
+            if (std.mem.eql(u8, c.id, id)) break :blk i;
+        }
+        return false;
+    };
     const saved = review.comments.items[idx];
-    const id = saved.id;
-    review.remove(&.{id}) catch return;
+    review.remove(&.{id}) catch return false;
     store.save(review, alloc, io, .cwd()) catch {
         review.comments.insert(review.arena.allocator(), idx, saved) catch {};
         note.set("failed to save .rv comment store");
-        return;
+        return false;
     };
     note.setFmt("deleted {s}", .{id});
+    return true;
+}
+
+/// Comment list `d`/`D`: drop that store id, reload the overlay, keep the
+/// cursor on a neighbor. Empty list: stay in the overlay. Failed save: list
+/// unchanged.
+fn applyListDismiss(
+    alloc: std.mem.Allocator,
+    io: std.Io,
+    review: *store.Review,
+    list: *CommentList,
+    note: *StatusNote,
+) std.mem.Allocator.Error!void {
+    const idx = list.cursor;
+    if (idx >= list.items.items.len) return;
+    if (!dismissById(review, alloc, io, list.items.items[idx].id, note)) return;
+    try list.load(alloc, review.comments.items);
+    if (list.items.items.len > 0) {
+        list.cursor = @min(idx, list.items.items.len - 1);
+    }
+}
+
+/// File list `a`/`A`: approve remaining hunks of that file (same as `A` on
+/// the header). Local only. Range: no-op. Unresolved comments open the existing
+/// confirm and return here afterward. After a silent approve the overlay
+/// stays open and refreshes; cursor stays on a neighbor.
+fn applyListApprove(
+    alloc: std.mem.Allocator,
+    io: std.Io,
+    source: cli.Source,
+    diff_view: *DiffView,
+    cursor: *usize,
+    note: *StatusNote,
+    review: *const store.Review,
+    confirm: *DiscardConfirm,
+    focus: *Focus,
+    list: *FileList,
+) std.mem.Allocator.Error!void {
+    if (source != .local) return;
+    const idx = list.cursor;
+    if (idx >= list.items.items.len) return;
+    cursor.* = list.items.items[idx];
+    try dispatchApprove(alloc, io, source, diff_view, cursor, note, review, confirm, focus, true);
+    if (focus.* == .discard_confirm) {
+        confirm.return_to_files = true;
+        return;
+    }
+    try list.reload(alloc, diff_view.rows, idx);
 }
 
 /// Centered overlay. Width up to 120; height grows with rows, clamped to
@@ -2004,9 +2112,10 @@ const CommentList = struct {
         closed,
         quit,
         help,
-        jump: usize,
-        hidden: view.CommentLoc,
+        jump: struct { row: usize, edit: bool },
+        hidden: struct { loc: view.CommentLoc, edit: bool },
         missing,
+        dismiss,
     };
 
     items: std.ArrayList(store.Comment) = .empty,
@@ -2024,18 +2133,25 @@ const CommentList = struct {
         self.scroll = 0;
     }
 
+    fn jumpResult(self: *const CommentList, rows: []const view.row.Row, edit: bool) Result {
+        if (self.cursor >= self.items.items.len) return .open;
+        const loc = comments.loc(self.items.items[self.cursor]) orelse return .missing;
+        if (view.rowForComment(rows, loc)) |idx| return .{ .jump = .{ .row = idx, .edit = edit } };
+        return .{ .hidden = .{ .loc = loc, .edit = edit } };
+    }
+
     fn handleKey(self: *CommentList, key: tui.Key, rows: []const view.row.Row) Result {
         switch (key) {
             .esc => return .closed,
-            .enter => {
-                if (self.cursor >= self.items.items.len) return .open;
-                const loc = comments.loc(self.items.items[self.cursor]) orelse return .missing;
-                if (view.rowForComment(rows, loc)) |idx| return .{ .jump = idx };
-                return .{ .hidden = loc };
-            },
+            .enter => return self.jumpResult(rows, false),
             .char => |c| {
                 if (c == 'q' or c == 'Q') return .quit;
                 if (c == '?') return .help;
+                if (c == 'i' or c == 'I' or c == 'c' or c == 'C') return self.jumpResult(rows, true);
+                if (c == 'd' or c == 'D') {
+                    if (self.cursor >= self.items.items.len) return .open;
+                    return .dismiss;
+                }
                 if (c == 'j') {
                     if (self.cursor + 1 < self.items.items.len) self.cursor += 1;
                 } else if (c == 'k') {
@@ -2168,6 +2284,7 @@ const FileList = struct {
         quit,
         help,
         jump: usize,
+        approve,
     };
 
     items: std.ArrayList(usize) = .empty,
@@ -2196,6 +2313,13 @@ const FileList = struct {
         }
     }
 
+    fn reload(self: *FileList, alloc: std.mem.Allocator, rows: []const view.row.Row, keep: usize) std.mem.Allocator.Error!void {
+        try self.load(alloc, rows, null);
+        if (self.items.items.len > 0) {
+            self.cursor = @min(keep, self.items.items.len - 1);
+        }
+    }
+
     fn handleKey(self: *FileList, key: tui.Key) Result {
         switch (key) {
             .esc => return .closed,
@@ -2205,6 +2329,10 @@ const FileList = struct {
             .char => |c| {
                 if (c == 'q' or c == 'Q') return .quit;
                 if (c == '?') return .help;
+                if (c == 'a' or c == 'A') {
+                    if (self.cursor >= self.items.items.len) return .open;
+                    return .approve;
+                }
                 if (c == 'j') {
                     if (self.cursor + 1 < self.items.items.len) self.cursor += 1;
                 } else if (c == 'k') {
@@ -2755,6 +2883,36 @@ test "file list omits a fully approved file and keeps a mixed file" {
     try std.testing.expectEqualStrings("mixed.txt", hidden[list.items.items[0]].file_header.path);
 }
 
+test "file list a and A approve" {
+    const alloc = std.testing.allocator;
+    var d = try diff.parse(alloc,
+        \\diff --git a/f.txt b/f.txt
+        \\--- a/f.txt
+        \\+++ b/f.txt
+        \\@@ -1 +1 @@
+        \\-old
+        \\+new
+    );
+    defer d.deinit();
+    const rows = try view.row.flatten(alloc, &d);
+    defer alloc.free(rows);
+
+    var list: FileList = .{};
+    defer list.items.deinit(alloc);
+    try list.load(alloc, rows, null);
+    try std.testing.expect(list.handleKey(.{ .char = 'A' }) == .approve);
+    try std.testing.expect(list.handleKey(.{ .char = 'a' }) == .approve);
+    switch (list.handleKey(.enter)) {
+        .jump => |row| try std.testing.expectEqual(0, row),
+        else => try std.testing.expect(false),
+    }
+
+    var empty: FileList = .{};
+    defer empty.items.deinit(alloc);
+    try std.testing.expect(empty.handleKey(.{ .char = 'A' }) == .open);
+    try std.testing.expect(empty.handleKey(.{ .char = 'a' }) == .open);
+}
+
 test "comment list Enter on a hidden loc is hidden not missing" {
     const alloc = std.testing.allocator;
     const io = std.testing.io;
@@ -2788,19 +2946,23 @@ test "comment list Enter on a hidden loc is hidden not missing" {
         .body = "on hidden hunk",
     }});
     switch (list.handleKey(.enter, hidden)) {
-        .hidden => |loc| {
-            try std.testing.expectEqualStrings("f.txt", loc.path);
-            try std.testing.expectEqual(.new, loc.side.?);
-            try std.testing.expectEqual(1, loc.line.?);
+        .hidden => |h| {
+            try std.testing.expectEqualStrings("f.txt", h.loc.path);
+            try std.testing.expectEqual(.new, h.loc.side.?);
+            try std.testing.expectEqual(1, h.loc.line.?);
+            try std.testing.expect(!h.edit);
         },
         else => try std.testing.expect(false),
     }
     switch (list.handleKey(.enter, full)) {
-        .jump => |row| try std.testing.expectEqual(view.rowForComment(full, .{
-            .path = "f.txt",
-            .side = .new,
-            .line = 1,
-        }).?, row),
+        .jump => |j| {
+            try std.testing.expectEqual(view.rowForComment(full, .{
+                .path = "f.txt",
+                .side = .new,
+                .line = 1,
+            }).?, j.row);
+            try std.testing.expect(!j.edit);
+        },
         else => try std.testing.expect(false),
     }
 }
@@ -2829,7 +2991,98 @@ test "comment list Enter on a hunk comment jumps to the header" {
         .body = "hunk",
     }});
     switch (list.handleKey(.enter, rows)) {
-        .jump => |row| try std.testing.expectEqual(1, row),
+        .jump => |j| {
+            try std.testing.expectEqual(1, j.row);
+            try std.testing.expect(!j.edit);
+        },
+        else => try std.testing.expect(false),
+    }
+}
+
+test "comment list d dismisses and i edits" {
+    const alloc = std.testing.allocator;
+    var d = try diff.parse(alloc,
+        \\diff --git a/f.txt b/f.txt
+        \\--- a/f.txt
+        \\+++ b/f.txt
+        \\@@ -1 +1 @@
+        \\-old
+        \\+new
+    );
+    defer d.deinit();
+    const rows = try view.row.flatten(alloc, &d);
+    defer alloc.free(rows);
+
+    var list: CommentList = .{};
+    defer list.items.deinit(alloc);
+    try list.load(alloc, &.{.{
+        .id = "1",
+        .path = "f.txt",
+        .new_line = 1,
+        .side = .new,
+        .body = "note",
+    }});
+    try std.testing.expect(list.handleKey(.{ .char = 'd' }, rows) == .dismiss);
+    try std.testing.expect(list.handleKey(.{ .char = 'D' }, rows) == .dismiss);
+    switch (list.handleKey(.{ .char = 'i' }, rows)) {
+        .jump => |j| {
+            try std.testing.expect(j.edit);
+            try std.testing.expectEqual(view.rowForComment(rows, .{
+                .path = "f.txt",
+                .side = .new,
+                .line = 1,
+            }).?, j.row);
+        },
+        else => try std.testing.expect(false),
+    }
+    switch (list.handleKey(.{ .char = 'C' }, rows)) {
+        .jump => |j| try std.testing.expect(j.edit),
+        else => try std.testing.expect(false),
+    }
+
+    var empty: CommentList = .{};
+    defer empty.items.deinit(alloc);
+    try std.testing.expect(empty.handleKey(.{ .char = 'd' }, rows) == .open);
+    try std.testing.expect(empty.handleKey(.{ .char = 'i' }, rows) == .open);
+}
+
+test "comment list i on a hidden loc is hidden with edit" {
+    const alloc = std.testing.allocator;
+    const io = std.testing.io;
+    var d = try diff.parse(alloc,
+        \\diff --git a/f.txt b/f.txt
+        \\--- a/f.txt
+        \\+++ b/f.txt
+        \\@@ -1 +1 @@
+        \\-old
+        \\+new
+        \\@@ -10 +10 @@
+        \\-old2
+        \\+new2
+    );
+    defer d.deinit();
+    var approved = approve.initEmpty(alloc);
+    defer approved.deinit();
+    try approved.append("f.txt", approve.fingerprintHunk(d.files[0].hunks[0]));
+    const hidden = try approve.hide(alloc, &d, &approved, io, .cwd());
+    defer alloc.free(hidden);
+
+    var list: CommentList = .{};
+    defer list.items.deinit(alloc);
+    try list.load(alloc, &.{.{
+        .id = "1",
+        .path = "f.txt",
+        .new_line = 1,
+        .side = .new,
+        .body = "on hidden hunk",
+    }});
+    switch (list.handleKey(.{ .char = 'i' }, hidden)) {
+        .hidden => |h| {
+            try std.testing.expect(h.edit);
+            try std.testing.expectEqualStrings("f.txt", h.loc.path);
+            try std.testing.expectEqual(.new, h.loc.side.?);
+            try std.testing.expectEqual(1, h.loc.line.?);
+        },
         else => try std.testing.expect(false),
     }
 }
