@@ -19,7 +19,9 @@
 //! the worktree is clean, `HEAD · N approved` when every local change is
 //! hidden).
 //!
-//! With a git range arg: load `git diff <range>` as written → same TUI.
+//! With a git commit-ish arg: load that commit's patch → same TUI (read-only
+//! git mutate / approve). With a range that contains `..` or `...`: load
+//! `git diff <range>` as written → same TUI.
 //! With a subcommand: headless CLI (`status`, `approved`, `unapprove`, `list`,
 //! `show`, `resolve`, `export`, `install-skill`, help). Comment-only commands
 //! do not load git. `status` / `approved` / `unapprove` load the local diff.
@@ -133,6 +135,7 @@ fn runTui(alloc: std.mem.Allocator, io: std.Io, source: cli.Source) !u8 {
         var parsed = switch (source) {
             .local => git.loadDefaultDiff(alloc, io),
             .range => |r| git.loadRangeDiff(alloc, io, .inherit, r),
+            .commit => |c| git.loadCommitDiff(alloc, io, .inherit, c),
         } catch |err| {
             std.debug.print("rv: {s}\n", .{git.errorMessage(err)});
             return 1;
@@ -229,7 +232,7 @@ fn runTui(alloc: std.mem.Allocator, io: std.Io, source: cli.Source) !u8 {
                 // Notes are one-shot; any key clears them (including keys that no-op).
                 frame.note.clear();
                 switch (focus) {
-                    .commenting => switch (try draft.handleKey(alloc, io, &review, key, size)) {
+                    .commenting => switch (try draft.handleKey(alloc, io, &review, source, key, size)) {
                         .closed => focus = .normal,
                         .quit => running = false,
                         .save_failed => {
@@ -634,7 +637,7 @@ pub const DiffView = struct {
     /// Flatten rows (paint, nav, git targeting). Strings borrow from `diff`.
     rows: []view.row.Row,
     sbs_slots: []view.layout.SbsSlot,
-    /// Live approved identities still in `diff` after prune. 0 on range loads.
+    /// Live approved identities still in `diff` after prune. 0 on range/commit loads.
     approved_n: usize,
 
     fn maybeInit(
@@ -646,6 +649,7 @@ pub const DiffView = struct {
         var new_diff = switch (source) {
             .local => git.loadDefaultDiff(alloc, io),
             .range => |r| git.loadRangeDiff(alloc, io, .inherit, r),
+            .commit => |c| git.loadCommitDiff(alloc, io, .inherit, c),
         } catch |err| {
             note.set(git.errorMessage(err));
             return null;
@@ -708,7 +712,7 @@ fn flattenSource(
 ) approve.LoadError!approve.Visible {
     return switch (source) {
         .local => approve.loadVisible(alloc, io, .cwd(), d),
-        .range => .{ .rows = try view.row.flatten(alloc, d), .approved_n = 0 },
+        .range, .commit => .{ .rows = try view.row.flatten(alloc, d), .approved_n = 0 },
     };
 }
 
@@ -765,12 +769,8 @@ fn expandCurrentHunk(
     const hunk_row = view.nav.currentHunkInFile(rows, cur) orelse return;
     const hh = rows[hunk_row].hunk_header;
 
-    const range: ?[]const u8 = switch (source) {
-        .local => null,
-        .range => |r| r,
-    };
     const file = &diff_view.diff.files[target.file_i];
-    const text = git.survivingFileText(alloc, io, .inherit, file, range) catch |err| switch (err) {
+    const text = git.survivingFileText(alloc, io, .inherit, file, source) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
         else => {
             note.set(git.errorMessage(err));
@@ -1440,6 +1440,7 @@ pub const Draft = struct {
         alloc: std.mem.Allocator,
         io: std.Io,
         review: *store.Review,
+        source: cli.Source,
         key: tui.Key,
         size: tui.Size,
     ) std.mem.Allocator.Error!Result {
@@ -1472,6 +1473,7 @@ pub const Draft = struct {
                             self.anchor.new_line,
                             side,
                             self.buf.items,
+                            source,
                         );
                         store.save(review, alloc, io, .cwd()) catch {
                             // Stay in review; next save can retry. Marker is in-memory.
@@ -2195,7 +2197,13 @@ const CommentList = struct {
             .new => "new",
             .context => "ctx",
         } else "-";
-        const prefix = Frame.bufPrintTrunc(buf, "{s}  {s}  {s}  {s}  ", .{ c.id, c.path, side, line_col });
+        const prefix = Frame.bufPrintTrunc(buf, "{s}  {s}  {s}  {s}  {s}  ", .{
+            c.id,
+            if (c.source) |s| s.label() else "-",
+            c.path,
+            side,
+            line_col,
+        });
         var i: usize = 0;
         const rest = buf[prefix.len..];
         for (c.body) |b| {
@@ -2672,11 +2680,11 @@ test "draft titleBar file vs line" {
 test "comment list file row has no line" {
     var buf: [128]u8 = undefined;
     try std.testing.expectEqualStrings(
-        "1  a.zig  file  -  note",
+        "1  -  a.zig  file  -  note",
         CommentList.formatLine(&buf, .{ .id = "1", .path = "a.zig", .body = "note" }),
     );
     try std.testing.expectEqualStrings(
-        "2  a.zig  new  +10  x",
+        "2  -  a.zig  new  +10  x",
         CommentList.formatLine(&buf, .{
             .id = "2",
             .path = "a.zig",
@@ -2686,13 +2694,24 @@ test "comment list file row has no line" {
         }),
     );
     try std.testing.expectEqualStrings(
-        "3  a.zig  hunk  -1,+2  h",
+        "3  -  a.zig  hunk  -1,+2  h",
         CommentList.formatLine(&buf, .{
             .id = "3",
             .path = "a.zig",
             .old_line = 1,
             .new_line = 2,
             .body = "h",
+        }),
+    );
+    try std.testing.expectEqualStrings(
+        "4  abc123  a.zig  new  +1  n",
+        CommentList.formatLine(&buf, .{
+            .id = "4",
+            .path = "a.zig",
+            .new_line = 1,
+            .side = .new,
+            .body = "n",
+            .source = .{ .commit = "abc123" },
         }),
     );
 }
@@ -2770,13 +2789,13 @@ test "draft begin on file and hunk header" {
     try std.testing.expectEqual(1, draft.anchor.new_line.?);
     try std.testing.expect(draft.edit_id == null);
 
-    _ = try review.addOpen("f", null, null, null, "hello");
+    _ = try review.addOpen("f", null, null, null, "hello", .local);
     try std.testing.expect(try draft.begin(&review, std.testing.allocator, rows, empty, .unified, 0, .old));
     try std.testing.expectEqualStrings("hello", draft.buf.items);
     try std.testing.expect(draft.edit_id != null);
 
-    _ = try review.addOpen("f", null, 1, .new, "line");
-    _ = try review.addOpen("f", 1, 1, null, "hunk body");
+    _ = try review.addOpen("f", null, 1, .new, "line", .local);
+    _ = try review.addOpen("f", 1, 1, null, "hunk body", .local);
     try std.testing.expect(try draft.begin(&review, std.testing.allocator, rows, empty, .unified, 1, .new));
     try std.testing.expectEqualStrings("hunk body", draft.buf.items);
     try std.testing.expect(draft.edit_id != null);

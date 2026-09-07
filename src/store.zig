@@ -1,5 +1,7 @@
 //! Comment store: `.rv/reviews/<id>.json` (default `current`). Arena-owned;
 //! missing file → empty; `save` is atomic. Anchors: path + optional lines/side.
+//! `Source` is the review load a comment was left on (local / range / commit).
+//! Identity is still path + lines (`firstAt`); source is context, not a key.
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
@@ -13,6 +15,21 @@ pub const State = enum { open, resolved };
 pub const Side = enum { old, new, context };
 pub const CommentKind = enum { file, hunk, line };
 
+/// Review load: local worktree, an explicit `git diff` range, or one commit.
+pub const Source = union(enum) {
+    local,
+    range: []const u8,
+    commit: []const u8,
+
+    /// List/export text: `local`, or the range/commit string as given.
+    pub fn label(self: Source) []const u8 {
+        return switch (self) {
+            .local => "local",
+            .range, .commit => |s| s,
+        };
+    }
+};
+
 pub const Comment = struct {
     id: []const u8,
     path: []const u8,
@@ -21,6 +38,8 @@ pub const Comment = struct {
     side: ?Side = null,
     body: []const u8,
     state: State = .open,
+    /// Null on comments saved before this field existed.
+    source: ?Source = null,
 };
 
 pub const Review = struct {
@@ -84,6 +103,7 @@ pub const Review = struct {
         new_line: ?u32,
         side: ?Side,
         body: []const u8,
+        source: Source,
     ) Allocator.Error![]const u8 {
         const alloc = self.arena.allocator();
         const id = try std.fmt.allocPrint(alloc, "{d}", .{self.next_seq});
@@ -96,6 +116,7 @@ pub const Review = struct {
             .side = side,
             .body = try alloc.dupe(u8, body),
             .state = .open,
+            .source = try dupeSource(alloc, source),
         });
         return id;
     }
@@ -156,6 +177,14 @@ fn lineMatch(a: ?u32, b: ?u32) bool {
     return (a orelse return false) == (b orelse return false);
 }
 
+fn dupeSource(alloc: Allocator, source: Source) Allocator.Error!Source {
+    return switch (source) {
+        .local => .local,
+        .range => |r| .{ .range = try alloc.dupe(u8, r) },
+        .commit => |c| .{ .commit = try alloc.dupe(u8, c) },
+    };
+}
+
 pub const LoadError = error{ InvalidJson, InvalidState, InvalidSide } ||
     Allocator.Error || Io.Dir.ReadFileAllocError || Io.Dir.OpenError;
 
@@ -204,6 +233,7 @@ const WireComment = struct {
     side: ?[]const u8 = null,
     body: []const u8,
     state: []const u8 = "open",
+    source: ?Source = null,
 };
 
 const WireReview = struct {
@@ -242,6 +272,7 @@ fn parseJson(alloc: Allocator, raw: []const u8, fallback_id: []const u8) LoadErr
             .side = side,
             .body = try review.arena.allocator().dupe(u8, wc.body),
             .state = state,
+            .source = if (wc.source) |s| try dupeSource(review.arena.allocator(), s) else null,
         });
     }
     review.next_seq = max_seq + 1;
@@ -261,6 +292,7 @@ fn stringify(self: *const Review, alloc: Allocator) Allocator.Error![]u8 {
             .side = if (c.side) |s| @tagName(s) else null,
             .body = c.body,
             .state = @tagName(c.state),
+            .source = c.source,
         });
     }
     const wire: WireReview = .{
@@ -282,10 +314,11 @@ const IsolatedTmp = if (builtin.is_test) @import("isolated_tmp").IsolatedTmp els
 test "addOpen firstAt and roundtrip" {
     var r = try initEmpty(testing.allocator, default_review_id);
     defer r.deinit();
-    try testing.expectEqualStrings("1", try r.addOpen("a.zig", null, 10, .new, "fix"));
+    try testing.expectEqualStrings("1", try r.addOpen("a.zig", null, 10, .new, "fix", .local));
     try testing.expect(r.firstAt("a.zig", null, 10, .line) != null);
     try testing.expect(r.firstAt("a.zig", null, 11, .line) == null);
     try testing.expectEqual(1, r.openCount());
+    try testing.expectEqual(Source.local, r.comments.items[0].source.?);
     const bad =
         \\{"version":1,"id":"current","comments":[{"id":"1","path":"f","body":"x","state":"nope"}]}
     ;
@@ -306,14 +339,16 @@ test "addOpen firstAt and roundtrip" {
     try testing.expectEqualStrings("a.zig", loaded.comments.items[0].path);
     try testing.expectEqual(10, loaded.comments.items[0].new_line.?);
     try testing.expectEqualStrings("fix", loaded.comments.items[0].body);
-    try testing.expectEqualStrings("2", try loaded.addOpen("b.zig", 1, null, .old, "x"));
+    try testing.expectEqual(Source.local, loaded.comments.items[0].source.?);
+    try testing.expectEqualStrings("2", try loaded.addOpen("b.zig", 1, null, .old, "x", .{ .commit = "abc123" }));
+    try testing.expectEqualStrings("abc123", loaded.comments.items[1].source.?.commit);
 }
 
 test "find" {
     var review = try initEmpty(testing.allocator, default_review_id);
     defer review.deinit();
-    const id1 = try review.addOpen("a.zig", null, 1, .new, "one");
-    _ = try review.addOpen("b.zig", null, 2, .new, "two");
+    const id1 = try review.addOpen("a.zig", null, 1, .new, "one", .local);
+    _ = try review.addOpen("b.zig", null, 2, .new, "two", .local);
 
     try testing.expect(review.find("nope") == null);
     try testing.expectEqualStrings("one", review.find(id1).?.body);
@@ -323,9 +358,9 @@ test "find" {
 test "remove all-or-nothing preserves remaining order" {
     var review = try initEmpty(testing.allocator, default_review_id);
     defer review.deinit();
-    const id1 = try review.addOpen("a.zig", null, 1, .new, "one");
-    const id2 = try review.addOpen("b.zig", null, 2, .new, "two");
-    const id3 = try review.addOpen("c.zig", null, 3, .new, "three");
+    const id1 = try review.addOpen("a.zig", null, 1, .new, "one", .local);
+    const id2 = try review.addOpen("b.zig", null, 2, .new, "two", .local);
+    const id3 = try review.addOpen("c.zig", null, 3, .new, "three", .local);
 
     try testing.expectError(error.NotFound, review.remove(&.{ id2, "ghost" }));
     try testing.expectEqual(3, review.comments.items.len);
@@ -358,14 +393,26 @@ test "load drops resolved comments and keeps next_seq" {
     try testing.expect(review.find("5") == null);
     try testing.expectEqual(6, review.next_seq);
     try testing.expectEqual(1, review.openCount());
+    try testing.expect(review.comments.items[0].source == null);
+}
+
+test "parseJson reads source and treats missing as null" {
+    const raw =
+        \\{"version":1,"id":"current","comments":[{"id":"1","path":"a.zig","body":"x","state":"open","source":{"commit":"HEAD"}},{"id":"2","path":"b.zig","body":"y","state":"open","source":{"range":"main...HEAD"}},{"id":"3","path":"c.zig","body":"z","state":"open","source":{"local":{}}}]}
+    ;
+    var review = try parseJson(testing.allocator, raw, default_review_id);
+    defer review.deinit();
+    try testing.expectEqualStrings("HEAD", review.comments.items[0].source.?.commit);
+    try testing.expectEqualStrings("main...HEAD", review.comments.items[1].source.?.range);
+    try testing.expectEqual(Source.local, review.comments.items[2].source.?);
 }
 
 test "firstAt store order and opposite side" {
     var review = try initEmpty(testing.allocator, default_review_id);
     defer review.deinit();
-    _ = try review.addOpen("f.zig", null, 10, .new, "new first");
-    _ = try review.addOpen("f.zig", 10, null, .old, "old");
-    _ = try review.addOpen("f.zig", null, 10, .new, "new second");
+    _ = try review.addOpen("f.zig", null, 10, .new, "new first", .local);
+    _ = try review.addOpen("f.zig", 10, null, .old, "old", .local);
+    _ = try review.addOpen("f.zig", null, 10, .new, "new second", .local);
 
     try testing.expectEqual(0, review.firstAt("f.zig", null, 10, .line).?);
     try testing.expectEqual(1, review.firstAt("f.zig", 10, null, .line).?);
@@ -379,9 +426,9 @@ test "firstAt store order and opposite side" {
 test "firstAt path-only is not a line" {
     var review = try initEmpty(testing.allocator, default_review_id);
     defer review.deinit();
-    _ = try review.addOpen("f.zig", null, null, null, "file");
-    _ = try review.addOpen("f.zig", null, 10, .new, "line");
-    _ = try review.addOpen("f.zig", null, null, null, "file second");
+    _ = try review.addOpen("f.zig", null, null, null, "file", .local);
+    _ = try review.addOpen("f.zig", null, 10, .new, "line", .local);
+    _ = try review.addOpen("f.zig", null, null, null, "file second", .local);
 
     try testing.expectEqual(0, review.firstAt("f.zig", null, null, .file).?);
     try testing.expectEqual(1, review.firstAt("f.zig", null, 10, .line).?);
@@ -396,9 +443,9 @@ test "firstAt path-only is not a line" {
 test "firstAt hunk is not a line" {
     var review = try initEmpty(testing.allocator, default_review_id);
     defer review.deinit();
-    _ = try review.addOpen("f.zig", null, null, null, "file");
-    _ = try review.addOpen("f.zig", 1, 1, null, "hunk");
-    _ = try review.addOpen("f.zig", 1, 1, .context, "line both");
+    _ = try review.addOpen("f.zig", null, null, null, "file", .local);
+    _ = try review.addOpen("f.zig", 1, 1, null, "hunk", .local);
+    _ = try review.addOpen("f.zig", 1, 1, .context, "line both", .local);
 
     try testing.expectEqual(0, review.firstAt("f.zig", null, null, .file).?);
     try testing.expectEqual(1, review.firstAt("f.zig", 1, 1, .hunk).?);
@@ -415,8 +462,8 @@ test "firstAt hunk is not a line" {
 test "setBody overwrites body only" {
     var review = try initEmpty(testing.allocator, default_review_id);
     defer review.deinit();
-    const id1 = try review.addOpen("a.zig", null, 10, .new, "one");
-    const id2 = try review.addOpen("b.zig", 2, null, .old, "other");
+    const id1 = try review.addOpen("a.zig", null, 10, .new, "one", .local);
+    const id2 = try review.addOpen("b.zig", 2, null, .old, "other", .local);
 
     try testing.expectError(error.NotFound, review.setBody("ghost", "x"));
     try review.setBody(id1, "two");
@@ -448,8 +495,8 @@ test "setBody overwrites body only" {
 test "setLines overwrites lines and side only" {
     var review = try initEmpty(testing.allocator, default_review_id);
     defer review.deinit();
-    const id1 = try review.addOpen("a.zig", null, 10, .new, "one");
-    const id2 = try review.addOpen("b.zig", 2, null, .old, "other");
+    const id1 = try review.addOpen("a.zig", null, 10, .new, "one", .local);
+    const id2 = try review.addOpen("b.zig", 2, null, .old, "other", .local);
 
     try testing.expectError(error.NotFound, review.setLines("ghost", 1, 2, .context));
     try review.setLines(id1, 4, 8, .context);

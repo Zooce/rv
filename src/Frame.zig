@@ -895,8 +895,8 @@ test "formatRow file header rename" {
 test "rowMarked file header is not a line" {
     var review = try store.initEmpty(testing.allocator, "t");
     defer review.deinit();
-    _ = try review.addOpen("f", null, null, null, "file");
-    _ = try review.addOpen("f", null, 1, .new, "line");
+    _ = try review.addOpen("f", null, null, null, "file", .local);
+    _ = try review.addOpen("f", null, 1, .new, "line", .local);
 
     const fh: view.row.Row = .{ .file_header = .{ .path = "f", .is_binary = false } };
     const other: view.row.Row = .{ .file_header = .{ .path = "g", .is_binary = false } };
@@ -908,7 +908,7 @@ test "rowMarked file header is not a line" {
 
     var lines_only = try store.initEmpty(testing.allocator, "t");
     defer lines_only.deinit();
-    _ = try lines_only.addOpen("f", null, 1, .new, "line");
+    _ = try lines_only.addOpen("f", null, 1, .new, "line", .local);
     try testing.expect(!rowMarked(fh, &lines_only));
     try testing.expect(rowMarked(line, &lines_only));
 }
@@ -916,8 +916,8 @@ test "rowMarked file header is not a line" {
 test "rowMarked hunk is not a line" {
     var review = try store.initEmpty(testing.allocator, "t");
     defer review.deinit();
-    _ = try review.addOpen("f", 1, 1, null, "hunk");
-    _ = try review.addOpen("f", null, 1, .new, "line");
+    _ = try review.addOpen("f", 1, 1, null, "hunk", .local);
+    _ = try review.addOpen("f", null, 1, .new, "line", .local);
 
     const hunk: view.row.Row = .{ .hunk_header = .{
         .path = "f",
@@ -944,7 +944,7 @@ test "rowMarked hunk is not a line" {
 
     var hunk_only = try store.initEmpty(testing.allocator, "t");
     defer hunk_only.deinit();
-    _ = try hunk_only.addOpen("f", 1, 1, null, "hunk");
+    _ = try hunk_only.addOpen("f", 1, 1, null, "hunk", .local);
     try testing.expect(rowMarked(hunk, &hunk_only));
     try testing.expect(!rowMarked(line, &hunk_only));
     try testing.expect(!rowMarked(fh, &hunk_only));
@@ -1161,5 +1161,9 @@ test "formatFooter approved-only is not a clean worktree" {
     try testing.expectEqualStrings(
         "main...HEAD",
         formatFooter(&buf, empty, 0, .side_by_side, 80, .{ .range = "main...HEAD" }, 3),
+    );
+    try testing.expectEqualStrings(
+        "abc123",
+        formatFooter(&buf, empty, 0, .side_by_side, 80, .{ .commit = "abc123" }, 3),
     );
 }

@@ -27,11 +27,20 @@
 //! string as written (no `...` / `..` rewrite). Untracked files are not
 //! appended. An empty result is an empty `Diff`. Invalid range is `GitFailed`.
 //!
+//! ## Commit
+//!
+//! `loadCommitDiff` verifies `<commit>^{commit}` then runs
+//! `git diff-tree -p --root --find-renames --no-commit-id --first-parent <commit>`.
+//! That is the patch the commit introduced (parent → commit), not worktree vs
+//! that rev. Untracked files are not appended. An empty commit is an empty
+//! `Diff`. Invalid commit-ish is `GitFailed`. Root commits work (`--root`).
+//! Merge commits diff against the first parent (unified).
+//!
 //! ## Empty diffs
 //!
 //! No matching changes yields an empty `Diff` (zero files), **not** an error.
-//! That covers a clean worktree with no untracked files, and a repo with no
-//! commits and no untracked files.
+//! That covers a clean worktree with no untracked files, a repo with no
+//! commits and no untracked files, and an empty commit.
 //!
 //! ## Mutations
 //!
@@ -63,9 +72,10 @@
 //! ## Expand
 //!
 //! `expandTargetAt` maps a flatten cursor to a file+hunk in the loaded `Diff`
-//! (local or range). `survivingFileText` is the bytes `Diff.expandHunk` needs:
-//! worktree for unstaged/untracked, index blob for staged, new-side blob for
-//! a range load; deleted files use the old side. Does not re-run `git diff`.
+//! (local, range, or commit). `survivingFileText` is the bytes `Diff.expandHunk`
+//! needs: worktree for unstaged/untracked, index blob for staged, new-side
+//! blob for a range or commit load; deleted files use the old side. Does not
+//! re-run `git diff`.
 //!
 //! `applyAtCursor` / `applyGroupAtCursor` run `mutate`, reload the local diff
 //! (hiding approved hunks), restore the cursor, and call comment remap (and
@@ -145,20 +155,52 @@ pub fn loadRangeDiff(alloc: Allocator, io: Io, cwd: std.process.Child.Cwd, range
     return try diff.parse(alloc, out);
 }
 
+/// Load the patch `<commit>` introduced (parent → that commit).
+/// `commit` is a commit-ish as given; it must peel to a commit.
+pub fn loadCommitDiff(alloc: Allocator, io: Io, cwd: std.process.Child.Cwd, commit: []const u8) Error!diff.Diff {
+    try ensureInsideWorkTree(alloc, io, cwd);
+    const as_commit = try std.fmt.allocPrint(alloc, "{s}^{{commit}}", .{commit});
+    defer alloc.free(as_commit);
+    const peeled = try git(alloc, io, cwd, .{
+        .argv = &.{ "git", "rev-parse", "--verify", as_commit },
+    });
+    alloc.free(peeled);
+
+    const out = try git(alloc, io, cwd, .{
+        .argv = &.{
+            "git",
+            "diff-tree",
+            "-p",
+            "--root",
+            "--find-renames",
+            "--no-commit-id",
+            "--first-parent",
+            commit,
+        },
+    });
+    defer alloc.free(out);
+    return try diff.parse(alloc, out);
+}
+
 /// Surviving-side file bytes for expand. Caller frees.
 ///
 /// Local: worktree for unstaged/untracked, `git show :path` for staged.
 /// Deleted unstaged reads the index; deleted staged reads `HEAD`.
 /// Range: new-side blob (`git show <rev>:path`), or worktree when the range
 /// is a single rev (`git diff <rev>` is vs the worktree). Deleted: old side.
+/// Commit: blob at the commit (new side), or first parent when deleted.
 pub fn survivingFileText(
     alloc: Allocator,
     io: Io,
     cwd: std.process.Child.Cwd,
     file: *const diff.File,
-    range: ?[]const u8,
+    origin: store.Source,
 ) Error![]u8 {
-    if (range) |r| return rangeFileText(alloc, io, cwd, file, r);
+    switch (origin) {
+        .range => |r| return rangeFileText(alloc, io, cwd, file, r),
+        .commit => |c| return commitFileText(alloc, io, cwd, file, c),
+        .local => {},
+    }
 
     // New path: worktree (unstaged/untracked) or index (staged).
     if (file.new_path) |path| {
@@ -205,6 +247,20 @@ fn rangeFileText(
         return gitShowPath(alloc, io, cwd, left, path);
     }
     return gitShowPath(alloc, io, cwd, range, path);
+}
+
+fn commitFileText(
+    alloc: Allocator,
+    io: Io,
+    cwd: std.process.Child.Cwd,
+    file: *const diff.File,
+    commit: []const u8,
+) Error![]u8 {
+    if (file.new_path) |path| return gitShowPath(alloc, io, cwd, commit, path);
+    const path = file.old_path orelse return error.GitFailed;
+    const parent = try std.fmt.allocPrint(alloc, "{s}^", .{commit});
+    defer alloc.free(parent);
+    return gitShowPath(alloc, io, cwd, parent, path);
 }
 
 fn rangeRightRev(range: []const u8) []const u8 {
@@ -1610,6 +1666,83 @@ test "range not a git repository" {
     );
 }
 
+test "commit load is the commit patch, not the worktree" {
+    if (builtin.os.tag == .wasi) return error.SkipZigTest;
+
+    const io = testing.io;
+    const alloc = testing.allocator;
+    var tmp = try IsolatedTmp.init(alloc, io);
+    defer tmp.deinit(alloc, io);
+    const cwd = tmp.cwd();
+
+    try initTestRepo(alloc, io, cwd);
+    try tmp.write(io, "committed.txt", "committed\n");
+    try expectGitOk(alloc, io, cwd, &.{ "git", "add", "committed.txt" });
+    try expectGitOk(alloc, io, cwd, &.{ "git", "commit", "-m", "init" });
+
+    try tmp.write(io, "committed.txt", "dirty\n");
+    try tmp.write(io, "untracked.txt", "must not appear\n");
+
+    var d = try loadCommitDiff(alloc, io, cwd, "HEAD");
+    defer d.deinit();
+    try testing.expectEqual(1, d.files.len);
+    try expectHasDisplayPath(d, "committed.txt");
+    try testing.expect(d.files[0].group == null);
+
+    const blob = try survivingFileText(alloc, io, cwd, &d.files[0], .{ .commit = "HEAD" });
+    defer alloc.free(blob);
+    try testing.expectEqualStrings("committed\n", blob);
+
+    const peeled = try git(alloc, io, cwd, .{ .argv = &.{ "git", "rev-parse", "HEAD" } });
+    defer alloc.free(peeled);
+    const hash = std.mem.trim(u8, peeled, " \t\r\n");
+    var hashed = try loadCommitDiff(alloc, io, cwd, hash);
+    defer hashed.deinit();
+    try testing.expectEqual(1, hashed.files.len);
+    try expectHasDisplayPath(hashed, "committed.txt");
+}
+
+test "empty commit loads empty Diff" {
+    if (builtin.os.tag == .wasi) return error.SkipZigTest;
+
+    const io = testing.io;
+    const alloc = testing.allocator;
+    var tmp = try IsolatedTmp.init(alloc, io);
+    defer tmp.deinit(alloc, io);
+    const cwd = tmp.cwd();
+
+    try initTestRepo(alloc, io, cwd);
+    try tmp.write(io, "only.txt", "x\n");
+    try expectGitOk(alloc, io, cwd, &.{ "git", "add", "only.txt" });
+    try expectGitOk(alloc, io, cwd, &.{ "git", "commit", "-m", "init" });
+    try expectGitOk(alloc, io, cwd, &.{ "git", "commit", "--allow-empty", "-m", "empty" });
+
+    var d = try loadCommitDiff(alloc, io, cwd, "HEAD");
+    defer d.deinit();
+    try testing.expectEqual(0, d.files.len);
+    try testing.expectEqual(0, d.hunk_count);
+}
+
+test "invalid commit: GitFailed" {
+    if (builtin.os.tag == .wasi) return error.SkipZigTest;
+
+    const io = testing.io;
+    const alloc = testing.allocator;
+    var tmp = try IsolatedTmp.init(alloc, io);
+    defer tmp.deinit(alloc, io);
+    const cwd = tmp.cwd();
+
+    try initTestRepo(alloc, io, cwd);
+    try tmp.write(io, "only.txt", "x\n");
+    try expectGitOk(alloc, io, cwd, &.{ "git", "add", "only.txt" });
+    try expectGitOk(alloc, io, cwd, &.{ "git", "commit", "-m", "init" });
+
+    try testing.expectError(
+        error.GitFailed,
+        loadCommitDiff(alloc, io, cwd, "this-ref-does-not-exist"),
+    );
+}
+
 test "mutate file: stage, unstage, discard; refuse discard staged" {
     if (builtin.os.tag == .wasi) return error.SkipZigTest;
 
@@ -2269,9 +2402,9 @@ test "survivingFileText unstaged is worktree, staged is index" {
 
     const unstaged = try findFile(d, "f.txt", .unstaged);
     const staged = try findFile(d, "f.txt", .staged);
-    const wt = try survivingFileText(alloc, io, cwd, &unstaged, null);
+    const wt = try survivingFileText(alloc, io, cwd, &unstaged, .local);
     defer alloc.free(wt);
-    const idx = try survivingFileText(alloc, io, cwd, &staged, null);
+    const idx = try survivingFileText(alloc, io, cwd, &staged, .local);
     defer alloc.free(idx);
     try testing.expectEqualStrings("worktree body\n", wt);
     try testing.expectEqualStrings("staged body\n", idx);
@@ -2307,7 +2440,7 @@ test "approveHasComments hunk vs other hunk vs file" {
 
     var review = try store.initEmpty(alloc, "t");
     defer review.deinit();
-    _ = try review.addOpen("f", null, 10, .new, "hunk1");
+    _ = try review.addOpen("f", null, 10, .new, "hunk1", .local);
 
     try testing.expect(!approveHasComments(&review, &fix.d, rows, 4, false));
     try testing.expect(approveHasComments(&review, &fix.d, rows, 7, false));
@@ -2326,7 +2459,7 @@ test "approveHasComments file header does not trigger hunk a" {
 
     var review = try store.initEmpty(alloc, "t");
     defer review.deinit();
-    _ = try review.addOpen("f", null, null, null, "file");
+    _ = try review.addOpen("f", null, null, null, "file", .local);
 
     try testing.expect(!approveHasComments(&review, &fix.d, rows, 4, false));
     try testing.expect(!approveHasComments(&review, &fix.d, rows, 7, false));

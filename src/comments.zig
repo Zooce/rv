@@ -509,9 +509,9 @@ test "next prev display order wrap skip missing" {
     var review = try store.initEmpty(testing.allocator, "t");
     defer review.deinit();
     // Store order is add then delete; display order is delete (3) then add (4).
-    _ = try review.addOpen("f", null, 2, .new, "add");
-    _ = try review.addOpen("f", 2, null, .old, "del");
-    _ = try review.addOpen("gone", null, 1, .new, "missing");
+    _ = try review.addOpen("f", null, 2, .new, "add", .local);
+    _ = try review.addOpen("f", 2, null, .old, "del", .local);
+    _ = try review.addOpen("gone", null, 1, .new, "missing", .local);
 
     var empty = try store.initEmpty(testing.allocator, "t");
     defer empty.deinit();
@@ -565,8 +565,8 @@ test "next on truncated rows skips a comment on an omitted hunk" {
 
     var review = try store.initEmpty(testing.allocator, "t");
     defer review.deinit();
-    _ = try review.addOpen("f", null, 1, .new, "on first hunk");
-    _ = try review.addOpen("f", null, 10, .new, "on second hunk");
+    _ = try review.addOpen("f", null, 1, .new, "on first hunk", .local);
+    _ = try review.addOpen("f", null, 10, .new, "on second hunk", .local);
 
     try testing.expectEqual(view.rowForComment(hidden, .{ .path = "f", .side = .new, .line = 10 }).?, next(&review, hidden, 0).?.row);
     try testing.expectEqual(view.rowForComment(full, .{ .path = "f", .side = .new, .line = 1 }).?, next(&review, full, 0).?.row);
@@ -590,9 +590,9 @@ test "next same row is one stop then later row" {
 
     var review = try store.initEmpty(testing.allocator, "t");
     defer review.deinit();
-    _ = try review.addOpen("f", null, 1, .new, "ctx new");
-    _ = try review.addOpen("f", 1, null, .old, "ctx old");
-    _ = try review.addOpen("f", null, 2, .new, "add");
+    _ = try review.addOpen("f", null, 1, .new, "ctx new", .local);
+    _ = try review.addOpen("f", 1, null, .old, "ctx old", .local);
+    _ = try review.addOpen("f", null, 2, .new, "add", .local);
 
     const n0 = next(&review, rows, 1).?;
     try testing.expectEqual(2, n0.row);
@@ -763,8 +763,8 @@ test "path-only comments stay path-only on remap" {
 
     var review = try store.initEmpty(testing.allocator, "t");
     defer review.deinit();
-    _ = try review.addOpen("a.zig", null, null, null, "file");
-    _ = try review.addOpen("a.zig", null, 1, .new, "line");
+    _ = try review.addOpen("a.zig", null, null, null, "file", .local);
+    _ = try review.addOpen("a.zig", null, 1, .new, "line", .local);
 
     var priors: std.ArrayList(AnchorSnap) = .empty;
     defer priors.deinit(testing.allocator);
@@ -840,8 +840,8 @@ test "hunk comments remap starts and stay hunk" {
 
     var review = try store.initEmpty(testing.allocator, "t");
     defer review.deinit();
-    _ = try review.addOpen("a.zig", 1, 1, null, "hunk");
-    _ = try review.addOpen("a.zig", null, 1, .new, "line");
+    _ = try review.addOpen("a.zig", 1, 1, null, "hunk", .local);
+    _ = try review.addOpen("a.zig", null, 1, .new, "line", .local);
 
     var priors: std.ArrayList(AnchorSnap) = .empty;
     defer priors.deinit(testing.allocator);
@@ -935,9 +935,9 @@ test "atSide file line and hunk" {
 
     var review = try store.initEmpty(testing.allocator, "t");
     defer review.deinit();
-    _ = try review.addOpen("f", null, null, null, "file");
-    _ = try review.addOpen("f", null, 1, .new, "line");
-    _ = try review.addOpen("f", 1, 1, null, "hunk");
+    _ = try review.addOpen("f", null, null, null, "file", .local);
+    _ = try review.addOpen("f", null, 1, .new, "line", .local);
+    _ = try review.addOpen("f", 1, 1, null, "hunk", .local);
 
     const found = atSide(&review, rows, empty, .unified, 0, .new).?;
     try testing.expectEqualStrings("f", found.anchor.path);
@@ -981,8 +981,8 @@ test "next prev file comment lands on header" {
 
     var review = try store.initEmpty(testing.allocator, "t");
     defer review.deinit();
-    _ = try review.addOpen("f", null, 1, .new, "line");
-    _ = try review.addOpen("f", null, null, null, "file");
+    _ = try review.addOpen("f", null, 1, .new, "line", .local);
+    _ = try review.addOpen("f", null, null, null, "file", .local);
 
     const n0 = next(&review, rows, 0).?;
     try testing.expectEqual(3, n0.row);
@@ -1013,8 +1013,8 @@ test "next prev hunk comment lands on header" {
 
     var review = try store.initEmpty(testing.allocator, "t");
     defer review.deinit();
-    _ = try review.addOpen("f", null, 1, .new, "line");
-    _ = try review.addOpen("f", 1, 1, null, "hunk");
+    _ = try review.addOpen("f", null, 1, .new, "line", .local);
+    _ = try review.addOpen("f", 1, 1, null, "hunk", .local);
 
     const n0 = next(&review, rows, 0).?;
     try testing.expectEqual(1, n0.row);

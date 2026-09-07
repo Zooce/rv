@@ -3,8 +3,8 @@
 //! Subcommands: `status`, `approved`, `unapprove`, `list`, `show`, `resolve`,
 //! `export`, `install-skill`, help. Comment-only commands do not load git.
 //! `status`, `approved`, and `unapprove` load the local diff (staged /
-//! unstaged / untracked). No raw TTY modes. Bare `rv` and `rv <range>`
-//! launch the review TUI from `main` (`classify`). `resolve` deletes ids.
+//! unstaged / untracked). No raw TTY modes. Bare `rv`, `rv <commit>`, and
+//! `rv <range>` launch the review TUI from `main` (`classify`). `resolve` deletes ids.
 //! There is no reopen and no list/export filter.
 
 const std = @import("std");
@@ -45,20 +45,16 @@ pub const Command = union(enum) {
     install_skill: install_skill.Opts,
 };
 
-/// Where the TUI diff came from. Recorded at launch; paint prints a label
-/// and must not re-resolve git.
-pub const Source = union(enum) {
-    local,
-    range: []const u8,
-};
+/// Where the TUI diff came from. Same type as `store.Source` (comments record it).
+pub const Source = store.Source;
 
 /// Status-strip text for `source`. `empty` is a clean worktree (no local
 /// changes), not an approved-only hide. Local is `HEAD`; an explicit range
-/// stays the user-supplied string even if empty.
+/// or commit stays the user-supplied string even if empty.
 pub fn sourceLabel(source: Source, empty: bool) []const u8 {
     return switch (source) {
         .local => if (empty) "HEAD · empty" else "HEAD",
-        .range => |r| r,
+        .range, .commit => |s| s,
     };
 }
 
@@ -73,7 +69,11 @@ pub fn classify(args: []const []const u8) error{Usage}!Launch {
     if (args.len == 0) return .{ .tui = .local };
     if (isCommand(args[0])) return .{ .command = try parse(args) };
     if (args.len == 1 and args[0].len > 0 and args[0][0] != '-') {
-        return .{ .tui = .{ .range = args[0] } };
+        const spec = args[0];
+        if (std.mem.indexOf(u8, spec, "..") != null) {
+            return .{ .tui = .{ .range = spec } };
+        }
+        return .{ .tui = .{ .commit = spec } };
     }
     return error.Usage;
 }
@@ -184,11 +184,13 @@ fn parseInstallSkill(args: []const []const u8) error{Usage}!install_skill.Opts {
 }
 
 pub const usage_text =
-    \\usage: rv [<range> | <command>] [args]
+    \\usage: rv [<commit> | <range> | <command>] [args]
     \\
     \\With no args, opens the review TUI on local changes (staged, unstaged,
-    \\and untracked). A clean worktree opens empty. A git revision or range
-    \\(for example main...HEAD) opens the TUI on `git diff <range>` as written.
+    \\and untracked). A clean worktree opens empty. A git commit-ish (for
+    \\example HEAD or a hash) opens the patch that commit introduced. A range
+    \\that contains .. or ... (for example main...HEAD) opens `git diff <range>`
+    \\as written.
     \\
     \\Commands:
     \\  status                         live comment count, approved count, and store paths
@@ -384,8 +386,8 @@ fn cmdList(alloc: Allocator, io: Io, root: Io.Dir) u8 {
     var anchor_buf: [256]u8 = undefined;
     for (review.comments.items) |c| {
         const anchor = formatAnchor(&anchor_buf, c);
-        // One line: id anchor body (newlines in body → spaces).
-        out.print("{s}  {s}  ", .{ c.id, anchor }) catch {
+        // One line: id source anchor body (newlines in body → spaces).
+        out.print("{s}  {s}  {s}  ", .{ c.id, if (c.source) |s| s.label() else "-", anchor }) catch {
             std.debug.print("rv: write failed\n", .{});
             return exit_operational;
         };
@@ -418,6 +420,7 @@ fn cmdShow(alloc: Allocator, io: Io, root: Io.Dir, id: []const u8) u8 {
     var w = std.Io.File.stdout().writer(io, &buf);
     const out = &w.interface;
     out.print("id: {s}\n", .{c.id}) catch return writeFail();
+    out.print("source: {s}\n", .{if (c.source) |s| s.label() else "-"}) catch return writeFail();
     out.print("path: {s}\n", .{c.path}) catch return writeFail();
     if (c.old_line) |n| {
         out.print("old_line: {d}\n", .{n}) catch return writeFail();
@@ -516,6 +519,7 @@ fn formatMarkdown(alloc: Allocator, review: *const store.Review) Allocator.Error
         const anchor = formatAnchor(&anchor_buf, c);
         w.print("## [{s}] — {s}", .{ c.id, anchor }) catch return error.OutOfMemory;
         if (c.side) |s| w.print(" ({s})", .{@tagName(s)}) catch return error.OutOfMemory;
+        w.print(" · {s}", .{if (c.source) |s| s.label() else "-"}) catch return error.OutOfMemory;
         w.writeAll("\n\n") catch return error.OutOfMemory;
         w.writeAll(c.body) catch return error.OutOfMemory;
         if (c.body.len == 0 or c.body[c.body.len - 1] != '\n') w.writeAll("\n") catch return error.OutOfMemory;
@@ -532,6 +536,7 @@ const ExportComment = struct {
     new_line: ?u32 = null,
     side: ?[]const u8 = null,
     body: []const u8,
+    source: ?store.Source = null,
 };
 
 const ExportEnvelope = struct {
@@ -552,6 +557,7 @@ fn formatJson(alloc: Allocator, review: *const store.Review) Allocator.Error![]u
             .new_line = c.new_line,
             .side = if (c.side) |s| @tagName(s) else null,
             .body = c.body,
+            .source = c.source,
         });
     }
     const envelope: ExportEnvelope = .{
@@ -707,7 +713,15 @@ test "classify tui vs command" {
         .command => return error.TestUnexpectedResult,
     }
     switch (try classify(&.{"HEAD"})) {
-        .tui => |src| try testing.expectEqualStrings("HEAD", src.range),
+        .tui => |src| try testing.expectEqualStrings("HEAD", src.commit),
+        .command => return error.TestUnexpectedResult,
+    }
+    switch (try classify(&.{"HEAD~1"})) {
+        .tui => |src| try testing.expectEqualStrings("HEAD~1", src.commit),
+        .command => return error.TestUnexpectedResult,
+    }
+    switch (try classify(&.{"main..HEAD"})) {
+        .tui => |src| try testing.expectEqualStrings("main..HEAD", src.range),
         .command => return error.TestUnexpectedResult,
     }
     switch (try classify(&.{"@{upstream}...HEAD"})) {
@@ -746,26 +760,30 @@ test "usage_text names approved commands and status approved lines" {
     try testing.expect(std.mem.indexOf(u8, usage_text, "store paths") != null);
 }
 
-test "sourceLabel local and range" {
+test "sourceLabel local range commit" {
     try testing.expectEqualStrings("HEAD", sourceLabel(.local, false));
     try testing.expectEqualStrings("HEAD · empty", sourceLabel(.local, true));
     try testing.expectEqualStrings("main...HEAD", sourceLabel(.{ .range = "main...HEAD" }, false));
     try testing.expectEqualStrings("main...HEAD", sourceLabel(.{ .range = "main...HEAD" }, true));
+    try testing.expectEqualStrings("abc123", sourceLabel(.{ .commit = "abc123" }, false));
+    try testing.expectEqualStrings("abc123", sourceLabel(.{ .commit = "abc123" }, true));
 }
 
 test "formatMarkdown and formatJson envelope" {
     var review = try store.initEmpty(testing.allocator, "current");
     defer review.deinit();
-    _ = try review.addOpen("a.zig", null, 10, .new, "fix me");
-    _ = try review.addOpen("b.zig", 2, null, .old, "also");
+    _ = try review.addOpen("a.zig", null, 10, .new, "fix me", .local);
+    _ = try review.addOpen("b.zig", 2, null, .old, "also", .local);
+    _ = try review.addOpen("c.zig", null, 3, .new, "on commit", .{ .commit = "abc123" });
 
     const md = try formatMarkdown(testing.allocator, &review);
     defer testing.allocator.free(md);
     try testing.expect(std.mem.indexOf(u8, md, "# rv export — review `current`") != null);
-    try testing.expect(std.mem.indexOf(u8, md, "## [1] — a.zig:+10 (new)") != null);
+    try testing.expect(std.mem.indexOf(u8, md, "## [1] — a.zig:+10 (new) · local") != null);
     try testing.expect(std.mem.indexOf(u8, md, "fix me") != null);
-    try testing.expect(std.mem.indexOf(u8, md, "## [2] — b.zig:-2 (old)") != null);
+    try testing.expect(std.mem.indexOf(u8, md, "## [2] — b.zig:-2 (old) · local") != null);
     try testing.expect(std.mem.indexOf(u8, md, "also") != null);
+    try testing.expect(std.mem.indexOf(u8, md, "## [3] — c.zig:+3 (new) · abc123") != null);
 
     const js = try formatJson(testing.allocator, &review);
     defer testing.allocator.free(js);
@@ -776,12 +794,14 @@ test "formatMarkdown and formatJson envelope" {
     defer parsed.deinit();
     try testing.expectEqual(1, parsed.value.version);
     try testing.expectEqualStrings("current", parsed.value.review_id);
-    try testing.expectEqual(2, parsed.value.comments.len);
+    try testing.expectEqual(3, parsed.value.comments.len);
     try testing.expectEqualStrings("1", parsed.value.comments[0].id);
     try testing.expectEqualStrings("a.zig", parsed.value.comments[0].path);
     try testing.expectEqual(10, parsed.value.comments[0].new_line.?);
     try testing.expectEqualStrings("new", parsed.value.comments[0].side.?);
     try testing.expectEqualStrings("fix me", parsed.value.comments[0].body);
+    try testing.expectEqual(store.Source.local, parsed.value.comments[0].source.?);
+    try testing.expectEqualStrings("abc123", parsed.value.comments[2].source.?.commit);
 }
 
 test "formatAnchor" {
