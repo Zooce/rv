@@ -212,29 +212,17 @@ pub const Tty = struct {
     }
 
     /// Wait up to `timeout_ms` for input, then `read`.
-    /// - timeout 0: poll once, don't block
+    /// - timeout 0: probe once, don't block
     /// - returns 0 if the timer expired with no data (soft timeout)
-    /// - returns `error.EndOfStream` if poll says ready/HUP/ERR and `read` yields 0
+    /// - returns `error.EndOfStream` if the fd is ready/hung up and `read` yields 0
     ///   (hangup/EOF — must not be treated like a timeout or wait loops busy-spin)
     ///
     /// Callers must not treat only `n == 0` as "keep waiting": hangup is an error.
     /// Prefer `event.poll` / `event.next`, which map `EndOfStream` → `.quit`.
     pub fn readTimeout(self: *Tty, buf: []u8, timeout_ms: i32) ReadError!usize {
-        // poll() watches fds for readiness without consuming data.
-        var pfd = [_]posix.pollfd{.{
-            .fd = self.fd, // which fd to watch
-            .events = posix.POLL.IN, // wake when readable
-            .revents = 0, // kernel fills this with what actually happened
-        }};
-        // n = number of fds with events; 0 means timeout.
-        const n = posix.poll(&pfd, timeout_ms) catch return error.Unexpected;
-        if (n == 0) return 0; // timed out
-        // Only proceed if input (or hangup/error) is set on our fd.
-        if (pfd[0].revents & (posix.POLL.IN | posix.POLL.HUP | posix.POLL.ERR) == 0) {
-            return 0;
-        }
+        if (!try waitReadable(self.fd, timeout_ms)) return 0; // timed out
         // Kernel says the fd is readable (or hung up). read(0) means EOF, not
-        // "try again" — a soft timeout is only when poll itself returned 0 above.
+        // "try again" — a soft timeout is only when the wait itself returned false.
         const nread = try self.read(buf);
         if (nread == 0 and buf.len > 0) return error.EndOfStream;
         return nread;
@@ -375,6 +363,73 @@ fn getWinsize(fd: posix.fd_t) !Size {
     return Size{ .cols = ws.col, .rows = ws.row };
 }
 
+/// Wait until `fd` is readable (or hung up), or `timeout_ms` elapses.
+/// timeout 0 = probe once; timeout < 0 = wait forever; false = timed out.
+///
+/// Darwin cannot `poll(2)` / kqueue `/dev/tty` (POLLNVAL, or never POLLIN),
+/// so the event loop would draw once and then ignore keys. `select(2)` works.
+fn waitReadable(fd: posix.fd_t, timeout_ms: i32) Tty.ReadError!bool {
+    if (builtin.os.tag == .macos) {
+        return macos.wait(fd, timeout_ms);
+    }
+
+    var pfd = [_]posix.pollfd{.{
+        .fd = fd,
+        .events = posix.POLL.IN,
+        .revents = 0,
+    }};
+    const n = posix.poll(&pfd, timeout_ms) catch return error.Unexpected;
+    if (n == 0) return false;
+    return pfd[0].revents & (posix.POLL.IN | posix.POLL.HUP | posix.POLL.ERR) != 0;
+}
+
+/// Darwin `select(2)` wait. Compiled only for macOS so Linux stays libc-free.
+const macos = if (builtin.os.tag == .macos) struct {
+    const fd_setsize = 1024;
+    const nfdbits = 32;
+    const FdSet = extern struct {
+        bits: [fd_setsize / nfdbits]u32,
+    };
+
+    extern "c" fn select(
+        nfds: c_int,
+        readfds: ?*FdSet,
+        writefds: ?*FdSet,
+        exceptfds: ?*FdSet,
+        timeout: ?*posix.timeval,
+    ) c_int;
+
+    fn wait(fd: posix.fd_t, timeout_ms: i32) Tty.ReadError!bool {
+        if (fd < 0 or fd >= fd_setsize) return error.Unexpected;
+
+        var tv: posix.timeval = undefined;
+        var tv_ptr: ?*posix.timeval = null;
+        if (timeout_ms >= 0) {
+            tv = .{
+                .sec = @intCast(@divTrunc(timeout_ms, 1000)),
+                .usec = @intCast(@mod(timeout_ms, 1000) * 1000),
+            };
+            tv_ptr = &tv;
+        }
+
+        const nfds: c_int = fd + 1;
+        while (true) {
+            var readfds = std.mem.zeroes(FdSet);
+            const n: u32 = @intCast(fd);
+            const one: u32 = 1;
+            const shift: u5 = @intCast(n % nfdbits);
+            readfds.bits[n / nfdbits] |= one << shift;
+
+            const rc = select(nfds, &readfds, null, null, tv_ptr);
+            switch (posix.errno(rc)) {
+                .SUCCESS => return rc > 0,
+                .INTR => continue,
+                else => return error.Unexpected,
+            }
+        }
+    }
+} else struct {};
+
 /// Write every byte of `bytes` to `fd`, handling short writes and EINTR.
 fn writeAllFd(fd: posix.fd_t, bytes: []const u8) Tty.WriteError!void {
     var offset: usize = 0; // how many bytes already accepted by the kernel
@@ -496,8 +551,10 @@ fn handleWinch(sig: posix.SIG) callconv(.c) void {
 }
 
 // Keep the linux import referenced on all targets that compile this file.
+// macos is only called from a comptime-dead branch on non-macOS.
 comptime {
     _ = linux;
+    _ = macos;
 }
 
 // Test-only pipe pair for controllable input (EOF / timeout tests).
