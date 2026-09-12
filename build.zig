@@ -139,7 +139,7 @@ pub fn build(b: *std.Build) void {
         },
     });
 
-    // Headless CLI: status / approved / unapprove / list / show / export / install-skill.
+    // Headless CLI: status / approved / unapprove / list / show / export / install-skill / version.
     const cli_mod = b.addModule("cli", .{
         .root_source_file = b.path("src/cli.zig"),
         .target = target,
@@ -153,6 +153,9 @@ pub fn build(b: *std.Build) void {
             .{ .name = "isolated_tmp", .module = isolated_tmp_mod },
         },
     });
+    const build_opts = b.addOptions();
+    build_opts.addOption([]const u8, "version", @import("build.zig.zon").version);
+    cli_mod.addOptions("build_options", build_opts);
 
     // `rv` binary: full-screen read-only diff review TUI.
     const rv = b.addExecutable(.{

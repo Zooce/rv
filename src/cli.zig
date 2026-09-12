@@ -1,7 +1,7 @@
 //! Headless CLI for the comment store and local approved hunks/files.
 //!
 //! Subcommands: `status`, `approved`, `unapprove`, `list`, `show`, `resolve`,
-//! `export`, `install-skill`, help. Comment-only commands do not load git.
+//! `export`, `install-skill`, `version`, help. Comment-only commands do not load git.
 //! `status`, `approved`, and `unapprove` load the local diff (staged /
 //! unstaged / untracked). No raw TTY modes. Bare `rv`, `rv <commit>`, and
 //! `rv <range>` launch the review TUI from `main` (`classify`). `resolve` deletes ids.
@@ -13,6 +13,7 @@ const install_skill = @import("install_skill");
 const git = @import("git");
 const approve = @import("approve");
 const diff = @import("diff");
+const build_options = @import("build_options");
 const Allocator = std.mem.Allocator;
 const Io = std.Io;
 
@@ -35,6 +36,7 @@ pub const ExportOpts = struct {
 
 pub const Command = union(enum) {
     help,
+    version,
     status,
     approved,
     unapprove: []const u8,
@@ -80,6 +82,7 @@ pub fn classify(args: []const []const u8) error{Usage}!Launch {
 
 fn isCommand(s: []const u8) bool {
     return isHelp(s) or
+        isVersion(s) or
         std.mem.eql(u8, s, "status") or
         std.mem.eql(u8, s, "approved") or
         std.mem.eql(u8, s, "unapprove") or
@@ -97,6 +100,10 @@ pub fn parse(args: []const []const u8) error{Usage}!Command {
     if (isHelp(cmd)) {
         if (args.len != 1) return error.Usage;
         return .help;
+    }
+    if (isVersion(cmd)) {
+        if (args.len != 1) return error.Usage;
+        return .version;
     }
     if (std.mem.eql(u8, cmd, "status")) {
         if (args.len != 1) return error.Usage;
@@ -135,6 +142,12 @@ fn isHelp(s: []const u8) bool {
     return std.mem.eql(u8, s, "help") or
         std.mem.eql(u8, s, "--help") or
         std.mem.eql(u8, s, "-h");
+}
+
+fn isVersion(s: []const u8) bool {
+    return std.mem.eql(u8, s, "version") or
+        std.mem.eql(u8, s, "--version") or
+        std.mem.eql(u8, s, "-v");
 }
 
 /// Flags may appear in any order. Default: md, stdout.
@@ -206,6 +219,7 @@ pub const usage_text =
     \\    --list                       show source, canonical, and agent links
     \\    --uninstall                  remove skill symlinks
     \\    --agent <name>               only grok|claude|codex|cursor
+    \\  version, -v, --version         print version and exit
     \\  help, -h, --help               show this help
     \\
     \\Exit codes: 0 success, 1 error, 2 usage
@@ -224,6 +238,10 @@ pub fn run(alloc: Allocator, io: Io, cmd: Command, env: Env, root: Io.Dir) u8 {
     }
     switch (cmd) {
         .help => return cmdHelp(io),
+        .version => {
+            out_w.interface.print("rv {s}\n", .{build_options.version}) catch return writeFail();
+            return exit_success;
+        },
         .status => return cmdStatus(alloc, io, root, &out_w.interface, &err_w.interface),
         .approved => return cmdApproved(alloc, io, root, &out_w.interface, &err_w.interface),
         .unapprove => |tok| return cmdUnapprove(alloc, io, root, tok, &out_w.interface, &err_w.interface),
@@ -636,6 +654,9 @@ test "parse help status approved unapprove list show resolve export install-skil
     try testing.expectEqual(Command.help, try parse(&.{"help"}));
     try testing.expectEqual(Command.help, try parse(&.{"--help"}));
     try testing.expectEqual(Command.help, try parse(&.{"-h"}));
+    try testing.expectEqual(Command.version, try parse(&.{"version"}));
+    try testing.expectEqual(Command.version, try parse(&.{"--version"}));
+    try testing.expectEqual(Command.version, try parse(&.{"-v"}));
     try testing.expectEqual(Command.status, try parse(&.{"status"}));
     try testing.expectEqual(Command.approved, try parse(&.{"approved"}));
     try testing.expectEqualStrings("3", (try parse(&.{ "unapprove", "3" })).unapprove);
@@ -687,6 +708,9 @@ test "parse usage errors" {
     try testing.expectError(error.Usage, parse(&.{ "list", "--resolved" }));
     try testing.expectError(error.Usage, parse(&.{ "list", "--bogus" }));
     try testing.expectError(error.Usage, parse(&.{ "help", "extra" }));
+    try testing.expectError(error.Usage, parse(&.{ "version", "foo" }));
+    try testing.expectError(error.Usage, parse(&.{ "--version", "--help" }));
+    try testing.expectError(error.Usage, parse(&.{ "-v", "foo" }));
     try testing.expectError(error.Usage, parse(&.{"resolve"}));
     try testing.expectError(error.Usage, parse(&.{"reopen"}));
     try testing.expectError(error.Usage, parse(&.{ "reopen", "7" }));
@@ -748,6 +772,18 @@ test "classify tui vs command" {
         .command => |cmd| try testing.expectEqual(Command.help, cmd),
         .tui => return error.TestUnexpectedResult,
     }
+    switch (try classify(&.{"--version"})) {
+        .command => |cmd| try testing.expectEqual(Command.version, cmd),
+        .tui => return error.TestUnexpectedResult,
+    }
+    switch (try classify(&.{"version"})) {
+        .command => |cmd| try testing.expectEqual(Command.version, cmd),
+        .tui => return error.TestUnexpectedResult,
+    }
+    switch (try classify(&.{"-v"})) {
+        .command => |cmd| try testing.expectEqual(Command.version, cmd),
+        .tui => return error.TestUnexpectedResult,
+    }
     try testing.expectError(error.Usage, classify(&.{"--bogus"}));
     try testing.expectError(error.Usage, classify(&.{ "main...HEAD", "extra" }));
     try testing.expectError(error.Usage, classify(&.{""}));
@@ -758,6 +794,14 @@ test "usage_text names approved commands and status approved lines" {
     try testing.expect(std.mem.indexOf(u8, usage_text, "unapprove <n>") != null);
     try testing.expect(std.mem.indexOf(u8, usage_text, "approved count") != null);
     try testing.expect(std.mem.indexOf(u8, usage_text, "store paths") != null);
+    try testing.expect(std.mem.indexOf(u8, usage_text, "version, -v, --version") != null);
+}
+
+test "build version is major.minor.0" {
+    const v = try std.SemanticVersion.parse(build_options.version);
+    try testing.expectEqual(0, v.patch);
+    try testing.expect(v.pre == null);
+    try testing.expect(v.build == null);
 }
 
 test "sourceLabel local range commit" {

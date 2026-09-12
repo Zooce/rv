@@ -23,7 +23,7 @@
 //! git mutate / approve). With a range that contains `..` or `...`: load
 //! `git diff <range>` as written → same TUI.
 //! With a subcommand: headless CLI (`status`, `approved`, `unapprove`, `list`,
-//! `show`, `resolve`, `export`, `install-skill`, help). Comment-only commands
+//! `show`, `resolve`, `export`, `install-skill`, `version`, help). Comment-only commands
 //! do not load git. `status` / `approved` / `unapprove` load the local diff.
 //! No raw TTY modes.
 //!
