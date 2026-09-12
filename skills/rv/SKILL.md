@@ -16,13 +16,17 @@ Comments: `.rv/reviews/current.json` in the **repo root**. Approvals:
 `.rv/approved.json` in the repo root, separate from the comment store. Run
 commands there.
 
+Approved local hunks are hidden from the TUI walk **and** already staged. The
+index is the user's accepted set. Staging is the TUI's job at sign-off (`a` /
+`A`); do not stage those hunks yourself.
+
 ## Commands
 
 | Command | Purpose |
 |---------|---------|
 | `rv status` | Live comment count, approved count, and store paths |
-| `rv approved` | List approved hunks and files (hidden from the TUI walk) |
-| `rv unapprove <n>` | Drop the nth row from that list |
+| `rv approved` | List approved hunks and files (hidden from the TUI walk; staged) |
+| `rv unapprove <n>` | Drop the nth row from that list (does not unstage) |
 | `rv list` | Comments on the board (`id  source  anchor  body`) |
 | `rv show <id>` | One comment: source, path, lines, side, body |
 | `rv export` | Markdown (default) or `--format json`; `-o path` writes a file |
@@ -42,7 +46,18 @@ agents should use the headless commands above.
    commit. Fix the current tree.
 4. `rv resolve <id>` for each fully addressed comment (deletes the id).
 5. `rv unapprove <n>` only when you must see or comment on that hunk again.
+   Unapprove does not unstage; do not unstage it either unless the user asks.
 6. `rv list` again until the board is empty (or only deferred items remain).
+
+## Index after review
+
+The next batch is the remaining **unstaged** (and untracked) work. Do not
+mutate the index as part of continuing.
+
+- Do not `git add`, `git add -A`, or unstage. File-level add is the wrong
+  granularity when a file is only partly approved.
+- Do not commit unless the user asks. Do not commit each reviewed batch and
+  squash later.
 
 ## Rules
 
