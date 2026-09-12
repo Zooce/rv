@@ -136,12 +136,14 @@ pub const Approved = struct {
             }
             return;
         }
-        for (file.hunks) |h| {
-            const hash = fingerprintHunk(h);
-            if (self.take(used, path, hash)) continue;
-            try self.append(path, hash);
-            used = try alloc.realloc(used, self.entries.items.len);
-            used[used.len - 1] = true;
+        for (file.hunks) |*h| {
+            for (h.identityHunks()) |id| {
+                const hash = fingerprintHunk(id);
+                if (self.take(used, path, hash)) continue;
+                try self.append(path, hash);
+                used = try alloc.realloc(used, self.entries.items.len);
+                used[used.len - 1] = true;
+            }
         }
     }
 
@@ -268,8 +270,10 @@ pub fn collectLive(alloc: Allocator, io: Io, root: Io.Dir, d: *const diff.Diff) 
             }
             continue;
         }
-        for (f.hunks) |h| {
-            try list.append(alloc, .{ .path = path, .hash = fingerprintHunk(h) });
+        for (f.hunks) |*h| {
+            for (h.identityHunks()) |id| {
+                try list.append(alloc, .{ .path = path, .hash = fingerprintHunk(id) });
+            }
         }
     }
     return try list.toOwnedSlice(alloc);
@@ -335,26 +339,28 @@ pub fn collectApproved(
             });
             continue;
         }
-        for (f.hunks) |h| {
-            const hash = fingerprintHunk(h);
-            if (!approved.take(used, path, hash)) continue;
-            var preview: []const u8 = "";
-            for (h.lines) |ln| {
-                switch (ln.kind) {
-                    .add, .delete => {
-                        preview = ln.text;
-                        break;
-                    },
-                    .context, .meta => {},
+        for (f.hunks) |*h| {
+            for (h.identityHunks()) |id| {
+                const hash = fingerprintHunk(id);
+                if (!approved.take(used, path, hash)) continue;
+                var preview: []const u8 = "";
+                for (id.lines) |ln| {
+                    switch (ln.kind) {
+                        .add, .delete => {
+                            preview = ln.text;
+                            break;
+                        },
+                        .context, .meta => {},
+                    }
                 }
+                try list.append(alloc, .{
+                    .path = path,
+                    .hash = hash,
+                    .group = f.group,
+                    .kind = .hunk,
+                    .preview = preview,
+                });
             }
-            try list.append(alloc, .{
-                .path = path,
-                .hash = hash,
-                .group = f.group,
-                .kind = .hunk,
-                .preview = preview,
-            });
         }
     }
     return try list.toOwnedSlice(alloc);
@@ -385,7 +391,9 @@ pub fn rowForIdentity(
                 if (!std.mem.eql(u8, cur_path, path)) continue;
                 const file = fileAt(d, cur_path, cur_group) orelse continue;
                 const hi = hunkAt(file.*, hh.old_start, hh.new_start) orelse continue;
-                if (std.mem.eql(u8, &fingerprintHunk(file.hunks[hi]), &hash)) return i;
+                for (file.hunks[hi].identityHunks()) |id| {
+                    if (std.mem.eql(u8, &fingerprintHunk(id), &hash)) return i;
+                }
             },
             .section_header, .line => {},
         }
@@ -423,7 +431,7 @@ pub fn identityAtRow(
                 const hi = hunkAt(file.*, hh.old_start, hh.new_start) orelse return null;
                 return .{
                     .path = file.displayPath(),
-                    .hash = fingerprintHunk(file.hunks[hi]),
+                    .hash = fingerprintHunk(file.hunks[hi].identityHunks()[0]),
                     .group = file.group,
                     .kind = .hunk,
                     .preview = "",
@@ -443,7 +451,7 @@ pub fn identityAtRow(
                 }
                 return .{
                     .path = file.displayPath(),
-                    .hash = fingerprintHunk(file.hunks[0]),
+                    .hash = fingerprintHunk(file.hunks[0].identityHunks()[0]),
                     .group = file.group,
                     .kind = .hunk,
                     .preview = "",
@@ -498,9 +506,13 @@ pub fn hide(
         const keep_hunk = try alloc.alloc(bool, f.hunks.len);
         defer alloc.free(keep_hunk);
         var keep_file = false;
-        for (f.hunks, 0..) |h, i| {
-            keep_hunk[i] = !approved.take(used, path, fingerprintHunk(h));
-            if (keep_hunk[i]) keep_file = true;
+        for (f.hunks, 0..) |*h, i| {
+            var keep = false;
+            for (h.identityHunks()) |id| {
+                if (!approved.take(used, path, fingerprintHunk(id))) keep = true;
+            }
+            keep_hunk[i] = keep;
+            if (keep) keep_file = true;
         }
         if (!keep_file) continue;
 
@@ -747,6 +759,64 @@ test "hunk merge is a different hash from either piece" {
     try testing.expect(!std.mem.eql(u8, &h0, &hm));
     try testing.expect(!std.mem.eql(u8, &h1, &hm));
     try testing.expect(!std.mem.eql(u8, &h0, &h1));
+}
+
+test "approving a merged expand hunk takes the original hunks after reload" {
+    const split =
+        \\diff --git a/f.txt b/f.txt
+        \\--- a/f.txt
+        \\+++ b/f.txt
+        \\@@ -1 +1 @@
+        \\-a
+        \\+A
+        \\@@ -3 +3 @@
+        \\-c
+        \\+C
+    ;
+    const new_file =
+        \\A
+        \\b
+        \\C
+        \\
+    ;
+
+    var d = try diff.parse(testing.allocator, split);
+    defer d.deinit();
+    const path = d.files[0].displayPath();
+    const h0 = fingerprintHunk(d.files[0].hunks[0]);
+    const h1 = fingerprintHunk(d.files[0].hunks[1]);
+    try testing.expectEqual(.expanded, try d.expandHunk(0, 0, new_file));
+    try testing.expectEqual(1, d.files[0].hunks.len);
+
+    const ids = d.files[0].hunks[0].identityHunks();
+    try testing.expectEqual(2, ids.len);
+    try testing.expectEqual(h0, fingerprintHunk(ids[0]));
+    try testing.expectEqual(h1, fingerprintHunk(ids[1]));
+
+    const io = testing.io;
+    const alloc = testing.allocator;
+    const live = try collectLive(alloc, io, .cwd(), &d);
+    defer alloc.free(live);
+    try testing.expectEqual(2, live.len);
+    try testing.expectEqual(h0, live[0].hash);
+    try testing.expectEqual(h1, live[1].hash);
+
+    var approved = initEmpty(alloc);
+    defer approved.deinit();
+    try approved.appendFile(alloc, io, .cwd(), d.files[0]);
+    try testing.expectEqual(2, approved.entries.items.len);
+    try approved.prune(alloc, live);
+    try testing.expectEqual(2, approved.entries.items.len);
+
+    const hidden = try hide(alloc, &d, &approved, io, .cwd());
+    defer alloc.free(hidden);
+    try testing.expectEqual(0, hidden.len);
+
+    var reload = try diff.parse(alloc, split);
+    defer reload.deinit();
+    var used = [_]bool{ false, false };
+    try testing.expect(approved.take(&used, path, fingerprintHunk(reload.files[0].hunks[0])));
+    try testing.expect(approved.take(&used, path, fingerprintHunk(reload.files[0].hunks[1])));
 }
 
 test "length-prefix: add a then delete b is not add a-b" {

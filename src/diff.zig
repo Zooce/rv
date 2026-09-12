@@ -95,6 +95,18 @@ pub const Hunk = struct {
     index: usize = 0,
     /// False after expand has reached both file bounds (the `e` hint hides).
     can_grow: bool = true,
+    /// Original hunks this view hunk absorbed when expand merged neighbors.
+    /// Empty: this hunk is its own approve identity.
+    originals: []const Hunk = &.{},
+
+    /// Hunks whose fingerprints are this view hunk's approve identity.
+    pub fn identityHunks(self: *const Hunk) []const Hunk {
+        if (self.originals.len == 0) {
+            const one: *const [1]Hunk = self;
+            return one;
+        }
+        return self.originals;
+    }
 };
 
 /// Local default-load bucket. `null` on raw `parse` and range diffs.
@@ -261,6 +273,12 @@ pub const Diff = struct {
         };
         const other_after = if (side == .new) old_start else new_start;
         const after = growSides(result_start, result_end, other_after, file_n);
+        // Merge keeps each absorbed hunk's approve identity; grow-only keeps
+        // whatever originals a prior merge already stored.
+        const originals: []const Hunk = if (first == last)
+            file.hunks[first].originals
+        else
+            try originalHunks(alloc, file.hunks[first .. last + 1]);
         const merged: Hunk = .{
             .old_start = old_start,
             .old_count = counts.old,
@@ -270,6 +288,7 @@ pub const Diff = struct {
             .lines = try lines.toOwnedSlice(alloc),
             .index = lo.index,
             .can_grow = after.up > 0 or after.down > 0,
+            .originals = originals,
         };
 
         // Replace the included hunks with the one merged hunk; reindex globally.
@@ -308,6 +327,28 @@ pub const expand_amount: u32 = 8;
 pub const ExpandResult = enum { expanded, noop };
 
 const ExpandSide = enum { old, new };
+
+/// Approve-identity hunks for this span: each hunk's `originals`, or the hunk itself.
+fn originalHunks(alloc: Allocator, hunks: []const Hunk) Allocator.Error![]Hunk {
+    var n: usize = 0;
+    for (hunks) |h| {
+        n += if (h.originals.len == 0) 1 else h.originals.len;
+    }
+    const out = try alloc.alloc(Hunk, n);
+    var i: usize = 0;
+    for (hunks) |h| {
+        if (h.originals.len == 0) {
+            out[i] = h;
+            i += 1;
+        } else {
+            for (h.originals) |o| {
+                out[i] = o;
+                i += 1;
+            }
+        }
+    }
+    return out;
+}
 
 fn growSides(start: u32, end: u32, other_start: u32, file_n: u32) struct { up: u32, down: u32 } {
     var up: u32 = 0;

@@ -871,19 +871,18 @@ fn applyApprove(
     if (!whole_file and target.hunk_i == null) return;
     const file = groupedFile(&diff_view.diff, target.path, target.group) orelse return;
 
-    // Identity and neighbor must outlive stage: applyAtCursor replaces the rows.
-    var old_start: u32 = 0;
-    var new_start: u32 = 0;
-    var hunk_hash: ?approve.Hash = null;
+    // Identities must outlive stage: applyAtCursor replaces the diff.
+    var hashes: std.ArrayList(approve.Hash) = .empty;
+    defer hashes.deinit(alloc);
     if (!whole_file) {
         const hh = switch (rows[target.first]) {
             .hunk_header => |h| h,
             else => return,
         };
-        old_start = hh.old_start;
-        new_start = hh.new_start;
-        const hi = approve.hunkAt(file.*, old_start, new_start) orelse return;
-        hunk_hash = approve.fingerprintHunk(file.hunks[hi]);
+        const hi = approve.hunkAt(file.*, hh.old_start, hh.new_start) orelse return;
+        for (file.hunks[hi].identityHunks()) |id| {
+            try hashes.append(alloc, approve.fingerprintHunk(id));
+        }
     }
     const hunk_mark = git.neighborMark(rows, target);
     const mark_path = if (hunk_mark) |m| try alloc.dupe(u8, m.path) else null;
@@ -927,16 +926,9 @@ fn applyApprove(
     if (whole_file) {
         try approved.appendFile(alloc, io, root, live_file.*);
     } else {
-        const hash = hunk_hash orelse return;
-        const hi = blk: {
-            for (live_file.hunks, 0..) |h, i| {
-                if (std.mem.eql(u8, &approve.fingerprintHunk(h), &hash)) break :blk i;
-            }
-            if (approve.hunkAt(live_file.*, old_start, new_start)) |i| break :blk i;
-            if (live_file.hunks.len == 1) break :blk 0;
-            return;
-        };
-        try approved.append(live_file.displayPath(), approve.fingerprintHunk(live_file.hunks[hi]));
+        for (hashes.items) |hash| {
+            try approved.append(live_file.displayPath(), hash);
+        }
     }
 
     const live = try approve.collectLive(alloc, io, root, &diff_view.diff);
