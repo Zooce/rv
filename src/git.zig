@@ -79,7 +79,9 @@
 //!
 //! `applyAtCursor` / `applyGroupAtCursor` run `mutate`, reload the local diff
 //! (hiding approved hunks), restore the cursor, and call comment remap (and
-//! discard comment delete).
+//! discard comment delete). Local TUI `a` / `A` stages through `applyAtCursor`
+//! (same hunk vs file as `gs` / `gS`), then hides; already staged skips
+//! mutate. Unapprove does not unstage.
 //! `discardTargetAt` is the allowed discard; staged is a no-op. `stagePlan` /
 //! `approveHasComments` / `confirmNext` are what the app loop dispatches.
 //! Overlay paint stays in the TUI.

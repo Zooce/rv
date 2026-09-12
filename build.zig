@@ -268,6 +268,7 @@ pub fn build(b: *std.Build) void {
                 .{ .name = "comment_input", .module = comment_input_mod },
                 .{ .name = "Help", .module = help_mod },
                 .{ .name = "approve", .module = approve_mod },
+                .{ .name = "isolated_tmp", .module = isolated_tmp_mod },
             },
         }),
     });

@@ -5,8 +5,8 @@
 //! `h`/`l` pan, `0`/`$` col home/end, `[`/`]` hunk, `{`/`}` file header,
 //! `(`/`)` prev/next comment (unapproves a hidden hunk if needed), `/` text search, `n`/`N` next/prev match,
 //! `Space` `f` file list, `Space` `c` comment list, `Space` `a` approved list
-//! (local; Enter unapproves and jumps), `gs`/`gu`/`gd` hunk git and `gS`/`gU`/`gD`
-//! file git (local), `a`/`A` approve hunk/file (local),
+//! (local; Enter unapproves and jumps, does not unstage), `gs`/`gu`/`gd` hunk git and `gS`/`gU`/`gD`
+//! file git (local), `a`/`A` approve hunk/file (local; stages, then hides),
 //! `i`/`c`/`Enter`
 //! create or edit new, `I`/`C` old, `d` dismiss new, `D` dismiss old,
 //! `e` expand the current hunk's context, `r` reload the loaded diff, `q` quit).
@@ -42,7 +42,7 @@
 //! File list: `Space` then `f` opens a centered overlay of changed-file
 //! paths (flatten order). `j`/`k` move; Enter jumps to that file header and
 //! closes. `a`/`A` approve the remaining hunks of that file in its group
-//! (same as `A` on the file header; local only; range no-op). The overlay stays
+//! (same as `A` on the file header; stages, then hides; local only; range no-op). The overlay stays
 //! open and refreshes; a fully approved file leaves the list. Live comments
 //! on the file open the same approve confirm; Esc on that confirm returns
 //! to the list. Esc on the list closes without moving the cursor. `q` still
@@ -60,11 +60,12 @@
 //! success. Staged `gd`/`gD` are no-ops (unstage first). Range loads ignore
 //! git and approve keys. Exactly one leader at a time (`Space` lists, `g`
 //! git); an unmatched leader is dropped and the next key is
-//! handled as usual. Local `a` approves the current hunk; `A` approves the
-//! remaining hunks of that file in this group (from a hunk or the file
-//! header; no-op on a section). Live comments on that hunk (`a`) or on
-//! the file / any of its hunks (`A`) open a confirm (No selected; `yes`
-//! proceeds). Range loads ignore `a`/`A`.
+//! handled as usual. Local `a` stages the current hunk then hides it; `A`
+//! stages the remaining hunks of that file in this group then hides them
+//! (from a hunk or the file header; no-op on a section). Already staged:
+//! hide only. Unapprove does not unstage. Live comments on that hunk (`a`)
+//! or on the file / any of its hunks (`A`) open a confirm (No selected;
+//! `yes` proceeds). Range and commit loads ignore `a`/`A`.
 //! Git failure opens a centered overlay with git’s error; Enter or Esc
 //! dismisses. The list is unchanged. Local load paints git and approve
 //! chords on the current file and hunk rows (no git/approve hints on a range
@@ -76,17 +77,18 @@
 //! Comment list: `Space` then `c` opens a centered overlay of live comments
 //! (same store as `rv list`). `j`/`k` move; Enter jumps with the same landing
 //! as `(`/`)` and closes the overlay. A live comment on an approved hunk
-//! unapproves that hunk, rebuilds, and lands (same as `(`/`)`). `d`/`D`
-//! dismisses the selected comment (list stays open; cursor stays on a
-//! neighbor). `i`/`c`/`I`/`C` jump the same way as Enter and open the
-//! create-or-edit box on that comment. Esc closes without moving the
-//! cursor. A row whose path/line is gone from the live diff stays in the
-//! list and shows a footer note. `q` still quits.
+//! unapproves that hunk, rebuilds, and lands (same as `(`/`)`); unapprove
+//! does not unstage. `d`/`D` dismisses the selected comment (list stays
+//! open; cursor stays on a neighbor). `i`/`c`/`I`/`C` jump the same way as
+//! Enter and open the create-or-edit box on that comment. Esc closes
+//! without moving the cursor. A row whose path/line is gone from the live
+//! diff stays in the list and shows a footer note. `q` still quits.
 //!
 //! Approved list: `Space` then `a` opens a centered overlay of live approved
 //! identities (flatten order). Local only. `j`/`k` move; Enter removes one
 //! matching store entry, rebuilds the main list, jumps to that row, and
-//! closes. Esc closes without changing approval. Empty set: empty overlay.
+//! closes. Unapprove does not unstage. Esc closes without changing approval.
+//! Empty set: empty overlay.
 //! Opens on an approved identity in the file under the cursor when there is
 //! one; otherwise the first row. `q` still quits.
 //!
@@ -312,9 +314,10 @@ fn runTui(alloc: std.mem.Allocator, io: std.Io, source: cli.Source) !u8 {
                             &diff_view,
                             &viewport.cursor,
                             &frame.note,
+                            &focus,
+                            &failure,
                             &review,
                             &discard_confirm,
-                            &focus,
                             &file_list,
                         ),
                         .open => {},
@@ -335,6 +338,7 @@ fn runTui(alloc: std.mem.Allocator, io: std.Io, source: cli.Source) !u8 {
                                 &diff_view,
                                 &viewport.cursor,
                                 &frame.note,
+                                .cwd(),
                                 approved_list.items.items[idx],
                             );
                         },
@@ -394,13 +398,20 @@ fn runTui(alloc: std.mem.Allocator, io: std.Io, source: cli.Source) !u8 {
                                 &diff_view,
                                 &viewport.cursor,
                                 &frame.note,
+                                &focus,
+                                &failure,
+                                &review,
+                                .inherit,
+                                .cwd(),
                                 discard_confirm.whole_file,
                             );
-                            if (discard_confirm.return_to_files) {
-                                try file_list.reload(alloc, diff_view.rows, file_list.cursor);
-                                focus = .files;
-                            } else {
-                                focus = .normal;
+                            if (focus != .git_error) {
+                                if (discard_confirm.return_to_files) {
+                                    try file_list.reload(alloc, diff_view.rows, file_list.cursor);
+                                    focus = .files;
+                                } else {
+                                    focus = .normal;
+                                }
                             }
                         },
                     },
@@ -560,9 +571,10 @@ fn runTui(alloc: std.mem.Allocator, io: std.Io, source: cli.Source) !u8 {
                                         &diff_view,
                                         &viewport.cursor,
                                         &frame.note,
+                                        &focus,
+                                        &failure,
                                         &review,
                                         &discard_confirm,
-                                        &focus,
                                         false,
                                     );
                                 } else if (c == 'A') {
@@ -573,9 +585,10 @@ fn runTui(alloc: std.mem.Allocator, io: std.Io, source: cli.Source) !u8 {
                                         &diff_view,
                                         &viewport.cursor,
                                         &frame.note,
+                                        &focus,
+                                        &failure,
                                         &review,
                                         &discard_confirm,
-                                        &focus,
                                         true,
                                     );
                                 } else if (c == 'd') {
@@ -834,8 +847,10 @@ fn restoreExpandCursor(
 /// Approve the hunk (`whole_file == false`, requires a hunk) or the remaining
 /// hunks of that file in this group (`true`, from a hunk or the file header).
 /// Local only. No-op on a section, on a file header for hunk approve, and
-/// when the source is a range. Save, hide, restore onto the neighbor change
-/// (same rule as staging a row away). Does not mutate git.
+/// when the source is a range. Unstaged/untracked: stage first (same as
+/// `gs`/`gS`); GitFailed opens the git-error overlay and does not write the
+/// store. Already staged: skip mutate. Then save, hide, restore onto the
+/// neighbor of the original target (same rule as staging a row away).
 fn applyApprove(
     alloc: std.mem.Allocator,
     io: std.Io,
@@ -843,6 +858,11 @@ fn applyApprove(
     diff_view: *DiffView,
     cursor: *usize,
     note: *StatusNote,
+    focus: *Focus,
+    failure: *Failure,
+    review: *store.Review,
+    cwd: std.process.Child.Cwd,
+    root: std.Io.Dir,
     whole_file: bool,
 ) std.mem.Allocator.Error!void {
     if (source != .local) return;
@@ -850,7 +870,51 @@ fn applyApprove(
     const target = git.indexTargetAt(rows, cursor.*, whole_file) orelse return;
     if (!whole_file and target.hunk_i == null) return;
     const file = groupedFile(&diff_view.diff, target.path, target.group) orelse return;
-    const root: std.Io.Dir = .cwd();
+
+    // Identity and neighbor must outlive stage: applyAtCursor replaces the rows.
+    var old_start: u32 = 0;
+    var new_start: u32 = 0;
+    var hunk_hash: ?approve.Hash = null;
+    if (!whole_file) {
+        const hh = switch (rows[target.first]) {
+            .hunk_header => |h| h,
+            else => return,
+        };
+        old_start = hh.old_start;
+        new_start = hh.new_start;
+        const hi = approve.hunkAt(file.*, old_start, new_start) orelse return;
+        hunk_hash = approve.fingerprintHunk(file.hunks[hi]);
+    }
+    const hunk_mark = git.neighborMark(rows, target);
+    const mark_path = if (hunk_mark) |m| try alloc.dupe(u8, m.path) else null;
+    defer if (mark_path) |p| alloc.free(p);
+    const path = try alloc.dupe(u8, file.displayPath());
+    defer alloc.free(path);
+    const needs_stage = target.group != .staged;
+
+    // Stage first. GitFailed (overlay via commitApply) does not write the store.
+    if (needs_stage) {
+        const status = try git.applyAtCursor(
+            alloc,
+            io,
+            cwd,
+            &diff_view.diff,
+            diff_view.rows,
+            cursor.*,
+            review,
+            whole_file,
+            .stage_unstage,
+            false,
+        );
+        const stage_ok: bool = switch (status) {
+            .noop => false,
+            .result => |*r| r.snapshot != null,
+        };
+        try commitApply(alloc, diff_view, cursor, note, focus, failure, status);
+        if (!stage_ok) return;
+    }
+
+    const live_file = groupedFile(&diff_view.diff, path, .staged) orelse return;
     var approved = approve.load(alloc, io, root) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
         else => {
@@ -860,16 +924,19 @@ fn applyApprove(
     };
     defer approved.deinit();
 
-    const hunk_mark = git.neighborMark(rows, target);
     if (whole_file) {
-        try approved.appendFile(alloc, io, root, file.*);
+        try approved.appendFile(alloc, io, root, live_file.*);
     } else {
-        const hh = switch (rows[target.first]) {
-            .hunk_header => |h| h,
-            else => return,
+        const hash = hunk_hash orelse return;
+        const hi = blk: {
+            for (live_file.hunks, 0..) |h, i| {
+                if (std.mem.eql(u8, &approve.fingerprintHunk(h), &hash)) break :blk i;
+            }
+            if (approve.hunkAt(live_file.*, old_start, new_start)) |i| break :blk i;
+            if (live_file.hunks.len == 1) break :blk 0;
+            return;
         };
-        const hi = approve.hunkAt(file.*, hh.old_start, hh.new_start) orelse return;
-        try approved.append(file.displayPath(), approve.fingerprintHunk(file.hunks[hi]));
+        try approved.append(live_file.displayPath(), approve.fingerprintHunk(live_file.hunks[hi]));
     }
 
     const live = try approve.collectLive(alloc, io, root, &diff_view.diff);
@@ -885,7 +952,11 @@ fn applyApprove(
 
     const new_rows = try approve.hide(alloc, &diff_view.diff, &approved, io, root);
     const restored: usize = if (hunk_mark) |m|
-        git.restoreNeighbor(new_rows, m)
+        git.restoreNeighbor(new_rows, .{
+            .path = mark_path.?,
+            .group = m.group,
+            .hunk_i = m.hunk_i,
+        })
     else
         0;
     diff_view.replaceRows(alloc, new_rows, approved.entries.items.len) catch {
@@ -904,10 +975,10 @@ fn unapproveRebuild(
     source: cli.Source,
     diff_view: *DiffView,
     note: *StatusNote,
+    root: std.Io.Dir,
     item: approve.Hidden,
 ) std.mem.Allocator.Error!bool {
     if (source != .local) return false;
-    const root: std.Io.Dir = .cwd();
     var approved = approve.load(alloc, io, root) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
         else => {
@@ -947,9 +1018,10 @@ fn applyUnapprove(
     diff_view: *DiffView,
     cursor: *usize,
     note: *StatusNote,
+    root: std.Io.Dir,
     item: approve.Hidden,
 ) std.mem.Allocator.Error!void {
-    if (!try unapproveRebuild(alloc, io, source, diff_view, note, item)) return;
+    if (!try unapproveRebuild(alloc, io, source, diff_view, note, root, item)) return;
     const jump = approve.rowForIdentity(
         diff_view.rows,
         &diff_view.diff,
@@ -1072,9 +1144,10 @@ fn dispatchApprove(
     diff_view: *DiffView,
     cursor: *usize,
     note: *StatusNote,
-    review: *const store.Review,
-    confirm: *DiscardConfirm,
     focus: *Focus,
+    failure: *Failure,
+    review: *store.Review,
+    confirm: *DiscardConfirm,
     whole_file: bool,
 ) std.mem.Allocator.Error!void {
     if (source != .local) return;
@@ -1083,7 +1156,7 @@ fn dispatchApprove(
         focus.* = .discard_confirm;
         return;
     }
-    try applyApprove(alloc, io, source, diff_view, cursor, note, whole_file);
+    try applyApprove(alloc, io, source, diff_view, cursor, note, focus, failure, review, .inherit, .cwd(), whole_file);
 }
 
 /// Open the discard confirm for the hunk or file at the cursor. Hunk
@@ -1935,7 +2008,7 @@ fn landComment(
         note.set("comment not in this diff");
         return false;
     };
-    if (!try unapproveRebuild(alloc, io, source, diff_view, note, item)) return false;
+    if (!try unapproveRebuild(alloc, io, source, diff_view, note, .cwd(), item)) return false;
     const row = view.rowForComment(diff_view.rows, loc) orelse {
         note.set("comment not in this diff");
         return false;
@@ -2073,20 +2146,22 @@ fn applyListApprove(
     diff_view: *DiffView,
     cursor: *usize,
     note: *StatusNote,
-    review: *const store.Review,
-    confirm: *DiscardConfirm,
     focus: *Focus,
+    failure: *Failure,
+    review: *store.Review,
+    confirm: *DiscardConfirm,
     list: *FileList,
 ) std.mem.Allocator.Error!void {
     if (source != .local) return;
     const idx = list.cursor;
     if (idx >= list.items.items.len) return;
     cursor.* = list.items.items[idx];
-    try dispatchApprove(alloc, io, source, diff_view, cursor, note, review, confirm, focus, true);
+    try dispatchApprove(alloc, io, source, diff_view, cursor, note, focus, failure, review, confirm, true);
     if (focus.* == .discard_confirm) {
         confirm.return_to_files = true;
         return;
     }
+    if (focus.* == .git_error) return;
     try list.reload(alloc, diff_view.rows, idx);
 }
 
@@ -3130,4 +3205,297 @@ test "fullIndexOfHidden maps the remaining hunk onto the full flatten" {
     defer alloc.free(hidden);
     try std.testing.expectEqual(0, fullIndexOfHidden(full, hidden, 0));
     try std.testing.expectEqual(4, fullIndexOfHidden(full, hidden, 1));
+}
+
+const builtin = @import("builtin");
+const IsolatedTmp = if (builtin.is_test) @import("isolated_tmp").IsolatedTmp else void;
+
+const ten_lines = "line1\nline2\nline3\nline4\nline5\nline6\nline7\nline8\nline9\nline10\n";
+const accepted_body = "line1\naccepted\nline2\nline3\nline4\nline5\nline6\nline7\nline8\nline9\nline10\n";
+const nearby_body = "line1\naccepted\nnearby\nline2\nline3\nline4\nline5\nline6\nline7\nline8\nline9\nline10\n";
+
+fn expectGitOk(io: std.Io, cwd: std.process.Child.Cwd, argv: []const []const u8) !void {
+    var child = std.process.spawn(io, .{
+        .argv = argv,
+        .cwd = cwd,
+        .stdin = .ignore,
+        .stdout = .ignore,
+        .stderr = .ignore,
+    }) catch return error.TestUnexpectedResult;
+    defer child.kill(io);
+    const term = child.wait(io) catch return error.TestUnexpectedResult;
+    switch (term) {
+        .exited => |code| if (code != 0) return error.TestUnexpectedResult,
+        else => return error.TestUnexpectedResult,
+    }
+}
+
+fn initTrackedRepo(io: std.Io, tmp: IsolatedTmp) !void {
+    const cwd = tmp.cwd();
+    try expectGitOk(io, cwd, &.{ "git", "init", "-b", "main" });
+    try expectGitOk(io, cwd, &.{ "git", "config", "user.email", "rv@test" });
+    try expectGitOk(io, cwd, &.{ "git", "config", "user.name", "rv test" });
+    try tmp.write(io, "f.txt", ten_lines);
+    try expectGitOk(io, cwd, &.{ "git", "add", "f.txt" });
+    try expectGitOk(io, cwd, &.{ "git", "commit", "-m", "init" });
+}
+
+fn loadLocalView(alloc: std.mem.Allocator, io: std.Io, cwd: std.process.Child.Cwd, root: std.Io.Dir) !DiffView {
+    var parsed = try git.loadDefaultDiffCwd(alloc, io, cwd);
+    errdefer parsed.deinit();
+    const vis = try approve.loadVisible(alloc, io, root, &parsed);
+    errdefer alloc.free(vis.rows);
+    return try DiffView.build(alloc, parsed, vis.rows, vis.approved_n);
+}
+
+fn firstHunkRow(rows: []const view.row.Row) ?usize {
+    for (rows, 0..) |row, i| {
+        if (row == .hunk_header) return i;
+    }
+    return null;
+}
+
+fn hasDiffFile(d: diff.Diff, path: []const u8, group: diff.Group) bool {
+    for (d.files) |f| {
+        const g = f.group orelse continue;
+        if (g == group and std.mem.eql(u8, f.displayPath(), path)) return true;
+    }
+    return false;
+}
+
+fn hasRowFile(rows: []const view.row.Row, path: []const u8, group: diff.Group) bool {
+    for (rows) |row| {
+        switch (row) {
+            .file_header => |fh| {
+                const g = fh.group orelse continue;
+                if (g == group and std.mem.eql(u8, fh.path, path)) return true;
+            },
+            else => {},
+        }
+    }
+    return false;
+}
+
+fn hunkAdds(file: diff.File, text: []const u8) bool {
+    for (file.hunks) |h| {
+        for (h.lines) |ln| {
+            if (ln.kind == .add and std.mem.eql(u8, ln.text, text)) return true;
+        }
+    }
+    return false;
+}
+
+test "applyApprove stages an unstaged hunk and hides it; nearby edit is unstaged only" {
+    if (builtin.os.tag == .wasi) return error.SkipZigTest;
+
+    const io = std.testing.io;
+    const alloc = std.testing.allocator;
+    var tmp = try IsolatedTmp.init(alloc, io);
+    defer tmp.deinit(alloc, io);
+    try initTrackedRepo(io, tmp);
+    try tmp.write(io, "f.txt", accepted_body);
+
+    var diff_view = try loadLocalView(alloc, io, tmp.cwd(), tmp.dir);
+    defer diff_view.deinit(alloc);
+    var cursor: usize = firstHunkRow(diff_view.rows) orelse return error.TestUnexpectedResult;
+    var note: StatusNote = .{};
+    var focus: Focus = .normal;
+    var failure: Failure = .{};
+    defer failure.buf.deinit(alloc);
+    var review = try store.initEmpty(alloc, store.default_review_id);
+    defer review.deinit();
+
+    try applyApprove(
+        alloc,
+        io,
+        .local,
+        &diff_view,
+        &cursor,
+        &note,
+        &focus,
+        &failure,
+        &review,
+        tmp.cwd(),
+        tmp.dir,
+        false,
+    );
+    try std.testing.expect(focus != .git_error);
+    try std.testing.expect(!hasRowFile(diff_view.rows, "f.txt", .unstaged));
+    try std.testing.expect(!hasRowFile(diff_view.rows, "f.txt", .staged));
+    {
+        var raw = try git.loadDefaultDiffCwd(alloc, io, tmp.cwd());
+        defer raw.deinit();
+        try std.testing.expect(!hasDiffFile(raw, "f.txt", .unstaged));
+        try std.testing.expect(hasDiffFile(raw, "f.txt", .staged));
+    }
+
+    try tmp.write(io, "f.txt", nearby_body);
+    const next = try loadLocalView(alloc, io, tmp.cwd(), tmp.dir);
+    diff_view.deinit(alloc);
+    diff_view = next;
+    try std.testing.expect(hasRowFile(diff_view.rows, "f.txt", .unstaged));
+    try std.testing.expect(!hasRowFile(diff_view.rows, "f.txt", .staged));
+    const unstaged = blk: {
+        for (diff_view.diff.files) |f| {
+            const g = f.group orelse continue;
+            if (g == .unstaged and std.mem.eql(u8, f.displayPath(), "f.txt")) break :blk f;
+        }
+        return error.TestUnexpectedResult;
+    };
+    try std.testing.expect(hunkAdds(unstaged, "nearby"));
+    try std.testing.expect(!hunkAdds(unstaged, "accepted"));
+}
+
+test "applyApprove on already-staged only hides" {
+    if (builtin.os.tag == .wasi) return error.SkipZigTest;
+
+    const io = std.testing.io;
+    const alloc = std.testing.allocator;
+    var tmp = try IsolatedTmp.init(alloc, io);
+    defer tmp.deinit(alloc, io);
+    try initTrackedRepo(io, tmp);
+    try tmp.write(io, "f.txt", accepted_body);
+    try expectGitOk(io, tmp.cwd(), &.{ "git", "add", "f.txt" });
+
+    var diff_view = try loadLocalView(alloc, io, tmp.cwd(), tmp.dir);
+    defer diff_view.deinit(alloc);
+    var cursor: usize = firstHunkRow(diff_view.rows) orelse return error.TestUnexpectedResult;
+    var note: StatusNote = .{};
+    var focus: Focus = .normal;
+    var failure: Failure = .{};
+    defer failure.buf.deinit(alloc);
+    var review = try store.initEmpty(alloc, store.default_review_id);
+    defer review.deinit();
+
+    try applyApprove(
+        alloc,
+        io,
+        .local,
+        &diff_view,
+        &cursor,
+        &note,
+        &focus,
+        &failure,
+        &review,
+        tmp.cwd(),
+        tmp.dir,
+        false,
+    );
+    try std.testing.expect(focus != .git_error);
+    try std.testing.expect(!hasRowFile(diff_view.rows, "f.txt", .staged));
+    {
+        var raw = try git.loadDefaultDiffCwd(alloc, io, tmp.cwd());
+        defer raw.deinit();
+        try std.testing.expect(hasDiffFile(raw, "f.txt", .staged));
+        try std.testing.expect(!hasDiffFile(raw, "f.txt", .unstaged));
+    }
+}
+
+test "applyApprove GitFailed does not write the store" {
+    if (builtin.os.tag == .wasi) return error.SkipZigTest;
+
+    const io = std.testing.io;
+    const alloc = std.testing.allocator;
+    var tmp = try IsolatedTmp.init(alloc, io);
+    defer tmp.deinit(alloc, io);
+    try initTrackedRepo(io, tmp);
+    try tmp.write(io, "f.txt", accepted_body);
+
+    var diff_view = try loadLocalView(alloc, io, tmp.cwd(), tmp.dir);
+    defer diff_view.deinit(alloc);
+    const before_len = diff_view.rows.len;
+    var cursor: usize = firstHunkRow(diff_view.rows) orelse return error.TestUnexpectedResult;
+    var note: StatusNote = .{};
+    var focus: Focus = .normal;
+    var failure: Failure = .{};
+    defer failure.buf.deinit(alloc);
+    var review = try store.initEmpty(alloc, store.default_review_id);
+    defer review.deinit();
+
+    // Index no longer matches the loaded hunk's old side, so apply --cached fails.
+    try tmp.write(io, "f.txt", "this no longer matches the loaded hunk\n");
+    try expectGitOk(io, tmp.cwd(), &.{ "git", "add", "f.txt" });
+    try applyApprove(
+        alloc,
+        io,
+        .local,
+        &diff_view,
+        &cursor,
+        &note,
+        &focus,
+        &failure,
+        &review,
+        tmp.cwd(),
+        tmp.dir,
+        false,
+    );
+    try std.testing.expectEqual(Focus.git_error, focus);
+    try std.testing.expect(failure.buf.items.len > 0);
+    try std.testing.expectEqual(before_len, diff_view.rows.len);
+    try std.testing.expect(hasRowFile(diff_view.rows, "f.txt", .unstaged));
+    {
+        var approved = try approve.load(alloc, io, tmp.dir);
+        defer approved.deinit();
+        try std.testing.expectEqual(0, approved.entries.items.len);
+    }
+}
+
+test "applyUnapprove restores the row under Staged and leaves the index" {
+    if (builtin.os.tag == .wasi) return error.SkipZigTest;
+
+    const io = std.testing.io;
+    const alloc = std.testing.allocator;
+    var tmp = try IsolatedTmp.init(alloc, io);
+    defer tmp.deinit(alloc, io);
+    try initTrackedRepo(io, tmp);
+    try tmp.write(io, "f.txt", accepted_body);
+
+    var diff_view = try loadLocalView(alloc, io, tmp.cwd(), tmp.dir);
+    defer diff_view.deinit(alloc);
+    var cursor: usize = firstHunkRow(diff_view.rows) orelse return error.TestUnexpectedResult;
+    var note: StatusNote = .{};
+    var focus: Focus = .normal;
+    var failure: Failure = .{};
+    defer failure.buf.deinit(alloc);
+    var review = try store.initEmpty(alloc, store.default_review_id);
+    defer review.deinit();
+
+    try applyApprove(
+        alloc,
+        io,
+        .local,
+        &diff_view,
+        &cursor,
+        &note,
+        &focus,
+        &failure,
+        &review,
+        tmp.cwd(),
+        tmp.dir,
+        false,
+    );
+    try std.testing.expect(focus != .git_error);
+
+    var stored = try approve.load(alloc, io, tmp.dir);
+    defer stored.deinit();
+    const hidden = try approve.collectApproved(alloc, io, tmp.dir, &diff_view.diff, &stored);
+    defer alloc.free(hidden);
+    try std.testing.expectEqual(1, hidden.len);
+
+    try applyUnapprove(alloc, io, .local, &diff_view, &cursor, &note, tmp.dir, hidden[0]);
+    try std.testing.expect(hasRowFile(diff_view.rows, "f.txt", .staged));
+    try std.testing.expect(!hasRowFile(diff_view.rows, "f.txt", .unstaged));
+    const restored = diff_view.rows[cursor];
+    const restored_group = switch (restored) {
+        .file_header => |fh| fh.group,
+        .hunk_header => |hh| hh.group,
+        else => null,
+    };
+    try std.testing.expectEqual(diff.Group.staged, restored_group.?);
+    {
+        var raw = try git.loadDefaultDiffCwd(alloc, io, tmp.cwd());
+        defer raw.deinit();
+        try std.testing.expect(hasDiffFile(raw, "f.txt", .staged));
+        try std.testing.expect(!hasDiffFile(raw, "f.txt", .unstaged));
+    }
 }

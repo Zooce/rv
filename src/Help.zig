@@ -40,7 +40,7 @@ const rows = [_]Row{
     .{ .item = .{ .key = "sections", .label = "Unstaged, Untracked, Staged" } },
     .{ .item = .{ .key = "gs/gu/gd", .label = "stage / unstage / discard hunk" } },
     .{ .item = .{ .key = "gS/gU/gD", .label = "stage / unstage / discard file" } },
-    .{ .item = .{ .key = "a/A", .label = "approve hunk / file" } },
+    .{ .item = .{ .key = "a/A", .label = "approve hunk / file (stages, then hides)" } },
     .blank,
     .{ .group = "Session" },
     .{ .item = .{ .key = "t", .label = "layout" } },
@@ -54,7 +54,7 @@ const rows = [_]Row{
     .{ .item = .{ .key = "comment", .label = "Enter save · Esc cancel · arrows move" } },
     .{ .item = .{ .key = "search", .label = "Enter jump · Esc cancel" } },
     .{ .item = .{ .key = "list", .label = "j/k move · Enter jump · Esc close" } },
-    .{ .item = .{ .key = "approved", .label = "Enter unapprove · jump · Esc close" } },
+    .{ .item = .{ .key = "approved", .label = "Enter unapprove (does not unstage) · jump · Esc close" } },
     .{ .item = .{ .key = "discard", .label = "No/yes · comments no/Yes · Esc cancel" } },
     .{ .item = .{ .key = "approve", .label = "No/yes · Esc cancel" } },
 };
