@@ -1,0 +1,57 @@
+name: release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: 0.16.0
+
+      - name: Build and pack
+        run: |
+          mkdir -p dist
+          pack() {
+            target="$1"
+            asset="$2"
+            stage="$RUNNER_TEMP/stage-$asset"
+            packdir="$RUNNER_TEMP/pack-$asset"
+            rm -rf "$stage" "$packdir"
+            zig build -Doptimize=ReleaseSafe -Dtarget="$target" --prefix "$stage"
+            mkdir -p "$packdir/bin" "$packdir/share/rv/skills"
+            cp "$stage/bin/rv" "$packdir/bin/rv"
+            cp -a "$stage/share/rv/skills/rv" "$packdir/share/rv/skills/rv"
+            tar -C "$packdir" -czf "dist/$asset" bin share
+          }
+          pack x86_64-linux-musl rv-linux-x86_64.tar.gz
+          pack aarch64-linux-musl rv-linux-aarch64.tar.gz
+          pack x86_64-macos rv-macos-x86_64.tar.gz
+          pack aarch64-macos rv-macos-aarch64.tar.gz
+          cd dist
+          sha256sum \
+            rv-linux-x86_64.tar.gz \
+            rv-linux-aarch64.tar.gz \
+            rv-macos-x86_64.tar.gz \
+            rv-macos-aarch64.tar.gz \
+            > SHA256SUMS
+
+      - name: Publish GitHub Release
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" \
+            dist/rv-linux-x86_64.tar.gz \
+            dist/rv-linux-aarch64.tar.gz \
+            dist/rv-macos-x86_64.tar.gz \
+            dist/rv-macos-aarch64.tar.gz \
+            dist/SHA256SUMS \
+            --generate-notes

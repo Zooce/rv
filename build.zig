@@ -23,6 +23,7 @@ pub fn build(b: *std.Build) void {
             },
         }),
     });
+    demo.root_module.strip = optimize != .Debug;
     b.installArtifact(demo);
 
     const run_demo = b.addRunArtifact(demo);
@@ -178,6 +179,7 @@ pub fn build(b: *std.Build) void {
             },
         }),
     });
+    rv.root_module.strip = optimize != .Debug;
     b.installArtifact(rv);
     // Bundled skill for `rv install-skill` (prefix/share/rv/skills/rv).
     b.installDirectory(.{
