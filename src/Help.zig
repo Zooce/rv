@@ -45,6 +45,7 @@ const rows = [_]Row{
     .{ .group = "Session" },
     .{ .item = .{ .key = "t", .label = "layout" } },
     .{ .item = .{ .key = "#", .label = "line numbers" } },
+    .{ .item = .{ .key = "w", .label = "wrap" } },
     .{ .item = .{ .key = "e", .label = "expand hunk context" } },
     .{ .item = .{ .key = "r", .label = "reload" } },
     .{ .item = .{ .key = "?", .label = "this help" } },
@@ -182,7 +183,7 @@ test "help catalog includes normal bindings" {
     const required = [_][]const u8{
         "j/k",     "h/l",     "0/$", "J/K", "[/]", "{/}", "(/)", "/", "n/N",
         "Space f", "Space c", "Space a", "gs", "gS", "a", "A", "i", "I", "d", "D",
-        "t",       "#",       "e",           "r", "?", "q", "approved", "approve",
+        "t",       "#",       "w",           "e", "r", "?", "q", "approved", "approve",
     };
     for (required) |token| {
         var found = false;

@@ -1,7 +1,7 @@
 //! Display/review-list topic: comment helpers on rows.
 //! Row model is `row.zig`; viewport is `viewport.zig`; side-by-side layout
-//! is `layout.zig`; structural nav is `nav.zig`; search is `search.zig`.
-//! Pure data — no TTY.
+//! is `layout.zig`; structural nav is `nav.zig`; search is `search.zig`;
+//! body wrap is `wrap.zig`. Pure data — no TTY.
 
 const std = @import("std");
 const diff = @import("diff");
@@ -12,6 +12,7 @@ pub const viewport = @import("viewport.zig");
 pub const layout = @import("layout.zig");
 pub const nav = @import("nav.zig");
 pub const search = @import("search.zig");
+pub const wrap = @import("wrap.zig");
 
 /// Comment target for `want` at `cursor`, or null if that side is missing.
 /// File header: path-only (both sides the same). Hunk header: both starts,
@@ -135,6 +136,7 @@ test {
     _ = layout;
     _ = nav;
     _ = search;
+    _ = wrap;
 }
 
 fn threeGroupFixture(alloc: Allocator) !struct { d: diff.Diff, rows: []row.Row } {

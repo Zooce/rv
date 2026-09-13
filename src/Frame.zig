@@ -304,31 +304,52 @@ pub fn paint(
                 const is_cur = i == cur;
                 const marked = rowMarked(rows[i], review);
                 const st = pal.rowStyle(rows[i], is_cur);
-                if (rows[i] == .section_header) {
-                    scr.fillRect(.{ .x = 0, .y = screen_y, .w = scr.cols, .h = 1 }, '─', st);
-                } else {
-                    fillRow(scr, screen_y, st);
-                }
                 switch (rows[i]) {
-                    .line => putPannedBody(
-                        scr,
-                        0,
-                        screen_y,
-                        size.cols,
-                        rows[i],
-                        marked,
-                        num_w,
-                        .unified,
-                        pan_span.containsBody(i),
-                        cs,
-                        st,
-                    ),
-                    else => {
+                    .line => {
+                        if (viewport.wrap) {
+                            screen_y = putWrappedPane(
+                                scr,
+                                0,
+                                screen_y,
+                                content_bottom,
+                                size.cols,
+                                rows[i],
+                                marked,
+                                num_w,
+                                .unified,
+                                st,
+                            );
+                        } else {
+                            fillRow(scr, screen_y, st);
+                            putPannedBody(
+                                scr,
+                                0,
+                                screen_y,
+                                size.cols,
+                                rows[i],
+                                marked,
+                                num_w,
+                                .unified,
+                                pan_span.containsBody(i),
+                                cs,
+                                st,
+                            );
+                            screen_y += 1;
+                        }
+                    },
+                    .section_header => {
+                        scr.fillRect(.{ .x = 0, .y = screen_y, .w = scr.cols, .h = 1 }, '─', st);
                         const text = formatRow(&line_buf, rows[i], marked);
                         putRowHint(scr, screen_y, text, headerHint(&hint_buf, i, hint_file, hint_hunk, hint_section, hint_group, expand_hunk, expand_ok), st);
+                        screen_y += 1;
+                    },
+                    else => {
+                        fillRow(scr, screen_y, st);
+                        const text = formatRow(&line_buf, rows[i], marked);
+                        putRowHint(scr, screen_y, text, headerHint(&hint_buf, i, hint_file, hint_hunk, hint_section, hint_group, expand_hunk, expand_ok), st);
+                        screen_y += 1;
                     },
                 }
-                screen_y += 1;
             }
         },
         .side_by_side => {
@@ -358,25 +379,42 @@ pub fn paint(
                             fillRow(scr, screen_y, st);
                         }
                         putRowHint(scr, screen_y, text, headerHint(&hint_buf, ri, hint_file, hint_hunk, hint_section, hint_group, expand_hunk, expand_ok), st);
+                        screen_y += 1;
                     },
                     .body => |ri| {
                         const is_cur = ri == cur;
                         const marked = rowMarked(rows[ri], review);
                         const st = pal.rowStyle(rows[ri], is_cur);
-                        fillRow(scr, screen_y, st);
-                        putPannedBody(
-                            scr,
-                            0,
-                            screen_y,
-                            size.cols,
-                            rows[ri],
-                            marked,
-                            num_w,
-                            .unified,
-                            pan_span.containsBody(ri),
-                            cs,
-                            st,
-                        );
+                        if (viewport.wrap) {
+                            screen_y = putWrappedPane(
+                                scr,
+                                0,
+                                screen_y,
+                                content_bottom,
+                                size.cols,
+                                rows[ri],
+                                marked,
+                                num_w,
+                                .unified,
+                                st,
+                            );
+                        } else {
+                            fillRow(scr, screen_y, st);
+                            putPannedBody(
+                                scr,
+                                0,
+                                screen_y,
+                                size.cols,
+                                rows[ri],
+                                marked,
+                                num_w,
+                                .unified,
+                                pan_span.containsBody(ri),
+                                cs,
+                                st,
+                            );
+                            screen_y += 1;
+                        }
                     },
                     .pair => |p| {
                         // Whole slot is current when the cursor sits on either pane
@@ -388,54 +426,84 @@ pub fn paint(
                         const right_st = if (p.right) |ri|
                             pal.rowStyle(rows[ri], slot_cur)
                         else if (slot_cur) pal.ctx_cur else pal.body;
-
-                        fillSpan(scr, 0, panes.gutter_x, screen_y, left_st);
-                        if (panes.right_w > 0 or panes.gutter_x < size.cols) {
-                            fillSpan(scr, panes.gutter_x, panes.gutter_x + 1, screen_y, pal.gutter);
-                            if (panes.gutter_x < size.cols) {
-                                scr.setCell(panes.gutter_x, screen_y, .{
-                                    .char = '│',
-                                    .width = 1,
-                                    .style = pal.gutter,
-                                });
-                            }
-                        }
                         const right_x: u16 = panes.gutter_x + 1;
-                        fillSpan(scr, right_x, size.cols, screen_y, right_st);
-
-                        if (p.left) |ri| {
-                            putPannedBody(
-                                scr,
-                                0,
-                                screen_y,
-                                panes.left_w,
-                                rows[ri],
-                                rowMarked(rows[ri], review),
-                                num_w,
-                                .old,
-                                pan_span.containsBody(ri),
-                                cs,
-                                left_st,
-                            );
-                        }
-                        if (p.right) |ri| {
-                            putPannedBody(
-                                scr,
-                                right_x,
-                                screen_y,
-                                panes.right_w,
-                                rows[ri],
-                                rowMarked(rows[ri], review),
-                                num_w,
-                                .new,
-                                pan_span.containsBody(ri),
-                                cs,
-                                right_st,
-                            );
+                        const n = view.viewport.slotScreenHeight(
+                            sbs_slots[si],
+                            rows,
+                            bodyTextCols(panes.left_w, num_w, .side_by_side),
+                            bodyTextCols(panes.right_w, num_w, .side_by_side),
+                            bodyTextCols(size.cols, num_w, .unified),
+                            viewport.wrap,
+                        );
+                        var vis: usize = 0;
+                        while (vis < n and screen_y < content_bottom) : (vis += 1) {
+                            fillSpan(scr, 0, panes.gutter_x, screen_y, left_st);
+                            putSbsCenter(scr, panes, screen_y, size.cols, pal.gutter);
+                            fillSpan(scr, right_x, size.cols, screen_y, right_st);
+                            if (p.left) |ri| {
+                                if (viewport.wrap) {
+                                    putWrappedSegment(
+                                        scr,
+                                        0,
+                                        screen_y,
+                                        panes.left_w,
+                                        rows[ri],
+                                        rowMarked(rows[ri], review),
+                                        num_w,
+                                        .old,
+                                        vis,
+                                        left_st,
+                                    );
+                                } else {
+                                    putPannedBody(
+                                        scr,
+                                        0,
+                                        screen_y,
+                                        panes.left_w,
+                                        rows[ri],
+                                        rowMarked(rows[ri], review),
+                                        num_w,
+                                        .old,
+                                        pan_span.containsBody(ri),
+                                        cs,
+                                        left_st,
+                                    );
+                                }
+                            }
+                            if (p.right) |ri| {
+                                if (viewport.wrap) {
+                                    putWrappedSegment(
+                                        scr,
+                                        right_x,
+                                        screen_y,
+                                        panes.right_w,
+                                        rows[ri],
+                                        rowMarked(rows[ri], review),
+                                        num_w,
+                                        .new,
+                                        vis,
+                                        right_st,
+                                    );
+                                } else {
+                                    putPannedBody(
+                                        scr,
+                                        right_x,
+                                        screen_y,
+                                        panes.right_w,
+                                        rows[ri],
+                                        rowMarked(rows[ri], review),
+                                        num_w,
+                                        .new,
+                                        pan_span.containsBody(ri),
+                                        cs,
+                                        right_st,
+                                    );
+                                }
+                            }
+                            screen_y += 1;
                         }
                     },
                 }
-                screen_y += 1;
             }
         },
     }
@@ -456,6 +524,7 @@ pub fn paint(
                     size.cols,
                     source,
                     diff_view.approved_n,
+                    viewport.wrap,
                 );
                 scr.putStr(1, footer_y, footer_text, pal.footer, null);
             }
@@ -537,7 +606,14 @@ fn writePadded(dest: []u8, n: ?u32) void {
     @memcpy(dest[dest.len - s.len ..], s);
 }
 
-fn formatBodyGutter(buf: []u8, row: view.row.Row, marked: bool, num_w: usize, numbers: LineNumbers) []const u8 {
+fn formatBodyGutter(
+    buf: []u8,
+    row: view.row.Row,
+    marked: bool,
+    num_w: usize,
+    numbers: LineNumbers,
+    show_nums: bool,
+) []const u8 {
     const ln = switch (row) {
         .line => |l| l,
         else => return buf[0..0],
@@ -550,7 +626,7 @@ fn formatBodyGutter(buf: []u8, row: view.row.Row, marked: bool, num_w: usize, nu
         .meta => '\\',
         .context, .add, .delete => ' ',
     };
-    if (num_w == 0) return buf[0..total];
+    if (num_w == 0 or !show_nums) return buf[0..total];
     var pos: usize = 2;
     switch (numbers) {
         .unified => {
@@ -564,6 +640,35 @@ fn formatBodyGutter(buf: []u8, row: view.row.Row, marked: bool, num_w: usize, nu
         .new => writePadded(buf[pos .. pos + num_w], ln.new_no),
     }
     return buf[0..total];
+}
+
+/// Columns of `pane_w` left for body text after the sticky gutter.
+pub fn bodyTextCols(pane_w: u16, num_w: usize, layout: view.layout.EffectiveLayout) usize {
+    const gw = lineGutterCols(num_w, layout);
+    const gw_u16: u16 = std.math.cast(u16, gw) orelse pane_w;
+    return pane_w -| gw_u16;
+}
+
+/// Gutter (mark + numbers) at `x`, then `text` (already sliced for pan or wrap).
+fn putBodyLine(
+    scr: *tui.Screen,
+    x: u16,
+    y: u16,
+    pane_w: u16,
+    row: view.row.Row,
+    marked: bool,
+    num_w: usize,
+    numbers: LineNumbers,
+    show_nums: bool,
+    text: []const u8,
+    style: tui.Style,
+) void {
+    var gbuf: [32]u8 = undefined;
+    const gutter = formatBodyGutter(&gbuf, row, marked, num_w, numbers, show_nums);
+    const gw_usize = tui.screen.displayWidth(gutter);
+    const gw: u16 = std.math.cast(u16, gw_usize) orelse pane_w;
+    if (pane_w > 0) putPaneStr(scr, x, y, @min(gw, pane_w), gutter, style);
+    if (pane_w > gw) putPaneStr(scr, x +| gw, y, pane_w - gw, text, style);
 }
 
 /// Gutter (mark + numbers) at `x`; only `ln.text` pans.
@@ -584,14 +689,67 @@ fn putPannedBody(
         .line => |l| l,
         else => return,
     };
-    var gbuf: [32]u8 = undefined;
-    const gutter = formatBodyGutter(&gbuf, row, marked, num_w, numbers);
-    const gw_usize = tui.screen.displayWidth(gutter);
-    const gw: u16 = std.math.cast(u16, gw_usize) orelse pane_w;
     const text = ln.text;
     const visible = if (pan) text[tui.screen.byteAtCol(text, col_scroll)..] else text;
-    if (pane_w > 0) putPaneStr(scr, x, y, @min(gw, pane_w), gutter, style);
-    if (pane_w > gw) putPaneStr(scr, x +| gw, y, pane_w - gw, visible, style);
+    putBodyLine(scr, x, y, pane_w, row, marked, num_w, numbers, true, visible, style);
+}
+
+/// One wrapped visual segment of `row` at `vis`, or nothing if that segment
+/// does not exist (shorter pane of a pair).
+fn putWrappedSegment(
+    scr: *tui.Screen,
+    x: u16,
+    y: u16,
+    pane_w: u16,
+    row: view.row.Row,
+    marked: bool,
+    num_w: usize,
+    numbers: LineNumbers,
+    vis: usize,
+    style: tui.Style,
+) void {
+    const ln = switch (row) {
+        .line => |l| l,
+        else => return,
+    };
+    const layout: view.layout.EffectiveLayout = switch (numbers) {
+        .unified => .unified,
+        .old, .new => .side_by_side,
+    };
+    const seg = view.wrap.segmentAt(ln.text, bodyTextCols(pane_w, num_w, layout), vis) orelse return;
+    putBodyLine(scr, x, y, pane_w, row, marked, num_w, numbers, vis == 0, ln.text[seg.start..seg.end], style);
+}
+
+/// Wrap `row` into the pane and fill each visual line. Returns the next `y`.
+fn putWrappedPane(
+    scr: *tui.Screen,
+    x: u16,
+    y: u16,
+    y_end: u16,
+    pane_w: u16,
+    row: view.row.Row,
+    marked: bool,
+    num_w: usize,
+    numbers: LineNumbers,
+    style: tui.Style,
+) u16 {
+    const ln = switch (row) {
+        .line => |l| l,
+        else => return y,
+    };
+    const layout: view.layout.EffectiveLayout = switch (numbers) {
+        .unified => .unified,
+        .old, .new => .side_by_side,
+    };
+    const n = view.wrap.lineCount(ln.text, bodyTextCols(pane_w, num_w, layout));
+    var vis: usize = 0;
+    var yy = y;
+    while (vis < n and yy < y_end) : (vis += 1) {
+        fillSpan(scr, x, x +| pane_w, yy, style);
+        putWrappedSegment(scr, x, yy, pane_w, row, marked, num_w, numbers, vis, style);
+        yy += 1;
+    }
+    return yy;
 }
 
 fn rowMarked(row: view.row.Row, review: *const store.Review) bool {
@@ -626,6 +784,7 @@ fn formatFooter(
     cols: u16,
     source: cli.Source,
     approved_n: usize,
+    wrap: bool,
 ) []const u8 {
     if (st.row_n == 0) {
         if (source == .local and approved_n > 0) {
@@ -635,17 +794,19 @@ fn formatFooter(
     }
     const src = cli.sourceLabel(source, false);
     const mode = layoutFooterLabel(layout_pref, cols);
+    const wrap_tag: []const u8 = if (wrap) "  wrap" else "";
     if (st.hunk_n == 0) {
-        return bufPrintTrunc(buf, "{s}  {s}  {d}/{d}  {d} open  {s}", .{
+        return bufPrintTrunc(buf, "{s}  {s}  {d}/{d}  {d} open  {s}{s}", .{
             src,
             if (st.path.len > 0) st.path else "?",
             st.row_i,
             st.row_n,
             open_n,
             mode,
+            wrap_tag,
         });
     }
-    return bufPrintTrunc(buf, "{s}  {s}  hunk {d}/{d}  {d}/{d}  {d} open  {s}", .{
+    return bufPrintTrunc(buf, "{s}  {s}  hunk {d}/{d}  {d}/{d}  {d} open  {s}{s}", .{
         src,
         if (st.path.len > 0) st.path else "?",
         st.hunk_i,
@@ -654,6 +815,7 @@ fn formatFooter(
         st.row_n,
         open_n,
         mode,
+        wrap_tag,
     });
 }
 
@@ -842,6 +1004,20 @@ pub fn fillSpan(scr: *tui.Screen, x0: u16, x1: u16, y: u16, style: tui.Style) vo
     }
 }
 
+/// Center `│` between side-by-side panes on row `y`.
+fn putSbsCenter(scr: *tui.Screen, panes: view.layout.SbsPanes, y: u16, cols: u16, style: tui.Style) void {
+    if (panes.right_w > 0 or panes.gutter_x < cols) {
+        fillSpan(scr, panes.gutter_x, panes.gutter_x + 1, y, style);
+        if (panes.gutter_x < cols) {
+            scr.setCell(panes.gutter_x, y, .{
+                .char = '│',
+                .width = 1,
+                .style = style,
+            });
+        }
+    }
+}
+
 /// Write `text` into a pane starting at `x`, at most `pane_w` display columns.
 fn putPaneStr(scr: *tui.Screen, x: u16, y: u16, pane_w: u16, text: []const u8, style: tui.Style) void {
     if (pane_w == 0) return;
@@ -1009,18 +1185,20 @@ test "formatBodyGutter unified sbs meta and off" {
         .section = "",
     } };
 
-    try testing.expectEqualStrings("  10 11 ", formatBodyGutter(&buf, ctx, false, 2, .unified));
-    try testing.expectEqualStrings("* 10 11 ", formatBodyGutter(&buf, ctx, true, 2, .unified));
-    try testing.expectEqualStrings("  12    ", formatBodyGutter(&buf, del, false, 2, .unified));
-    try testing.expectEqualStrings("     13 ", formatBodyGutter(&buf, add, false, 2, .unified));
-    try testing.expectEqualStrings(" \\      ", formatBodyGutter(&buf, meta, false, 2, .unified));
-    try testing.expectEqualStrings("  12 ", formatBodyGutter(&buf, del, false, 2, .old));
-    try testing.expectEqualStrings("  13 ", formatBodyGutter(&buf, add, false, 2, .new));
-    try testing.expectEqualStrings("     ", formatBodyGutter(&buf, add, false, 2, .old));
-    try testing.expectEqualStrings("  ", formatBodyGutter(&buf, ctx, false, 0, .unified));
-    try testing.expectEqualStrings("* ", formatBodyGutter(&buf, ctx, true, 0, .unified));
-    try testing.expectEqualStrings(" \\", formatBodyGutter(&buf, meta, false, 0, .unified));
-    try testing.expectEqualStrings("", formatBodyGutter(&buf, hunk, false, 2, .unified));
+    try testing.expectEqualStrings("  10 11 ", formatBodyGutter(&buf, ctx, false, 2, .unified, true));
+    try testing.expectEqualStrings("* 10 11 ", formatBodyGutter(&buf, ctx, true, 2, .unified, true));
+    try testing.expectEqualStrings("  12    ", formatBodyGutter(&buf, del, false, 2, .unified, true));
+    try testing.expectEqualStrings("     13 ", formatBodyGutter(&buf, add, false, 2, .unified, true));
+    try testing.expectEqualStrings(" \\      ", formatBodyGutter(&buf, meta, false, 2, .unified, true));
+    try testing.expectEqualStrings("  12 ", formatBodyGutter(&buf, del, false, 2, .old, true));
+    try testing.expectEqualStrings("  13 ", formatBodyGutter(&buf, add, false, 2, .new, true));
+    try testing.expectEqualStrings("     ", formatBodyGutter(&buf, add, false, 2, .old, true));
+    try testing.expectEqualStrings("  ", formatBodyGutter(&buf, ctx, false, 0, .unified, true));
+    try testing.expectEqualStrings("* ", formatBodyGutter(&buf, ctx, true, 0, .unified, true));
+    try testing.expectEqualStrings(" \\", formatBodyGutter(&buf, meta, false, 0, .unified, true));
+    try testing.expectEqualStrings("", formatBodyGutter(&buf, hunk, false, 2, .unified, true));
+    try testing.expectEqualStrings("        ", formatBodyGutter(&buf, ctx, false, 2, .unified, false));
+    try testing.expectEqualStrings("*       ", formatBodyGutter(&buf, ctx, true, 2, .unified, false));
     try testing.expectEqualStrings("  hello", formatRow(&buf, ctx, false));
     try testing.expectEqualStrings("  @@ -1,1 +1,1 @@", formatRow(&buf, hunk, false));
     try testing.expectEqualStrings("* @@ -1,1 +1,1 @@", formatRow(&buf, hunk, true));
@@ -1074,6 +1252,100 @@ test "putPannedBody pans text and leaves gutter" {
     try testing.expectEqual('*', scr.getCell(0, 0).char);
     try testing.expectEqual(' ', scr.getCell(1, 0).char);
     try testing.expectEqual('C', scr.getCell(2, 0).char);
+}
+
+test "putWrappedPane wraps text and repeats gutter" {
+    const row: view.row.Row = .{ .line = .{
+        .kind = .context,
+        .text = "hello world",
+        .path = "f",
+        .old_no = 1,
+        .new_no = 2,
+    } };
+    const st = tui.Style{};
+    var scr = try tui.Screen.init(testing.allocator, .{ .cols = 12, .rows = 3 });
+    defer scr.deinit();
+    scr.clear();
+    const next = putWrappedPane(&scr, 0, 0, 3, 12, row, false, 0, .unified, st);
+    try testing.expectEqual(2, next);
+    try testing.expectEqual(' ', scr.getCell(0, 0).char);
+    try testing.expectEqual('h', scr.getCell(2, 0).char);
+    try testing.expectEqual('o', scr.getCell(6, 0).char);
+    try testing.expectEqual(' ', scr.getCell(0, 1).char);
+    try testing.expectEqual('w', scr.getCell(2, 1).char);
+    try testing.expectEqual('d', scr.getCell(6, 1).char);
+}
+
+test "putWrappedPane omits line numbers on continuation" {
+    const row: view.row.Row = .{ .line = .{
+        .kind = .context,
+        .text = "hello world",
+        .path = "f",
+        .old_no = 1,
+        .new_no = 2,
+    } };
+    const st = tui.Style{};
+    // gutter 2 + num_w 1 + 1 + num_w 1 + 1 = 6; pane 16 → text_w 10
+    var scr = try tui.Screen.init(testing.allocator, .{ .cols = 16, .rows = 2 });
+    defer scr.deinit();
+    scr.clear();
+    _ = putWrappedPane(&scr, 0, 0, 2, 16, row, false, 1, .unified, st);
+    try testing.expectEqual('1', scr.getCell(2, 0).char);
+    try testing.expectEqual('2', scr.getCell(4, 0).char);
+    try testing.expectEqual('h', scr.getCell(6, 0).char);
+    try testing.expectEqual(' ', scr.getCell(2, 1).char);
+    try testing.expectEqual(' ', scr.getCell(4, 1).char);
+    try testing.expectEqual('w', scr.getCell(6, 1).char);
+}
+
+test "putWrappedPane keeps mark on continuation" {
+    const row: view.row.Row = .{ .line = .{
+        .kind = .add,
+        .text = "hello world",
+        .path = "f",
+        .new_no = 1,
+    } };
+    const st = tui.Style{};
+    var scr = try tui.Screen.init(testing.allocator, .{ .cols = 12, .rows = 2 });
+    defer scr.deinit();
+    scr.clear();
+    _ = putWrappedPane(&scr, 0, 0, 2, 12, row, true, 0, .unified, st);
+    try testing.expectEqual('*', scr.getCell(0, 0).char);
+    try testing.expectEqual('*', scr.getCell(0, 1).char);
+}
+
+test "putWrappedPane clips at y_end" {
+    const row: view.row.Row = .{ .line = .{
+        .kind = .context,
+        .text = "hello world",
+        .path = "f",
+    } };
+    const st = tui.Style{};
+    var scr = try tui.Screen.init(testing.allocator, .{ .cols = 12, .rows = 2 });
+    defer scr.deinit();
+    scr.clear();
+    const next = putWrappedPane(&scr, 0, 0, 1, 12, row, false, 0, .unified, st);
+    try testing.expectEqual(1, next);
+    try testing.expectEqual('h', scr.getCell(2, 0).char);
+    try testing.expectEqual(' ', scr.getCell(2, 1).char);
+}
+
+test "putWrappedPane wraps at side-by-side pane width" {
+    const row: view.row.Row = .{ .line = .{
+        .kind = .delete,
+        .text = "hello world",
+        .path = "f",
+        .old_no = 1,
+    } };
+    const st = tui.Style{};
+    var scr = try tui.Screen.init(testing.allocator, .{ .cols = 24, .rows = 3 });
+    defer scr.deinit();
+    scr.clear();
+    const next = putWrappedPane(&scr, 10, 0, 3, 12, row, false, 0, .old, st);
+    try testing.expectEqual(2, next);
+    try testing.expectEqual(' ', scr.getCell(9, 0).char);
+    try testing.expectEqual('h', scr.getCell(12, 0).char);
+    try testing.expectEqual('w', scr.getCell(12, 1).char);
 }
 
 test "headerHint joins git and approve" {
@@ -1152,18 +1424,34 @@ test "formatFooter approved-only is not a clean worktree" {
     };
     try testing.expectEqualStrings(
         "HEAD · empty",
-        formatFooter(&buf, empty, 0, .side_by_side, 80, .local, 0),
+        formatFooter(&buf, empty, 0, .side_by_side, 80, .local, 0, false),
     );
     try testing.expectEqualStrings(
         "HEAD · 2 approved",
-        formatFooter(&buf, empty, 0, .side_by_side, 80, .local, 2),
+        formatFooter(&buf, empty, 0, .side_by_side, 80, .local, 2, false),
     );
     try testing.expectEqualStrings(
         "main...HEAD",
-        formatFooter(&buf, empty, 0, .side_by_side, 80, .{ .range = "main...HEAD" }, 3),
+        formatFooter(&buf, empty, 0, .side_by_side, 80, .{ .range = "main...HEAD" }, 3, false),
     );
     try testing.expectEqualStrings(
         "abc123",
-        formatFooter(&buf, empty, 0, .side_by_side, 80, .{ .commit = "abc123" }, 3),
+        formatFooter(&buf, empty, 0, .side_by_side, 80, .{ .commit = "abc123" }, 3, false),
     );
+}
+
+test "formatFooter shows wrap when on" {
+    var buf: [96]u8 = undefined;
+    const st = view.nav.Status{
+        .path = "f",
+        .hunk_i = 1,
+        .hunk_n = 1,
+        .row_i = 1,
+        .row_n = 2,
+    };
+    const off = formatFooter(&buf, st, 0, .unified, 80, .local, 0, false);
+    try testing.expect(std.mem.indexOf(u8, off, "wrap") == null);
+    var buf2: [96]u8 = undefined;
+    const on = formatFooter(&buf2, st, 0, .unified, 80, .local, 0, true);
+    try testing.expect(std.mem.indexOf(u8, on, "wrap") != null);
 }

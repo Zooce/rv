@@ -10,16 +10,112 @@ const layout_mod = @import("layout.zig");
 const SbsSlot = layout_mod.SbsSlot;
 const sbsSlotForRow = layout_mod.sbsSlotForRow;
 const nav = @import("nav.zig");
+const wrap_mod = @import("wrap.zig");
+
+/// Screen rows for one display row. Headers stay 1; body lines wrap when `wrap_on`.
+pub fn rowScreenHeight(r: Row, text_w: usize, wrap_on: bool) usize {
+    if (!wrap_on) return 1;
+    return switch (r) {
+        .line => |ln| wrap_mod.lineCount(ln.text, text_w),
+        else => 1,
+    };
+}
+
+/// Screen rows for one side-by-side slot. Pair height is the taller pane.
+pub fn slotScreenHeight(
+    slot: SbsSlot,
+    rows: []const Row,
+    left_tw: usize,
+    right_tw: usize,
+    full_tw: usize,
+    wrap_on: bool,
+) usize {
+    if (!wrap_on) return 1;
+    return switch (slot) {
+        .header => 1,
+        .body => |ri| if (ri < rows.len) rowScreenHeight(rows[ri], full_tw, true) else 1,
+        .pair => |p| blk: {
+            const lh: usize = if (p.left) |ri| rowScreenHeight(rows[ri], left_tw, true) else 1;
+            const rh: usize = if (p.right) |ri| rowScreenHeight(rows[ri], right_tw, true) else 1;
+            break :blk @max(lh, rh);
+        },
+    };
+}
+
+const RowHeights = struct {
+    rows: []const Row,
+    text_w: usize,
+    wrap_on: bool,
+};
+
+fn rowHeightAt(ctx: RowHeights, i: usize) usize {
+    if (i >= ctx.rows.len) return 1;
+    return rowScreenHeight(ctx.rows[i], ctx.text_w, ctx.wrap_on);
+}
+
+const SlotHeights = struct {
+    slots: []const SbsSlot,
+    rows: []const Row,
+    left_tw: usize,
+    right_tw: usize,
+    full_tw: usize,
+    wrap_on: bool,
+};
+
+fn slotHeightAt(ctx: SlotHeights, i: usize) usize {
+    if (i >= ctx.slots.len) return 1;
+    return slotScreenHeight(ctx.slots[i], ctx.rows, ctx.left_tw, ctx.right_tw, ctx.full_tw, ctx.wrap_on);
+}
 
 /// Move `scroll` so `cursor` is visible in a viewport of `height` rows.
 /// Also clamps scroll so the last page is not overscrolled when possible.
 pub fn ensureVisible(scroll: usize, cursor: usize, height: usize, row_count: usize) usize {
-    if (height == 0 or row_count == 0) return 0;
+    const Unit = struct {
+        fn h(_: void, _: usize) usize {
+            return 1;
+        }
+    };
+    return ensureByHeight(scroll, cursor, height, row_count, {}, Unit.h);
+}
+
+/// Like `ensureVisible`, but item `i` occupies `itemHeight(ctx, i)` screen rows.
+/// A cursor row taller than `height` is pinned at the top of the window.
+fn ensureByHeight(
+    scroll: usize,
+    cursor: usize,
+    height: usize,
+    n: usize,
+    ctx: anytype,
+    comptime itemHeight: fn (@TypeOf(ctx), usize) usize,
+) usize {
+    if (height == 0 or n == 0) return 0;
+    const cur = if (cursor >= n) n - 1 else cursor;
+
+    var need = itemHeight(ctx, cur);
+    var min_s = cur;
+    while (min_s > 0) {
+        const prev = itemHeight(ctx, min_s - 1);
+        if (need + prev > height) break;
+        need += prev;
+        min_s -= 1;
+    }
+
     var s = scroll;
-    if (cursor < s) s = cursor;
-    if (cursor >= s + height) s = cursor + 1 - height;
-    const max_scroll = if (row_count > height) row_count - height else 0;
-    if (s > max_scroll) s = max_scroll;
+    if (cur < s) s = cur;
+    if (s < min_s) s = min_s;
+
+    var acc: usize = 0;
+    var max_s: usize = 0;
+    var i = n;
+    while (i > 0) {
+        i -= 1;
+        acc += itemHeight(ctx, i);
+        if (acc >= height) {
+            max_s = i;
+            break;
+        }
+    }
+    if (s > max_s) s = max_s;
     return s;
 }
 
@@ -117,16 +213,20 @@ pub fn stickyHeaders(
 
 /// Scroll + sticky set so `cursor` stays visible below reserved sticky rows.
 /// Iterates because sticky depends on scroll and reserved height depends on sticky.
+/// When `wrap_on`, item heights are wrapped body lines at `text_w`.
 pub fn ensureVisibleSticky(
     scroll: usize,
     cursor: usize,
     content_height: usize,
     rows: []const Row,
+    wrap_on: bool,
+    text_w: usize,
 ) struct { scroll: usize, sticky: Sticky } {
     if (content_height == 0 or rows.len == 0) {
         return .{ .scroll = 0, .sticky = .{} };
     }
     const cur = clampCursor(cursor, rows.len);
+    const heights = RowHeights{ .rows = rows, .text_w = text_w, .wrap_on = wrap_on };
     var s = scroll;
     var sticky: Sticky = .{};
     // Sticky ↔ height feedback is small (at most two rows); a few passes settle.
@@ -134,7 +234,7 @@ pub fn ensureVisibleSticky(
     while (n < 4) : (n += 1) {
         sticky = stickyHeaders(rows, s, content_height);
         const h = content_height - sticky.reserved();
-        const next = ensureVisible(s, cur, h, rows.len);
+        const next = ensureByHeight(s, cur, h, rows.len, heights, rowHeightAt);
         if (next == s) break;
         s = next;
     }
@@ -173,19 +273,31 @@ pub fn ensureVisibleStickySbs(
     content_height: usize,
     slots: []const SbsSlot,
     rows: []const Row,
+    wrap_on: bool,
+    left_tw: usize,
+    right_tw: usize,
+    full_tw: usize,
 ) struct { scroll: usize, sticky: Sticky } {
     if (content_height == 0 or slots.len == 0) {
         return .{ .scroll = 0, .sticky = .{} };
     }
     const cur_row = clampCursor(cursor_row, rows.len);
     const slot_cur = sbsSlotForRow(slots, cur_row) orelse 0;
+    const heights = SlotHeights{
+        .slots = slots,
+        .rows = rows,
+        .left_tw = left_tw,
+        .right_tw = right_tw,
+        .full_tw = full_tw,
+        .wrap_on = wrap_on,
+    };
     var s = scroll;
     var sticky: Sticky = .{};
     var n: usize = 0;
     while (n < 4) : (n += 1) {
         sticky = stickyHeadersSbs(slots, rows, s, content_height);
         const h = content_height - sticky.reserved();
-        const next = ensureVisible(s, slot_cur, h, slots.len);
+        const next = ensureByHeight(s, slot_cur, h, slots.len, heights, slotHeightAt);
         if (next == s) break;
         s = next;
     }
@@ -207,6 +319,36 @@ test "ensureVisible scrolls with cursor" {
     try testing.expectEqual(7, ensureVisible(0, 9, 3, 10));
     try testing.expectEqual(0, ensureVisible(0, 0, 3, 2));
     try testing.expectEqual(0, ensureVisible(0, 0, 0, 10));
+}
+
+test "ensureVisibleSticky wrap pins a tall body row" {
+    const fixture =
+        \\diff --git a/f b/f
+        \\--- a/f
+        \\+++ b/f
+        \\@@ -1,3 +1,3 @@
+        \\ keep
+        \\-old
+        \\+this line is long enough to wrap
+    ;
+    var d = try diff.parse(testing.allocator, fixture);
+    defer d.deinit();
+    const rows = try row.flatten(testing.allocator, &d);
+    defer testing.allocator.free(rows);
+    // 0 file, 1 hunk, 2 keep, 3 del, 4 add. text_w=8 → add wraps to several lines.
+    const text_w: usize = 8;
+    try testing.expect(rowScreenHeight(rows[4], text_w, true) > 1);
+    try testing.expectEqual(1, rowScreenHeight(rows[4], text_w, false));
+    try testing.expectEqual(1, rowScreenHeight(rows[0], text_w, true));
+
+    const r = ensureVisibleSticky(0, 4, 3, rows, true, text_w);
+    try testing.expectEqual(4, r.scroll);
+
+    const slots = try layout_mod.pairSideBySide(testing.allocator, rows);
+    defer testing.allocator.free(slots);
+    const sbs = ensureVisibleStickySbs(0, 4, 3, slots, rows, true, text_w, text_w, text_w);
+    const add_slot = sbsSlotForRow(slots, 4).?;
+    try testing.expectEqual(add_slot, sbs.scroll);
 }
 
 test "maxColScroll and clampColScroll" {
@@ -302,7 +444,7 @@ test "ensureVisibleSticky reserves file row and keeps cursor in body" {
     const rows = fix.rows;
 
     // Mid first hunk: file sticky; cursor in reduced body window.
-    const r = ensureVisibleSticky(3, 3, 5, rows);
+    const r = ensureVisibleSticky(3, 3, 5, rows, false, 0);
     try testing.expectEqual(0, r.sticky.file_idx.?);
     try testing.expectEqual(1, r.sticky.reserved());
     const body_h = 5 - r.sticky.reserved();
@@ -310,17 +452,17 @@ test "ensureVisibleSticky reserves file row and keeps cursor in body" {
     try testing.expect(3 < r.scroll + body_h);
 
     // Deep in file A with a short window.
-    const deep = ensureVisibleSticky(0, 6, 3, rows);
+    const deep = ensureVisibleSticky(0, 6, 3, rows, false, 0);
     try testing.expect(deep.sticky.file_idx != null);
     try testing.expect(deep.scroll <= 6);
     try testing.expect(6 < deep.scroll + (3 - deep.sticky.reserved()));
 
     // At top of list: no sticky.
-    const top = ensureVisibleSticky(0, 0, 5, rows);
+    const top = ensureVisibleSticky(0, 0, 5, rows, false, 0);
     try testing.expectEqual(0, top.scroll);
     try testing.expectEqual(0, top.sticky.reserved());
 
-    const empty = ensureVisibleSticky(0, 0, 5, &.{});
+    const empty = ensureVisibleSticky(0, 0, 5, &.{}, false, 0);
     try testing.expectEqual(0, empty.scroll);
     try testing.expectEqual(0, empty.sticky.reserved());
 }
@@ -344,7 +486,7 @@ test "ensureVisibleStickySbs uses slot indices" {
     try testing.expectEqual(3, slots.len);
 
     // Cursor on add (row 3) → slot 2; short window should scroll to show it.
-    const r = ensureVisibleStickySbs(0, 3, 2, slots, rows);
+    const r = ensureVisibleStickySbs(0, 3, 2, slots, rows, false, 0, 0, 0);
     try testing.expectEqual(2, sbsSlotForRow(slots, 3).?);
     try testing.expect(r.scroll <= 2);
     try testing.expect(2 < r.scroll + (2 - r.sticky.reserved()));
@@ -356,7 +498,7 @@ test "ensureVisibleStickySbs uses slot indices" {
     const slots2 = try layout_mod.pairSideBySide(testing.allocator, fix.rows);
     defer testing.allocator.free(slots2);
     // Scroll past first file's slots; pin file A.
-    const deep = ensureVisibleStickySbs(0, fix.rows.len - 1, 3, slots2, fix.rows);
+    const deep = ensureVisibleStickySbs(0, fix.rows.len - 1, 3, slots2, fix.rows, false, 0, 0, 0);
     try testing.expect(deep.sticky.file_idx != null or deep.scroll == 0);
 }
 
