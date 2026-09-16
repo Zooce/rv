@@ -190,6 +190,9 @@ fn parseInstallSkill(args: []const []const u8) error{Usage}!install_skill.Opts {
             if (i >= args.len or args[i].len == 0) return error.Usage;
             if (opts.agent != null) return error.Usage;
             opts.agent = args[i];
+        } else if (std.mem.eql(u8, a, "--follow-symlinks")) {
+            if (opts.follow_symlinks) return error.Usage;
+            opts.follow_symlinks = true;
         } else return error.Usage;
     }
     if (opts.list and opts.uninstall) return error.Usage;
@@ -219,6 +222,7 @@ pub const usage_text =
     \\    --list                       show source, canonical, and agent links
     \\    --uninstall                  remove skill symlinks
     \\    --agent <name>               only grok|claude|codex|cursor
+    \\    --follow-symlinks            install into a skills dir that is a symlink
     \\  version, -v, --version         print version and exit
     \\  help, -h, --help               show this help
     \\
@@ -686,12 +690,15 @@ test "parse help status approved unapprove list show resolve export install-skil
     try testing.expectEqualStrings("/tmp/r.md", exp_order.out_path.?);
 
     const inst = (try parse(&.{"install-skill"})).install_skill;
-    try testing.expect(!inst.list and !inst.uninstall and inst.agent == null);
+    try testing.expect(!inst.list and !inst.uninstall and inst.agent == null and !inst.follow_symlinks);
     const inst_list = (try parse(&.{ "install-skill", "--list" })).install_skill;
     try testing.expect(inst_list.list);
     const inst_agent = (try parse(&.{ "install-skill", "--agent", "grok", "--uninstall" })).install_skill;
     try testing.expect(inst_agent.uninstall);
     try testing.expectEqualStrings("grok", inst_agent.agent.?);
+    const inst_follow = (try parse(&.{ "install-skill", "--follow-symlinks", "--agent", "claude" })).install_skill;
+    try testing.expect(inst_follow.follow_symlinks);
+    try testing.expectEqualStrings("claude", inst_follow.agent.?);
 }
 
 test "parse usage errors" {
@@ -725,6 +732,7 @@ test "parse usage errors" {
     try testing.expectError(error.Usage, parse(&.{ "install-skill", "--list", "--uninstall" }));
     try testing.expectError(error.Usage, parse(&.{ "install-skill", "--agent" }));
     try testing.expectError(error.Usage, parse(&.{ "install-skill", "--bogus" }));
+    try testing.expectError(error.Usage, parse(&.{ "install-skill", "--follow-symlinks", "--follow-symlinks" }));
 }
 
 test "classify tui vs command" {

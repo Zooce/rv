@@ -15,6 +15,7 @@ pub const Opts = struct {
     list: bool = false,
     uninstall: bool = false,
     agent: ?[]const u8 = null,
+    follow_symlinks: bool = false,
 };
 
 /// stdout = status / list data; stderr = errors and usage.
@@ -47,7 +48,7 @@ pub fn run(
     }
     if (opts.list) return cmdList(alloc, io, h, skill_override, opts.agent, streams);
     if (opts.uninstall) return cmdUninstall(alloc, io, h, opts.agent, streams);
-    return cmdInstall(alloc, io, h, skill_override, opts.agent, streams);
+    return cmdInstall(alloc, io, h, skill_override, opts.agent, opts.follow_symlinks, streams);
 }
 
 fn findAgent(name: []const u8) ?Agent {
@@ -124,7 +125,7 @@ fn isLink(io: Io, p: []const u8) bool {
     return st.kind == .sym_link;
 }
 
-fn ensureDirSymlink(io: Io, link: []const u8, target: []const u8) !void {
+fn ensureDirSymlink(io: Io, link: []const u8, target: []const u8, follow_symlinks: bool) !void {
     if (isLink(io, link)) {
         var buf: [std.fs.max_path_bytes]u8 = undefined;
         if (Io.Dir.readLinkAbsolute(io, link, &buf)) |n| {
@@ -132,7 +133,14 @@ fn ensureDirSymlink(io: Io, link: []const u8, target: []const u8) !void {
         } else |_| {}
         try Io.Dir.deleteFileAbsolute(io, link);
     } else if (exists(io, link)) return error.NotASymlink;
-    if (std.fs.path.dirname(link)) |parent| try Io.Dir.cwd().createDirPath(io, parent);
+    if (std.fs.path.dirname(link)) |parent| {
+        // createDirPath treats a final-component symlink as NotDir.
+        if (isLink(io, parent)) {
+            if (!follow_symlinks) return error.ParentIsSymlink;
+        } else {
+            try Io.Dir.cwd().createDirPath(io, parent);
+        }
+    }
     try Io.Dir.symLinkAbsolute(io, target, link, .{ .is_directory = true });
 }
 
@@ -151,12 +159,27 @@ fn writeFail(s: Streams) u8 {
     return fail(s, "write failed");
 }
 
+fn failParentSymlink(s: Streams, io: Io, label: []const u8, dir: []const u8) u8 {
+    var buf: [std.fs.max_path_bytes]u8 = undefined;
+    if (Io.Dir.readLinkAbsolute(io, dir, &buf)) |n| {
+        s.err.print("rv: {s} is a symlink ({s} -> {s}); pass --follow-symlinks to install into the target\n", .{
+            label, dir, buf[0..n],
+        }) catch {};
+    } else |_| {
+        s.err.print("rv: {s} is a symlink ({s}); pass --follow-symlinks to install into the target\n", .{
+            label, dir,
+        }) catch {};
+    }
+    return 1;
+}
+
 fn cmdInstall(
     alloc: Allocator,
     io: Io,
     home: []const u8,
     skill_override: ?[]const u8,
     agent_filter: ?[]const u8,
+    follow_symlinks: bool,
     s: Streams,
 ) u8 {
     const source = (resolveSource(alloc, io, skill_override) catch return oom(s)) orelse
@@ -164,19 +187,19 @@ fn cmdInstall(
     defer alloc.free(source);
     const canonical = canonicalPath(alloc, home) catch return oom(s);
     defer alloc.free(canonical);
-    ensureDirSymlink(io, canonical, source) catch |err| {
-        if (err == error.NotASymlink)
-            return fail(s, "canonical path exists and is not a symlink; remove it and retry");
-        return fail(s, "failed to install canonical skill");
+    ensureDirSymlink(io, canonical, source, follow_symlinks) catch |err| switch (err) {
+        error.NotASymlink => return fail(s, "canonical path exists and is not a symlink; remove it and retry"),
+        error.ParentIsSymlink => return failParentSymlink(s, io, "canonical skills dir", std.fs.path.dirname(canonical).?),
+        else => return fail(s, "failed to install canonical skill"),
     };
     s.out.print("canonical: {s} -> {s}\n", .{ canonical, source }) catch return writeFail(s);
     if (agent_filter) |name|
-        return linkAgent(alloc, io, home, findAgent(name).?, canonical, true, s);
+        return linkAgent(alloc, io, home, findAgent(name).?, canonical, true, follow_symlinks, s);
     for (known) |a| {
         const skills = agentSkills(alloc, home, a) catch return oom(s);
         defer alloc.free(skills);
         if (!exists(io, skills)) continue;
-        const rc = linkAgent(alloc, io, home, a, canonical, false, s);
+        const rc = linkAgent(alloc, io, home, a, canonical, false, follow_symlinks, s);
         if (rc != 0) return rc;
     }
     return 0;
@@ -189,6 +212,7 @@ fn linkAgent(
     a: Agent,
     canonical: []const u8,
     create_root: bool,
+    follow_symlinks: bool,
     s: Streams,
 ) u8 {
     const skills = agentSkills(alloc, home, a) catch return oom(s);
@@ -199,10 +223,14 @@ fn linkAgent(
     }
     const link = agentLink(alloc, home, a) catch return oom(s);
     defer alloc.free(link);
-    ensureDirSymlink(io, link, canonical) catch |err| {
-        if (err == error.NotASymlink)
-            return fail(s, "agent link exists and is not a symlink; remove it and retry");
-        return fail(s, "failed to link agent skill");
+    ensureDirSymlink(io, link, canonical, follow_symlinks) catch |err| switch (err) {
+        error.NotASymlink => return fail(s, "agent link exists and is not a symlink; remove it and retry"),
+        error.ParentIsSymlink => {
+            var lb: [64]u8 = undefined;
+            const label = std.fmt.bufPrint(&lb, "agent {s} skills dir", .{a.name}) catch "agent skills dir";
+            return failParentSymlink(s, io, label, skills);
+        },
+        else => return fail(s, "failed to link agent skill"),
     };
     s.out.print("agent {s}: {s} -> {s}\n", .{ a.name, link, canonical }) catch return writeFail(s);
     return 0;
@@ -405,4 +433,111 @@ test "unknown agent writes usage to stderr" {
     ));
     try testing.expectEqualStrings("", cap.stdout());
     try testing.expectEqualStrings("rv: unknown agent (try: grok, claude, codex, cursor)\n", cap.stderr());
+}
+
+test "agent skills dir symlink: refuse without flag, install into target with --follow-symlinks" {
+    if (builtin.os.tag == .wasi) return;
+    const io = testing.io;
+    const alloc = testing.allocator;
+
+    var home_tmp = try IsolatedTmp.init(alloc, io);
+    defer home_tmp.deinit(alloc, io);
+    var src_tmp = try IsolatedTmp.init(alloc, io);
+    defer src_tmp.deinit(alloc, io);
+    try src_tmp.write(io, skill_md, "# rv\n");
+    var skills_tmp = try IsolatedTmp.init(alloc, io);
+    defer skills_tmp.deinit(alloc, io);
+
+    const grok_parent = try homeJoin(alloc, home_tmp.path, ".grok");
+    defer alloc.free(grok_parent);
+    try Io.Dir.cwd().createDirPath(io, grok_parent);
+    const grok = try homeJoin(alloc, home_tmp.path, ".grok/skills");
+    defer alloc.free(grok);
+    try Io.Dir.symLinkAbsolute(io, skills_tmp.path, grok, .{ .is_directory = true });
+
+    const home = home_tmp.path;
+    const src = src_tmp.path;
+    const canonical = try canonicalPath(alloc, home);
+    defer alloc.free(canonical);
+    const gl = try agentLink(alloc, home, known[0]);
+    defer alloc.free(gl);
+    const in_target = try std.fs.path.join(alloc, &.{ skills_tmp.path, "rv" });
+    defer alloc.free(in_target);
+
+    var cap: Capture = .{};
+    const streams = cap.init();
+
+    try testing.expectEqual(1, run(alloc, io, .{}, home, src, streams));
+    try testing.expect(isLink(io, canonical));
+    try testing.expect(!exists(io, in_target));
+    const refuse_out = try std.fmt.allocPrint(alloc, "canonical: {s} -> {s}\n", .{ canonical, src });
+    defer alloc.free(refuse_out);
+    const refuse_err = try std.fmt.allocPrint(alloc, "rv: agent grok skills dir is a symlink ({s} -> {s}); pass --follow-symlinks to install into the target\n", .{
+        grok, skills_tmp.path,
+    });
+    defer alloc.free(refuse_err);
+    try testing.expectEqualStrings(refuse_out, cap.stdout());
+    try testing.expectEqualStrings(refuse_err, cap.stderr());
+    cap.resetOut();
+    cap.resetErr();
+
+    try testing.expectEqual(0, run(alloc, io, .{ .follow_symlinks = true }, home, src, streams));
+    try testing.expect(isLink(io, gl));
+    try testing.expect(isLink(io, in_target));
+    const follow_out = try std.fmt.allocPrint(alloc, "canonical: {s} -> {s}\nagent grok: {s} -> {s}\n", .{
+        canonical, src, gl, canonical,
+    });
+    defer alloc.free(follow_out);
+    try testing.expectEqualStrings(follow_out, cap.stdout());
+    try testing.expectEqualStrings("", cap.stderr());
+}
+
+test "canonical skills dir symlink: refuse without flag, install into target with --follow-symlinks" {
+    if (builtin.os.tag == .wasi) return;
+    const io = testing.io;
+    const alloc = testing.allocator;
+
+    var home_tmp = try IsolatedTmp.init(alloc, io);
+    defer home_tmp.deinit(alloc, io);
+    var src_tmp = try IsolatedTmp.init(alloc, io);
+    defer src_tmp.deinit(alloc, io);
+    try src_tmp.write(io, skill_md, "# rv\n");
+    var agents_tmp = try IsolatedTmp.init(alloc, io);
+    defer agents_tmp.deinit(alloc, io);
+
+    const agents_parent = try homeJoin(alloc, home_tmp.path, ".agents");
+    defer alloc.free(agents_parent);
+    try Io.Dir.cwd().createDirPath(io, agents_parent);
+    const agents_skills = try homeJoin(alloc, home_tmp.path, ".agents/skills");
+    defer alloc.free(agents_skills);
+    try Io.Dir.symLinkAbsolute(io, agents_tmp.path, agents_skills, .{ .is_directory = true });
+
+    const home = home_tmp.path;
+    const src = src_tmp.path;
+    const canonical = try canonicalPath(alloc, home);
+    defer alloc.free(canonical);
+    const in_target = try std.fs.path.join(alloc, &.{ agents_tmp.path, "rv" });
+    defer alloc.free(in_target);
+
+    var cap: Capture = .{};
+    const streams = cap.init();
+
+    try testing.expectEqual(1, run(alloc, io, .{}, home, src, streams));
+    try testing.expect(!exists(io, in_target));
+    const refuse_err = try std.fmt.allocPrint(alloc, "rv: canonical skills dir is a symlink ({s} -> {s}); pass --follow-symlinks to install into the target\n", .{
+        agents_skills, agents_tmp.path,
+    });
+    defer alloc.free(refuse_err);
+    try testing.expectEqualStrings("", cap.stdout());
+    try testing.expectEqualStrings(refuse_err, cap.stderr());
+    cap.resetOut();
+    cap.resetErr();
+
+    try testing.expectEqual(0, run(alloc, io, .{ .follow_symlinks = true }, home, src, streams));
+    try testing.expect(isLink(io, canonical));
+    try testing.expect(isLink(io, in_target));
+    const follow_out = try std.fmt.allocPrint(alloc, "canonical: {s} -> {s}\n", .{ canonical, src });
+    defer alloc.free(follow_out);
+    try testing.expectEqualStrings(follow_out, cap.stdout());
+    try testing.expectEqualStrings("", cap.stderr());
 }
