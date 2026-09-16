@@ -1,5 +1,7 @@
 .{
     .name = .rv,
+    // Bump this, commit, then `git tag -a vX.Y.Z && git push origin vX.Y.Z`.
+    // The annotated tag message is the GitHub release notes.
     .version = "1.1.0",
     .fingerprint = 0xe5b6dd825d0e580a,
     .minimum_zig_version = "0.16.0",

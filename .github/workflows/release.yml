@@ -1,3 +1,7 @@
+# Pushing an annotated v* tag publishes the GitHub Release.
+# The tag message is the release notes.
+# After bumping .version in build.zig.zon and committing:
+#   git tag -a vX.Y.Z && git push origin vX.Y.Z
 name: release
 
 on:
@@ -12,6 +16,8 @@ jobs:
       contents: write
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
       - uses: mlugg/setup-zig@v2
         with:
@@ -53,4 +59,4 @@ jobs:
             dist/rv-macos-x86_64.tar.gz \
             dist/rv-macos-aarch64.tar.gz \
             dist/SHA256SUMS \
-            --generate-notes
+            --notes-from-tag
