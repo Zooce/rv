@@ -10,25 +10,11 @@
 
 Linux and macOS. No Windows builds yet.
 
-Prebuilt binaries are on [GitHub Releases](https://github.com/Zooce/rv/releases):
-
-| OS | Arch | Asset |
-|---|---|---|
-| Linux | x86_64 | `rv-linux-x86_64.tar.gz` |
-| Linux | aarch64 | `rv-linux-aarch64.tar.gz` |
-| macOS | x86_64 | `rv-macos-x86_64.tar.gz` |
-| macOS | aarch64 | `rv-macos-aarch64.tar.gz` |
-
-Each tarball contains `bin/rv` and `share/rv/skills/rv`. Extract into `~/.local` so `rv install-skill` can find the bundled skill:
-
 ```sh
-mkdir -p ~/.local
-tar -C ~/.local -xzf rv-linux-x86_64.tar.gz
+curl -fsSL https://raw.githubusercontent.com/Zooce/rv/master/install.sh | sh
 ```
 
-`SHA256SUMS` is on the same release; verify the tarball before extracting.
-
-If `~/.local/bin` is not on `PATH`:
+This puts `rv` and the bundled skill under `~/.local`. If `~/.local/bin` is not on `PATH`:
 
 ```sh
 export PATH="$HOME/.local/bin:$PATH"
