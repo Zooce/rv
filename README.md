@@ -1,8 +1,8 @@
 # rv
 
-**Local terminal diff review for humans. Precise comments for AI agents.**
+**Local terminal diff review for humans.**
 
-Stay in the terminal. Point at the exact lines. Hand the note to Grok, Claude, or any other agent.
+Review and approve hunks or files. Add comments. Tell your agent `rv comments` and it will address them.
 
 ## Install
 
@@ -47,12 +47,14 @@ rv HEAD            # one commit
 rv main...HEAD     # a range
 ```
 
-Vim keys move a **current line** on the diff. `i` / `Enter` comments there. Press `?` for every key.
+Vim keys move a **current line** on the diff. `i` / `Enter` comments there. `a` / `A` approve a hunk or file (stages, then hides). Press `?` for keybindings.
 
 ```sh
 rv export          # comments for the agent
 rv list
 rv resolve <id>    # drop an addressed comment
+rv approved        # hidden hunks and files
+rv unapprove <n>
 ```
 
 `rv` does not apply fixes. It is the comment board; the agent does the work.
