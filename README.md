@@ -4,12 +4,6 @@
 
 Stay in the terminal. Point at the exact lines. Hand the note to Grok, Claude, or any other agent.
 
-![Side-by-side review with the current line highlighted](docs/screenshots/review.png)
-
-![Inline comment box under the cursor](docs/screenshots/comment.png)
-
-![Help overlay (`?`)](docs/screenshots/help.png)
-
 ## Install
 
 Linux and macOS. No Windows builds yet.
@@ -37,6 +31,12 @@ Zig 0.16.0.
 ```sh
 zig build -Doptimize=ReleaseSafe --prefix ~/.local
 ```
+
+![Side-by-side review with the current line highlighted](docs/screenshots/review.png)
+
+![Inline comment box under the cursor](docs/screenshots/comment.png)
+
+![Help overlay (`?`)](docs/screenshots/help.png)
 
 ## Use
 
