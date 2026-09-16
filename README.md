@@ -12,7 +12,7 @@ Linux and macOS. No Windows builds yet.
 curl -fsSL https://raw.githubusercontent.com/Zooce/rv/master/install.sh | sh
 ```
 
-Puts `rv` and the bundled skill under `~/.local`. If `~/.local/bin` is not on `PATH`:
+Puts `rv` in `~/.local/bin`. If that directory is not on `PATH`:
 
 ```sh
 export PATH="$HOME/.local/bin:$PATH"
@@ -30,6 +30,7 @@ Zig 0.16.0.
 
 ```sh
 zig build -Doptimize=ReleaseSafe --prefix ~/.local
+rv install-skill
 ```
 
 ![Side-by-side review with the current line highlighted](docs/screenshots/review.png)
