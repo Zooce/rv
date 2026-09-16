@@ -1,35 +1,24 @@
-//! Install / list / uninstall the bundled `rv` agent skill (MVP-2.5).
-//! Canonical: `$HOME/.agents/skills/rv` → skill source.
-//! Agent roots (`~/.grok/skills`, …) get `rv` → canonical when present.
-//!
-//! All output goes through injectable `Streams` (stdout/stderr) so tests can
-//! capture with fixed writers (same pattern as goal's `TestEnv`).
+//! Install / uninstall the bundled `rv` agent skill.
+//! Copy `SKILL.md` to `$HOME/.agents/skills/rv/`. Agent skill roots that
+//! already exist (`~/.grok/skills`, …) get `rv` → that directory.
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 const Io = std.Io;
 
-pub const skill_md = "SKILL.md";
+const skill_file = "SKILL.md";
+const skill_bytes = @import("skill_bytes").bytes;
+const canonical_rel = ".agents/skills/rv";
+
+const agents = [_]struct { name: []const u8, rel: []const u8 }{
+    .{ .name = "grok", .rel = ".grok/skills/rv" },
+    .{ .name = "claude", .rel = ".claude/skills/rv" },
+    .{ .name = "codex", .rel = ".codex/skills/rv" },
+    .{ .name = "cursor", .rel = ".cursor/skills/rv" },
+};
 
 pub const Opts = struct {
-    list: bool = false,
     uninstall: bool = false,
-    agent: ?[]const u8 = null,
-    follow_symlinks: bool = false,
-};
-
-/// stdout = status / list data; stderr = errors and usage.
-pub const Streams = struct {
-    out: *std.Io.Writer,
-    err: *std.Io.Writer,
-};
-
-const Agent = struct { name: []const u8, skills_rel: []const u8 };
-const known = [_]Agent{
-    .{ .name = "grok", .skills_rel = ".grok/skills" },
-    .{ .name = "claude", .skills_rel = ".claude/skills" },
-    .{ .name = "codex", .skills_rel = ".codex/skills" },
-    .{ .name = "cursor", .skills_rel = ".cursor/skills" },
 };
 
 pub fn run(
@@ -37,507 +26,270 @@ pub fn run(
     io: Io,
     opts: Opts,
     home: ?[]const u8,
-    skill_override: ?[]const u8,
-    streams: Streams,
+    out: *std.Io.Writer,
+    err_w: *std.Io.Writer,
 ) u8 {
-    const h = home orelse return fail(streams, "HOME is not set");
-    if (h.len == 0) return fail(streams, "HOME is empty");
-    if (opts.list and opts.uninstall) return usage(streams, "use only one of --list or --uninstall");
-    if (opts.agent) |n| {
-        if (findAgent(n) == null) return usage(streams, "unknown agent (try: grok, claude, codex, cursor)");
-    }
-    if (opts.list) return cmdList(alloc, io, h, skill_override, opts.agent, streams);
-    if (opts.uninstall) return cmdUninstall(alloc, io, h, opts.agent, streams);
-    return cmdInstall(alloc, io, h, skill_override, opts.agent, opts.follow_symlinks, streams);
+    const h = home orelse return fail(err_w, "HOME is not set");
+    if (h.len == 0) return fail(err_w, "HOME is empty");
+    if (opts.uninstall) return cmdUninstall(alloc, io, h, out, err_w);
+    return cmdInstall(alloc, io, h, out, err_w);
 }
 
-fn findAgent(name: []const u8) ?Agent {
-    for (known) |a| if (std.mem.eql(u8, a.name, name)) return a;
-    return null;
-}
-
-fn homeJoin(alloc: Allocator, home: []const u8, rel: []const u8) Allocator.Error![]u8 {
-    return std.fs.path.join(alloc, &.{ home, rel });
-}
-
-fn canonicalPath(alloc: Allocator, home: []const u8) Allocator.Error![]u8 {
-    return homeJoin(alloc, home, ".agents/skills/rv");
-}
-
-fn agentSkills(alloc: Allocator, home: []const u8, a: Agent) Allocator.Error![]u8 {
-    return homeJoin(alloc, home, a.skills_rel);
-}
-
-fn agentLink(alloc: Allocator, home: []const u8, a: Agent) Allocator.Error![]u8 {
-    return std.fs.path.join(alloc, &.{ home, a.skills_rel, "rv" });
-}
-
-pub fn resolveSource(alloc: Allocator, io: Io, skill_override: ?[]const u8) Allocator.Error!?[]u8 {
-    if (skill_override) |p| {
-        if (p.len > 0) {
-            const abs = try absPath(alloc, io, p);
-            if (hasSkillMd(io, abs)) return abs;
-            alloc.free(abs);
-        }
-    }
-    if (std.process.executablePathAlloc(io, alloc)) |exe| {
-        defer alloc.free(exe);
-        if (std.fs.path.dirname(exe)) |bindir| {
-            if (std.fs.path.dirname(bindir)) |prefix| {
-                const cand = try std.fs.path.join(alloc, &.{ prefix, "share/rv/skills/rv" });
-                if (hasSkillMd(io, cand)) return cand;
-                alloc.free(cand);
-            }
-            const rel = try std.fs.path.join(alloc, &.{ bindir, "../../skills/rv" });
-            const abs = try absPath(alloc, io, rel);
-            alloc.free(rel);
-            if (hasSkillMd(io, abs)) return abs;
-            alloc.free(abs);
-        }
-    } else |_| {}
-    const cwd_cand = try absPath(alloc, io, "skills/rv");
-    if (hasSkillMd(io, cwd_cand)) return cwd_cand;
-    alloc.free(cwd_cand);
-    return null;
-}
-
-fn hasSkillMd(io: Io, dir: []const u8) bool {
-    var buf: [std.fs.max_path_bytes]u8 = undefined;
-    const p = std.fmt.bufPrint(&buf, "{s}/{s}", .{ dir, skill_md }) catch return false;
-    Io.Dir.accessAbsolute(io, p, .{}) catch return false;
-    return true;
-}
-
-fn absPath(alloc: Allocator, io: Io, p: []const u8) Allocator.Error![]u8 {
-    if (std.fs.path.isAbsolute(p)) return try alloc.dupe(u8, p);
-    const cwd = std.process.currentPathAlloc(io, alloc) catch return error.OutOfMemory;
-    defer alloc.free(cwd);
-    return std.fs.path.resolve(alloc, &.{ cwd, p }) catch return error.OutOfMemory;
-}
-
-fn exists(io: Io, p: []const u8) bool {
-    Io.Dir.accessAbsolute(io, p, .{}) catch return false;
-    return true;
-}
-
-fn isLink(io: Io, p: []const u8) bool {
-    const st = Io.Dir.cwd().statFile(io, p, .{ .follow_symlinks = false }) catch return false;
-    return st.kind == .sym_link;
-}
-
-fn ensureDirSymlink(io: Io, link: []const u8, target: []const u8, follow_symlinks: bool) !void {
-    if (isLink(io, link)) {
-        var buf: [std.fs.max_path_bytes]u8 = undefined;
-        if (Io.Dir.readLinkAbsolute(io, link, &buf)) |n| {
-            if (std.mem.eql(u8, buf[0..n], target)) return;
-        } else |_| {}
-        try Io.Dir.deleteFileAbsolute(io, link);
-    } else if (exists(io, link)) return error.NotASymlink;
-    if (std.fs.path.dirname(link)) |parent| {
-        // createDirPath treats a final-component symlink as NotDir.
-        if (isLink(io, parent)) {
-            if (!follow_symlinks) return error.ParentIsSymlink;
-        } else {
-            try Io.Dir.cwd().createDirPath(io, parent);
-        }
-    }
-    try Io.Dir.symLinkAbsolute(io, target, link, .{ .is_directory = true });
-}
-
-fn fail(s: Streams, msg: []const u8) u8 {
-    s.err.print("rv: {s}\n", .{msg}) catch {};
-    return 1;
-}
-fn usage(s: Streams, msg: []const u8) u8 {
-    s.err.print("rv: {s}\n", .{msg}) catch {};
-    return 2;
-}
-fn oom(s: Streams) u8 {
-    return fail(s, "out of memory");
-}
-fn writeFail(s: Streams) u8 {
-    return fail(s, "write failed");
-}
-
-fn failParentSymlink(s: Streams, io: Io, label: []const u8, dir: []const u8) u8 {
-    var buf: [std.fs.max_path_bytes]u8 = undefined;
-    if (Io.Dir.readLinkAbsolute(io, dir, &buf)) |n| {
-        s.err.print("rv: {s} is a symlink ({s} -> {s}); pass --follow-symlinks to install into the target\n", .{
-            label, dir, buf[0..n],
-        }) catch {};
-    } else |_| {
-        s.err.print("rv: {s} is a symlink ({s}); pass --follow-symlinks to install into the target\n", .{
-            label, dir,
-        }) catch {};
-    }
+fn fail(err_w: *std.Io.Writer, msg: []const u8) u8 {
+    err_w.print("rv: {s}\n", .{msg}) catch {};
     return 1;
 }
 
-fn cmdInstall(
-    alloc: Allocator,
-    io: Io,
-    home: []const u8,
-    skill_override: ?[]const u8,
-    agent_filter: ?[]const u8,
-    follow_symlinks: bool,
-    s: Streams,
-) u8 {
-    const source = (resolveSource(alloc, io, skill_override) catch return oom(s)) orelse
-        return fail(s, "skill source not found (set RV_SKILL_DIR or install share/rv/skills/rv)");
-    defer alloc.free(source);
-    const canonical = canonicalPath(alloc, home) catch return oom(s);
+fn cmdInstall(alloc: Allocator, io: Io, home: []const u8, out: *std.Io.Writer, err_w: *std.Io.Writer) u8 {
+    const canonical = std.fs.path.join(alloc, &.{ home, canonical_rel }) catch return fail(err_w, "out of memory");
     defer alloc.free(canonical);
-    ensureDirSymlink(io, canonical, source, follow_symlinks) catch |err| switch (err) {
-        error.NotASymlink => return fail(s, "canonical path exists and is not a symlink; remove it and retry"),
-        error.ParentIsSymlink => return failParentSymlink(s, io, "canonical skills dir", std.fs.path.dirname(canonical).?),
-        else => return fail(s, "failed to install canonical skill"),
+    putDirFile(io, canonical, skill_bytes) catch |e| switch (e) {
+        error.NotADirectory => return fail(err_w, "canonical path exists and is not a directory; remove it and retry"),
+        else => return fail(err_w, "failed to install canonical skill"),
     };
-    s.out.print("canonical: {s} -> {s}\n", .{ canonical, source }) catch return writeFail(s);
-    if (agent_filter) |name|
-        return linkAgent(alloc, io, home, findAgent(name).?, canonical, true, follow_symlinks, s);
-    for (known) |a| {
-        const skills = agentSkills(alloc, home, a) catch return oom(s);
-        defer alloc.free(skills);
-        if (!exists(io, skills)) continue;
-        const rc = linkAgent(alloc, io, home, a, canonical, false, follow_symlinks, s);
-        if (rc != 0) return rc;
+    out.print("canonical: {s}\n", .{canonical}) catch return fail(err_w, "write failed");
+
+    for (agents) |a| {
+        const link = std.fs.path.join(alloc, &.{ home, a.rel }) catch return fail(err_w, "out of memory");
+        defer alloc.free(link);
+        const linked = putLink(io, link, canonical) catch |e| switch (e) {
+            error.NotASymlink => return fail(err_w, "agent link exists and is not a symlink; remove it and retry"),
+            else => return fail(err_w, "failed to link agent skill"),
+        };
+        if (linked) {
+            out.print("agent {s}: {s} -> {s}\n", .{ a.name, link, canonical }) catch return fail(err_w, "write failed");
+        }
     }
     return 0;
 }
 
-fn linkAgent(
-    alloc: Allocator,
-    io: Io,
-    home: []const u8,
-    a: Agent,
-    canonical: []const u8,
-    create_root: bool,
-    follow_symlinks: bool,
-    s: Streams,
-) u8 {
-    const skills = agentSkills(alloc, home, a) catch return oom(s);
-    defer alloc.free(skills);
-    if (!exists(io, skills)) {
-        if (!create_root) return 0;
-        Io.Dir.cwd().createDirPath(io, skills) catch return fail(s, "failed to create agent skills dir");
-    }
-    const link = agentLink(alloc, home, a) catch return oom(s);
-    defer alloc.free(link);
-    ensureDirSymlink(io, link, canonical, follow_symlinks) catch |err| switch (err) {
-        error.NotASymlink => return fail(s, "agent link exists and is not a symlink; remove it and retry"),
-        error.ParentIsSymlink => {
-            var lb: [64]u8 = undefined;
-            const label = std.fmt.bufPrint(&lb, "agent {s} skills dir", .{a.name}) catch "agent skills dir";
-            return failParentSymlink(s, io, label, skills);
-        },
-        else => return fail(s, "failed to link agent skill"),
-    };
-    s.out.print("agent {s}: {s} -> {s}\n", .{ a.name, link, canonical }) catch return writeFail(s);
-    return 0;
-}
-
-fn cmdUninstall(alloc: Allocator, io: Io, home: []const u8, agent_filter: ?[]const u8, s: Streams) u8 {
+fn cmdUninstall(alloc: Allocator, io: Io, home: []const u8, out: *std.Io.Writer, err_w: *std.Io.Writer) u8 {
     var failed: u8 = 0;
-    if (agent_filter) |name| {
-        const link = agentLink(alloc, home, findAgent(name).?) catch return oom(s);
+    for (agents) |a| {
+        const link = std.fs.path.join(alloc, &.{ home, a.rel }) catch return fail(err_w, "out of memory");
         defer alloc.free(link);
-        return dropLink(io, link, s);
-    }
-    for (known) |a| {
-        const link = agentLink(alloc, home, a) catch return oom(s);
-        defer alloc.free(link);
-        const rc = dropLink(io, link, s);
+        const rc = dropLink(io, link, out, err_w);
         if (rc != 0) failed = rc;
     }
-    const canonical = canonicalPath(alloc, home) catch return oom(s);
+    const canonical = std.fs.path.join(alloc, &.{ home, canonical_rel }) catch return fail(err_w, "out of memory");
     defer alloc.free(canonical);
-    const rc = dropLink(io, canonical, s);
+    const rc = dropCanonical(io, canonical, out, err_w);
     return if (rc != 0) rc else failed;
 }
 
-fn dropLink(io: Io, link: []const u8, s: Streams) u8 {
-    if (!isLink(io, link)) {
-        if (exists(io, link)) {
-            s.err.print("rv: left {s} (not a symlink)\n", .{link}) catch {};
-            return 1;
-        }
+/// Write `SKILL.md` into `dir_path`, replacing an old directory symlink.
+fn putDirFile(io: Io, dir_path: []const u8, contents: []const u8) !void {
+    const parent = std.fs.path.dirname(dir_path) orelse return error.NotADirectory;
+    Io.Dir.accessAbsolute(io, parent, .{}) catch {
+        try Io.Dir.cwd().createDirPath(io, parent);
+    };
+
+    const st = Io.Dir.cwd().statFile(io, dir_path, .{ .follow_symlinks = false }) catch null;
+    if (st) |s| switch (s.kind) {
+        .sym_link => {
+            try Io.Dir.deleteFileAbsolute(io, dir_path);
+            try Io.Dir.createDirAbsolute(io, dir_path, .default_dir);
+        },
+        .directory => {},
+        else => return error.NotADirectory,
+    } else {
+        try Io.Dir.createDirAbsolute(io, dir_path, .default_dir);
+    }
+
+    var d = try Io.Dir.openDirAbsolute(io, dir_path, .{});
+    defer d.close(io);
+    try d.writeFile(io, .{ .sub_path = skill_file, .data = contents });
+}
+
+/// Symlink `link` → `target` when the parent exists. False = parent missing.
+fn putLink(io: Io, link: []const u8, target: []const u8) !bool {
+    const parent = std.fs.path.dirname(link) orelse return error.NotASymlink;
+    Io.Dir.accessAbsolute(io, parent, .{}) catch return false;
+
+    var buf: [std.fs.max_path_bytes]u8 = undefined;
+    if (Io.Dir.readLinkAbsolute(io, link, &buf)) |n| {
+        if (std.mem.eql(u8, buf[0..n], target)) return true;
+        try Io.Dir.deleteFileAbsolute(io, link);
+    } else |e| switch (e) {
+        error.FileNotFound => {},
+        else => return error.NotASymlink,
+    }
+    try Io.Dir.symLinkAbsolute(io, target, link, .{ .is_directory = true });
+    return true;
+}
+
+fn dropLink(io: Io, link: []const u8, out: *std.Io.Writer, err_w: *std.Io.Writer) u8 {
+    const st = Io.Dir.cwd().statFile(io, link, .{ .follow_symlinks = false }) catch return 0;
+    if (st.kind != .sym_link) {
+        err_w.print("rv: left {s} (not a symlink)\n", .{link}) catch {};
+        return 1;
+    }
+    Io.Dir.deleteFileAbsolute(io, link) catch return fail(err_w, "failed to remove skill link");
+    out.print("removed: {s}\n", .{link}) catch return fail(err_w, "write failed");
+    return 0;
+}
+
+fn dropCanonical(io: Io, dir_path: []const u8, out: *std.Io.Writer, err_w: *std.Io.Writer) u8 {
+    const st = Io.Dir.cwd().statFile(io, dir_path, .{ .follow_symlinks = false }) catch return 0;
+    if (st.kind == .sym_link) {
+        Io.Dir.deleteFileAbsolute(io, dir_path) catch return fail(err_w, "failed to remove skill link");
+        out.print("removed: {s}\n", .{dir_path}) catch return fail(err_w, "write failed");
         return 0;
     }
-    Io.Dir.deleteFileAbsolute(io, link) catch return fail(s, "failed to remove skill link");
-    s.out.print("removed: {s}\n", .{link}) catch return writeFail(s);
+    if (st.kind != .directory) {
+        err_w.print("rv: left {s} (not a directory)\n", .{dir_path}) catch {};
+        return 1;
+    }
+    {
+        var d = Io.Dir.openDirAbsolute(io, dir_path, .{}) catch return fail(err_w, "failed to remove skill");
+        defer d.close(io);
+        d.deleteFile(io, skill_file) catch |e| switch (e) {
+            error.FileNotFound => {},
+            else => return fail(err_w, "failed to remove skill"),
+        };
+    }
+    Io.Dir.deleteDirAbsolute(io, dir_path) catch |e| switch (e) {
+        error.DirNotEmpty => {},
+        else => return fail(err_w, "failed to remove skill"),
+    };
+    out.print("removed: {s}\n", .{dir_path}) catch return fail(err_w, "write failed");
     return 0;
-}
-
-fn cmdList(
-    alloc: Allocator,
-    io: Io,
-    home: []const u8,
-    skill_override: ?[]const u8,
-    agent_filter: ?[]const u8,
-    s: Streams,
-) u8 {
-    if (resolveSource(alloc, io, skill_override) catch null) |source| {
-        defer alloc.free(source);
-        s.out.print("source: {s}\n", .{source}) catch return writeFail(s);
-    } else {
-        s.out.writeAll("source: (not found)\n") catch return writeFail(s);
-    }
-    const canonical = canonicalPath(alloc, home) catch return oom(s);
-    defer alloc.free(canonical);
-    printLink(io, s.out, "canonical", canonical) catch return writeFail(s);
-    if (agent_filter) |name| {
-        printAgent(alloc, io, home, findAgent(name).?, s.out) catch return writeFail(s);
-    } else {
-        for (known) |a| printAgent(alloc, io, home, a, s.out) catch return writeFail(s);
-    }
-    return 0;
-}
-
-fn printAgent(alloc: Allocator, io: Io, home: []const u8, a: Agent, out: *std.Io.Writer) !void {
-    const skills = try agentSkills(alloc, home, a);
-    defer alloc.free(skills);
-    if (!exists(io, skills)) {
-        try out.print("agent {s}: (skills root not present: {s})\n", .{ a.name, skills });
-        return;
-    }
-    const link = try agentLink(alloc, home, a);
-    defer alloc.free(link);
-    var lb: [48]u8 = undefined;
-    const label = std.fmt.bufPrint(&lb, "agent {s}", .{a.name}) catch "agent";
-    try printLink(io, out, label, link);
-}
-
-fn printLink(io: Io, out: *std.Io.Writer, label: []const u8, path: []const u8) !void {
-    if (isLink(io, path)) {
-        var buf: [std.fs.max_path_bytes]u8 = undefined;
-        if (Io.Dir.readLinkAbsolute(io, path, &buf)) |n| {
-            try out.print("{s}: {s} -> {s}\n", .{ label, path, buf[0..n] });
-            return;
-        } else |_| {}
-    }
-    if (exists(io, path))
-        try out.print("{s}: {s} (not a symlink)\n", .{ label, path })
-    else
-        try out.print("{s}: {s} (missing)\n", .{ label, path });
 }
 
 const testing = std.testing;
 const builtin = @import("builtin");
 const IsolatedTmp = if (builtin.is_test) @import("isolated_tmp").IsolatedTmp else void;
 
-/// Fixed stdout/stderr buffers for unit tests (goal `TestEnv` pattern).
-const Capture = struct {
-    out_buf: [4096]u8 = undefined,
-    err_buf: [1024]u8 = undefined,
-    out: std.Io.Writer = undefined,
-    err: std.Io.Writer = undefined,
+const t = if (builtin.is_test) struct {
+    fn writers(out_buf: *[4096]u8, err_buf: *[1024]u8) struct { out: std.Io.Writer, err_w: std.Io.Writer } {
+        return .{ .out = .fixed(out_buf), .err_w = .fixed(err_buf) };
+    }
 
-    fn init(self: *Capture) Streams {
-        self.out = .fixed(&self.out_buf);
-        self.err = .fixed(&self.err_buf);
-        return .{ .out = &self.out, .err = &self.err };
+    fn entryKind(io: Io, p: []const u8) ?Io.File.Kind {
+        const st = Io.Dir.cwd().statFile(io, p, .{ .follow_symlinks = false }) catch return null;
+        return st.kind;
     }
-    fn stdout(self: *const Capture) []const u8 {
-        return self.out.buffered();
-    }
-    fn stderr(self: *const Capture) []const u8 {
-        return self.err.buffered();
-    }
-    fn resetOut(self: *Capture) void {
-        _ = self.out.consumeAll();
-    }
-    fn resetErr(self: *Capture) void {
-        _ = self.err.consumeAll();
-    }
-};
 
-test "install list uninstall: stdout capture and fs roundtrip" {
+    fn readSkill(alloc: Allocator, io: Io, dir_path: []const u8) ![]u8 {
+        var d = try Io.Dir.openDirAbsolute(io, dir_path, .{});
+        defer d.close(io);
+        return d.readFileAlloc(io, skill_file, alloc, .limited(1 << 20));
+    }
+} else void;
+
+test "install copies SKILL.md, links existing agent, uninstalls" {
     if (builtin.os.tag == .wasi) return;
     const io = testing.io;
     const alloc = testing.allocator;
 
     var home_tmp = try IsolatedTmp.init(alloc, io);
     defer home_tmp.deinit(alloc, io);
-    var src_tmp = try IsolatedTmp.init(alloc, io);
-    defer src_tmp.deinit(alloc, io);
-    try src_tmp.write(io, skill_md, "# rv\n");
-
-    const grok = try homeJoin(alloc, home_tmp.path, ".grok/skills");
-    defer alloc.free(grok);
-    try Io.Dir.cwd().createDirPath(io, grok);
-
     const home = home_tmp.path;
-    const src = src_tmp.path;
-    const canonical = try canonicalPath(alloc, home);
+
+    const grok_skills = try std.fs.path.join(alloc, &.{ home, ".grok/skills" });
+    defer alloc.free(grok_skills);
+    try Io.Dir.cwd().createDirPath(io, grok_skills);
+
+    const canonical = try std.fs.path.join(alloc, &.{ home, canonical_rel });
     defer alloc.free(canonical);
-    const gl = try agentLink(alloc, home, known[0]);
+    const gl = try std.fs.path.join(alloc, &.{ home, agents[0].rel });
     defer alloc.free(gl);
 
-    var cap: Capture = .{};
-    const streams = cap.init();
+    var out_buf: [4096]u8 = undefined;
+    var err_buf: [1024]u8 = undefined;
+    var w = t.writers(&out_buf, &err_buf);
 
-    // install
-    try testing.expectEqual(0, run(alloc, io, .{}, home, src, streams));
-    try testing.expect(isLink(io, canonical));
-    try testing.expect(isLink(io, gl));
-    const install_out = try std.fmt.allocPrint(alloc, "canonical: {s} -> {s}\nagent grok: {s} -> {s}\n", .{
-        canonical, src, gl, canonical,
-    });
-    defer alloc.free(install_out);
-    try testing.expectEqualStrings(install_out, cap.stdout());
-    try testing.expectEqualStrings("", cap.stderr());
-    cap.resetOut();
+    try testing.expectEqual(0, run(alloc, io, .{}, home, &w.out, &w.err_w));
+    try testing.expectEqual(.directory, t.entryKind(io, canonical).?);
+    const got = try t.readSkill(alloc, io, canonical);
+    defer alloc.free(got);
+    try testing.expectEqualStrings(skill_bytes, got);
+    try testing.expectEqual(.sym_link, t.entryKind(io, gl).?);
+    var buf: [std.fs.max_path_bytes]u8 = undefined;
+    const n = try Io.Dir.readLinkAbsolute(io, gl, &buf);
+    try testing.expectEqualStrings(canonical, buf[0..n]);
+    const claude = try std.fs.path.join(alloc, &.{ home, ".claude/skills/rv" });
+    defer alloc.free(claude);
+    try testing.expect(t.entryKind(io, claude) == null);
 
     // idempotent re-run
-    try testing.expectEqual(0, run(alloc, io, .{}, home, src, streams));
-    try testing.expectEqualStrings(install_out, cap.stdout());
-    try testing.expectEqualStrings("", cap.stderr());
-    cap.resetOut();
+    w = t.writers(&out_buf, &err_buf);
+    try testing.expectEqual(0, run(alloc, io, .{}, home, &w.out, &w.err_w));
+    try testing.expectEqual(.directory, t.entryKind(io, canonical).?);
+    try testing.expectEqual(.sym_link, t.entryKind(io, gl).?);
 
-    // list
-    try testing.expectEqual(0, run(alloc, io, .{ .list = true }, home, src, streams));
-    const list_out = try std.fmt.allocPrint(alloc,
-        \\source: {s}
-        \\canonical: {s} -> {s}
-        \\agent grok: {s} -> {s}
-        \\agent claude: (skills root not present: {s}/.claude/skills)
-        \\agent codex: (skills root not present: {s}/.codex/skills)
-        \\agent cursor: (skills root not present: {s}/.cursor/skills)
-        \\
-    , .{ src, canonical, src, gl, canonical, home, home, home });
-    defer alloc.free(list_out);
-    try testing.expectEqualStrings(list_out, cap.stdout());
-    try testing.expectEqualStrings("", cap.stderr());
-    cap.resetOut();
-
-    // uninstall
-    try testing.expectEqual(0, run(alloc, io, .{ .uninstall = true }, home, null, streams));
-    try testing.expect(!exists(io, canonical));
-    try testing.expect(!isLink(io, gl));
-    const un_out = try std.fmt.allocPrint(alloc, "removed: {s}\nremoved: {s}\n", .{ gl, canonical });
-    defer alloc.free(un_out);
-    try testing.expectEqualStrings(un_out, cap.stdout());
-    try testing.expectEqualStrings("", cap.stderr());
+    w = t.writers(&out_buf, &err_buf);
+    try testing.expectEqual(0, run(alloc, io, .{ .uninstall = true }, home, &w.out, &w.err_w));
+    try testing.expect(t.entryKind(io, canonical) == null);
+    try testing.expect(t.entryKind(io, gl) == null);
 }
 
-test "unknown agent writes usage to stderr" {
-    var cap: Capture = .{};
-    const streams = cap.init();
-    try testing.expectEqual(2, run(
-        testing.allocator,
-        testing.io,
-        .{ .agent = "nope" },
-        "/tmp",
-        null,
-        streams,
-    ));
-    try testing.expectEqualStrings("", cap.stdout());
-    try testing.expectEqualStrings("rv: unknown agent (try: grok, claude, codex, cursor)\n", cap.stderr());
-}
-
-test "agent skills dir symlink: refuse without flag, install into target with --follow-symlinks" {
+test "agent skills dir that is a symlink still receives rv" {
     if (builtin.os.tag == .wasi) return;
     const io = testing.io;
     const alloc = testing.allocator;
 
     var home_tmp = try IsolatedTmp.init(alloc, io);
     defer home_tmp.deinit(alloc, io);
-    var src_tmp = try IsolatedTmp.init(alloc, io);
-    defer src_tmp.deinit(alloc, io);
-    try src_tmp.write(io, skill_md, "# rv\n");
     var skills_tmp = try IsolatedTmp.init(alloc, io);
     defer skills_tmp.deinit(alloc, io);
 
-    const grok_parent = try homeJoin(alloc, home_tmp.path, ".grok");
+    const grok_parent = try std.fs.path.join(alloc, &.{ home_tmp.path, ".grok" });
     defer alloc.free(grok_parent);
     try Io.Dir.cwd().createDirPath(io, grok_parent);
-    const grok = try homeJoin(alloc, home_tmp.path, ".grok/skills");
+    const grok = try std.fs.path.join(alloc, &.{ home_tmp.path, ".grok/skills" });
     defer alloc.free(grok);
     try Io.Dir.symLinkAbsolute(io, skills_tmp.path, grok, .{ .is_directory = true });
 
-    const home = home_tmp.path;
-    const src = src_tmp.path;
-    const canonical = try canonicalPath(alloc, home);
+    const canonical = try std.fs.path.join(alloc, &.{ home_tmp.path, canonical_rel });
     defer alloc.free(canonical);
-    const gl = try agentLink(alloc, home, known[0]);
+    const gl = try std.fs.path.join(alloc, &.{ home_tmp.path, agents[0].rel });
     defer alloc.free(gl);
     const in_target = try std.fs.path.join(alloc, &.{ skills_tmp.path, "rv" });
     defer alloc.free(in_target);
 
-    var cap: Capture = .{};
-    const streams = cap.init();
+    var out_buf: [4096]u8 = undefined;
+    var err_buf: [1024]u8 = undefined;
+    var w = t.writers(&out_buf, &err_buf);
 
-    try testing.expectEqual(1, run(alloc, io, .{}, home, src, streams));
-    try testing.expect(isLink(io, canonical));
-    try testing.expect(!exists(io, in_target));
-    const refuse_out = try std.fmt.allocPrint(alloc, "canonical: {s} -> {s}\n", .{ canonical, src });
-    defer alloc.free(refuse_out);
-    const refuse_err = try std.fmt.allocPrint(alloc, "rv: agent grok skills dir is a symlink ({s} -> {s}); pass --follow-symlinks to install into the target\n", .{
-        grok, skills_tmp.path,
-    });
-    defer alloc.free(refuse_err);
-    try testing.expectEqualStrings(refuse_out, cap.stdout());
-    try testing.expectEqualStrings(refuse_err, cap.stderr());
-    cap.resetOut();
-    cap.resetErr();
-
-    try testing.expectEqual(0, run(alloc, io, .{ .follow_symlinks = true }, home, src, streams));
-    try testing.expect(isLink(io, gl));
-    try testing.expect(isLink(io, in_target));
-    const follow_out = try std.fmt.allocPrint(alloc, "canonical: {s} -> {s}\nagent grok: {s} -> {s}\n", .{
-        canonical, src, gl, canonical,
-    });
-    defer alloc.free(follow_out);
-    try testing.expectEqualStrings(follow_out, cap.stdout());
-    try testing.expectEqualStrings("", cap.stderr());
+    try testing.expectEqual(0, run(alloc, io, .{}, home_tmp.path, &w.out, &w.err_w));
+    try testing.expectEqual(.sym_link, t.entryKind(io, gl).?);
+    try testing.expectEqual(.sym_link, t.entryKind(io, in_target).?);
+    try testing.expectEqual(.directory, t.entryKind(io, canonical).?);
 }
 
-test "canonical skills dir symlink: refuse without flag, install into target with --follow-symlinks" {
+test "old canonical symlink is replaced by a directory copy" {
     if (builtin.os.tag == .wasi) return;
     const io = testing.io;
     const alloc = testing.allocator;
 
     var home_tmp = try IsolatedTmp.init(alloc, io);
     defer home_tmp.deinit(alloc, io);
-    var src_tmp = try IsolatedTmp.init(alloc, io);
-    defer src_tmp.deinit(alloc, io);
-    try src_tmp.write(io, skill_md, "# rv\n");
-    var agents_tmp = try IsolatedTmp.init(alloc, io);
-    defer agents_tmp.deinit(alloc, io);
+    var old_tmp = try IsolatedTmp.init(alloc, io);
+    defer old_tmp.deinit(alloc, io);
 
-    const agents_parent = try homeJoin(alloc, home_tmp.path, ".agents");
-    defer alloc.free(agents_parent);
-    try Io.Dir.cwd().createDirPath(io, agents_parent);
-    const agents_skills = try homeJoin(alloc, home_tmp.path, ".agents/skills");
-    defer alloc.free(agents_skills);
-    try Io.Dir.symLinkAbsolute(io, agents_tmp.path, agents_skills, .{ .is_directory = true });
-
-    const home = home_tmp.path;
-    const src = src_tmp.path;
-    const canonical = try canonicalPath(alloc, home);
+    const parent = try std.fs.path.join(alloc, &.{ home_tmp.path, ".agents/skills" });
+    defer alloc.free(parent);
+    try Io.Dir.cwd().createDirPath(io, parent);
+    const canonical = try std.fs.path.join(alloc, &.{ home_tmp.path, canonical_rel });
     defer alloc.free(canonical);
-    const in_target = try std.fs.path.join(alloc, &.{ agents_tmp.path, "rv" });
-    defer alloc.free(in_target);
+    try Io.Dir.symLinkAbsolute(io, old_tmp.path, canonical, .{ .is_directory = true });
 
-    var cap: Capture = .{};
-    const streams = cap.init();
+    var out_buf: [4096]u8 = undefined;
+    var err_buf: [1024]u8 = undefined;
+    var w = t.writers(&out_buf, &err_buf);
 
-    try testing.expectEqual(1, run(alloc, io, .{}, home, src, streams));
-    try testing.expect(!exists(io, in_target));
-    const refuse_err = try std.fmt.allocPrint(alloc, "rv: canonical skills dir is a symlink ({s} -> {s}); pass --follow-symlinks to install into the target\n", .{
-        agents_skills, agents_tmp.path,
-    });
-    defer alloc.free(refuse_err);
-    try testing.expectEqualStrings("", cap.stdout());
-    try testing.expectEqualStrings(refuse_err, cap.stderr());
-    cap.resetOut();
-    cap.resetErr();
+    try testing.expectEqual(0, run(alloc, io, .{}, home_tmp.path, &w.out, &w.err_w));
+    try testing.expectEqual(.directory, t.entryKind(io, canonical).?);
+    const got = try t.readSkill(alloc, io, canonical);
+    defer alloc.free(got);
+    try testing.expectEqualStrings(skill_bytes, got);
+}
 
-    try testing.expectEqual(0, run(alloc, io, .{ .follow_symlinks = true }, home, src, streams));
-    try testing.expect(isLink(io, canonical));
-    try testing.expect(isLink(io, in_target));
-    const follow_out = try std.fmt.allocPrint(alloc, "canonical: {s} -> {s}\n", .{ canonical, src });
-    defer alloc.free(follow_out);
-    try testing.expectEqualStrings(follow_out, cap.stdout());
-    try testing.expectEqualStrings("", cap.stderr());
+test "HOME unset writes to stderr" {
+    var out_buf: [4096]u8 = undefined;
+    var err_buf: [1024]u8 = undefined;
+    var w = t.writers(&out_buf, &err_buf);
+    try testing.expectEqual(1, run(testing.allocator, testing.io, .{}, null, &w.out, &w.err_w));
+    try testing.expectEqualStrings("rv: HOME is not set\n", w.err_w.buffered());
 }

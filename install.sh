@@ -66,7 +66,7 @@ download "$base/$asset" "$tmpdir/$asset"
     fi
 )
 
-# Unpack bin/rv and share/rv/skills/rv into the prefix.
+# Unpack bin/rv into the prefix.
 mkdir -p "$prefix"
 tar -x -C "$prefix" -f "$tmpdir/$asset"
 chmod 755 "$prefix/bin/rv"

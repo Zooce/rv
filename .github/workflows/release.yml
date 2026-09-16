@@ -27,10 +27,9 @@ jobs:
             packdir="$RUNNER_TEMP/pack-$asset"
             rm -rf "$stage" "$packdir"
             zig build -Doptimize=ReleaseSafe -Dtarget="$target" --prefix "$stage"
-            mkdir -p "$packdir/bin" "$packdir/share/rv/skills"
+            mkdir -p "$packdir/bin"
             cp "$stage/bin/rv" "$packdir/bin/rv"
-            cp -a "$stage/share/rv/skills/rv" "$packdir/share/rv/skills/rv"
-            tar -C "$packdir" -czf "dist/$asset" bin share
+            tar -C "$packdir" -czf "dist/$asset" bin
           }
           pack x86_64-linux-musl rv-linux-x86_64.tar.gz
           pack aarch64-linux-musl rv-linux-aarch64.tar.gz

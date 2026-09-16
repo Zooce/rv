@@ -130,13 +130,19 @@ pub fn build(b: *std.Build) void {
     git_mod.addImport("comments", comments_mod);
     git_mod.addImport("approve", approve_mod);
 
-    // Bundled agent skill install (MVP-2.5).
+    // Bundled agent skill install. Embed SKILL.md (outside src/) via a
+    // generated module so @embedFile stays inside that package path.
+    const skill_wf = b.addWriteFiles();
+    _ = skill_wf.addCopyFile(b.path("skills/rv/SKILL.md"), "SKILL.md");
+    const skill_zig = skill_wf.add("skill_bytes.zig", "pub const bytes = @embedFile(\"SKILL.md\");\n");
+    const skill_bytes_mod = b.createModule(.{ .root_source_file = skill_zig });
     const install_skill_mod = b.addModule("install_skill", .{
         .root_source_file = b.path("src/install_skill.zig"),
         .target = target,
         .optimize = optimize,
         .imports = &.{
             .{ .name = "isolated_tmp", .module = isolated_tmp_mod },
+            .{ .name = "skill_bytes", .module = skill_bytes_mod },
         },
     });
 
@@ -181,12 +187,6 @@ pub fn build(b: *std.Build) void {
     });
     rv.root_module.strip = optimize != .Debug;
     b.installArtifact(rv);
-    // Bundled skill for `rv install-skill` (prefix/share/rv/skills/rv).
-    b.installDirectory(.{
-        .source_dir = b.path("skills/rv"),
-        .install_dir = .prefix,
-        .install_subdir = "share/rv/skills/rv",
-    });
 
     const run_rv = b.addRunArtifact(rv);
     run_rv.step.dependOn(b.getInstallStep());

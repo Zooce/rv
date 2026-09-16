@@ -124,7 +124,6 @@ pub fn main(init: std.process.Init) !u8 {
         .command => |cmd| {
             const env: cli.Env = .{
                 .home = init.environ_map.get("HOME"),
-                .skill_dir = init.environ_map.get("RV_SKILL_DIR"),
             };
             return cli.run(alloc, io, cmd, env, .cwd());
         },
