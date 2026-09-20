@@ -130,30 +130,13 @@ pub fn build(b: *std.Build) void {
     git_mod.addImport("comments", comments_mod);
     git_mod.addImport("approve", approve_mod);
 
-    // Bundled agent skill install. Embed SKILL.md (outside src/) via a
-    // generated module so @embedFile stays inside that package path.
-    const skill_wf = b.addWriteFiles();
-    _ = skill_wf.addCopyFile(b.path("skills/rv/SKILL.md"), "SKILL.md");
-    const skill_zig = skill_wf.add("skill_bytes.zig", "pub const bytes = @embedFile(\"SKILL.md\");\n");
-    const skill_bytes_mod = b.createModule(.{ .root_source_file = skill_zig });
-    const install_skill_mod = b.addModule("install_skill", .{
-        .root_source_file = b.path("src/install_skill.zig"),
-        .target = target,
-        .optimize = optimize,
-        .imports = &.{
-            .{ .name = "isolated_tmp", .module = isolated_tmp_mod },
-            .{ .name = "skill_bytes", .module = skill_bytes_mod },
-        },
-    });
-
-    // Headless CLI: status / approved / unapprove / list / show / export / install-skill / version.
+    // Headless CLI: status / approved / unapprove / list / show / export / version.
     const cli_mod = b.addModule("cli", .{
         .root_source_file = b.path("src/cli.zig"),
         .target = target,
         .optimize = optimize,
         .imports = &.{
             .{ .name = "store", .module = store_mod },
-            .{ .name = "install_skill", .module = install_skill_mod },
             .{ .name = "git", .module = git_mod },
             .{ .name = "approve", .module = approve_mod },
             .{ .name = "diff", .module = diff_mod },
@@ -252,11 +235,6 @@ pub fn build(b: *std.Build) void {
     });
     const run_cli_tests = b.addRunArtifact(cli_tests);
 
-    const install_skill_tests = b.addTest(.{
-        .root_module = install_skill_mod,
-    });
-    const run_install_skill_tests = b.addRunArtifact(install_skill_tests);
-
     const main_tests = b.addTest(.{
         .root_module = b.createModule(.{
             .root_source_file = b.path("src/main.zig"),
@@ -279,7 +257,7 @@ pub fn build(b: *std.Build) void {
     });
     const run_main_tests = b.addRunArtifact(main_tests);
 
-    const test_step = b.step("test", "Run unit tests (TUI + diff + git + view + comment_input + Help + approve + store + comments + cli + install_skill + main)");
+    const test_step = b.step("test", "Run unit tests (TUI + diff + git + view + comment_input + Help + approve + store + comments + cli + main)");
     test_step.dependOn(&run_tui_tests.step);
     test_step.dependOn(&run_diff_tests.step);
     test_step.dependOn(&run_git_tests.step);
@@ -290,6 +268,5 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&run_store_tests.step);
     test_step.dependOn(&run_comments_tests.step);
     test_step.dependOn(&run_cli_tests.step);
-    test_step.dependOn(&run_install_skill_tests.step);
     test_step.dependOn(&run_main_tests.step);
 }

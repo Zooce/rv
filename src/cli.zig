@@ -1,7 +1,7 @@
 //! Headless CLI for the comment store and local approved hunks/files.
 //!
 //! Subcommands: `status`, `approved`, `unapprove`, `list`, `show`, `resolve`,
-//! `export`, `install-skill`, `version`, help. Comment-only commands do not load git.
+//! `export`, `version`, help. Comment-only commands do not load git.
 //! `status`, `approved`, and `unapprove` load the local diff (staged /
 //! unstaged / untracked). No raw TTY modes. Bare `rv`, `rv <commit>`, and
 //! `rv <range>` launch the review TUI from `main` (`classify`). `resolve` deletes ids.
@@ -9,18 +9,12 @@
 
 const std = @import("std");
 const store = @import("store");
-const install_skill = @import("install_skill");
 const git = @import("git");
 const approve = @import("approve");
 const diff = @import("diff");
 const build_options = @import("build_options");
 const Allocator = std.mem.Allocator;
 const Io = std.Io;
-
-/// Process env needed by install-skill (and future commands).
-pub const Env = struct {
-    home: ?[]const u8 = null,
-};
 
 pub const exit_success: u8 = 0;
 pub const exit_operational: u8 = 1;
@@ -43,7 +37,6 @@ pub const Command = union(enum) {
     show: []const u8,
     resolve: []const []const u8,
     @"export": ExportOpts,
-    install_skill: install_skill.Opts,
 };
 
 /// Where the TUI diff came from. Same type as `store.Source` (comments record it).
@@ -88,8 +81,7 @@ fn isCommand(s: []const u8) bool {
         std.mem.eql(u8, s, "list") or
         std.mem.eql(u8, s, "show") or
         std.mem.eql(u8, s, "resolve") or
-        std.mem.eql(u8, s, "export") or
-        std.mem.eql(u8, s, "install-skill");
+        std.mem.eql(u8, s, "export");
 }
 
 /// Parse a headless subcommand. argv after the program name, first token a command.
@@ -131,9 +123,6 @@ pub fn parse(args: []const []const u8) error{Usage}!Command {
     if (std.mem.eql(u8, cmd, "export")) {
         return .{ .@"export" = try parseExport(args[1..]) };
     }
-    if (std.mem.eql(u8, cmd, "install-skill")) {
-        return .{ .install_skill = try parseInstallSkill(args[1..]) };
-    }
     return error.Usage;
 }
 
@@ -173,17 +162,6 @@ fn parseExport(args: []const []const u8) error{Usage}!ExportOpts {
     return opts;
 }
 
-fn parseInstallSkill(args: []const []const u8) error{Usage}!install_skill.Opts {
-    var opts: install_skill.Opts = .{};
-    for (args) |a| {
-        if (std.mem.eql(u8, a, "--uninstall")) {
-            if (opts.uninstall) return error.Usage;
-            opts.uninstall = true;
-        } else return error.Usage;
-    }
-    return opts;
-}
-
 pub const usage_text =
     \\usage: rv [<commit> | <range> | <command>] [args]
     \\
@@ -203,8 +181,6 @@ pub const usage_text =
     \\  export [options]               dump comments (default: markdown, stdout)
     \\    --format md|json             output format (default: md)
     \\    -o <path>                    write file instead of stdout
-    \\  install-skill                  install bundled agent skill
-    \\    --uninstall                  remove the copied skill and agent links
     \\  version, -v, --version         print version and exit
     \\  help, -h, --help               show this help
     \\
@@ -213,7 +189,7 @@ pub const usage_text =
 ;
 
 /// Run a parsed headless command against `root` (the repo directory).
-pub fn run(alloc: Allocator, io: Io, cmd: Command, env: Env, root: Io.Dir) u8 {
+pub fn run(alloc: Allocator, io: Io, cmd: Command, root: Io.Dir) u8 {
     var out_buf: [4096]u8 = undefined;
     var err_buf: [1024]u8 = undefined;
     var out_w = std.Io.File.stdout().writer(io, &out_buf);
@@ -235,7 +211,6 @@ pub fn run(alloc: Allocator, io: Io, cmd: Command, env: Env, root: Io.Dir) u8 {
         .show => |id| return cmdShow(alloc, io, root, id),
         .resolve => |ids| return cmdResolve(alloc, io, root, ids),
         .@"export" => |opts| return cmdExport(alloc, io, root, opts),
-        .install_skill => |opts| return install_skill.run(alloc, io, opts, env.home, &out_w.interface, &err_w.interface),
     }
 }
 
@@ -633,7 +608,7 @@ const testing = std.testing;
 const builtin = @import("builtin");
 const IsolatedTmp = if (builtin.is_test) @import("isolated_tmp").IsolatedTmp else void;
 
-test "parse help status approved unapprove list show resolve export install-skill" {
+test "parse help status approved unapprove list show resolve export" {
     try testing.expectEqual(Command.help, try parse(&.{"help"}));
     try testing.expectEqual(Command.help, try parse(&.{"--help"}));
     try testing.expectEqual(Command.help, try parse(&.{"-h"}));
@@ -667,11 +642,6 @@ test "parse help status approved unapprove list show resolve export install-skil
     const exp_order = (try parse(&.{ "export", "-o", "/tmp/r.md", "--format", "md" })).@"export";
     try testing.expectEqual(ExportFormat.md, exp_order.format);
     try testing.expectEqualStrings("/tmp/r.md", exp_order.out_path.?);
-
-    const inst = (try parse(&.{"install-skill"})).install_skill;
-    try testing.expect(!inst.uninstall);
-    const inst_un = (try parse(&.{ "install-skill", "--uninstall" })).install_skill;
-    try testing.expect(inst_un.uninstall);
 }
 
 test "parse usage errors" {
@@ -702,10 +672,7 @@ test "parse usage errors" {
     try testing.expectError(error.Usage, parse(&.{ "export", "-o" }));
     try testing.expectError(error.Usage, parse(&.{ "export", "-o", "a", "-o", "b" }));
     try testing.expectError(error.Usage, parse(&.{ "export", "--bogus" }));
-    try testing.expectError(error.Usage, parse(&.{ "install-skill", "--list" }));
-    try testing.expectError(error.Usage, parse(&.{ "install-skill", "--agent" }));
-    try testing.expectError(error.Usage, parse(&.{ "install-skill", "--bogus" }));
-    try testing.expectError(error.Usage, parse(&.{ "install-skill", "--uninstall", "--uninstall" }));
+    try testing.expectError(error.Usage, parse(&.{"install-skill"}));
 }
 
 test "classify tui vs command" {
@@ -776,6 +743,7 @@ test "usage_text names approved commands and status approved lines" {
     try testing.expect(std.mem.indexOf(u8, usage_text, "approved count") != null);
     try testing.expect(std.mem.indexOf(u8, usage_text, "store paths") != null);
     try testing.expect(std.mem.indexOf(u8, usage_text, "version, -v, --version") != null);
+    try testing.expect(std.mem.indexOf(u8, usage_text, "install-skill") == null);
 }
 
 test "build version is major.minor.0" {

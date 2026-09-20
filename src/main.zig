@@ -23,7 +23,7 @@
 //! git mutate / approve). With a range that contains `..` or `...`: load
 //! `git diff <range>` as written → same TUI.
 //! With a subcommand: headless CLI (`status`, `approved`, `unapprove`, `list`,
-//! `show`, `resolve`, `export`, `install-skill`, `version`, help). Comment-only commands
+//! `show`, `resolve`, `export`, `version`, help). Comment-only commands
 //! do not load git. `status` / `approved` / `unapprove` load the local diff.
 //! No raw TTY modes.
 //!
@@ -122,10 +122,7 @@ pub fn main(init: std.process.Init) !u8 {
     switch (launch) {
         .tui => |source| return try runTui(alloc, io, source),
         .command => |cmd| {
-            const env: cli.Env = .{
-                .home = init.environ_map.get("HOME"),
-            };
-            return cli.run(alloc, io, cmd, env, .cwd());
+            return cli.run(alloc, io, cmd, .cwd());
         },
     }
 }

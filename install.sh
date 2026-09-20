@@ -78,4 +78,4 @@ case ":$PATH:" in
     printf '%s\n' "export PATH=\"$prefix/bin:\$PATH\""
     ;;
 esac
-printf '%s\n' "next: rv install-skill"
+printf '%s\n' "next: npx skills add Zooce/rv -g"

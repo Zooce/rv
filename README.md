@@ -21,7 +21,7 @@ export PATH="$HOME/.local/bin:$PATH"
 Then:
 
 ```sh
-rv install-skill
+npx skills add Zooce/rv -g
 ```
 
 ### From source
@@ -30,7 +30,7 @@ Zig 0.16.0.
 
 ```sh
 zig build -Doptimize=ReleaseSafe --prefix ~/.local
-rv install-skill
+npx skills add Zooce/rv -g
 ```
 
 ![Side-by-side review with the current line highlighted](docs/screenshots/review.png)
