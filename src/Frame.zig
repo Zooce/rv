@@ -12,8 +12,6 @@ const root = @import("root");
 const DiffView = root.DiffView;
 const Viewport = root.Viewport;
 const Focus = root.Focus;
-const Draft = root.Draft;
-const DiscardConfirm = root.DiscardConfirm;
 
 /// One-shot footer message owned by `Frame`. Bytes always live in `buf`;
 /// `len == 0` means none. Avoids optional slices that sometimes point at
@@ -192,17 +190,61 @@ const palette: Palette = blk: {
     };
 };
 
+/// Rows between the title bar and the footer. The caller clamps the viewport
+/// to `rows` before paint; paint only reads that scroll.
+pub const ContentArea = struct {
+    top: u16,
+    bottom: u16,
+    rows: usize,
+
+    /// `footer_h` is the rows reserved under the body (0 when the terminal
+    /// has no room for a footer).
+    pub fn init(size: tui.Size, footer_h: u16) ContentArea {
+        const top: u16 = 1;
+        const bottom: u16 = if (size.rows >= 2) size.rows - footer_h else size.rows;
+        return .{
+            .top = top,
+            .bottom = bottom,
+            .rows = if (bottom > top) bottom - top else 0,
+        };
+    }
+};
+
+/// Rows reserved for the footer. A comment box uses `comment_h`; every other
+/// mode uses one status row. Zero when the terminal is a single row or less.
+pub fn footerRows(size: tui.Size, focus: Focus, comment_h: u16) u16 {
+    if (size.rows < 2) return 0;
+    if (focus == .commenting) return comment_h;
+    return 1;
+}
+
+/// Title-bar text. `comment` and `confirm` are the open draft and confirm
+/// dialog; other modes use a fixed label.
+pub fn title(focus: Focus, comment: []const u8, confirm: []const u8) []const u8 {
+    return switch (focus) {
+        .commenting => comment,
+        .searching => "rv  search  Enter jump  Esc cancel",
+        .listing => "rv  comments  j/k  Enter jump  i edit  d dismiss  Esc close  q quit",
+        .files => "rv  files  j/k  Enter jump  a/A approve  Esc close  q quit",
+        .approved => "rv  approved  j/k move  Enter unapprove  Esc close  q quit",
+        .helping => "rv  help  j/k  Esc/? close  q quit",
+        .git_error => "rv  git error  Enter/Esc close  q quit",
+        .discard_confirm => confirm,
+        .normal => "rv  j/k  /  i/I  ? help  q quit",
+    };
+}
+
 pub fn paint(
     self: *const Frame,
     scr: *tui.Screen,
     size: tui.Size,
     diff_view: *const DiffView,
-    viewport: *Viewport,
+    viewport: *const Viewport,
     review: *const store.Review,
     source: cli.Source,
     focus: Focus,
-    draft: *const Draft,
-    discard: DiscardConfirm,
+    title_text: []const u8,
+    area: ContentArea,
 ) void {
     const rows = diff_view.rows;
     const sbs_slots = diff_view.sbs_slots;
@@ -213,35 +255,8 @@ pub fn paint(
 
     if (size.rows > 0) {
         fillRow(scr, 0, pal.title);
-        const help = switch (focus) {
-            .commenting => draft.titleBar(),
-            .searching => "rv  search  Enter jump  Esc cancel",
-            .listing => "rv  comments  j/k  Enter jump  i edit  d dismiss  Esc close  q quit",
-            .files => "rv  files  j/k  Enter jump  a/A approve  Esc close  q quit",
-            .approved => "rv  approved  j/k move  Enter unapprove  Esc close  q quit",
-            .helping => "rv  help  j/k  Esc/? close  q quit",
-            .git_error => "rv  git error  Enter/Esc close  q quit",
-            .discard_confirm => discard.titleBar(),
-            .normal => "rv  j/k  /  i/I  ? help  q quit",
-        };
-        scr.putStr(1, 0, help, pal.title, 0, null);
+        scr.putStr(1, 0, title_text, pal.title, 0, null);
     }
-
-    // Footer: 1 status row, search prompt, or soft-wrapped comment box.
-    const has_footer = size.rows >= 2;
-    const footer_h: u16 = if (!has_footer)
-        0
-    else if (focus == .commenting)
-        draft.metrics(size).height
-    else
-        1;
-    const footer_top: u16 = if (has_footer) size.rows - footer_h else 0;
-    const content_top: u16 = 1;
-    const content_bottom: u16 = if (has_footer) footer_top else size.rows;
-    const content_rows: usize = if (content_bottom > content_top)
-        content_bottom - content_top
-    else
-        0;
 
     const cur = view.row.clampCursor(viewport.cursor, rows.len);
     const layout = view.layout.effectiveLayout(viewport.layout_pref, size.cols);
@@ -250,103 +265,62 @@ pub fn paint(
     var line_buf: [512]u8 = undefined;
     // Only lines in the cursor's hunk pan; file/hunk headers never pan.
     const pan_span = view.viewport.hunkSpanAt(rows, cur);
-    const sticky = viewport.settle(size.cols, content_rows, rows, sbs_slots);
-    const cs = viewport.col_scroll;
-
-    const hints_ok = source == .local and focus == .normal and rows.len > 0;
-    const hint_section: ?usize = if (hints_ok and rows[cur] == .section_header) cur else null;
-    const hint_file: ?usize = blk: {
-        if (!hints_ok or hint_section != null) break :blk null;
-        const fi = view.nav.currentFileStart(rows, cur) orelse break :blk null;
-        const grouped = switch (rows[fi]) {
-            .file_header => |fh| fh.group != null,
-            else => false,
-        };
-        break :blk if (grouped) fi else null;
+    const sticky = switch (layout) {
+        .unified => view.viewport.stickyHeaders(rows, viewport.scroll, area.rows),
+        .side_by_side => view.viewport.stickyHeadersSbs(sbs_slots, rows, viewport.scroll, area.rows),
     };
-    const hint_hunk: ?usize = if (hint_file != null)
-        view.nav.currentHunkInFile(rows, cur)
-    else
-        null;
-    const hint_group: ?diff.Group = if (hint_file) |fi|
-        rows[fi].file_header.group
-    else if (hint_section) |si|
-        rows[si].section_header
-    else
-        null;
-    const expand_hunk: ?usize = if (focus == .normal and rows.len > 0)
-        view.nav.currentHunkInFile(rows, cur)
-    else
-        null;
-    const expand_ok = if (expand_hunk) |hi| switch (rows[hi]) {
-        .hunk_header => |hh| hh.can_grow,
-        else => false,
-    } else false;
+    const cs = viewport.col_scroll;
+    const hints = rowHints(rows, cur, source, focus);
     var hint_buf: [160]u8 = undefined;
+    const full_pane = BodyPane{
+        .scr = scr,
+        .x = 0,
+        .pane_w = size.cols,
+        .num_w = num_w,
+        .numbers = .unified,
+        .col_scroll = cs,
+    };
 
     switch (layout) {
         .unified => {
-            var screen_y: u16 = content_top;
+            var screen_y: u16 = area.top;
 
             // Sticky file path under the title bar (hunk headers scroll with body).
             if (sticky.file_idx) |fi| {
-                if (screen_y < content_bottom) {
+                if (screen_y < area.bottom) {
                     const text = formatRow(&line_buf, rows[fi], rowMarked(rows[fi], review));
                     const st = if (fi == cur) pal.file_cur else pal.file;
                     fillRow(scr, screen_y, st);
-                    putRowHint(scr, screen_y, text, headerHint(&hint_buf, fi, hint_file, hint_hunk, hint_section, hint_group, expand_hunk, expand_ok), st);
+                    putRowHint(scr, screen_y, text, hints.text(&hint_buf, fi), st);
                     screen_y += 1;
                 }
             }
 
             var i: usize = viewport.scroll;
-            while (i < rows.len and screen_y < content_bottom) : (i += 1) {
+            while (i < rows.len and screen_y < area.bottom) : (i += 1) {
                 const is_cur = i == cur;
                 const marked = rowMarked(rows[i], review);
                 const st = pal.rowStyle(rows[i], is_cur);
                 switch (rows[i]) {
-                    .line => {
-                        if (viewport.wrap) {
-                            screen_y = putWrappedPane(
-                                scr,
-                                0,
-                                screen_y,
-                                content_bottom,
-                                size.cols,
-                                rows[i],
-                                marked,
-                                num_w,
-                                .unified,
-                                st,
-                            );
-                        } else {
-                            fillRow(scr, screen_y, st);
-                            putPannedBody(
-                                scr,
-                                0,
-                                screen_y,
-                                size.cols,
-                                rows[i],
-                                marked,
-                                num_w,
-                                .unified,
-                                pan_span.containsBody(i),
-                                cs,
-                                st,
-                            );
-                            screen_y += 1;
-                        }
-                    },
+                    .line => screen_y = full_pane.putRow(
+                        screen_y,
+                        area.bottom,
+                        rows[i],
+                        marked,
+                        viewport.wrap,
+                        pan_span.containsBody(i),
+                        st,
+                    ),
                     .section_header => {
                         scr.fillRect(.{ .x = 0, .y = screen_y, .w = scr.cols, .h = 1 }, '─', st);
                         const text = formatRow(&line_buf, rows[i], marked);
-                        putRowHint(scr, screen_y, text, headerHint(&hint_buf, i, hint_file, hint_hunk, hint_section, hint_group, expand_hunk, expand_ok), st);
+                        putRowHint(scr, screen_y, text, hints.text(&hint_buf, i), st);
                         screen_y += 1;
                     },
                     else => {
                         fillRow(scr, screen_y, st);
                         const text = formatRow(&line_buf, rows[i], marked);
-                        putRowHint(scr, screen_y, text, headerHint(&hint_buf, i, hint_file, hint_hunk, hint_section, hint_group, expand_hunk, expand_ok), st);
+                        putRowHint(scr, screen_y, text, hints.text(&hint_buf, i), st);
                         screen_y += 1;
                     },
                 }
@@ -354,20 +328,37 @@ pub fn paint(
         },
         .side_by_side => {
             const panes = view.layout.sbsPaneWidths(size.cols);
-            var screen_y: u16 = content_top;
+            const right_x: u16 = panes.gutter_x + 1;
+            const left_pane = BodyPane{
+                .scr = scr,
+                .x = 0,
+                .pane_w = panes.left_w,
+                .num_w = num_w,
+                .numbers = .old,
+                .col_scroll = cs,
+            };
+            const right_pane = BodyPane{
+                .scr = scr,
+                .x = right_x,
+                .pane_w = panes.right_w,
+                .num_w = num_w,
+                .numbers = .new,
+                .col_scroll = cs,
+            };
+            var screen_y: u16 = area.top;
 
             if (sticky.file_idx) |fi| {
-                if (screen_y < content_bottom) {
+                if (screen_y < area.bottom) {
                     const text = formatRow(&line_buf, rows[fi], rowMarked(rows[fi], review));
                     const st = if (fi == cur) pal.file_cur else pal.file;
                     fillRow(scr, screen_y, st);
-                    putRowHint(scr, screen_y, text, headerHint(&hint_buf, fi, hint_file, hint_hunk, hint_section, hint_group, expand_hunk, expand_ok), st);
+                    putRowHint(scr, screen_y, text, hints.text(&hint_buf, fi), st);
                     screen_y += 1;
                 }
             }
 
             var si: usize = viewport.scroll;
-            while (si < sbs_slots.len and screen_y < content_bottom) : (si += 1) {
+            while (si < sbs_slots.len and screen_y < area.bottom) : (si += 1) {
                 switch (sbs_slots[si]) {
                     .header => |ri| {
                         const is_cur = ri == cur;
@@ -378,43 +369,21 @@ pub fn paint(
                         } else {
                             fillRow(scr, screen_y, st);
                         }
-                        putRowHint(scr, screen_y, text, headerHint(&hint_buf, ri, hint_file, hint_hunk, hint_section, hint_group, expand_hunk, expand_ok), st);
+                        putRowHint(scr, screen_y, text, hints.text(&hint_buf, ri), st);
                         screen_y += 1;
                     },
                     .body => |ri| {
-                        const is_cur = ri == cur;
                         const marked = rowMarked(rows[ri], review);
-                        const st = pal.rowStyle(rows[ri], is_cur);
-                        if (viewport.wrap) {
-                            screen_y = putWrappedPane(
-                                scr,
-                                0,
-                                screen_y,
-                                content_bottom,
-                                size.cols,
-                                rows[ri],
-                                marked,
-                                num_w,
-                                .unified,
-                                st,
-                            );
-                        } else {
-                            fillRow(scr, screen_y, st);
-                            putPannedBody(
-                                scr,
-                                0,
-                                screen_y,
-                                size.cols,
-                                rows[ri],
-                                marked,
-                                num_w,
-                                .unified,
-                                pan_span.containsBody(ri),
-                                cs,
-                                st,
-                            );
-                            screen_y += 1;
-                        }
+                        const st = pal.rowStyle(rows[ri], ri == cur);
+                        screen_y = full_pane.putRow(
+                            screen_y,
+                            area.bottom,
+                            rows[ri],
+                            marked,
+                            viewport.wrap,
+                            pan_span.containsBody(ri),
+                            st,
+                        );
                     },
                     .pair => |p| {
                         // Whole slot is current when the cursor sits on either pane
@@ -426,7 +395,6 @@ pub fn paint(
                         const right_st = if (p.right) |ri|
                             pal.rowStyle(rows[ri], slot_cur)
                         else if (slot_cur) pal.ctx_cur else pal.body;
-                        const right_x: u16 = panes.gutter_x + 1;
                         const n = view.viewport.slotScreenHeight(
                             sbs_slots[si],
                             rows,
@@ -436,68 +404,26 @@ pub fn paint(
                             viewport.wrap,
                         );
                         var vis: usize = 0;
-                        while (vis < n and screen_y < content_bottom) : (vis += 1) {
+                        while (vis < n and screen_y < area.bottom) : (vis += 1) {
                             fillSpan(scr, 0, panes.gutter_x, screen_y, left_st);
                             putSbsCenter(scr, panes, screen_y, size.cols, pal.gutter);
                             fillSpan(scr, right_x, size.cols, screen_y, right_st);
                             if (p.left) |ri| {
+                                const marked = rowMarked(rows[ri], review);
+                                const pan = pan_span.containsBody(ri);
                                 if (viewport.wrap) {
-                                    putWrappedSegment(
-                                        scr,
-                                        0,
-                                        screen_y,
-                                        panes.left_w,
-                                        rows[ri],
-                                        rowMarked(rows[ri], review),
-                                        num_w,
-                                        .old,
-                                        vis,
-                                        left_st,
-                                    );
+                                    left_pane.putSegment(screen_y, rows[ri], marked, vis, left_st);
                                 } else {
-                                    putPannedBody(
-                                        scr,
-                                        0,
-                                        screen_y,
-                                        panes.left_w,
-                                        rows[ri],
-                                        rowMarked(rows[ri], review),
-                                        num_w,
-                                        .old,
-                                        pan_span.containsBody(ri),
-                                        cs,
-                                        left_st,
-                                    );
+                                    left_pane.putPanned(screen_y, rows[ri], marked, pan, left_st);
                                 }
                             }
                             if (p.right) |ri| {
+                                const marked = rowMarked(rows[ri], review);
+                                const pan = pan_span.containsBody(ri);
                                 if (viewport.wrap) {
-                                    putWrappedSegment(
-                                        scr,
-                                        right_x,
-                                        screen_y,
-                                        panes.right_w,
-                                        rows[ri],
-                                        rowMarked(rows[ri], review),
-                                        num_w,
-                                        .new,
-                                        vis,
-                                        right_st,
-                                    );
+                                    right_pane.putSegment(screen_y, rows[ri], marked, vis, right_st);
                                 } else {
-                                    putPannedBody(
-                                        scr,
-                                        right_x,
-                                        screen_y,
-                                        panes.right_w,
-                                        rows[ri],
-                                        rowMarked(rows[ri], review),
-                                        num_w,
-                                        .new,
-                                        pan_span.containsBody(ri),
-                                        cs,
-                                        right_st,
-                                    );
+                                    right_pane.putPanned(screen_y, rows[ri], marked, pan, right_st);
                                 }
                             }
                             screen_y += 1;
@@ -508,9 +434,9 @@ pub fn paint(
         },
     }
 
-    if (has_footer) {
+    if (size.rows >= 2) {
         if (focus != .searching and focus != .commenting) {
-            const footer_y = footer_top;
+            const footer_y = area.bottom;
             fillRow(scr, footer_y, pal.footer);
             if (status_note.len > 0) {
                 scr.putStr(1, footer_y, status_note, pal.footer, 0, null);
@@ -649,114 +575,127 @@ pub fn bodyTextCols(pane_w: u16, num_w: usize, layout: view.layout.EffectiveLayo
     return pane_w -| gw_u16;
 }
 
-/// Gutter (mark + numbers) at `x`, then `text`.
-/// `skip` hides that many columns of `text`. Tab stops still start at column 0.
-fn putBodyLine(
+/// Where one body pane draws: origin, width, which line numbers, and the
+/// column pan. The row, mark, and style change per line.
+const BodyPane = struct {
     scr: *tui.Screen,
     x: u16,
-    y: u16,
     pane_w: u16,
-    row: view.row.Row,
-    marked: bool,
     num_w: usize,
     numbers: LineNumbers,
-    show_nums: bool,
-    text: []const u8,
-    style: tui.Style,
-    skip: usize,
-) void {
-    var gbuf: [32]u8 = undefined;
-    const gutter = formatBodyGutter(&gbuf, row, marked, num_w, numbers, show_nums);
-    const gw_usize = tui.screen.displayWidth(gutter);
-    const gw: u16 = std.math.cast(u16, gw_usize) orelse pane_w;
-    if (pane_w > 0) putPaneStr(scr, x, y, @min(gw, pane_w), gutter, style);
-    if (pane_w > gw) {
-        const x_text = x +| gw;
-        const text_w = pane_w - gw;
-        const clip = tui.Rect{ .x = x_text, .y = y, .w = text_w, .h = 1 };
-        scr.putStr(x_text, y, text, style, skip, clip);
-    }
-}
-
-/// Gutter (mark + numbers) at `x`; only `ln.text` pans.
-fn putPannedBody(
-    scr: *tui.Screen,
-    x: u16,
-    y: u16,
-    pane_w: u16,
-    row: view.row.Row,
-    marked: bool,
-    num_w: usize,
-    numbers: LineNumbers,
-    pan: bool,
     col_scroll: usize,
-    style: tui.Style,
-) void {
-    const ln = switch (row) {
-        .line => |l| l,
-        else => return,
-    };
-    const skip: usize = if (pan) col_scroll else 0;
-    putBodyLine(scr, x, y, pane_w, row, marked, num_w, numbers, true, ln.text, style, skip);
-}
 
-/// One wrapped visual segment of `row` at `vis`, or nothing if that segment
-/// does not exist (shorter pane of a pair).
-fn putWrappedSegment(
-    scr: *tui.Screen,
-    x: u16,
-    y: u16,
-    pane_w: u16,
-    row: view.row.Row,
-    marked: bool,
-    num_w: usize,
-    numbers: LineNumbers,
-    vis: usize,
-    style: tui.Style,
-) void {
-    const ln = switch (row) {
-        .line => |l| l,
-        else => return,
-    };
-    const layout: view.layout.EffectiveLayout = switch (numbers) {
-        .unified => .unified,
-        .old, .new => .side_by_side,
-    };
-    const seg = view.wrap.segmentAt(ln.text, bodyTextCols(pane_w, num_w, layout), vis) orelse return;
-    putBodyLine(scr, x, y, pane_w, row, marked, num_w, numbers, vis == 0, ln.text[seg.start..seg.end], style, 0);
-}
-
-/// Wrap `row` into the pane and fill each visual line. Returns the next `y`.
-fn putWrappedPane(
-    scr: *tui.Screen,
-    x: u16,
-    y: u16,
-    y_end: u16,
-    pane_w: u16,
-    row: view.row.Row,
-    marked: bool,
-    num_w: usize,
-    numbers: LineNumbers,
-    style: tui.Style,
-) u16 {
-    const ln = switch (row) {
-        .line => |l| l,
-        else => return y,
-    };
-    const layout: view.layout.EffectiveLayout = switch (numbers) {
-        .unified => .unified,
-        .old, .new => .side_by_side,
-    };
-    const n = view.wrap.lineCount(ln.text, bodyTextCols(pane_w, num_w, layout));
-    var vis: usize = 0;
-    var yy = y;
-    while (vis < n and yy < y_end) : (vis += 1) {
-        fillSpan(scr, x, x +| pane_w, yy, style);
-        putWrappedSegment(scr, x, yy, pane_w, row, marked, num_w, numbers, vis, style);
-        yy += 1;
+    fn textLayout(self: BodyPane) view.layout.EffectiveLayout {
+        return switch (self.numbers) {
+            .unified => .unified,
+            .old, .new => .side_by_side,
+        };
     }
-    return yy;
-}
+
+    /// Gutter at `x`, then `text`. `skip` hides that many columns of `text`.
+    /// Tab stops still start at column 0 of `text`.
+    fn putText(
+        self: BodyPane,
+        y: u16,
+        row: view.row.Row,
+        marked: bool,
+        show_nums: bool,
+        text: []const u8,
+        style: tui.Style,
+        skip: usize,
+    ) void {
+        var gbuf: [32]u8 = undefined;
+        const gutter = formatBodyGutter(&gbuf, row, marked, self.num_w, self.numbers, show_nums);
+        const gw_usize = tui.screen.displayWidth(gutter);
+        const gw: u16 = std.math.cast(u16, gw_usize) orelse self.pane_w;
+        if (self.pane_w > 0) putPaneStr(self.scr, self.x, y, @min(gw, self.pane_w), gutter, style);
+        if (self.pane_w > gw) {
+            const x_text = self.x +| gw;
+            const text_w = self.pane_w - gw;
+            const clip = tui.Rect{ .x = x_text, .y = y, .w = text_w, .h = 1 };
+            self.scr.putStr(x_text, y, text, style, skip, clip);
+        }
+    }
+
+    /// Gutter, then `ln.text`. `pan` skips `col_scroll` columns of that text.
+    fn putPanned(
+        self: BodyPane,
+        y: u16,
+        row: view.row.Row,
+        marked: bool,
+        pan: bool,
+        style: tui.Style,
+    ) void {
+        const ln = switch (row) {
+            .line => |l| l,
+            else => return,
+        };
+        const skip: usize = if (pan) self.col_scroll else 0;
+        self.putText(y, row, marked, true, ln.text, style, skip);
+    }
+
+    /// One wrapped visual segment at `vis`, or nothing if that segment does
+    /// not exist (shorter pane of a pair).
+    fn putSegment(
+        self: BodyPane,
+        y: u16,
+        row: view.row.Row,
+        marked: bool,
+        vis: usize,
+        style: tui.Style,
+    ) void {
+        const ln = switch (row) {
+            .line => |l| l,
+            else => return,
+        };
+        const width = bodyTextCols(self.pane_w, self.num_w, self.textLayout());
+        const seg = view.wrap.segmentAt(ln.text, width, vis) orelse return;
+        self.putText(y, row, marked, vis == 0, ln.text[seg.start..seg.end], style, 0);
+    }
+
+    /// Fill the pane and draw one body row. Wrap uses several screen rows.
+    /// Returns the next `y`.
+    fn putRow(
+        self: BodyPane,
+        y: u16,
+        y_end: u16,
+        row: view.row.Row,
+        marked: bool,
+        wrap: bool,
+        pan: bool,
+        style: tui.Style,
+    ) u16 {
+        if (wrap) return self.putWrapped(y, y_end, row, marked, style);
+        if (y >= y_end) return y;
+        fillSpan(self.scr, self.x, self.x +| self.pane_w, y, style);
+        self.putPanned(y, row, marked, pan, style);
+        return y + 1;
+    }
+
+    fn putWrapped(
+        self: BodyPane,
+        y: u16,
+        y_end: u16,
+        row: view.row.Row,
+        marked: bool,
+        style: tui.Style,
+    ) u16 {
+        const ln = switch (row) {
+            .line => |l| l,
+            else => return y,
+        };
+        const width = bodyTextCols(self.pane_w, self.num_w, self.textLayout());
+        const n = view.wrap.lineCount(ln.text, width);
+        var vis: usize = 0;
+        var yy = y;
+        while (vis < n and yy < y_end) : (vis += 1) {
+            fillSpan(self.scr, self.x, self.x +| self.pane_w, yy, style);
+            self.putSegment(yy, row, marked, vis, style);
+            yy += 1;
+        }
+        return yy;
+    }
+};
 
 fn rowMarked(row: view.row.Row, review: *const store.Review) bool {
     return switch (row) {
@@ -880,97 +819,141 @@ pub fn bufPrintTrunc(buf: []u8, comptime fmt: []const u8, args: anytype) []const
     };
 }
 
-/// Git labels for the current file/hunk header. Empty on other rows, section
-/// rows, and range loads. File row always says File (`gS`/`gU`/`gD`), including
-/// the sticky file header while the cursor is in a hunk of that file. Hunk row
-/// always says Hunk (`gs`/`gu`/`gd`). Verb follows the file’s group. Discard
-/// chords only on unstaged/untracked file and hunk rows.
-pub fn indexHintForRow(ri: usize, file_i: ?usize, hunk_i: ?usize, section_i: ?usize, group: ?diff.Group) []const u8 {
-    const g = group orelse return "";
-    const stage = switch (g) {
-        .unstaged, .untracked => true,
-        .staged => false,
+/// Which header rows show git, approve, and expand labels for this cursor.
+/// Empty fields mean that label is off (range load, or the cursor is not on
+/// a grouped file).
+pub const RowHints = struct {
+    file: ?usize = null,
+    hunk: ?usize = null,
+    section: ?usize = null,
+    group: ?diff.Group = null,
+    expand_hunk: ?usize = null,
+    expand_ok: bool = false,
+
+    /// Git label for row `ri`. File row says File, including the sticky file
+    /// header while the cursor is in a hunk. Hunk row says Hunk. Verb follows
+    /// the file's group. Empty on other rows, section rows, and range loads.
+    pub fn indexAt(self: RowHints, ri: usize) []const u8 {
+        const g = self.group orelse return "";
+        const stage = switch (g) {
+            .unstaged, .untracked => true,
+            .staged => false,
+        };
+        if (self.section) |si| {
+            if (ri == si) return "";
+        }
+        if (self.file) |fi| {
+            if (ri == fi) {
+                return if (stage)
+                    "Stage File (gS)  Discard File (gD)"
+                else
+                    "Unstage File (gU)";
+            }
+        }
+        if (self.hunk) |hi| {
+            if (ri == hi) {
+                return if (stage)
+                    "Stage Hunk (gs)  Discard Hunk (gd)"
+                else
+                    "Unstage Hunk (gu)";
+            }
+        }
+        return "";
+    }
+
+    /// Approve label for row `ri`. File row says `A`, including the sticky
+    /// file header. Empty on other rows, section rows, and range loads.
+    pub fn approveAt(self: RowHints, ri: usize) []const u8 {
+        if (self.group == null) return "";
+        if (self.section) |si| {
+            if (ri == si) return "";
+        }
+        if (self.file) |fi| {
+            if (ri == fi) return "Approve File (A)";
+        }
+        if (self.hunk) |hi| {
+            if (ri == hi) return "Approve Hunk (a)";
+        }
+        return "";
+    }
+
+    /// Expand label for row `ri` when that hunk can still grow.
+    pub fn expandAt(self: RowHints, ri: usize) []const u8 {
+        const hi = self.expand_hunk orelse return "";
+        if (ri != hi or !self.expand_ok) return "";
+        return "Expand (e)";
+    }
+
+    fn text(self: RowHints, buf: []u8, ri: usize) []const u8 {
+        const git = self.indexAt(ri);
+        const approve = self.approveAt(ri);
+        const expand = self.expandAt(ri);
+        var n: usize = 0;
+        var parts: [3][]const u8 = undefined;
+        if (git.len > 0) {
+            parts[n] = git;
+            n += 1;
+        }
+        if (approve.len > 0) {
+            parts[n] = approve;
+            n += 1;
+        }
+        if (expand.len > 0) {
+            parts[n] = expand;
+            n += 1;
+        }
+        if (n == 0) return "";
+        if (n == 1) return parts[0];
+        if (n == 2) {
+            return std.fmt.bufPrint(buf, "{s}  {s}", .{ parts[0], parts[1] }) catch parts[0];
+        }
+        return std.fmt.bufPrint(buf, "{s}  {s}  {s}", .{ parts[0], parts[1], parts[2] }) catch parts[0];
+    }
+};
+
+fn rowHints(
+    rows: []const view.row.Row,
+    cur: usize,
+    source: cli.Source,
+    focus: Focus,
+) RowHints {
+    const hints_ok = source == .local and focus == .normal and rows.len > 0;
+    const section: ?usize = if (hints_ok and rows[cur] == .section_header) cur else null;
+    const file: ?usize = blk: {
+        if (!hints_ok or section != null) break :blk null;
+        const fi = view.nav.currentFileStart(rows, cur) orelse break :blk null;
+        const grouped = switch (rows[fi]) {
+            .file_header => |fh| fh.group != null,
+            else => false,
+        };
+        break :blk if (grouped) fi else null;
     };
-    if (section_i) |si| {
-        if (ri == si) return "";
-    }
-    if (file_i) |fi| {
-        if (ri == fi) {
-            return if (stage)
-                "Stage File (gS)  Discard File (gD)"
-            else
-                "Unstage File (gU)";
-        }
-    }
-    if (hunk_i) |hi| {
-        if (ri == hi) {
-            return if (stage)
-                "Stage Hunk (gs)  Discard Hunk (gd)"
-            else
-                "Unstage Hunk (gu)";
-        }
-    }
-    return "";
-}
-
-/// Approve labels on the current file or hunk header. Empty on other rows,
-/// section rows, and range loads (`group == null`). File row always says `A`,
-/// including the sticky file header while the cursor is in a hunk.
-pub fn approveHintForRow(ri: usize, file_i: ?usize, hunk_i: ?usize, section_i: ?usize, group: ?diff.Group) []const u8 {
-    if (group == null) return "";
-    if (section_i) |si| {
-        if (ri == si) return "";
-    }
-    if (file_i) |fi| {
-        if (ri == fi) return "Approve File (A)";
-    }
-    if (hunk_i) |hi| {
-        if (ri == hi) return "Approve Hunk (a)";
-    }
-    return "";
-}
-
-/// Expand label on the current hunk header when that hunk can still grow.
-/// Empty on other rows. Local and range.
-pub fn expandHintForRow(ri: usize, hunk_i: ?usize, can_grow: bool) []const u8 {
-    const hi = hunk_i orelse return "";
-    if (ri != hi or !can_grow) return "";
-    return "Expand (e)";
-}
-
-fn headerHint(
-    buf: []u8,
-    ri: usize,
-    file_i: ?usize,
-    hunk_i: ?usize,
-    section_i: ?usize,
-    group: ?diff.Group,
-    expand_hunk_i: ?usize,
-    can_grow: bool,
-) []const u8 {
-    const git = indexHintForRow(ri, file_i, hunk_i, section_i, group);
-    const approve = approveHintForRow(ri, file_i, hunk_i, section_i, group);
-    const expand = expandHintForRow(ri, expand_hunk_i, can_grow);
-    var n: usize = 0;
-    var parts: [3][]const u8 = undefined;
-    if (git.len > 0) {
-        parts[n] = git;
-        n += 1;
-    }
-    if (approve.len > 0) {
-        parts[n] = approve;
-        n += 1;
-    }
-    if (expand.len > 0) {
-        parts[n] = expand;
-        n += 1;
-    }
-    if (n == 0) return "";
-    if (n == 1) return parts[0];
-    if (n == 2) {
-        return std.fmt.bufPrint(buf, "{s}  {s}", .{ parts[0], parts[1] }) catch parts[0];
-    }
-    return std.fmt.bufPrint(buf, "{s}  {s}  {s}", .{ parts[0], parts[1], parts[2] }) catch parts[0];
+    const hunk: ?usize = if (file != null)
+        view.nav.currentHunkInFile(rows, cur)
+    else
+        null;
+    const group: ?diff.Group = if (file) |fi|
+        rows[fi].file_header.group
+    else if (section) |si|
+        rows[si].section_header
+    else
+        null;
+    const expand_hunk: ?usize = if (focus == .normal and rows.len > 0)
+        view.nav.currentHunkInFile(rows, cur)
+    else
+        null;
+    const expand_ok = if (expand_hunk) |hi| switch (rows[hi]) {
+        .hunk_header => |hh| hh.can_grow,
+        else => false,
+    } else false;
+    return .{
+        .file = file,
+        .hunk = hunk,
+        .section = section,
+        .group = group,
+        .expand_hunk = expand_hunk,
+        .expand_ok = expand_ok,
+    };
 }
 
 /// Path/header on the left; `hint` right-aligned with a one-column gap.
@@ -1238,15 +1221,25 @@ test "putPannedBody pans text and leaves gutter" {
     var scr = try tui.Screen.init(testing.allocator, .{ .cols = 20, .rows = 1 });
     defer scr.deinit();
 
+    const pane = BodyPane{
+        .scr = &scr,
+        .x = 0,
+        .pane_w = 20,
+        .num_w = 1,
+        .numbers = .unified,
+        .col_scroll = 0,
+    };
     scr.clear();
-    putPannedBody(&scr, 0, 0, 20, row, false, 1, .unified, false, 0, st);
+    pane.putPanned(0, row, false, false, st);
     try testing.expectEqual(' ', scr.getCell(0, 0).char);
     try testing.expectEqual('1', scr.getCell(2, 0).char);
     try testing.expectEqual('2', scr.getCell(4, 0).char);
     try testing.expectEqual('A', scr.getCell(6, 0).char);
 
     scr.clear();
-    putPannedBody(&scr, 0, 0, 20, row, false, 1, .unified, true, 3, st);
+    var panned = pane;
+    panned.col_scroll = 3;
+    panned.putPanned(0, row, false, true, st);
     try testing.expectEqual(' ', scr.getCell(0, 0).char);
     try testing.expectEqual('1', scr.getCell(2, 0).char);
     try testing.expectEqual('2', scr.getCell(4, 0).char);
@@ -1254,7 +1247,15 @@ test "putPannedBody pans text and leaves gutter" {
     try testing.expectEqual('E', scr.getCell(7, 0).char);
 
     scr.clear();
-    putPannedBody(&scr, 0, 0, 20, row, true, 0, .unified, true, 2, st);
+    const marked = BodyPane{
+        .scr = &scr,
+        .x = 0,
+        .pane_w = 20,
+        .num_w = 0,
+        .numbers = .unified,
+        .col_scroll = 2,
+    };
+    marked.putPanned(0, row, true, true, st);
     try testing.expectEqual('*', scr.getCell(0, 0).char);
     try testing.expectEqual(' ', scr.getCell(1, 0).char);
     try testing.expectEqual('C', scr.getCell(2, 0).char);
@@ -1273,8 +1274,16 @@ test "putPannedBody expands a tab to the next stop" {
     defer scr.deinit();
 
     // num_w 0 → 2-column gutter. Tab is a dim arrow plus 3 spaces, then X.
+    const pane = BodyPane{
+        .scr = &scr,
+        .x = 0,
+        .pane_w = 20,
+        .num_w = 0,
+        .numbers = .unified,
+        .col_scroll = 0,
+    };
     scr.clear();
-    putPannedBody(&scr, 0, 0, 20, row, false, 0, .unified, false, 0, st);
+    pane.putPanned(0, row, false, false, st);
     try testing.expectEqual('→', scr.getCell(2, 0).char);
     try testing.expect(scr.getCell(2, 0).style.dim);
     try testing.expectEqual(' ', scr.getCell(3, 0).char);
@@ -1283,7 +1292,9 @@ test "putPannedBody expands a tab to the next stop" {
 
     // Skip 3 columns: the arrow is gone, one space remains, then X.
     scr.clear();
-    putPannedBody(&scr, 0, 0, 20, row, false, 0, .unified, true, 3, st);
+    var skipped = pane;
+    skipped.col_scroll = 3;
+    skipped.putPanned(0, row, false, true, st);
     try testing.expectEqual(' ', scr.getCell(2, 0).char);
     try testing.expectEqual('X', scr.getCell(3, 0).char);
 }
@@ -1300,7 +1311,14 @@ test "putWrappedPane wraps text and repeats gutter" {
     var scr = try tui.Screen.init(testing.allocator, .{ .cols = 12, .rows = 3 });
     defer scr.deinit();
     scr.clear();
-    const next = putWrappedPane(&scr, 0, 0, 3, 12, row, false, 0, .unified, st);
+    const next = (BodyPane{
+        .scr = &scr,
+        .x = 0,
+        .pane_w = 12,
+        .num_w = 0,
+        .numbers = .unified,
+        .col_scroll = 0,
+    }).putWrapped(0, 3, row, false, st);
     try testing.expectEqual(2, next);
     try testing.expectEqual(' ', scr.getCell(0, 0).char);
     try testing.expectEqual('h', scr.getCell(2, 0).char);
@@ -1323,7 +1341,14 @@ test "putWrappedPane omits line numbers on continuation" {
     var scr = try tui.Screen.init(testing.allocator, .{ .cols = 16, .rows = 2 });
     defer scr.deinit();
     scr.clear();
-    _ = putWrappedPane(&scr, 0, 0, 2, 16, row, false, 1, .unified, st);
+    _ = (BodyPane{
+        .scr = &scr,
+        .x = 0,
+        .pane_w = 16,
+        .num_w = 1,
+        .numbers = .unified,
+        .col_scroll = 0,
+    }).putWrapped(0, 2, row, false, st);
     try testing.expectEqual('1', scr.getCell(2, 0).char);
     try testing.expectEqual('2', scr.getCell(4, 0).char);
     try testing.expectEqual('h', scr.getCell(6, 0).char);
@@ -1343,7 +1368,14 @@ test "putWrappedPane keeps mark on continuation" {
     var scr = try tui.Screen.init(testing.allocator, .{ .cols = 12, .rows = 2 });
     defer scr.deinit();
     scr.clear();
-    _ = putWrappedPane(&scr, 0, 0, 2, 12, row, true, 0, .unified, st);
+    _ = (BodyPane{
+        .scr = &scr,
+        .x = 0,
+        .pane_w = 12,
+        .num_w = 0,
+        .numbers = .unified,
+        .col_scroll = 0,
+    }).putWrapped(0, 2, row, true, st);
     try testing.expectEqual('*', scr.getCell(0, 0).char);
     try testing.expectEqual('*', scr.getCell(0, 1).char);
 }
@@ -1358,7 +1390,14 @@ test "putWrappedPane clips at y_end" {
     var scr = try tui.Screen.init(testing.allocator, .{ .cols = 12, .rows = 2 });
     defer scr.deinit();
     scr.clear();
-    const next = putWrappedPane(&scr, 0, 0, 1, 12, row, false, 0, .unified, st);
+    const next = (BodyPane{
+        .scr = &scr,
+        .x = 0,
+        .pane_w = 12,
+        .num_w = 0,
+        .numbers = .unified,
+        .col_scroll = 0,
+    }).putWrapped(0, 1, row, false, st);
     try testing.expectEqual(1, next);
     try testing.expectEqual('h', scr.getCell(2, 0).char);
     try testing.expectEqual(' ', scr.getCell(2, 1).char);
@@ -1375,7 +1414,14 @@ test "putWrappedPane wraps at side-by-side pane width" {
     var scr = try tui.Screen.init(testing.allocator, .{ .cols = 24, .rows = 3 });
     defer scr.deinit();
     scr.clear();
-    const next = putWrappedPane(&scr, 10, 0, 3, 12, row, false, 0, .old, st);
+    const next = (BodyPane{
+        .scr = &scr,
+        .x = 10,
+        .pane_w = 12,
+        .num_w = 0,
+        .numbers = .old,
+        .col_scroll = 0,
+    }).putWrapped(0, 3, row, false, st);
     try testing.expectEqual(2, next);
     try testing.expectEqual(' ', scr.getCell(9, 0).char);
     try testing.expectEqual('h', scr.getCell(12, 0).char);
@@ -1384,67 +1430,74 @@ test "putWrappedPane wraps at side-by-side pane width" {
 
 test "headerHint joins git and approve" {
     var buf: [160]u8 = undefined;
-    const file_i: usize = 1;
+    const hints = RowHints{ .file = 1, .group = .unstaged };
     try testing.expectEqualStrings(
         "Stage File (gS)  Discard File (gD)  Approve File (A)",
-        headerHint(&buf, file_i, file_i, null, null, .unstaged, null, false),
+        hints.text(&buf, 1),
     );
 }
 
 test "headerHint expand on hunk that can grow" {
     var buf: [160]u8 = undefined;
+    const growing = RowHints{
+        .file = 1,
+        .hunk = 2,
+        .group = .unstaged,
+        .expand_hunk = 2,
+        .expand_ok = true,
+    };
     try testing.expectEqualStrings(
         "Stage Hunk (gs)  Discard Hunk (gd)  Approve Hunk (a)  Expand (e)",
-        headerHint(&buf, 2, 1, 2, null, .unstaged, 2, true),
+        growing.text(&buf, 2),
     );
-    try testing.expectEqualStrings(
-        "Expand (e)",
-        headerHint(&buf, 2, null, null, null, null, 2, true),
-    );
+    const expand_only = RowHints{ .expand_hunk = 2, .expand_ok = true };
+    try testing.expectEqualStrings("Expand (e)", expand_only.text(&buf, 2));
+    const held = RowHints{
+        .file = 1,
+        .hunk = 2,
+        .group = .unstaged,
+        .expand_hunk = 2,
+        .expand_ok = false,
+    };
     try testing.expectEqualStrings(
         "Stage Hunk (gs)  Discard Hunk (gd)  Approve Hunk (a)",
-        headerHint(&buf, 2, 1, 2, null, .unstaged, 2, false),
+        held.text(&buf, 2),
     );
-    try testing.expectEqualStrings("", expandHintForRow(1, 2, true));
-    try testing.expectEqualStrings("Expand (e)", expandHintForRow(2, 2, true));
-    try testing.expectEqualStrings("", expandHintForRow(2, 2, false));
+    try testing.expectEqualStrings("", growing.expandAt(1));
+    try testing.expectEqualStrings("Expand (e)", growing.expandAt(2));
+    try testing.expectEqualStrings("", held.expandAt(2));
 }
 
 test "indexHintForRow file hunk and sticky file" {
+    const unstaged_file = RowHints{ .file = 1, .group = .unstaged };
     try testing.expectEqualStrings(
         "Stage File (gS)  Discard File (gD)",
-        indexHintForRow(1, 1, null, null, .unstaged),
+        unstaged_file.indexAt(1),
     );
+    const unstaged_both = RowHints{ .file = 1, .hunk = 2, .group = .unstaged };
     try testing.expectEqualStrings(
         "Stage File (gS)  Discard File (gD)",
-        indexHintForRow(1, 1, 2, null, .unstaged),
+        unstaged_both.indexAt(1),
     );
-    try testing.expectEqualStrings(
-        "Unstage File (gU)",
-        indexHintForRow(1, 1, 2, null, .staged),
-    );
+    const staged_both = RowHints{ .file = 1, .hunk = 2, .group = .staged };
+    try testing.expectEqualStrings("Unstage File (gU)", staged_both.indexAt(1));
     try testing.expectEqualStrings(
         "Stage Hunk (gs)  Discard Hunk (gd)",
-        indexHintForRow(2, 1, 2, null, .unstaged),
+        unstaged_both.indexAt(2),
     );
-    try testing.expectEqualStrings(
-        "Unstage Hunk (gu)",
-        indexHintForRow(2, 1, 2, null, .staged),
-    );
+    try testing.expectEqualStrings("Unstage Hunk (gu)", staged_both.indexAt(2));
 }
 
 test "approveHintForRow file hunk section and sticky file" {
-    try testing.expectEqualStrings("", approveHintForRow(0, null, null, 0, .unstaged));
-    try testing.expectEqualStrings(
-        "Approve File (A)",
-        approveHintForRow(1, 1, null, null, .staged),
-    );
-    try testing.expectEqualStrings(
-        "Approve Hunk (a)",
-        approveHintForRow(2, 1, 2, null, .unstaged),
-    );
-    try testing.expectEqualStrings("Approve File (A)", approveHintForRow(1, 1, 2, null, .unstaged));
-    try testing.expectEqualStrings("", approveHintForRow(0, null, null, 0, null));
+    const section = RowHints{ .section = 0, .group = .unstaged };
+    try testing.expectEqualStrings("", section.approveAt(0));
+    const staged_file = RowHints{ .file = 1, .group = .staged };
+    try testing.expectEqualStrings("Approve File (A)", staged_file.approveAt(1));
+    const unstaged_both = RowHints{ .file = 1, .hunk = 2, .group = .unstaged };
+    try testing.expectEqualStrings("Approve Hunk (a)", unstaged_both.approveAt(2));
+    try testing.expectEqualStrings("Approve File (A)", unstaged_both.approveAt(1));
+    const untagged = RowHints{ .section = 0 };
+    try testing.expectEqualStrings("", untagged.approveAt(0));
 }
 
 test "formatFooter approved-only is not a clean worktree" {

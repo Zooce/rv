@@ -473,9 +473,9 @@ fn fileAt(d: *const diff.Diff, path: []const u8, group: ?diff.Group) ?*const dif
     return null;
 }
 
-/// Flatten `d` without identities `approved.take` consumes. Same row shape as
-/// `view.row.flatten` for what remains. `root` is the worktree for hunk-less
-/// hashes.
+/// Rows for `d` minus identities `approved.take` consumes. File, hunk, and
+/// line rows come from `view.row.appendFile` (same builder as `flatten`).
+/// `root` is the worktree for hunk-less hashes.
 pub fn hide(
     alloc: Allocator,
     d: *const diff.Diff,
@@ -499,7 +499,7 @@ pub fn hide(
             else
                 true;
             if (!keep) continue;
-            try appendFileHeader(alloc, &rows, f, &prev_group);
+            try view.row.appendFile(alloc, &rows, f, &prev_group, null);
             continue;
         }
 
@@ -515,53 +515,9 @@ pub fn hide(
             if (keep) keep_file = true;
         }
         if (!keep_file) continue;
-
-        try appendFileHeader(alloc, &rows, f, &prev_group);
-        for (f.hunks, keep_hunk) |h, keep| {
-            if (!keep) continue;
-            try rows.append(alloc, .{ .hunk_header = .{
-                .path = path,
-                .old_start = h.old_start,
-                .old_count = h.old_count,
-                .new_start = h.new_start,
-                .new_count = h.new_count,
-                .section = h.section,
-                .group = f.group,
-                .can_grow = h.can_grow,
-            } });
-            for (h.lines) |ln| {
-                try rows.append(alloc, .{ .line = .{
-                    .kind = ln.kind,
-                    .text = ln.text,
-                    .path = path,
-                    .old_no = ln.old_no,
-                    .new_no = ln.new_no,
-                } });
-            }
-        }
+        try view.row.appendFile(alloc, &rows, f, &prev_group, keep_hunk);
     }
     return try rows.toOwnedSlice(alloc);
-}
-
-fn appendFileHeader(
-    alloc: Allocator,
-    rows: *std.ArrayList(view.row.Row),
-    f: diff.File,
-    prev_group: *?diff.Group,
-) Allocator.Error!void {
-    if (f.group) |g| {
-        if (prev_group.* == null or prev_group.*.? != g) {
-            try rows.append(alloc, .{ .section_header = g });
-            prev_group.* = g;
-        }
-    }
-    try rows.append(alloc, .{ .file_header = .{
-        .path = f.displayPath(),
-        .is_binary = f.is_binary,
-        .group = f.group,
-        .old_path = f.old_path,
-        .new_path = f.new_path,
-    } });
 }
 
 /// Unapproved flatten plus how many store entries remain after prune.

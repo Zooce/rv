@@ -55,6 +55,58 @@ pub const Anchor = struct {
 /// Old vs new side of a diff line.
 pub const CommentSide = enum { old, new };
 
+/// Append one file: a group divider when `f.group` changes, the file header,
+/// then each kept hunk and its lines. `keep_hunks == null` keeps every hunk.
+/// Otherwise it is one flag per hunk in `f.hunks`; false omits that hunk.
+/// The caller skips a file that should not appear at all.
+/// `flatten` and approved omission both call this, so a line row is built once.
+pub fn appendFile(
+    alloc: Allocator,
+    rows: *std.ArrayList(Row),
+    f: diff.File,
+    prev_group: *?diff.Group,
+    keep_hunks: ?[]const bool,
+) Allocator.Error!void {
+    if (f.group) |g| {
+        if (prev_group.* == null or prev_group.*.? != g) {
+            try rows.append(alloc, .{ .section_header = g });
+            prev_group.* = g;
+        }
+    }
+    const path = f.displayPath();
+    try rows.append(alloc, .{ .file_header = .{
+        .path = path,
+        .is_binary = f.is_binary,
+        .group = f.group,
+        .old_path = f.old_path,
+        .new_path = f.new_path,
+    } });
+    for (f.hunks, 0..) |h, i| {
+        if (keep_hunks) |keep| {
+            if (!keep[i]) continue;
+        }
+        try rows.append(alloc, .{ .hunk_header = .{
+            .path = path,
+            .old_start = h.old_start,
+            .old_count = h.old_count,
+            .new_start = h.new_start,
+            .new_count = h.new_count,
+            .section = h.section,
+            .group = f.group,
+            .can_grow = h.can_grow,
+        } });
+        for (h.lines) |ln| {
+            try rows.append(alloc, .{ .line = .{
+                .kind = ln.kind,
+                .text = ln.text,
+                .path = path,
+                .old_no = ln.old_no,
+                .new_no = ln.new_no,
+            } });
+        }
+    }
+}
+
 /// Build an owned list of rows from `d`. Caller's `alloc` owns the slice;
 /// free with `alloc.free(rows)`. Nested string data is borrowed from `d`.
 pub fn flatten(alloc: Allocator, d: *const diff.Diff) Allocator.Error![]Row {
@@ -63,40 +115,7 @@ pub fn flatten(alloc: Allocator, d: *const diff.Diff) Allocator.Error![]Row {
 
     var prev_group: ?diff.Group = null;
     for (d.files) |f| {
-        if (f.group) |g| {
-            if (prev_group == null or prev_group.? != g) {
-                try rows.append(alloc, .{ .section_header = g });
-                prev_group = g;
-            }
-        }
-        try rows.append(alloc, .{ .file_header = .{
-            .path = f.displayPath(),
-            .is_binary = f.is_binary,
-            .group = f.group,
-            .old_path = f.old_path,
-            .new_path = f.new_path,
-        } });
-        for (f.hunks) |h| {
-            try rows.append(alloc, .{ .hunk_header = .{
-                .path = f.displayPath(),
-                .old_start = h.old_start,
-                .old_count = h.old_count,
-                .new_start = h.new_start,
-                .new_count = h.new_count,
-                .section = h.section,
-                .group = f.group,
-                .can_grow = h.can_grow,
-            } });
-            for (h.lines) |ln| {
-                try rows.append(alloc, .{ .line = .{
-                    .kind = ln.kind,
-                    .text = ln.text,
-                    .path = f.displayPath(),
-                    .old_no = ln.old_no,
-                    .new_no = ln.new_no,
-                } });
-            }
-        }
+        try appendFile(alloc, &rows, f, &prev_group, null);
     }
     return try rows.toOwnedSlice(alloc);
 }
