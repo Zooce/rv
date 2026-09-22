@@ -69,6 +69,7 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
         .imports = &.{
             .{ .name = "diff", .module = diff_mod },
+            .{ .name = "tui", .module = tui_mod },
         },
     });
     // Mutate targeting uses flatten rows as a tool; load does not.

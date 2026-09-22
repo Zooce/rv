@@ -224,7 +224,7 @@ pub fn paint(
             .discard_confirm => discard.titleBar(),
             .normal => "rv  j/k  /  i/I  ? help  q quit",
         };
-        scr.putStr(1, 0, help, pal.title, null);
+        scr.putStr(1, 0, help, pal.title, 0, null);
     }
 
     // Footer: 1 status row, search prompt, or soft-wrapped comment box.
@@ -513,7 +513,7 @@ pub fn paint(
             const footer_y = footer_top;
             fillRow(scr, footer_y, pal.footer);
             if (status_note.len > 0) {
-                scr.putStr(1, footer_y, status_note, pal.footer, null);
+                scr.putStr(1, footer_y, status_note, pal.footer, 0, null);
             } else {
                 const st = view.nav.statusAt(rows, cur);
                 const footer_text = formatFooter(
@@ -526,7 +526,7 @@ pub fn paint(
                     diff_view.approved_n,
                     viewport.wrap,
                 );
-                scr.putStr(1, footer_y, footer_text, pal.footer, null);
+                scr.putStr(1, footer_y, footer_text, pal.footer, 0, null);
             }
             scr.hideCursor();
         }
@@ -649,7 +649,8 @@ pub fn bodyTextCols(pane_w: u16, num_w: usize, layout: view.layout.EffectiveLayo
     return pane_w -| gw_u16;
 }
 
-/// Gutter (mark + numbers) at `x`, then `text` (already sliced for pan or wrap).
+/// Gutter (mark + numbers) at `x`, then `text`.
+/// `skip` hides that many columns of `text`. Tab stops still start at column 0.
 fn putBodyLine(
     scr: *tui.Screen,
     x: u16,
@@ -662,13 +663,19 @@ fn putBodyLine(
     show_nums: bool,
     text: []const u8,
     style: tui.Style,
+    skip: usize,
 ) void {
     var gbuf: [32]u8 = undefined;
     const gutter = formatBodyGutter(&gbuf, row, marked, num_w, numbers, show_nums);
     const gw_usize = tui.screen.displayWidth(gutter);
     const gw: u16 = std.math.cast(u16, gw_usize) orelse pane_w;
     if (pane_w > 0) putPaneStr(scr, x, y, @min(gw, pane_w), gutter, style);
-    if (pane_w > gw) putPaneStr(scr, x +| gw, y, pane_w - gw, text, style);
+    if (pane_w > gw) {
+        const x_text = x +| gw;
+        const text_w = pane_w - gw;
+        const clip = tui.Rect{ .x = x_text, .y = y, .w = text_w, .h = 1 };
+        scr.putStr(x_text, y, text, style, skip, clip);
+    }
 }
 
 /// Gutter (mark + numbers) at `x`; only `ln.text` pans.
@@ -689,9 +696,8 @@ fn putPannedBody(
         .line => |l| l,
         else => return,
     };
-    const text = ln.text;
-    const visible = if (pan) text[tui.screen.byteAtCol(text, col_scroll)..] else text;
-    putBodyLine(scr, x, y, pane_w, row, marked, num_w, numbers, true, visible, style);
+    const skip: usize = if (pan) col_scroll else 0;
+    putBodyLine(scr, x, y, pane_w, row, marked, num_w, numbers, true, ln.text, style, skip);
 }
 
 /// One wrapped visual segment of `row` at `vis`, or nothing if that segment
@@ -717,7 +723,7 @@ fn putWrappedSegment(
         .old, .new => .side_by_side,
     };
     const seg = view.wrap.segmentAt(ln.text, bodyTextCols(pane_w, num_w, layout), vis) orelse return;
-    putBodyLine(scr, x, y, pane_w, row, marked, num_w, numbers, vis == 0, ln.text[seg.start..seg.end], style);
+    putBodyLine(scr, x, y, pane_w, row, marked, num_w, numbers, vis == 0, ln.text[seg.start..seg.end], style, 0);
 }
 
 /// Wrap `row` into the pane and fill each visual line. Returns the next `y`.
@@ -971,25 +977,25 @@ fn headerHint(
 /// Skips the hint when it would not leave that gap. Hint is dim on `style`.
 fn putRowHint(scr: *tui.Screen, y: u16, text: []const u8, hint: []const u8, style: tui.Style) void {
     if (hint.len == 0) {
-        scr.putStr(0, y, text, style, null);
+        scr.putStr(0, y, text, style, 0, null);
         return;
     }
     const cols = scr.cols;
     const hint_w: u16 = std.math.cast(u16, tui.screen.displayWidth(hint)) orelse {
-        scr.putStr(0, y, text, style, null);
+        scr.putStr(0, y, text, style, 0, null);
         return;
     };
     if (hint_w == 0 or hint_w + 1 >= cols) {
-        scr.putStr(0, y, text, style, null);
+        scr.putStr(0, y, text, style, 0, null);
         return;
     }
     const text_budget: usize = cols - hint_w - 1;
     const end = tui.screen.byteAtCol(text, text_budget);
-    scr.putStr(0, y, text[0..end], style, null);
+    scr.putStr(0, y, text[0..end], style, 0, null);
     var hint_st = style;
     hint_st.dim = true;
     hint_st.bold = false;
-    scr.putStr(cols - hint_w, y, hint, hint_st, null);
+    scr.putStr(cols - hint_w, y, hint, hint_st, 0, null);
 }
 
 pub fn fillRow(scr: *tui.Screen, y: u16, style: tui.Style) void {
@@ -1022,7 +1028,7 @@ fn putSbsCenter(scr: *tui.Screen, panes: view.layout.SbsPanes, y: u16, cols: u16
 fn putPaneStr(scr: *tui.Screen, x: u16, y: u16, pane_w: u16, text: []const u8, style: tui.Style) void {
     if (pane_w == 0) return;
     const end = tui.screen.byteAtCol(text, pane_w);
-    scr.putStr(x, y, text[0..end], style, null);
+    scr.putStr(x, y, text[0..end], style, 0, null);
 }
 
 const testing = std.testing;
@@ -1252,6 +1258,34 @@ test "putPannedBody pans text and leaves gutter" {
     try testing.expectEqual('*', scr.getCell(0, 0).char);
     try testing.expectEqual(' ', scr.getCell(1, 0).char);
     try testing.expectEqual('C', scr.getCell(2, 0).char);
+}
+
+test "putPannedBody expands a tab to the next stop" {
+    const row: view.row.Row = .{ .line = .{
+        .kind = .context,
+        .text = "\tX",
+        .path = "f",
+        .old_no = 1,
+        .new_no = 2,
+    } };
+    const st = tui.Style{};
+    var scr = try tui.Screen.init(testing.allocator, .{ .cols = 20, .rows = 1 });
+    defer scr.deinit();
+
+    // num_w 0 → 2-column gutter. Tab is a dim arrow plus 3 spaces, then X.
+    scr.clear();
+    putPannedBody(&scr, 0, 0, 20, row, false, 0, .unified, false, 0, st);
+    try testing.expectEqual('→', scr.getCell(2, 0).char);
+    try testing.expect(scr.getCell(2, 0).style.dim);
+    try testing.expectEqual(' ', scr.getCell(3, 0).char);
+    try testing.expect(!scr.getCell(3, 0).style.dim);
+    try testing.expectEqual('X', scr.getCell(6, 0).char);
+
+    // Skip 3 columns: the arrow is gone, one space remains, then X.
+    scr.clear();
+    putPannedBody(&scr, 0, 0, 20, row, false, 0, .unified, true, 3, st);
+    try testing.expectEqual(' ', scr.getCell(2, 0).char);
+    try testing.expectEqual('X', scr.getCell(3, 0).char);
 }
 
 test "putWrappedPane wraps text and repeats gutter" {

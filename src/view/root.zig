@@ -1,7 +1,7 @@
 //! Display/review-list topic: comment helpers on rows.
 //! Row model is `row.zig`; viewport is `viewport.zig`; side-by-side layout
 //! is `layout.zig`; structural nav is `nav.zig`; search is `search.zig`;
-//! body wrap is `wrap.zig`. Pure data — no TTY.
+//! body wrap is `wrap.zig` (a tab uses the screen's 4-column stops). No terminal drawing.
 
 const std = @import("std");
 const diff = @import("diff");

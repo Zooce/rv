@@ -224,14 +224,23 @@ pub const Screen = struct {
     /// Decode UTF-8 `text` into cells starting at (x, y), one row only.
     /// `x`/`y` are absolute. Stops at the screen edge. If `clip` is set, also
     /// stays inside that rect. Does not wrap.
-    pub fn putStr(self: *Screen, x: u16, y: u16, text: []const u8, style: Style, clip: ?Rect) void {
+    ///
+    /// `skip` is how many display columns of `text` to hide before painting.
+    /// Tab stops still count from column 0 of `text`. The first column of a
+    /// tab is a dimmed `→`; the rest are spaces. A skip past that first
+    /// column draws only the remaining spaces. `x` is the screen column of
+    /// the first visible cell.
+    pub fn putStr(self: *Screen, x: u16, y: u16, text: []const u8, style: Style, skip: usize, clip: ?Rect) void {
         const grid = Rect{ .x = 0, .y = 0, .w = self.cols, .h = self.rows };
         const area = (clip orelse grid).intersect(grid) orelse return;
         if (y < area.y or y >= area.y + area.h) return;
         const right = area.x + area.w;
-        var col: u16 = x; // current column we're writing
+        var col: u16 = x; // screen column of the next visible cell
+        var text_col: usize = 0; // display column in `text` (tab stops)
         var i: usize = 0; // byte index into `text`
-        while (i < text.len and col < right) {
+        while (i < text.len) {
+            if (text_col >= skip and col >= right) break;
+
             // How many bytes is the next UTF-8 character?
             const len = std.unicode.utf8ByteSequenceLength(text[i]) catch {
                 i += 1; // invalid lead byte — skip it
@@ -243,19 +252,55 @@ pub const Screen = struct {
                 i += 1; // bad sequence — skip a byte and keep going
                 continue;
             };
-            i += len; // advance past this character's bytes
 
-            const w = codepointWidth(cp); // 0, 1, or 2 terminal columns
-            if (w == 0) continue; // combining/control: skip for now
-            if (right - col < w) break; // would run past the clip edge
+            const w8 = codepointWidth(cp, text_col);
+            const w: usize = w8;
+            if (w == 0) {
+                i += len; // combining/control: skip for now
+                continue;
+            }
+
+            // Tab: first cell is a dimmed arrow, then spaces out to the stop.
+            // Columns before `skip` are not drawn, so a pan into the middle
+            // of a tab shows spaces only.
+            if (cp == '\t') {
+                var n: usize = 0;
+                while (n < w) : (n += 1) {
+                    if (text_col + n < skip) continue;
+                    if (col >= right) break;
+                    if (n == 0) {
+                        var mark_style = style;
+                        mark_style.dim = true;
+                        self.setCell(col, y, .{ .char = tab_mark, .width = 1, .style = mark_style });
+                    } else {
+                        self.setCell(col, y, .{ .char = ' ', .width = 1, .style = style });
+                    }
+                    col += 1;
+                }
+                text_col += w;
+                i += len;
+                continue;
+            }
+
+            // Hidden prefix: drop the glyph. A wide glyph is dropped whole.
+            if (text_col < skip) {
+                text_col += w;
+                i += len;
+                continue;
+            }
+
+            const room: usize = right - col;
+            if (room < w) break; // would run past the clip edge
 
             // Primary cell holds the glyph.
-            self.setCell(col, y, .{ .char = cp, .width = w, .style = style });
+            self.setCell(col, y, .{ .char = cp, .width = w8, .style = style });
             if (w == 2 and col + 1 < right) {
                 // Wide char: mark the next column as a continuation (not drawn).
                 self.setCell(col + 1, y, .{ .char = ' ', .width = 0, .style = style });
             }
-            col += w; // advance by display width, not by byte count
+            col += w8; // advance by display width, not by byte count
+            text_col += w;
+            i += len;
         }
     }
 
@@ -383,9 +428,17 @@ pub const Screen = struct {
     }
 };
 
-/// How many terminal columns a codepoint occupies (rough heuristic).
+/// Visible mark in the first column of a tab. Later columns of that stop are spaces.
+const tab_mark: u21 = '→';
+
+/// How many columns `cp` occupies when it starts at display column `col`.
+/// A tab advances to the next stop of 4. Other C0 controls and DEL are 0.
 /// Real apps eventually use an East Asian Width table; this is "good enough" for demos.
-pub fn codepointWidth(cp: u21) u8 {
+pub fn codepointWidth(cp: u21, col: usize) u8 {
+    if (cp == '\t') {
+        const stop: usize = 4;
+        return @intCast(stop - (col % stop));
+    }
     if (cp < 0x20 or cp == 0x7f) return 0; // C0 controls + DEL: not printable
     // A few common wide ranges (incomplete on purpose — learning stub).
     if (cp >= 0x1100 and cp <= 0x115f) return 2; // Hangul Jamo
@@ -414,15 +467,16 @@ pub fn displayWidth(text: []const u8) usize {
             i += 1;
             continue;
         };
+        const w: usize = codepointWidth(cp, cols);
         i += len;
-        cols += codepointWidth(cp);
+        cols += w;
     }
     return cols;
 }
 
 /// Byte index into UTF-8 `text` at the start of display column `col` (0-based).
-/// Past the end → `text.len`. If `col` lands inside a wide glyph, skips past it
-/// so callers do not start a slice mid-cell.
+/// Past the end → `text.len`. If `col` lands inside a wide glyph or a tab,
+/// skips past it so callers do not start a slice mid-cell.
 pub fn byteAtCol(text: []const u8, col: usize) usize {
     if (col == 0) return 0;
     var c: usize = 0;
@@ -438,10 +492,10 @@ pub fn byteAtCol(text: []const u8, col: usize) usize {
             i += 1;
             continue;
         };
-        const w = codepointWidth(cp);
+        const w: usize = codepointWidth(cp, c);
         i += len;
         if (w == 0) continue;
-        if (c + w > col) return i; // mid-wide glyph: start after it
+        if (c + w > col) return i; // inside a wide glyph or tab: start after it
         c += w;
     }
     return text.len;
@@ -662,7 +716,7 @@ test "putStr clips to an optional rect" {
 
     const st = Style{ .fg = .{ .indexed = 15 } };
     const rect = Rect{ .x = 2, .y = 1, .w = 4, .h = 2 };
-    scr.putStr(rect.x, rect.y, "HELLO", st, rect);
+    scr.putStr(rect.x, rect.y, "HELLO", st, 0, rect);
 
     try std.testing.expect(scr.getCell(2, 1).eql(.{ .char = 'H', .width = 1, .style = st }));
     try std.testing.expect(scr.getCell(3, 1).eql(.{ .char = 'E', .width = 1, .style = st }));
@@ -671,13 +725,13 @@ test "putStr clips to an optional rect" {
     try std.testing.expect(scr.getCell(6, 1).eql(Cell.blank()));
     try std.testing.expect(scr.getCell(1, 1).eql(Cell.blank()));
 
-    scr.putStr(rect.x + 1, rect.y + 1, "xyz", st, rect);
+    scr.putStr(rect.x + 1, rect.y + 1, "xyz", st, 0, rect);
     try std.testing.expect(scr.getCell(3, 2).eql(.{ .char = 'x', .width = 1, .style = st }));
     try std.testing.expect(scr.getCell(4, 2).eql(.{ .char = 'y', .width = 1, .style = st }));
     try std.testing.expect(scr.getCell(5, 2).eql(.{ .char = 'z', .width = 1, .style = st }));
 
-    scr.putStr(rect.x, rect.y + 5, "nope", st, rect);
-    scr.putStr(rect.x + 10, rect.y, "nope", st, rect);
+    scr.putStr(rect.x, rect.y + 5, "nope", st, 0, rect);
+    scr.putStr(rect.x + 10, rect.y, "nope", st, 0, rect);
     try std.testing.expect(scr.getCell(2, 1).eql(.{ .char = 'H', .width = 1, .style = st }));
 }
 
@@ -688,7 +742,7 @@ test "putStr on a tiny off-origin rect" {
 
     const st = Style{};
     const rect = Rect{ .x = 5, .y = 2, .w = 2, .h = 1 };
-    scr.putStr(rect.x, rect.y, "ABCD", st, rect);
+    scr.putStr(rect.x, rect.y, "ABCD", st, 0, rect);
     try std.testing.expect(scr.getCell(5, 2).eql(.{ .char = 'A', .width = 1, .style = st }));
     try std.testing.expect(scr.getCell(6, 2).eql(.{ .char = 'B', .width = 1, .style = st }));
     try std.testing.expect(scr.getCell(7, 2).eql(Cell.blank()));
@@ -703,6 +757,68 @@ test "displayWidth and byteAtCol ASCII" {
     try std.testing.expectEqual(5, byteAtCol("hello", 5));
     try std.testing.expectEqual(5, byteAtCol("hello", 99));
     try std.testing.expectEqualStrings("llo", "hello"[byteAtCol("hello", 2)..]);
+}
+
+test "tab expands to the next stop of 4 with a dim mark" {
+    try std.testing.expectEqual(4, displayWidth("\t"));
+    try std.testing.expectEqual(4, displayWidth("a\t"));
+    try std.testing.expectEqual(5, displayWidth("a\tX"));
+    try std.testing.expectEqual(8, displayWidth("\t\t"));
+    try std.testing.expectEqual(12, displayWidth("abcdefgh\t"));
+
+    try std.testing.expectEqual(0, byteAtCol("\tX", 0));
+    // Column 2 is inside the tab, so the cut starts after it.
+    try std.testing.expectEqual(1, byteAtCol("\tX", 2));
+    try std.testing.expectEqual(1, byteAtCol("\tX", 4));
+    try std.testing.expectEqual(2, byteAtCol("\tX", 5));
+
+    const alloc = std.testing.allocator;
+    var scr = try Screen.init(alloc, .{ .cols = 20, .rows = 1 });
+    defer scr.deinit();
+    const st = Style{};
+    var dimmed = st;
+    dimmed.dim = true;
+    const mark = Cell{ .char = tab_mark, .width = 1, .style = dimmed };
+    const gap = Cell{ .char = ' ', .width = 1, .style = st };
+
+    scr.putStr(0, 0, "\tX", st, 0, null);
+    try std.testing.expect(scr.getCell(0, 0).eql(mark));
+    try std.testing.expect(scr.getCell(1, 0).eql(gap));
+    try std.testing.expect(scr.getCell(2, 0).eql(gap));
+    try std.testing.expect(scr.getCell(3, 0).eql(gap));
+    try std.testing.expectEqual('X', scr.getCell(4, 0).char);
+
+    // Tab at column 2: width 2. Arrow, one space, then Z.
+    scr.clear();
+    scr.putStr(0, 0, "ab\tZ", st, 0, null);
+    try std.testing.expectEqual('a', scr.getCell(0, 0).char);
+    try std.testing.expectEqual('b', scr.getCell(1, 0).char);
+    try std.testing.expect(scr.getCell(2, 0).eql(mark));
+    try std.testing.expect(scr.getCell(3, 0).eql(gap));
+    try std.testing.expectEqual('Z', scr.getCell(4, 0).char);
+
+    // Skip past the arrow: the two remaining columns are spaces, then X.
+    scr.clear();
+    scr.putStr(0, 0, "\tX", st, 2, null);
+    try std.testing.expect(scr.getCell(0, 0).eql(gap));
+    try std.testing.expect(scr.getCell(1, 0).eql(gap));
+    try std.testing.expectEqual('X', scr.getCell(2, 0).char);
+
+    // "abcd" then a tab at column 4 (width 4) then Z. Skip 6 → 2 spaces, Z.
+    scr.clear();
+    scr.putStr(0, 0, "abcd\tZ", st, 6, null);
+    try std.testing.expect(scr.getCell(0, 0).eql(gap));
+    try std.testing.expect(scr.getCell(1, 0).eql(gap));
+    try std.testing.expectEqual('Z', scr.getCell(2, 0).char);
+
+    // Clip keeps the arrow and the spaces that fit, and does not paint past the rect.
+    scr.clear();
+    scr.fillRect(.{ .x = 0, .y = 0, .w = 20, .h = 1 }, '!', .{});
+    const clip = Rect{ .x = 0, .y = 0, .w = 2, .h = 1 };
+    scr.putStr(0, 0, "\tX", st, 0, clip);
+    try std.testing.expect(scr.getCell(0, 0).eql(mark));
+    try std.testing.expect(scr.getCell(1, 0).eql(gap));
+    try std.testing.expectEqual('!', scr.getCell(2, 0).char);
 }
 
 test "displayWidth wide glyph" {
@@ -739,7 +855,7 @@ test "present failure discards write buffer and does not commit back" {
     try std.testing.expect(back0.eql(Cell.blank()));
 
     // Force a real emit path (CUP / SGR / glyphs) so write_buf fills before flush.
-    screen.putStr(0, 0, "ab", .{}, null);
+    screen.putStr(0, 0, "ab", .{}, 0, null);
     screen.dirty_all = true;
 
     try std.testing.expectError(error.BrokenPipe, screen.present(&t));

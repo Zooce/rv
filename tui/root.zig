@@ -3,7 +3,7 @@
 //! 1. `tty.zig`    — own the terminal (termios, raw mode, alt screen, restore)
 //! 2. `event.zig`  — bytes → keys; SIGWINCH → resize
 //! 3. `screen.zig` — cell grid + diff render (CUP / SGR escapes);
-//!    overlay helpers (`Rect`, `fillRect`, `drawBox`; `putStr` takes an optional clip).
+//!    overlay helpers (`Rect`, `fillRect`, `drawBox`; `putStr` takes a column skip and an optional clip).
 //!    Still not a widget library.
 //!
 //! App loop pattern (see `examples/tui_demo.zig`):

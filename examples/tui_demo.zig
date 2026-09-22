@@ -160,34 +160,34 @@ fn draw(scr: *tui.Screen, size: tui.Size, counter: u64, last_key: []const u8, sh
 
     // Title row (y = 0): full-width bar, then text on top.
     scr.fillRect(.{ .x = 0, .y = 0, .w = size.cols, .h = 1 }, ' ', title_style);
-    scr.putStr(2, 0, "rv tui demo", title_style, null); // x=2 indent
+    scr.putStr(2, 0, "rv tui demo", title_style, 0, null); // x=2 indent
 
     // Scratch buffer for formatted lines (reused — each bufPrint overwrites it).
     var line_buf: [128]u8 = undefined;
 
     // Guard every putStr with a row check so tiny terminals don't panic us.
     const l1 = try std.fmt.bufPrint(&line_buf, "terminal size: {d} x {d}", .{ size.cols, size.rows });
-    if (2 < size.rows) scr.putStr(2, 2, l1, bg, null);
+    if (2 < size.rows) scr.putStr(2, 2, l1, bg, 0, null);
 
     const l2 = try std.fmt.bufPrint(&line_buf, "key events:   {d}", .{counter});
-    if (3 < size.rows) scr.putStr(2, 3, l2, accent, null);
+    if (3 < size.rows) scr.putStr(2, 3, l2, accent, 0, null);
 
     const l3 = try std.fmt.bufPrint(&line_buf, "last key:     {s}", .{last_key});
-    if (4 < size.rows) scr.putStr(2, 4, l3, bg, null);
+    if (4 < size.rows) scr.putStr(2, 4, l3, bg, 0, null);
 
     // Help text (only if the window is tall enough).
     if (6 < size.rows) {
-        scr.putStr(2, 6, "Press any key to increment the counter.", help, null);
-        scr.putStr(2, 7, "Press o to toggle floating panels (fill + box + clip).", help, null);
-        scr.putStr(2, 8, "Resize the terminal — size updates without flicker.", help, null);
-        scr.putStr(2, 9, "Press q (or Ctrl-C) to quit and restore the terminal.", help, null);
+        scr.putStr(2, 6, "Press any key to increment the counter.", help, 0, null);
+        scr.putStr(2, 7, "Press o to toggle floating panels (fill + box + clip).", help, 0, null);
+        scr.putStr(2, 8, "Resize the terminal — size updates without flicker.", help, 0, null);
+        scr.putStr(2, 9, "Press q (or Ctrl-C) to quit and restore the terminal.", help, 0, null);
     }
 
     // Footer on the last row.
     if (size.rows > 0) {
         const fy: u16 = size.rows - 1; // bottom row index
         scr.fillRect(.{ .x = 0, .y = fy, .w = size.cols, .h = 1 }, ' ', footer_style);
-        scr.putStr(2, fy, "q quit  |  o overlay  |  keys update counter  |  resize ok", footer_style, null);
+        scr.putStr(2, fy, "q quit  |  o overlay  |  keys update counter  |  resize ok", footer_style, 0, null);
     }
 
     if (show_panels) {
@@ -198,13 +198,13 @@ fn draw(scr: *tui.Screen, size: tui.Size, counter: u64, last_key: []const u8, sh
         scr.fillRect(panel, ' ', panel_bg);
         scr.drawBox(panel, panel_frame);
         const inner = panel.inset(1);
-        scr.putStr(inner.x, inner.y, " centered panel ", panel_frame, inner);
+        scr.putStr(inner.x, inner.y, " centered panel ", panel_frame, 0, inner);
         const s1 = try std.fmt.bufPrint(&line_buf, " size {d}x{d}  keys {d}", .{ size.cols, size.rows, counter });
-        if (1 < inner.h) scr.putStr(inner.x, inner.y + 1, s1, panel_bg, inner);
+        if (1 < inner.h) scr.putStr(inner.x, inner.y + 1, s1, panel_bg, 0, inner);
         const s2 = try std.fmt.bufPrint(&line_buf, " last: {s}", .{last_key});
-        if (2 < inner.h) scr.putStr(inner.x, inner.y + 2, s2, panel_bg, inner);
-        if (3 < inner.h) scr.putStr(inner.x, inner.y + 3, " long line clipped at the panel edge -----------", panel_dim, inner);
-        if (5 < inner.h) scr.putStr(inner.x, inner.y + 5, " o toggles overlays   q quits", panel_dim, inner);
+        if (2 < inner.h) scr.putStr(inner.x, inner.y + 2, s2, panel_bg, 0, inner);
+        if (3 < inner.h) scr.putStr(inner.x, inner.y + 3, " long line clipped at the panel edge -----------", panel_dim, 0, inner);
+        if (5 < inner.h) scr.putStr(inner.x, inner.y + 5, " o toggles overlays   q quits", panel_dim, 0, inner);
 
         // Second panel starts at the first panel's center so they overlap.
         const note_w: u16 = @min(size.cols, 26);
@@ -221,9 +221,9 @@ fn draw(scr: *tui.Screen, size: tui.Size, counter: u64, last_key: []const u8, sh
         scr.fillRect(note, ' ', note_bg);
         scr.drawBox(note, note_frame);
         const ninner = note.inset(1);
-        scr.putStr(ninner.x, ninner.y, " second panel ", note_frame, ninner);
-        if (1 < ninner.h) scr.putStr(ninner.x, ninner.y + 1, " painted last", note_bg, ninner);
-        if (2 < ninner.h) scr.putStr(ninner.x, ninner.y + 2, " covers the first", note_dim, ninner);
+        scr.putStr(ninner.x, ninner.y, " second panel ", note_frame, 0, ninner);
+        if (1 < ninner.h) scr.putStr(ninner.x, ninner.y + 1, " painted last", note_bg, 0, ninner);
+        if (2 < ninner.h) scr.putStr(ninner.x, ninner.y + 2, " covers the first", note_dim, 0, ninner);
     }
 
     // We don't need a caret for this demo.

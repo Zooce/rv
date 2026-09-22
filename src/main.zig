@@ -1357,7 +1357,7 @@ pub const DiscardConfirm = struct {
                 .discard => if (self.comments) " comments " else " discard ",
                 .approve => " approve ",
             };
-            scr.putStr(panel.x + 2, panel.y, title, panel_frame, panel);
+            scr.putStr(panel.x + 2, panel.y, title, panel_frame, 0, panel);
         }
         const inner = panel.inset(1);
         if (inner.h == 0 or inner.w == 0) return;
@@ -1369,7 +1369,7 @@ pub const DiscardConfirm = struct {
                 .staged => "Unstage all staged?",
             };
             if (row < inner.h) {
-                scr.putStr(inner.x, inner.y + row, question, panel_bg, inner);
+                scr.putStr(inner.x, inner.y + row, question, panel_bg, 0, inner);
                 row += 1;
             }
         } else if (self.kind == .approve) {
@@ -1378,22 +1378,22 @@ pub const DiscardConfirm = struct {
             else
                 "This hunk has unresolved comments. Approve anyway?";
             if (row < inner.h) {
-                scr.putStr(inner.x, inner.y + row, question, panel_bg, inner);
+                scr.putStr(inner.x, inner.y + row, question, panel_bg, 0, inner);
                 row += 1;
             }
         } else if (self.comments) {
             if (row < inner.h) {
-                scr.putStr(inner.x, inner.y + row, "delete comments with this change?", panel_bg, inner);
+                scr.putStr(inner.x, inner.y + row, "delete comments with this change?", panel_bg, 0, inner);
                 row += 1;
             }
         } else {
             if (path.len > 0 and row < inner.h) {
-                scr.putStr(inner.x, inner.y + row, path, panel_bg, inner);
+                scr.putStr(inner.x, inner.y + row, path, panel_bg, 0, inner);
                 row += 1;
             }
             if (hunk_text.len > 0 and row < inner.h) {
                 const start: usize = if (hunk_text[0] == ' ') 1 else 0;
-                scr.putStr(inner.x, inner.y + row, hunk_text[start..], panel_bg, inner);
+                scr.putStr(inner.x, inner.y + row, hunk_text[start..], panel_bg, 0, inner);
                 row += 1;
             }
         }
@@ -1437,9 +1437,9 @@ pub const DiscardConfirm = struct {
         const n_st = if (!yes) choice_cur else panel_bg;
         const y_st = if (yes) choice_cur else panel_bg;
         scr.fillRect(.{ .x = no_x -| 1, .y = y, .w = no_w + 2, .h = 1 }, ' ', n_st);
-        scr.putStr(no_x, y, no_label, n_st, inner);
+        scr.putStr(no_x, y, no_label, n_st, 0, inner);
         scr.fillRect(.{ .x = yes_x -| 1, .y = y, .w = yes_w + 2, .h = 1 }, ' ', y_st);
-        scr.putStr(yes_x, y, yes_label, y_st, inner);
+        scr.putStr(yes_x, y, yes_label, y_st, 0, inner);
     }
 };
 
@@ -1643,7 +1643,7 @@ pub const Draft = struct {
             const vline = ds + row;
             const piece = comment_input.writeVisualLine(&line_buf, text, m.text_w, vline);
             // Prefix + text start at column 1 (one-cell left gutter).
-            scr.putStr(1, y, piece, footer_style, null);
+            scr.putStr(1, y, piece, footer_style, 0, null);
         }
 
         // Right pad is always reserved (text_w stable). Scrollbar uses the
@@ -1770,7 +1770,7 @@ const Search = struct {
         var line_buf: [512]u8 = undefined;
         const caret_byte = @min(self.caret, self.buf.items.len);
         const prompt = Frame.bufPrintTrunc(&line_buf, "/{s}", .{self.buf.items});
-        scr.putStr(1, footer_y, prompt, footer_style, null);
+        scr.putStr(1, footer_y, prompt, footer_style, 0, null);
         const max_x: u16 = if (size.cols == 0) 0 else size.cols - 1;
         const raw_x: usize = 2 + caret_byte;
         const cx: u16 = if (raw_x > max_x) max_x else @intCast(raw_x);
@@ -2358,12 +2358,12 @@ const CommentList = struct {
         scr.drawBox(panel, panel_frame);
         const inner = panel.inset(1);
         if (panel.h > 0 and panel.w > 2) {
-            scr.putStr(panel.x + 2, panel.y, " comments ", panel_frame, panel);
+            scr.putStr(panel.x + 2, panel.y, " comments ", panel_frame, 0, panel);
         }
         ensureListCursorVisible(&self.scroll, self.cursor, inner.h, items.len);
         if (inner.h == 0 or inner.w == 0) return;
         if (items.len == 0) {
-            scr.putStr(inner.x, inner.y, "no comments", panel_bg, inner);
+            scr.putStr(inner.x, inner.y, "no comments", panel_bg, 0, inner);
             return;
         }
         const show_bar = items.len > inner.h;
@@ -2381,7 +2381,7 @@ const CommentList = struct {
             const st = if (idx == self.cursor) row_cur else panel_bg;
             scr.fillRect(.{ .x = inner.x, .y = y, .w = inner.w, .h = 1 }, ' ', st);
             const text = formatLine(&line_buf, items[idx]);
-            scr.putStr(inner.x, y, text, st, text_area);
+            scr.putStr(inner.x, y, text, st, 0, text_area);
         }
         if (show_bar) {
             const bar_x: u16 = inner.x + inner.w - 1;
@@ -2503,12 +2503,12 @@ const FileList = struct {
         scr.drawBox(panel, panel_frame);
         const inner = panel.inset(1);
         if (panel.h > 0 and panel.w > 2) {
-            scr.putStr(panel.x + 2, panel.y, " files ", panel_frame, panel);
+            scr.putStr(panel.x + 2, panel.y, " files ", panel_frame, 0, panel);
         }
         ensureListCursorVisible(&self.scroll, self.cursor, inner.h, items.len);
         if (inner.h == 0 or inner.w == 0) return;
         if (items.len == 0) {
-            scr.putStr(inner.x, inner.y, "no files", panel_bg, inner);
+            scr.putStr(inner.x, inner.y, "no files", panel_bg, 0, inner);
             return;
         }
         const show_bar = items.len > inner.h;
@@ -2526,7 +2526,7 @@ const FileList = struct {
             const st = if (idx == self.cursor) row_cur else panel_bg;
             scr.fillRect(.{ .x = inner.x, .y = y, .w = inner.w, .h = 1 }, ' ', st);
             const path = view.row.fileHeaderPathLabel(rows[items[idx]].file_header, &path_buf);
-            scr.putStr(inner.x, y, path, st, text_area);
+            scr.putStr(inner.x, y, path, st, 0, text_area);
         }
         if (show_bar) {
             const bar_x: u16 = inner.x + inner.w - 1;
@@ -2657,12 +2657,12 @@ const ApprovedList = struct {
         scr.drawBox(panel, panel_frame);
         const inner = panel.inset(1);
         if (panel.h > 0 and panel.w > 2) {
-            scr.putStr(panel.x + 2, panel.y, " approved ", panel_frame, panel);
+            scr.putStr(panel.x + 2, panel.y, " approved ", panel_frame, 0, panel);
         }
         ensureListCursorVisible(&self.scroll, self.cursor, inner.h, items.len);
         if (inner.h == 0 or inner.w == 0) return;
         if (items.len == 0) {
-            scr.putStr(inner.x, inner.y, "no approved", panel_bg, inner);
+            scr.putStr(inner.x, inner.y, "no approved", panel_bg, 0, inner);
             return;
         }
         const show_bar = items.len > inner.h;
@@ -2680,7 +2680,7 @@ const ApprovedList = struct {
             const st = if (idx == self.cursor) row_cur else panel_bg;
             scr.fillRect(.{ .x = inner.x, .y = y, .w = inner.w, .h = 1 }, ' ', st);
             const text = formatLine(&line_buf, items[idx]);
-            scr.putStr(inner.x, y, text, st, text_area);
+            scr.putStr(inner.x, y, text, st, 0, text_area);
         }
         if (show_bar) {
             const bar_x: u16 = inner.x + inner.w - 1;
@@ -2737,14 +2737,14 @@ const Failure = struct {
         scr.drawBox(panel, panel_frame);
         const inner = panel.inset(1);
         if (panel.h > 0 and panel.w > 2) {
-            scr.putStr(panel.x + 2, panel.y, " error ", panel_frame, panel);
+            scr.putStr(panel.x + 2, panel.y, " error ", panel_frame, 0, panel);
         }
         if (inner.h == 0 or inner.w == 0) return;
         var row: u16 = 0;
         var lines = std.mem.splitScalar(u8, text, '\n');
         while (lines.next()) |line| {
             if (row >= inner.h) break;
-            scr.putStr(inner.x, inner.y + row, line, panel_bg, inner);
+            scr.putStr(inner.x, inner.y + row, line, panel_bg, 0, inner);
             row += 1;
         }
     }

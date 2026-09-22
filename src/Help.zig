@@ -121,7 +121,7 @@ pub fn paint(self: *Help, scr: *tui.Screen, size: tui.Size) void {
     scr.fillRect(panel, ' ', panel_bg);
     scr.drawBox(panel, panel_frame);
     if (panel.h > 0 and panel.w > 2) {
-        scr.putStr(panel.x + 2, panel.y, " help ", panel_frame, panel);
+        scr.putStr(panel.x + 2, panel.y, " help ", panel_frame, 0, panel);
     }
     const inner = panel.inset(1);
     if (inner.h == 0 or inner.w == 0) return;
@@ -141,11 +141,11 @@ pub fn paint(self: *Help, scr: *tui.Screen, size: tui.Size) void {
         const y = inner.y + row;
         switch (rows[idx]) {
             .blank => {},
-            .group => |name| scr.putStr(inner.x, y, name, group_style, text_area),
+            .group => |name| scr.putStr(inner.x, y, name, group_style, 0, text_area),
             .item => |it| {
-                scr.putStr(inner.x + 2, y, it.key, panel_bg, text_area);
+                scr.putStr(inner.x + 2, y, it.key, panel_bg, 0, text_area);
                 const label_x = inner.x +| 2 +| key_w +| 2;
-                scr.putStr(label_x, y, it.label, panel_bg, text_area);
+                scr.putStr(label_x, y, it.label, panel_bg, 0, text_area);
             },
         }
     }

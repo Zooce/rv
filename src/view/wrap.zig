@@ -1,10 +1,12 @@
 //! Soft-wrap of one diff body line into visual segments (goal #135).
 //!
-//! Given pane text width, split `ln.text` at word boundaries; a token longer
-//! than the pane hard-splits. Same break rules as the comment box. Columns
-//! are bytes (one byte = one column). Pure data — no TTY.
+//! Given pane text width, split `text` at word boundaries; a token longer
+//! than the pane hard-splits. Same break rules as the comment box.
+//! A tab advances to the next stop of 4 columns (same rule as the screen).
+//! Other bytes count as one column.
 
 const std = @import("std");
+const tui = @import("tui");
 const testing = std.testing;
 
 /// Half-open byte range into the source line for one visual segment.
@@ -40,23 +42,28 @@ fn skipSpaces(text: []const u8, i: usize) usize {
 fn wrapEnd(text: []const u8, start: usize, text_w: usize) usize {
     if (start >= text.len) return start;
     if (text_w == 0) return start;
-    const rest = text.len - start;
-    if (rest <= text_w) return text.len;
 
     var last_break: ?usize = null;
-    var i: usize = 0;
-    while (i < text_w) : (i += 1) {
-        const c = text[start + i];
-        if (isSpace(c)) {
-            if (i > 0) last_break = start + i;
+    var i: usize = start;
+    var col: usize = 0;
+    while (i < text.len) {
+        const c = text[i];
+        const adv: usize = if (c == '\t') tui.screen.codepointWidth('\t', col) else 1;
+        if (col + adv > text_w) break;
+        if (c == ' ' or c == '\t') {
+            if (i > start) last_break = i;
         } else if (isBreakAfter(c)) {
-            last_break = start + i + 1;
+            last_break = i + 1;
         }
+        col += adv;
+        i += 1;
     }
+    if (i == text.len) return text.len;
     if (last_break) |b| {
         if (b > start) return b;
     }
-    return start + text_w;
+    if (i == start) return @min(start + 1, text.len);
+    return i;
 }
 
 fn nextStart(text: []const u8, end: usize) usize {
@@ -148,6 +155,23 @@ test "zero width is treated as one column" {
     const b = segmentAt(t, 0, 1).?;
     try testing.expectEqualStrings("a", t[a.start..a.end]);
     try testing.expectEqualStrings("b", t[b.start..b.end]);
+}
+
+test "leading tab takes four columns" {
+    const t = "\tfoo bar";
+    // tab (4) + "foo" (3) + space = 8, then "bar" does not fit.
+    const a = segmentAt(t, 8, 0).?;
+    const b = segmentAt(t, 8, 1).?;
+    try testing.expectEqualStrings("\tfoo", t[a.start..a.end]);
+    try testing.expectEqualStrings("bar", t[b.start..b.end]);
+}
+
+test "tab wider than the pane is its own segment" {
+    const t = "\tfoo";
+    const a = segmentAt(t, 3, 0).?;
+    const b = segmentAt(t, 3, 1).?;
+    try testing.expectEqualStrings("\t", t[a.start..a.end]);
+    try testing.expectEqualStrings("foo", t[b.start..b.end]);
 }
 
 test "leading indent stays on the first segment" {
