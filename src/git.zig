@@ -21,6 +21,10 @@
 //! A clean worktree (no local / untracked) yields an empty `Diff`. There is
 //! no fall-through to branch-vs-base (`git diff <base>...HEAD`).
 //!
+//! `git diff HEAD` is a different patch: staged and unstaged are one blob,
+//! and untracked files are omitted. The line oracle compares flattened rows
+//! to the blobs these loaders parse.
+//!
 //! ## Explicit range
 //!
 //! `loadRangeDiff` runs `git diff --find-renames <range>` with the range
@@ -124,42 +128,73 @@ pub fn loadDefaultDiff(alloc: Allocator, io: Io) Error!diff.Diff {
     return loadDefaultDiffCwd(alloc, io, .inherit);
 }
 
-/// Same as `loadDefaultDiff`, but run git with an explicit child cwd.
-pub fn loadDefaultDiffCwd(alloc: Allocator, io: Io, cwd: std.process.Child.Cwd) Error!diff.Diff {
+/// Unified blobs for the local load, in group order. Empty slices (still
+/// owned by `alloc`) when that group was not run.
+const DefaultTexts = struct {
+    unstaged: []u8,
+    untracked: []u8,
+    staged: []u8,
+
+    fn deinit(self: DefaultTexts, alloc: Allocator) void {
+        alloc.free(self.unstaged);
+        alloc.free(self.untracked);
+        alloc.free(self.staged);
+    }
+};
+
+fn loadDefaultTexts(alloc: Allocator, io: Io, cwd: std.process.Child.Cwd) Error!DefaultTexts {
     try ensureInsideWorkTree(alloc, io, cwd);
 
-    const untracked = try untrackedDiff(alloc, io, cwd);
-    defer if (untracked) |u| alloc.free(u);
+    const untracked = if (try untrackedDiff(alloc, io, cwd)) |text| text else try alloc.alloc(u8, 0);
+    errdefer alloc.free(untracked);
 
-    var unstaged: ?[]u8 = null;
-    defer if (unstaged) |s| alloc.free(s);
-    var staged: ?[]u8 = null;
-    defer if (staged) |s| alloc.free(s);
-
-    if (try revExists(alloc, io, cwd, "HEAD")) {
-        unstaged = try git(alloc, io, cwd, .{ .argv = &.{ "git", "diff", "--find-renames" } });
-        staged = try git(alloc, io, cwd, .{ .argv = &.{ "git", "diff", "--find-renames", "--cached" } });
+    if (!try revExists(alloc, io, cwd, "HEAD")) {
+        const unstaged = try alloc.alloc(u8, 0);
+        errdefer alloc.free(unstaged);
+        return .{
+            .unstaged = unstaged,
+            .untracked = untracked,
+            .staged = try alloc.alloc(u8, 0),
+        };
     }
 
+    const unstaged = try git(alloc, io, cwd, .{ .argv = &.{ "git", "diff", "--find-renames" } });
+    errdefer alloc.free(unstaged);
+    return .{
+        .unstaged = unstaged,
+        .untracked = untracked,
+        .staged = try git(alloc, io, cwd, .{ .argv = &.{ "git", "diff", "--find-renames", "--cached" } }),
+    };
+}
+
+/// Same as `loadDefaultDiff`, but run git with an explicit child cwd.
+pub fn loadDefaultDiffCwd(alloc: Allocator, io: Io, cwd: std.process.Child.Cwd) Error!diff.Diff {
+    const texts = try loadDefaultTexts(alloc, io, cwd);
+    defer texts.deinit(alloc);
     return try diff.parsePieces(alloc, &.{
-        .{ .text = unstaged orelse "", .group = .unstaged },
-        .{ .text = untracked orelse "", .group = .untracked },
-        .{ .text = staged orelse "", .group = .staged },
+        .{ .text = texts.unstaged, .group = .unstaged },
+        .{ .text = texts.untracked, .group = .untracked },
+        .{ .text = texts.staged, .group = .staged },
     });
+}
+
+/// `git diff --find-renames <range>` stdout. Caller frees.
+fn rangeDiffText(alloc: Allocator, io: Io, cwd: std.process.Child.Cwd, range: []const u8) Error![]u8 {
+    try ensureInsideWorkTree(alloc, io, cwd);
+    return try git(alloc, io, cwd, .{ .argv = &.{ "git", "diff", "--find-renames", range } });
 }
 
 /// Load `git diff --find-renames <range>`. `range` is passed through as
 /// written (no `...` / `..` rewrite). Pass `.inherit` for the process cwd.
 pub fn loadRangeDiff(alloc: Allocator, io: Io, cwd: std.process.Child.Cwd, range: []const u8) Error!diff.Diff {
-    try ensureInsideWorkTree(alloc, io, cwd);
-    const out = try git(alloc, io, cwd, .{ .argv = &.{ "git", "diff", "--find-renames", range } });
+    const out = try rangeDiffText(alloc, io, cwd, range);
     defer alloc.free(out);
     return try diff.parse(alloc, out);
 }
 
-/// Load the patch `<commit>` introduced (parent → that commit).
-/// `commit` is a commit-ish as given; it must peel to a commit.
-pub fn loadCommitDiff(alloc: Allocator, io: Io, cwd: std.process.Child.Cwd, commit: []const u8) Error!diff.Diff {
+/// `git diff-tree` patch for `commit` (parent → commit). Caller frees.
+/// The commit-ish must peel to a commit.
+fn commitDiffText(alloc: Allocator, io: Io, cwd: std.process.Child.Cwd, commit: []const u8) Error![]u8 {
     try ensureInsideWorkTree(alloc, io, cwd);
     const as_commit = try std.fmt.allocPrint(alloc, "{s}^{{commit}}", .{commit});
     defer alloc.free(as_commit);
@@ -168,7 +203,7 @@ pub fn loadCommitDiff(alloc: Allocator, io: Io, cwd: std.process.Child.Cwd, comm
     });
     alloc.free(peeled);
 
-    const out = try git(alloc, io, cwd, .{
+    return try git(alloc, io, cwd, .{
         .argv = &.{
             "git",
             "diff-tree",
@@ -180,6 +215,12 @@ pub fn loadCommitDiff(alloc: Allocator, io: Io, cwd: std.process.Child.Cwd, comm
             commit,
         },
     });
+}
+
+/// Load the patch `<commit>` introduced (parent → that commit).
+/// `commit` is a commit-ish as given; it must peel to a commit.
+pub fn loadCommitDiff(alloc: Allocator, io: Io, cwd: std.process.Child.Cwd, commit: []const u8) Error!diff.Diff {
+    const out = try commitDiffText(alloc, io, cwd, commit);
     defer alloc.free(out);
     return try diff.parse(alloc, out);
 }
@@ -1743,6 +1784,211 @@ test "invalid commit: GitFailed" {
         error.GitFailed,
         loadCommitDiff(alloc, io, cwd, "this-ref-does-not-exist"),
     );
+}
+
+// Line oracle: flattened body lines vs the unified blobs the loaders parse.
+// A body line is ` `, `+`, `-`, or `\` after `@@`, until the next `diff --git`.
+// The marker is stripped. A blank line is not body text.
+
+const BodyLine = struct {
+    kind: diff.LineKind,
+    text: []const u8,
+};
+
+fn appendUnifiedBody(alloc: Allocator, lines: *std.ArrayList(BodyLine), text: []const u8) !void {
+    var in_hunk = false;
+    var it = std.mem.splitScalar(u8, text, '\n');
+    while (it.next()) |raw| {
+        const line = if (raw.len > 0 and raw[raw.len - 1] == '\r') raw[0 .. raw.len - 1] else raw;
+        if (std.mem.startsWith(u8, line, "diff --git ")) {
+            in_hunk = false;
+            continue;
+        }
+        if (std.mem.startsWith(u8, line, "@@")) {
+            in_hunk = true;
+            continue;
+        }
+        if (!in_hunk or line.len == 0) continue;
+        switch (line[0]) {
+            ' ', '+', '-' => {
+                const kind: diff.LineKind = switch (line[0]) {
+                    ' ' => .context,
+                    '+' => .add,
+                    '-' => .delete,
+                    else => unreachable,
+                };
+                try lines.append(alloc, .{ .kind = kind, .text = line[1..] });
+            },
+            '\\' => {
+                const body = if (std.mem.startsWith(u8, line, "\\ ")) line[2..] else line[1..];
+                try lines.append(alloc, .{ .kind = .meta, .text = body });
+            },
+            else => {},
+        }
+    }
+}
+
+fn expectLineRowsMatchStream(alloc: Allocator, rows: []const view.row.Row, parts: []const []const u8) !void {
+    var body: std.ArrayList(BodyLine) = .empty;
+    defer body.deinit(alloc);
+    for (parts) |text| try appendUnifiedBody(alloc, &body, text);
+
+    var seen: usize = 0;
+    for (rows) |row| {
+        const ln = switch (row) {
+            .line => |line| line,
+            else => continue,
+        };
+        if (seen >= body.items.len) {
+            std.debug.print(
+                "line oracle: row body line {d} past unified stream ({d} lines)\n",
+                .{ seen, body.items.len },
+            );
+            return error.TestExpectedEqual;
+        }
+        const want = body.items[seen];
+        if (want.kind != ln.kind or !std.mem.eql(u8, want.text, ln.text)) {
+            std.debug.print(
+                "line oracle mismatch at body line {d}\n  unified: {t} \"{s}\"\n  row:     {t} \"{s}\"\n",
+                .{ seen, want.kind, want.text, ln.kind, ln.text },
+            );
+            return error.TestExpectedEqual;
+        }
+        seen += 1;
+    }
+    if (seen != body.items.len) {
+        std.debug.print(
+            "line oracle: unified stream has {d} body lines, rows have {d}\n",
+            .{ body.items.len, seen },
+        );
+        return error.TestExpectedEqual;
+    }
+}
+
+fn rowHasText(rows: []const view.row.Row, text: []const u8) bool {
+    for (rows) |row| {
+        switch (row) {
+            .line => |ln| if (std.mem.eql(u8, ln.text, text)) return true,
+            else => {},
+        }
+    }
+    return false;
+}
+
+fn expectLineTokens(rows: []const view.row.Row, present: []const []const u8, absent: []const []const u8) !void {
+    for (present) |text| {
+        if (!rowHasText(rows, text)) {
+            std.debug.print("line oracle: missing row text \"{s}\"\n", .{text});
+            return error.TestExpectedEqual;
+        }
+    }
+    for (absent) |text| {
+        if (rowHasText(rows, text)) {
+            std.debug.print("line oracle: unexpected row text \"{s}\"\n", .{text});
+            return error.TestExpectedEqual;
+        }
+    }
+}
+
+test "line oracle: local rows match the unified body" {
+    if (builtin.os.tag == .wasi) return error.SkipZigTest;
+
+    const io = testing.io;
+    const alloc = testing.allocator;
+    var tmp = try IsolatedTmp.init(alloc, io);
+    defer tmp.deinit(alloc, io);
+    const cwd = tmp.cwd();
+
+    try initTestRepo(alloc, io, cwd);
+    try tmp.write(io, "unstaged.txt", "keep\nbase\n");
+    try tmp.write(io, "staged.txt", "base\n");
+    try expectGitOk(alloc, io, cwd, &.{ "git", "add", "unstaged.txt", "staged.txt" });
+    try expectGitOk(alloc, io, cwd, &.{ "git", "commit", "-m", "init" });
+
+    // Staged-only edit. The worktree matches the index, so the unstaged diff omits it.
+    try tmp.write(io, "staged.txt", "staged-token\n");
+    try expectGitOk(alloc, io, cwd, &.{ "git", "add", "staged.txt" });
+
+    // Unstaged edit with no trailing newline, so the stream includes a meta line.
+    try tmp.write(io, "unstaged.txt", "keep\nunstaged-token");
+    // Untracked. `git diff HEAD` does not include this file.
+    try tmp.write(io, "extra.txt", "untracked-token\n");
+
+    var d = try loadDefaultDiffCwd(alloc, io, cwd);
+    defer d.deinit();
+    const rows = try view.row.flatten(alloc, &d);
+    defer alloc.free(rows);
+
+    const texts = try loadDefaultTexts(alloc, io, cwd);
+    defer texts.deinit(alloc);
+    try expectLineRowsMatchStream(alloc, rows, &.{ texts.unstaged, texts.untracked, texts.staged });
+    try expectLineTokens(
+        rows,
+        &.{ "unstaged-token", "staged-token", "untracked-token", "No newline at end of file" },
+        &.{},
+    );
+}
+
+test "line oracle: range rows match the unified body" {
+    if (builtin.os.tag == .wasi) return error.SkipZigTest;
+
+    const io = testing.io;
+    const alloc = testing.allocator;
+    var tmp = try IsolatedTmp.init(alloc, io);
+    defer tmp.deinit(alloc, io);
+    const cwd = tmp.cwd();
+
+    try initTestRepo(alloc, io, cwd);
+    try tmp.write(io, "shared.txt", "on main\n");
+    try expectGitOk(alloc, io, cwd, &.{ "git", "add", "shared.txt" });
+    try expectGitOk(alloc, io, cwd, &.{ "git", "commit", "-m", "on main" });
+
+    try expectGitOk(alloc, io, cwd, &.{ "git", "checkout", "-b", "feature" });
+    try tmp.write(io, "shared.txt", "on main\nfeature-token\n");
+    try expectGitOk(alloc, io, cwd, &.{ "git", "add", "shared.txt" });
+    try expectGitOk(alloc, io, cwd, &.{ "git", "commit", "-m", "on feature" });
+
+    // Worktree dirt must stay out of a range load.
+    try tmp.write(io, "shared.txt", "on main\nfeature-token\ndirty-token\n");
+    try tmp.write(io, "extra.txt", "untracked-token\n");
+
+    var d = try loadRangeDiff(alloc, io, cwd, "main...HEAD");
+    defer d.deinit();
+    const rows = try view.row.flatten(alloc, &d);
+    defer alloc.free(rows);
+
+    const text = try rangeDiffText(alloc, io, cwd, "main...HEAD");
+    defer alloc.free(text);
+    try expectLineRowsMatchStream(alloc, rows, &.{text});
+    try expectLineTokens(rows, &.{ "feature-token" }, &.{ "dirty-token", "untracked-token" });
+}
+
+test "line oracle: commit rows match the unified body" {
+    if (builtin.os.tag == .wasi) return error.SkipZigTest;
+
+    const io = testing.io;
+    const alloc = testing.allocator;
+    var tmp = try IsolatedTmp.init(alloc, io);
+    defer tmp.deinit(alloc, io);
+    const cwd = tmp.cwd();
+
+    try initTestRepo(alloc, io, cwd);
+    try tmp.write(io, "committed.txt", "committed-token\n");
+    try expectGitOk(alloc, io, cwd, &.{ "git", "add", "committed.txt" });
+    try expectGitOk(alloc, io, cwd, &.{ "git", "commit", "-m", "init" });
+
+    try tmp.write(io, "committed.txt", "dirty-token\n");
+    try tmp.write(io, "extra.txt", "untracked-token\n");
+
+    var d = try loadCommitDiff(alloc, io, cwd, "HEAD");
+    defer d.deinit();
+    const rows = try view.row.flatten(alloc, &d);
+    defer alloc.free(rows);
+
+    const text = try commitDiffText(alloc, io, cwd, "HEAD");
+    defer alloc.free(text);
+    try expectLineRowsMatchStream(alloc, rows, &.{text});
+    try expectLineTokens(rows, &.{ "committed-token" }, &.{ "dirty-token", "untracked-token" });
 }
 
 test "mutate file: stage, unstage, discard; refuse discard staged" {
