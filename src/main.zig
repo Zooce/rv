@@ -9,7 +9,7 @@
 //! file git (local), `a`/`A` approve hunk/file (local; stages, then hides),
 //! `i`/`c`/`Enter`
 //! create or edit new, `I`/`C` old, `d` dismiss new, `D` dismiss old,
-//! `e` expand the current hunk's context, `r` reload the loaded diff, `q` quit).
+//! `e` expand the current hunk's context, `r` reload the diff and comments, `q` quit).
 //! Diff layout defaults to side-by-side when the terminal is wide enough;
 //! falls back to unified when narrow. `t` toggles session preference
 //! (explicit unified stays unified even when wide). `#` toggles line numbers
@@ -31,7 +31,8 @@
 //! scrolls with a right-edge scrollbar). Arrow keys move the caret; insert and
 //! backspace edit at the caret. Esc cancels; Enter saves. Open-comment marker:
 //! `*` in the gutter. Add/delete lines use green/red backgrounds (no `+/-`).
-//! Reload on next `rv` via `.rv/reviews/current.json`.
+//! Comments are stored in `.rv/reviews/current.json`. `r` re-reads that file;
+//! starting `rv` again does too.
 //!
 //! Diff text search (MVP-3a): `/` opens a single-line footer prompt. Enter
 //! commits a case-sensitive substring query over add/delete/context body text
@@ -72,7 +73,7 @@
 //! load). `e` expands the current hunk’s context (local and range); a hunk
 //! that can still grow shows Expand (e) on the hunk header. Not bound while
 //! commenting, searching, or in a list/help overlay. `r` restores git’s
-//! default context.
+//! default context and re-reads the comment file.
 //!
 //! Comment list: `Space` then `c` opens a centered overlay of live comments
 //! (same store as `rv list`). `j`/`k` move; Enter jumps with the same landing
@@ -149,14 +150,7 @@ fn runTui(alloc: std.mem.Allocator, io: std.Io, source: cli.Source) !u8 {
     defer diff_view.deinit(alloc);
 
     var review = store.load(alloc, io, .cwd(), store.default_review_id) catch |err| {
-        const msg: []const u8 = switch (err) {
-            error.InvalidJson => "invalid .rv review JSON",
-            error.InvalidState => "invalid comment state in .rv store",
-            error.InvalidSide => "invalid comment side in .rv store",
-            error.OutOfMemory => "out of memory",
-            else => "failed to load .rv comment store",
-        };
-        std.debug.print("rv: {s}\n", .{msg});
+        std.debug.print("rv: {s}\n", .{reviewLoadMessage(err)});
         return 1;
     };
     defer review.deinit();
@@ -541,6 +535,7 @@ fn runTui(alloc: std.mem.Allocator, io: std.Io, source: cli.Source) !u8 {
                                 } else if (c == '(') {
                                     try jumpLiveComment(&review, &diff_view, alloc, io, source, &viewport.cursor, &frame.note, .prev);
                                 } else if (c == 'r') {
+                                    reloadReview(alloc, io, .cwd(), &review, &frame.note);
                                     reloadDiff(alloc, io, source, &diff_view, &viewport.cursor, &frame.note);
                                 } else if (c == 'e') {
                                     try expandCurrentHunk(
@@ -731,6 +726,33 @@ fn approvedLoadMessage(err: approve.LoadError) []const u8 {
         error.InvalidJson, error.InvalidHash => "invalid .rv approved JSON",
         else => "failed to load .rv approved store",
     };
+}
+
+fn reviewLoadMessage(err: store.LoadError) []const u8 {
+    return switch (err) {
+        error.InvalidJson => "invalid .rv review JSON",
+        error.InvalidState => "invalid comment state in .rv store",
+        error.InvalidSide => "invalid comment side in .rv store",
+        error.OutOfMemory => "out of memory",
+        else => "failed to load .rv comment store",
+    };
+}
+
+/// Re-read `.rv/reviews/current.json` into `review`. On failure, keep the
+/// previous comments and set `note`.
+fn reloadReview(
+    alloc: std.mem.Allocator,
+    io: std.Io,
+    root: std.Io.Dir,
+    review: *store.Review,
+    note: *StatusNote,
+) void {
+    const loaded = store.load(alloc, io, root, store.default_review_id) catch |err| {
+        note.set(reviewLoadMessage(err));
+        return;
+    };
+    review.deinit();
+    review.* = loaded;
 }
 
 /// Re-run the startup load. On success, replace the live DiffView and restore
@@ -3309,6 +3331,38 @@ fn hasRowFile(rows: []const view.row.Row, path: []const u8, group: diff.Group) b
         }
     }
     return false;
+}
+
+test "reloadReview takes comments from the file and keeps them when the file is invalid" {
+    if (builtin.os.tag == .wasi) return error.SkipZigTest;
+
+    const io = std.testing.io;
+    const alloc = std.testing.allocator;
+    var tmp = try IsolatedTmp.init(alloc, io);
+    defer tmp.deinit(alloc, io);
+
+    var review = try store.initEmpty(alloc, store.default_review_id);
+    defer review.deinit();
+    _ = try review.addOpen("f.txt", null, 1, .new, "stale", .local);
+    try store.save(&review, alloc, io, tmp.dir);
+
+    var disk = try store.load(alloc, io, tmp.dir, store.default_review_id);
+    defer disk.deinit();
+    try disk.remove(&.{"1"});
+    _ = try disk.addOpen("f.txt", null, 2, .new, "fresh", .local);
+    try store.save(&disk, alloc, io, tmp.dir);
+
+    var note: StatusNote = .{};
+    reloadReview(alloc, io, tmp.dir, &review, &note);
+    try std.testing.expectEqual(1, review.comments.items.len);
+    try std.testing.expectEqualStrings("fresh", review.comments.items[0].body);
+    try std.testing.expectEqual(0, note.slice().len);
+
+    try tmp.write(io, ".rv/reviews/current.json", "{");
+    reloadReview(alloc, io, tmp.dir, &review, &note);
+    try std.testing.expectEqual(1, review.comments.items.len);
+    try std.testing.expectEqualStrings("fresh", review.comments.items[0].body);
+    try std.testing.expectEqualStrings("invalid .rv review JSON", note.slice());
 }
 
 fn hunkAdds(file: diff.File, text: []const u8) bool {
