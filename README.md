@@ -2,7 +2,7 @@
 
 **Local terminal diff review for humans.**
 
-Review and approve hunks or files. Add comments. Tell your agent `rv comments` and it will address them.
+Open `rv` on your local changes. Approve the changes you like, and comment on the changes you have feedback on. Tell your agent to address your rv comments. Reload with `r` and continue until you are happy with the changes.
 
 ## Install
 
@@ -43,21 +43,28 @@ npx skills add Zooce/rv -g
 
 ```sh
 rv                 # local changes (staged, unstaged, untracked)
+```
+
+`j` and `k` move the current line. `a` approves the hunk at that line and `A` approves the whole file. Approving stages the change and hides it from the diff. `i` or `Enter` comments on the current line. Press `?` for every key, and `q` to quit.
+
+Tell your agent to address your rv comments. The skill from the install step reads those comments, edits the code, and resolves each comment it has handled. What you approved stays staged and stays out of the next diff.
+
+`r` reloads the diff and the comments. Continue until you are happy with the changes.
+
+```sh
 rv HEAD            # one commit
 rv main...HEAD     # a range
 ```
 
-Vim keys move a **current line** on the diff. `i` / `Enter` comments there. `a` / `A` approve a hunk or file (stages, then hides). Press `?` for keybindings.
-
 ```sh
-rv export          # comments for the agent
-rv list
+rv list            # open comments
+rv export          # those comments as markdown
 rv resolve <id>    # drop an addressed comment
 rv approved        # hidden hunks and files
 rv unapprove <n>
 ```
 
-`rv` does not apply fixes. It is the comment board; the agent does the work.
+`rv` keeps your approvals and your comments. Your agent changes the code.
 
 ## License
 
