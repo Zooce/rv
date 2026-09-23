@@ -51,6 +51,16 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
 
+    // Word-diff porcelain spans. Not linked into rv until paint uses them.
+    const worddiff_mod = b.addModule("worddiff", .{
+        .root_source_file = b.path("src/worddiff.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{
+            .{ .name = "isolated_tmp", .module = isolated_tmp_mod },
+        },
+    });
+
     // Git subprocess loader + local-only default (MVP-0.2).
     const git_mod = b.addModule("git", .{
         .root_source_file = b.path("src/git.zig"),
@@ -196,6 +206,11 @@ pub fn build(b: *std.Build) void {
     });
     const run_diff_tests = b.addRunArtifact(diff_tests);
 
+    const worddiff_tests = b.addTest(.{
+        .root_module = worddiff_mod,
+    });
+    const run_worddiff_tests = b.addRunArtifact(worddiff_tests);
+
     const git_tests = b.addTest(.{
         .root_module = git_mod,
     });
@@ -258,9 +273,10 @@ pub fn build(b: *std.Build) void {
     });
     const run_main_tests = b.addRunArtifact(main_tests);
 
-    const test_step = b.step("test", "Run unit tests (TUI + diff + git + view + comment_input + Help + approve + store + comments + cli + main)");
+    const test_step = b.step("test", "Run unit tests (TUI + diff + worddiff + git + view + comment_input + Help + approve + store + comments + cli + main)");
     test_step.dependOn(&run_tui_tests.step);
     test_step.dependOn(&run_diff_tests.step);
+    test_step.dependOn(&run_worddiff_tests.step);
     test_step.dependOn(&run_git_tests.step);
     test_step.dependOn(&run_view_tests.step);
     test_step.dependOn(&run_comment_input_tests.step);
