@@ -188,22 +188,27 @@ pub fn loadDefaultDiffCwd(alloc: Allocator, io: Io, cwd: std.process.Child.Cwd) 
 }
 
 /// `git diff --find-renames <range>` stdout. Caller frees.
-fn rangeDiffText(alloc: Allocator, io: Io, cwd: std.process.Child.Cwd, range: []const u8) Error![]u8 {
+/// `porcelain` adds `--word-diff=porcelain`.
+fn rangeDiffText(alloc: Allocator, io: Io, cwd: std.process.Child.Cwd, range: []const u8, porcelain: bool) Error![]u8 {
     try ensureInsideWorkTree(alloc, io, cwd);
-    return try git(alloc, io, cwd, .{ .argv = &.{ "git", "diff", "--find-renames", range } });
+    const argv: []const []const u8 = if (porcelain)
+        &.{ "git", "diff", "--find-renames", "--word-diff=porcelain", range }
+    else
+        &.{ "git", "diff", "--find-renames", range };
+    return try git(alloc, io, cwd, .{ .argv = argv });
 }
 
 /// Load `git diff --find-renames <range>`. `range` is passed through as
 /// written (no `...` / `..` rewrite). Pass `.inherit` for the process cwd.
 pub fn loadRangeDiff(alloc: Allocator, io: Io, cwd: std.process.Child.Cwd, range: []const u8) Error!diff.Diff {
-    const out = try rangeDiffText(alloc, io, cwd, range);
+    const out = try rangeDiffText(alloc, io, cwd, range, false);
     defer alloc.free(out);
     return try diff.parse(alloc, out);
 }
 
 /// `git diff-tree` patch for `commit` (parent → commit). Caller frees.
-/// The commit-ish must peel to a commit.
-fn commitDiffText(alloc: Allocator, io: Io, cwd: std.process.Child.Cwd, commit: []const u8) Error![]u8 {
+/// The commit-ish must peel to a commit. `porcelain` adds `--word-diff=porcelain`.
+fn commitDiffText(alloc: Allocator, io: Io, cwd: std.process.Child.Cwd, commit: []const u8, porcelain: bool) Error![]u8 {
     try ensureInsideWorkTree(alloc, io, cwd);
     const as_commit = try std.fmt.allocPrint(alloc, "{s}^{{commit}}", .{commit});
     defer alloc.free(as_commit);
@@ -212,8 +217,20 @@ fn commitDiffText(alloc: Allocator, io: Io, cwd: std.process.Child.Cwd, commit: 
     });
     alloc.free(peeled);
 
-    return try git(alloc, io, cwd, .{
-        .argv = &.{
+    const argv: []const []const u8 = if (porcelain)
+        &.{
+            "git",
+            "diff-tree",
+            "-p",
+            "--root",
+            "--find-renames",
+            "--word-diff=porcelain",
+            "--no-commit-id",
+            "--first-parent",
+            commit,
+        }
+    else
+        &.{
             "git",
             "diff-tree",
             "-p",
@@ -222,14 +239,14 @@ fn commitDiffText(alloc: Allocator, io: Io, cwd: std.process.Child.Cwd, commit: 
             "--no-commit-id",
             "--first-parent",
             commit,
-        },
-    });
+        };
+    return try git(alloc, io, cwd, .{ .argv = argv });
 }
 
 /// Load the patch `<commit>` introduced (parent → that commit).
 /// `commit` is a commit-ish as given; it must peel to a commit.
 pub fn loadCommitDiff(alloc: Allocator, io: Io, cwd: std.process.Child.Cwd, commit: []const u8) Error!diff.Diff {
-    const out = try commitDiffText(alloc, io, cwd, commit);
+    const out = try commitDiffText(alloc, io, cwd, commit, false);
     defer alloc.free(out);
     return try diff.parse(alloc, out);
 }
@@ -1971,7 +1988,7 @@ test "line oracle: range rows match the unified body" {
     const rows = try view.row.flatten(alloc, &d);
     defer alloc.free(rows);
 
-    const text = try rangeDiffText(alloc, io, cwd, "main...HEAD");
+    const text = try rangeDiffText(alloc, io, cwd, "main...HEAD", false);
     defer alloc.free(text);
     try expectLineRowsMatchStream(alloc, rows, &.{text});
     try expectLineTokens(rows, &.{ "feature-token" }, &.{ "dirty-token", "untracked-token" });
@@ -1999,7 +2016,7 @@ test "line oracle: commit rows match the unified body" {
     const rows = try view.row.flatten(alloc, &d);
     defer alloc.free(rows);
 
-    const text = try commitDiffText(alloc, io, cwd, "HEAD");
+    const text = try commitDiffText(alloc, io, cwd, "HEAD", false);
     defer alloc.free(text);
     try expectLineRowsMatchStream(alloc, rows, &.{text});
     try expectLineTokens(rows, &.{ "committed-token" }, &.{ "dirty-token", "untracked-token" });
@@ -2086,6 +2103,97 @@ test "local word-diff porcelain matches the loaded hunks" {
     }
     try testing.expect(saw_word);
     try testing.expect(saw_other);
+}
+
+fn expectGitOnly(report: *const worddiff.MismatchReport, text: []const u8, side: worddiff.Side, hunk: usize) !void {
+    for (report.items) |m| {
+        if (!std.mem.eql(u8, m.text, text)) continue;
+        try testing.expectEqual(worddiff.Which.git_only, m.kind);
+        try testing.expectEqual(side, m.side);
+        try testing.expectEqual(hunk, m.hunk);
+        return;
+    }
+    std.debug.print("missing git_only \"{s}\"\n", .{text});
+    return error.TestExpectedEqual;
+}
+
+fn expectAbsentText(report: *const worddiff.MismatchReport, text: []const u8) !void {
+    for (report.items) |m| {
+        if (std.mem.eql(u8, m.text, text)) {
+            std.debug.print("unexpected mismatch text \"{s}\"\n", .{text});
+            return error.TestExpectedEqual;
+        }
+    }
+}
+
+test "range word-diff porcelain matches the loaded hunks" {
+    if (builtin.os.tag == .wasi) return error.SkipZigTest;
+
+    const io = testing.io;
+    const alloc = testing.allocator;
+    var tmp = try IsolatedTmp.init(alloc, io);
+    defer tmp.deinit(alloc, io);
+    const cwd = tmp.cwd();
+
+    try initTestRepo(alloc, io, cwd);
+    try tmp.write(io, "shared.txt", "keep alpha\n");
+    try expectGitOk(alloc, io, cwd, &.{ "git", "add", "shared.txt" });
+    try expectGitOk(alloc, io, cwd, &.{ "git", "commit", "-m", "on main" });
+    try expectGitOk(alloc, io, cwd, &.{ "git", "checkout", "-b", "feature" });
+    try tmp.write(io, "shared.txt", "keep BETA\n");
+    try expectGitOk(alloc, io, cwd, &.{ "git", "add", "shared.txt" });
+    try expectGitOk(alloc, io, cwd, &.{ "git", "commit", "-m", "on feature" });
+    // Worktree dirt stays out of a range load.
+    try tmp.write(io, "shared.txt", "keep BETA\ndirt-token\n");
+    try tmp.write(io, "extra.txt", "untracked-token\n");
+
+    var d = try loadRangeDiff(alloc, io, cwd, "main...HEAD");
+    defer d.deinit();
+    const por = try rangeDiffText(alloc, io, cwd, "main...HEAD", true);
+    defer alloc.free(por);
+
+    try testing.expectEqual(1, d.files.len);
+    try testing.expectEqual(1, d.files[0].hunks.len);
+    var report = try worddiff.mismatches(alloc, d.files[0].displayPath(), d.files[0].hunks, por, &.{});
+    defer report.deinit();
+    try expectGitOnly(&report, "BETA", .new, 0);
+    try expectGitOnly(&report, "alpha", .old, 0);
+    try expectAbsentText(&report, "dirt-token");
+    try expectAbsentText(&report, "untracked-token");
+}
+
+test "commit word-diff porcelain matches the loaded hunks" {
+    if (builtin.os.tag == .wasi) return error.SkipZigTest;
+
+    const io = testing.io;
+    const alloc = testing.allocator;
+    var tmp = try IsolatedTmp.init(alloc, io);
+    defer tmp.deinit(alloc, io);
+    const cwd = tmp.cwd();
+
+    try initTestRepo(alloc, io, cwd);
+    try tmp.write(io, "committed.txt", "keep alpha\n");
+    try expectGitOk(alloc, io, cwd, &.{ "git", "add", "committed.txt" });
+    try expectGitOk(alloc, io, cwd, &.{ "git", "commit", "-m", "init" });
+    try tmp.write(io, "committed.txt", "keep BETA\n");
+    try expectGitOk(alloc, io, cwd, &.{ "git", "add", "committed.txt" });
+    try expectGitOk(alloc, io, cwd, &.{ "git", "commit", "-m", "edit" });
+    try tmp.write(io, "committed.txt", "keep BETA\ndirt-token\n");
+    try tmp.write(io, "extra.txt", "untracked-token\n");
+
+    var d = try loadCommitDiff(alloc, io, cwd, "HEAD");
+    defer d.deinit();
+    const por = try commitDiffText(alloc, io, cwd, "HEAD", true);
+    defer alloc.free(por);
+
+    try testing.expectEqual(1, d.files.len);
+    try testing.expectEqual(1, d.files[0].hunks.len);
+    var report = try worddiff.mismatches(alloc, d.files[0].displayPath(), d.files[0].hunks, por, &.{});
+    defer report.deinit();
+    try expectGitOnly(&report, "BETA", .new, 0);
+    try expectGitOnly(&report, "alpha", .old, 0);
+    try expectAbsentText(&report, "dirt-token");
+    try expectAbsentText(&report, "untracked-token");
 }
 
 test "mutate file: stage, unstage, discard; refuse discard staged" {
