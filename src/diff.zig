@@ -65,6 +65,12 @@ pub const LineKind = enum {
     meta,
 };
 
+/// Half-open byte range `[start, end)` into a line's text.
+pub const Span = struct {
+    start: usize,
+    end: usize,
+};
+
 /// One line of a hunk.
 pub const Line = struct {
     kind: LineKind,

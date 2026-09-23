@@ -51,7 +51,8 @@ note: StatusNote = .{},
 ///   section header — body bg, box-drawing rule (`─ Unstaged ─`)
 ///   file header   — full-row dark grey bar, bold light path
 ///   hunk header   — full-row deeper grey bar, light `@@`
-///   add / delete  — green/red fills (#35); markers are not restored
+///   add / delete  — green/red fills when the line has no word spans
+///   change        — dim grey for a line that has word spans; spans use add/delete
 ///   *@_cur        — lighter lift of the same kind (keeps identity)
 ///   meta / meta@cur — dim / reverse gray only
 /// No color → bg may not show; structure still relies on bold/dim when set.
@@ -67,6 +68,9 @@ const Palette = struct {
     hunk_cur: tui.Style,
     add: tui.Style,
     del: tui.Style,
+    /// Dim grey behind a changed line whose words are highlighted separately.
+    change: tui.Style,
+    change_cur: tui.Style,
     add_cur: tui.Style,
     del_cur: tui.Style,
     ctx_cur: tui.Style,
@@ -79,12 +83,7 @@ const Palette = struct {
     fn rowStyle(self: Palette, row: view.row.Row, is_cur: bool) tui.Style {
         if (is_cur) {
             return switch (row) {
-                .line => |ln| switch (ln.kind) {
-                    .add => self.add_cur,
-                    .delete => self.del_cur,
-                    .context => self.ctx_cur,
-                    .meta => self.cur,
-                },
+                .line => |ln| lineStyle(self, ln.kind, ln.spans, true),
                 .section_header => self.section_cur,
                 .file_header => self.file_cur,
                 .hunk_header => self.hunk_cur,
@@ -94,15 +93,38 @@ const Palette = struct {
             .section_header => self.section,
             .file_header => self.file,
             .hunk_header => self.hunk,
-            .line => |ln| switch (ln.kind) {
-                .add => self.add,
-                .delete => self.del,
-                .meta => self.meta,
-                .context => self.body,
-            },
+            .line => |ln| lineStyle(self, ln.kind, ln.spans, false),
         };
     }
 };
+
+fn lineStyle(pal: Palette, kind: diff.LineKind, spans: []const diff.Span, is_cur: bool) tui.Style {
+    if (spans.len > 0 and (kind == .add or kind == .delete)) {
+        return if (is_cur) pal.change_cur else pal.change;
+    }
+    if (is_cur) {
+        return switch (kind) {
+            .add => pal.add_cur,
+            .delete => pal.del_cur,
+            .context => pal.ctx_cur,
+            .meta => pal.cur,
+        };
+    }
+    return switch (kind) {
+        .add => pal.add,
+        .delete => pal.del,
+        .meta => pal.meta,
+        .context => pal.body,
+    };
+}
+
+fn spanStyle(kind: diff.LineKind, is_cur: bool) tui.Style {
+    return switch (kind) {
+        .add => if (is_cur) palette.add_cur else palette.add,
+        .delete => if (is_cur) palette.del_cur else palette.del,
+        .context, .meta => if (is_cur) palette.change_cur else palette.change,
+    };
+}
 
 const palette: Palette = blk: {
     const bg = tui.Color{ .rgb = .{ .r = 0x12, .g = 0x12, .b = 0x14 } };
@@ -146,6 +168,15 @@ const palette: Palette = blk: {
         .hunk_cur = .{
             .fg = .{ .rgb = .{ .r = 0xee, .g = 0xee, .b = 0xf0 } },
             .bg = .{ .rgb = .{ .r = 0x44, .g = 0x44, .b = 0x48 } },
+            .bold = true,
+        },
+        .change = .{
+            .fg = fg,
+            .bg = .{ .rgb = .{ .r = 0x2c, .g = 0x2c, .b = 0x32 } },
+        },
+        .change_cur = .{
+            .fg = fg,
+            .bg = .{ .rgb = .{ .r = 0x3c, .g = 0x3c, .b = 0x44 } },
             .bold = true,
         },
         .add = .{
@@ -310,6 +341,7 @@ pub fn paint(
                         viewport.wrap,
                         pan_span.containsBody(i),
                         st,
+                        is_cur,
                     ),
                     .section_header => {
                         scr.fillRect(.{ .x = 0, .y = screen_y, .w = scr.cols, .h = 1 }, '─', st);
@@ -383,6 +415,7 @@ pub fn paint(
                             viewport.wrap,
                             pan_span.containsBody(ri),
                             st,
+                            ri == cur,
                         );
                     },
                     .pair => |p| {
@@ -412,18 +445,18 @@ pub fn paint(
                                 const marked = rowMarked(rows[ri], review);
                                 const pan = pan_span.containsBody(ri);
                                 if (viewport.wrap) {
-                                    left_pane.putSegment(screen_y, rows[ri], marked, vis, left_st);
+                                    left_pane.putSegment(screen_y, rows[ri], marked, vis, left_st, slot_cur);
                                 } else {
-                                    left_pane.putPanned(screen_y, rows[ri], marked, pan, left_st);
+                                    left_pane.putPanned(screen_y, rows[ri], marked, pan, left_st, slot_cur);
                                 }
                             }
                             if (p.right) |ri| {
                                 const marked = rowMarked(rows[ri], review);
                                 const pan = pan_span.containsBody(ri);
                                 if (viewport.wrap) {
-                                    right_pane.putSegment(screen_y, rows[ri], marked, vis, right_st);
+                                    right_pane.putSegment(screen_y, rows[ri], marked, vis, right_st, slot_cur);
                                 } else {
-                                    right_pane.putPanned(screen_y, rows[ri], marked, pan, right_st);
+                                    right_pane.putPanned(screen_y, rows[ri], marked, pan, right_st, slot_cur);
                                 }
                             }
                             screen_y += 1;
@@ -603,6 +636,8 @@ const BodyPane = struct {
         text: []const u8,
         style: tui.Style,
         skip: usize,
+        spans: []const diff.Span,
+        is_cur: bool,
     ) void {
         var gbuf: [32]u8 = undefined;
         const gutter = formatBodyGutter(&gbuf, row, marked, self.num_w, self.numbers, show_nums);
@@ -614,6 +649,18 @@ const BodyPane = struct {
             const text_w = self.pane_w - gw;
             const clip = tui.Rect{ .x = x_text, .y = y, .w = text_w, .h = 1 };
             self.scr.putStr(x_text, y, text, style, skip, clip);
+            if (spans.len > 0) {
+                const kind = switch (row) {
+                    .line => |l| l.kind,
+                    else => diff.LineKind.context,
+                };
+                const hi = spanStyle(kind, is_cur);
+                for (spans) |sp| {
+                    if (sp.start >= sp.end or sp.start >= text.len) continue;
+                    const end = @min(sp.end, text.len);
+                    self.scr.putStrRange(x_text, y, text, sp.start, end, hi, skip, clip);
+                }
+            }
         }
     }
 
@@ -625,13 +672,14 @@ const BodyPane = struct {
         marked: bool,
         pan: bool,
         style: tui.Style,
+        is_cur: bool,
     ) void {
         const ln = switch (row) {
             .line => |l| l,
             else => return,
         };
         const skip: usize = if (pan) self.col_scroll else 0;
-        self.putText(y, row, marked, true, ln.text, style, skip);
+        self.putText(y, row, marked, true, ln.text, style, skip, ln.spans, is_cur);
     }
 
     /// One wrapped visual segment at `vis`, or nothing if that segment does
@@ -643,6 +691,7 @@ const BodyPane = struct {
         marked: bool,
         vis: usize,
         style: tui.Style,
+        is_cur: bool,
     ) void {
         const ln = switch (row) {
             .line => |l| l,
@@ -650,7 +699,9 @@ const BodyPane = struct {
         };
         const width = bodyTextCols(self.pane_w, self.num_w, self.textLayout());
         const seg = view.wrap.segmentAt(ln.text, width, vis) orelse return;
-        self.putText(y, row, marked, vis == 0, ln.text[seg.start..seg.end], style, 0);
+        var buf: [16]diff.Span = undefined;
+        const spans = shiftSpans(ln.spans, seg.start, seg.end, &buf);
+        self.putText(y, row, marked, vis == 0, ln.text[seg.start..seg.end], style, 0, spans, is_cur);
     }
 
     /// Fill the pane and draw one body row. Wrap uses several screen rows.
@@ -664,11 +715,12 @@ const BodyPane = struct {
         wrap: bool,
         pan: bool,
         style: tui.Style,
+        is_cur: bool,
     ) u16 {
-        if (wrap) return self.putWrapped(y, y_end, row, marked, style);
+        if (wrap) return self.putWrapped(y, y_end, row, marked, style, is_cur);
         if (y >= y_end) return y;
         fillSpan(self.scr, self.x, self.x +| self.pane_w, y, style);
-        self.putPanned(y, row, marked, pan, style);
+        self.putPanned(y, row, marked, pan, style, is_cur);
         return y + 1;
     }
 
@@ -679,6 +731,7 @@ const BodyPane = struct {
         row: view.row.Row,
         marked: bool,
         style: tui.Style,
+        is_cur: bool,
     ) u16 {
         const ln = switch (row) {
             .line => |l| l,
@@ -690,12 +743,26 @@ const BodyPane = struct {
         var yy = y;
         while (vis < n and yy < y_end) : (vis += 1) {
             fillSpan(self.scr, self.x, self.x +| self.pane_w, yy, style);
-            self.putSegment(yy, row, marked, vis, style);
+            self.putSegment(yy, row, marked, vis, style, is_cur);
             yy += 1;
         }
         return yy;
     }
 };
+
+/// Spans overlapping `[lo, hi)`, shifted so 0 is `lo`. `buf` caps the count.
+fn shiftSpans(spans: []const diff.Span, lo: usize, hi: usize, buf: []diff.Span) []const diff.Span {
+    var n: usize = 0;
+    for (spans) |s| {
+        if (n >= buf.len) break;
+        const a = @max(s.start, lo);
+        const b = @min(s.end, hi);
+        if (a >= b) continue;
+        buf[n] = .{ .start = a - lo, .end = b - lo };
+        n += 1;
+    }
+    return buf[0..n];
+}
 
 fn rowMarked(row: view.row.Row, review: *const store.Review) bool {
     return switch (row) {
@@ -1230,7 +1297,7 @@ test "putPannedBody pans text and leaves gutter" {
         .col_scroll = 0,
     };
     scr.clear();
-    pane.putPanned(0, row, false, false, st);
+    pane.putPanned(0, row, false, false, st, false);
     try testing.expectEqual(' ', scr.getCell(0, 0).char);
     try testing.expectEqual('1', scr.getCell(2, 0).char);
     try testing.expectEqual('2', scr.getCell(4, 0).char);
@@ -1239,7 +1306,7 @@ test "putPannedBody pans text and leaves gutter" {
     scr.clear();
     var panned = pane;
     panned.col_scroll = 3;
-    panned.putPanned(0, row, false, true, st);
+    panned.putPanned(0, row, false, true, st, false);
     try testing.expectEqual(' ', scr.getCell(0, 0).char);
     try testing.expectEqual('1', scr.getCell(2, 0).char);
     try testing.expectEqual('2', scr.getCell(4, 0).char);
@@ -1255,10 +1322,81 @@ test "putPannedBody pans text and leaves gutter" {
         .numbers = .unified,
         .col_scroll = 2,
     };
-    marked.putPanned(0, row, true, true, st);
+    marked.putPanned(0, row, true, true, st, false);
     try testing.expectEqual('*', scr.getCell(0, 0).char);
     try testing.expectEqual(' ', scr.getCell(1, 0).char);
     try testing.expectEqual('C', scr.getCell(2, 0).char);
+}
+
+test "word spans grey the line and color only the changed columns" {
+    const spans = [_]diff.Span{.{ .start = 6, .end = 11 }};
+    const row: view.row.Row = .{ .line = .{
+        .kind = .add,
+        .text = "hello WORLD",
+        .path = "f",
+        .new_no = 1,
+        .spans = &spans,
+    } };
+    const plain: view.row.Row = .{ .line = .{
+        .kind = .add,
+        .text = "hello WORLD",
+        .path = "f",
+        .new_no = 1,
+    } };
+    try testing.expect(palette.rowStyle(plain, false).bg.eql(palette.add.bg));
+    try testing.expect(palette.rowStyle(row, false).bg.eql(palette.change.bg));
+    try testing.expect(palette.rowStyle(row, true).bg.eql(palette.change_cur.bg));
+
+    var scr = try tui.Screen.init(testing.allocator, .{ .cols = 20, .rows = 3 });
+    defer scr.deinit();
+    const pane = BodyPane{
+        .scr = &scr,
+        .x = 0,
+        .pane_w = 20,
+        .num_w = 0,
+        .numbers = .unified,
+        .col_scroll = 0,
+    };
+    const base = palette.rowStyle(row, false);
+    scr.clear();
+    pane.putPanned(0, row, false, false, base, false);
+    // 2-column gutter, then "hello " on grey and "WORLD" on the add fill.
+    try testing.expect(scr.getCell(2, 0).style.bg.eql(palette.change.bg));
+    try testing.expectEqual('h', scr.getCell(2, 0).char);
+    try testing.expect(scr.getCell(7, 0).style.bg.eql(palette.change.bg));
+    try testing.expectEqual(' ', scr.getCell(7, 0).char);
+    try testing.expect(scr.getCell(8, 0).style.bg.eql(palette.add.bg));
+    try testing.expectEqual('W', scr.getCell(8, 0).char);
+
+    scr.clear();
+    var panned = pane;
+    panned.col_scroll = 6;
+    panned.putPanned(0, row, false, true, base, false);
+    try testing.expect(scr.getCell(2, 0).style.bg.eql(palette.add.bg));
+    try testing.expectEqual('W', scr.getCell(2, 0).char);
+
+    const del_spans = [_]diff.Span{.{ .start = 6, .end = 11 }};
+    const deleted: view.row.Row = .{ .line = .{
+        .kind = .delete,
+        .text = "hello WORLD",
+        .path = "f",
+        .old_no = 1,
+        .spans = &del_spans,
+    } };
+    scr.clear();
+    pane.putPanned(0, deleted, false, false, palette.rowStyle(deleted, true), true);
+    try testing.expect(scr.getCell(2, 0).style.bg.eql(palette.change_cur.bg));
+    try testing.expect(scr.getCell(8, 0).style.bg.eql(palette.del_cur.bg));
+
+    // Text width 6 wraps "hello WORLD" into "hello" and "WORLD".
+    scr.clear();
+    var wrapped = pane;
+    wrapped.pane_w = 8;
+    _ = wrapped.putWrapped(0, 3, row, false, base, false);
+    try testing.expect(scr.getCell(2, 0).style.bg.eql(palette.change.bg));
+    try testing.expectEqual('h', scr.getCell(2, 0).char);
+    try testing.expect(scr.getCell(2, 1).style.bg.eql(palette.add.bg));
+    try testing.expectEqual('W', scr.getCell(2, 1).char);
 }
 
 test "putPannedBody expands a tab to the next stop" {
@@ -1283,7 +1421,7 @@ test "putPannedBody expands a tab to the next stop" {
         .col_scroll = 0,
     };
     scr.clear();
-    pane.putPanned(0, row, false, false, st);
+    pane.putPanned(0, row, false, false, st, false);
     try testing.expectEqual('→', scr.getCell(2, 0).char);
     try testing.expect(scr.getCell(2, 0).style.dim);
     try testing.expectEqual(' ', scr.getCell(3, 0).char);
@@ -1294,7 +1432,7 @@ test "putPannedBody expands a tab to the next stop" {
     scr.clear();
     var skipped = pane;
     skipped.col_scroll = 3;
-    skipped.putPanned(0, row, false, true, st);
+    skipped.putPanned(0, row, false, true, st, false);
     try testing.expectEqual(' ', scr.getCell(2, 0).char);
     try testing.expectEqual('X', scr.getCell(3, 0).char);
 }
@@ -1318,7 +1456,7 @@ test "putWrappedPane wraps text and repeats gutter" {
         .num_w = 0,
         .numbers = .unified,
         .col_scroll = 0,
-    }).putWrapped(0, 3, row, false, st);
+    }).putWrapped(0, 3, row, false, st, false);
     try testing.expectEqual(2, next);
     try testing.expectEqual(' ', scr.getCell(0, 0).char);
     try testing.expectEqual('h', scr.getCell(2, 0).char);
@@ -1348,7 +1486,7 @@ test "putWrappedPane omits line numbers on continuation" {
         .num_w = 1,
         .numbers = .unified,
         .col_scroll = 0,
-    }).putWrapped(0, 2, row, false, st);
+    }).putWrapped(0, 2, row, false, st, false);
     try testing.expectEqual('1', scr.getCell(2, 0).char);
     try testing.expectEqual('2', scr.getCell(4, 0).char);
     try testing.expectEqual('h', scr.getCell(6, 0).char);
@@ -1375,7 +1513,7 @@ test "putWrappedPane keeps mark on continuation" {
         .num_w = 0,
         .numbers = .unified,
         .col_scroll = 0,
-    }).putWrapped(0, 2, row, true, st);
+    }).putWrapped(0, 2, row, true, st, false);
     try testing.expectEqual('*', scr.getCell(0, 0).char);
     try testing.expectEqual('*', scr.getCell(0, 1).char);
 }
@@ -1397,7 +1535,7 @@ test "putWrappedPane clips at y_end" {
         .num_w = 0,
         .numbers = .unified,
         .col_scroll = 0,
-    }).putWrapped(0, 1, row, false, st);
+    }).putWrapped(0, 1, row, false, st, false);
     try testing.expectEqual(1, next);
     try testing.expectEqual('h', scr.getCell(2, 0).char);
     try testing.expectEqual(' ', scr.getCell(2, 1).char);
@@ -1421,7 +1559,7 @@ test "putWrappedPane wraps at side-by-side pane width" {
         .num_w = 0,
         .numbers = .old,
         .col_scroll = 0,
-    }).putWrapped(0, 3, row, false, st);
+    }).putWrapped(0, 3, row, false, st, false);
     try testing.expectEqual(2, next);
     try testing.expectEqual(' ', scr.getCell(9, 0).char);
     try testing.expectEqual('h', scr.getCell(12, 0).char);

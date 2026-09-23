@@ -231,6 +231,23 @@ pub const Screen = struct {
     /// column draws only the remaining spaces. `x` is the screen column of
     /// the first visible cell.
     pub fn putStr(self: *Screen, x: u16, y: u16, text: []const u8, style: Style, skip: usize, clip: ?Rect) void {
+        self.putStrRange(x, y, text, 0, text.len, style, skip, clip);
+    }
+
+    /// Paint bytes `[byte_lo, byte_hi)` of `text`. Tab stops and `skip` still
+    /// count from column 0 of `text`. `x` is the screen column of the first
+    /// visible column, same as `putStr`.
+    pub fn putStrRange(
+        self: *Screen,
+        x: u16,
+        y: u16,
+        text: []const u8,
+        byte_lo: usize,
+        byte_hi: usize,
+        style: Style,
+        skip: usize,
+        clip: ?Rect,
+    ) void {
         const grid = Rect{ .x = 0, .y = 0, .w = self.cols, .h = self.rows };
         const area = (clip orelse grid).intersect(grid) orelse return;
         if (y < area.y or y >= area.y + area.h) return;
@@ -239,6 +256,7 @@ pub const Screen = struct {
         var text_col: usize = 0; // display column in `text` (tab stops)
         var i: usize = 0; // byte index into `text`
         while (i < text.len) {
+            if (i >= byte_hi) break;
             if (text_col >= skip and col >= right) break;
 
             // How many bytes is the next UTF-8 character?
@@ -259,20 +277,22 @@ pub const Screen = struct {
                 i += len; // combining/control: skip for now
                 continue;
             }
+            const paint = i >= byte_lo;
 
             // Tab: first cell is a dimmed arrow, then spaces out to the stop.
             // Columns before `skip` are not drawn, so a pan into the middle
-            // of a tab shows spaces only.
+            // of a tab shows spaces only. Columns outside `[byte_lo, byte_hi)`
+            // still advance `col` so a later byte lands on the same cell.
             if (cp == '\t') {
                 var n: usize = 0;
                 while (n < w) : (n += 1) {
                     if (text_col + n < skip) continue;
                     if (col >= right) break;
-                    if (n == 0) {
+                    if (paint and n == 0) {
                         var mark_style = style;
                         mark_style.dim = true;
                         self.setCell(col, y, .{ .char = tab_mark, .width = 1, .style = mark_style });
-                    } else {
+                    } else if (paint) {
                         self.setCell(col, y, .{ .char = ' ', .width = 1, .style = style });
                     }
                     col += 1;
@@ -292,11 +312,11 @@ pub const Screen = struct {
             const room: usize = right - col;
             if (room < w) break; // would run past the clip edge
 
-            // Primary cell holds the glyph.
-            self.setCell(col, y, .{ .char = cp, .width = w8, .style = style });
-            if (w == 2 and col + 1 < right) {
-                // Wide char: mark the next column as a continuation (not drawn).
-                self.setCell(col + 1, y, .{ .char = ' ', .width = 0, .style = style });
+            if (paint) {
+                self.setCell(col, y, .{ .char = cp, .width = w8, .style = style });
+                if (w == 2 and col + 1 < right) {
+                    self.setCell(col + 1, y, .{ .char = ' ', .width = 0, .style = style });
+                }
             }
             col += w8; // advance by display width, not by byte count
             text_col += w;

@@ -15,11 +15,8 @@ pub const Error = error{
     OutOfMemory,
 };
 
-/// Byte range `[start, end)` in one side's text. Newlines are not inside a span.
-pub const Span = struct {
-    start: usize,
-    end: usize,
-};
+/// Byte range in a line or a joined side. Same type the diff row paints.
+pub const Span = diff.Span;
 
 pub const Side = enum { old, new };
 

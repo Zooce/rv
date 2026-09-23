@@ -41,6 +41,8 @@ pub const Row = union(enum) {
         old_no: ?u32 = null,
         /// 1-based new-file line when this line exists on the new side.
         new_no: ?u32 = null,
+        /// Changed bytes in `text`. Empty keeps the whole-line add/delete fill.
+        spans: []const diff.Span = &.{},
     },
 };
 
