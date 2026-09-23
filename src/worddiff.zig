@@ -273,25 +273,43 @@ fn isWordGap(c: u8) bool {
     return c == ' ' or c == '\t' or c == '\n' or c == '\r' or c == 0x0b or c == 0x0c;
 }
 
-/// Bytes of one side of `lines`. A meta line means the previous body line has
-/// no trailing newline. Every other body line ends with `\n`.
-pub fn sideText(alloc: Allocator, lines: []const diff.Line, side: Side) Error![]u8 {
+const Part = struct {
+    /// Index into the hunk `lines` this slice came from.
+    index: usize,
+    /// Offset of `lines[index].text` inside the joined side text.
+    start: usize,
+    len: usize,
+};
+
+const SideBuild = struct {
+    text: []u8,
+    parts: []Part,
+
+    fn deinit(self: SideBuild, alloc: Allocator) void {
+        alloc.free(self.text);
+        alloc.free(self.parts);
+    }
+};
+
+/// Joined bytes of one side, plus where each included line sits in that buffer.
+/// A meta line means the previous body line has no trailing newline.
+fn buildSide(alloc: Allocator, lines: []const diff.Line, side: Side) Error!SideBuild {
     var buf: std.ArrayList(u8) = .empty;
     errdefer buf.deinit(alloc);
+    var parts: std.ArrayList(Part) = .empty;
+    errdefer parts.deinit(alloc);
 
-    var pending: ?[]const u8 = null;
-    for (lines) |line| {
+    const Pending = struct { index: usize, text: []const u8 };
+    var pending: ?Pending = null;
+    for (lines, 0..) |line, i| {
         switch (line.kind) {
-            .meta => {
-                if (pending) |text| {
-                    try buf.appendSlice(alloc, text);
-                    pending = null;
-                }
+            .meta => if (pending) |p| {
+                try appendPart(alloc, &buf, &parts, p.index, p.text, false);
+                pending = null;
             },
             .context, .add, .delete => {
-                if (pending) |text| {
-                    try buf.appendSlice(alloc, text);
-                    try buf.append(alloc, '\n');
+                if (pending) |p| {
+                    try appendPart(alloc, &buf, &parts, p.index, p.text, true);
                     pending = null;
                 }
                 const include = switch (line.kind) {
@@ -300,15 +318,92 @@ pub fn sideText(alloc: Allocator, lines: []const diff.Line, side: Side) Error![]
                     .add => side == .new,
                     .meta => false,
                 };
-                if (include) pending = line.text;
+                if (include) pending = .{ .index = i, .text = line.text };
             },
         }
     }
-    if (pending) |text| {
-        try buf.appendSlice(alloc, text);
-        try buf.append(alloc, '\n');
+    if (pending) |p| try appendPart(alloc, &buf, &parts, p.index, p.text, true);
+
+    const text = try buf.toOwnedSlice(alloc);
+    errdefer alloc.free(text);
+    return .{
+        .text = text,
+        .parts = try parts.toOwnedSlice(alloc),
+    };
+}
+
+fn appendPart(
+    alloc: Allocator,
+    buf: *std.ArrayList(u8),
+    parts: *std.ArrayList(Part),
+    index: usize,
+    text: []const u8,
+    newline: bool,
+) Error!void {
+    const start = buf.items.len;
+    try buf.appendSlice(alloc, text);
+    try parts.append(alloc, .{ .index = index, .start = start, .len = text.len });
+    if (newline) try buf.append(alloc, '\n');
+}
+
+/// Changed bytes on one hunk line. Offsets are into `lines[index].text`.
+pub const LineChange = struct {
+    index: usize,
+    spans: []Span,
+};
+
+/// Per-line spans for one hunk. Free with `LineChangeList.deinit`.
+pub const LineChangeList = struct {
+    items: []LineChange,
+
+    pub fn deinit(self: LineChangeList, alloc: Allocator) void {
+        for (self.items) |item| alloc.free(item.spans);
+        alloc.free(self.items);
     }
-    return try buf.toOwnedSlice(alloc);
+};
+
+/// Git's changed ranges on each add/delete line of this hunk.
+/// `porcelain` is the file's word-diff output (one hunk, or a whole diff of one hunk).
+/// Context lines and whitespace-only edits are omitted: git marks no words there.
+/// A line git marks in full (a pure insert or delete) has one span over all of `text`.
+pub fn lineChanges(alloc: Allocator, lines: []const diff.Line, porcelain: []const u8) Error!LineChangeList {
+    const old = try buildSide(alloc, lines, .old);
+    defer old.deinit(alloc);
+    const new = try buildSide(alloc, lines, .new);
+    defer new.deinit(alloc);
+    const spans = try gitSpans(alloc, porcelain, old.text, new.text);
+    defer spans.deinit(alloc);
+
+    var items: std.ArrayList(LineChange) = .empty;
+    errdefer {
+        for (items.items) |item| alloc.free(item.spans);
+        items.deinit(alloc);
+    }
+    for (lines, 0..) |_, i| {
+        const from_old = try clipParts(alloc, spans.old, old.parts, i);
+        defer alloc.free(from_old);
+        const from_new = try clipParts(alloc, spans.new, new.parts, i);
+        defer alloc.free(from_new);
+        const chosen = if (from_old.len > 0) from_old else from_new;
+        if (chosen.len == 0) continue;
+        try items.append(alloc, .{ .index = i, .spans = try alloc.dupe(Span, chosen) });
+    }
+    return .{ .items = try items.toOwnedSlice(alloc) };
+}
+
+fn clipParts(alloc: Allocator, spans: []const Span, parts: []const Part, index: usize) Error![]Span {
+    var out: std.ArrayList(Span) = .empty;
+    errdefer out.deinit(alloc);
+    for (parts) |part| {
+        if (part.index != index) continue;
+        const end = part.start + part.len;
+        for (spans) |span| {
+            const lo = @max(span.start, part.start);
+            const hi = @min(span.end, end);
+            if (lo < hi) try out.append(alloc, .{ .start = lo - part.start, .end = hi - part.start });
+        }
+    }
+    return try out.toOwnedSlice(alloc);
 }
 
 const Region = struct { start: usize, end: usize };
@@ -350,20 +445,20 @@ pub fn mismatches(
         const region = hunkRegion(porcelain, from) orelse return error.AlignFailed;
         from = region.end;
 
-        const old_text = try sideText(alloc, hunk.lines, .old);
-        defer alloc.free(old_text);
-        const new_text = try sideText(alloc, hunk.lines, .new);
-        defer alloc.free(new_text);
-        const spans = try gitSpans(alloc, porcelain[region.start..region.end], old_text, new_text);
+        const old_side = try buildSide(alloc, hunk.lines, .old);
+        defer old_side.deinit(alloc);
+        const new_side = try buildSide(alloc, hunk.lines, .new);
+        defer new_side.deinit(alloc);
+        const spans = try gitSpans(alloc, porcelain[region.start..region.end], old_side.text, new_side.text);
         defer spans.deinit(alloc);
 
         const none: []const Span = &.{};
         const part = try compareMarks(alloc, path_owned, hi, .{
-            .text = old_text,
+            .text = old_side.text,
             .git = spans.old,
             .our = if (our.len == 0) none else our[hi].old,
         }, .{
-            .text = new_text,
+            .text = new_side.text,
             .git = spans.new,
             .our = if (our.len == 0) none else our[hi].new,
         });
@@ -533,19 +628,19 @@ test "compareMarks reports our_only and git_only" {
     try testing.expectEqualStrings("there", got[2].text);
 }
 
-test "sideText drops the newline only when meta follows that line" {
+test "buildSide drops the newline only when meta follows that line" {
     const lines = [_]diff.Line{
         .{ .kind = .delete, .text = "old" },
         .{ .kind = .add, .text = "new" },
         .{ .kind = .meta, .text = "No newline at end of file" },
     };
     const alloc = testing.allocator;
-    const old = try sideText(alloc, &lines, .old);
-    defer alloc.free(old);
-    const new = try sideText(alloc, &lines, .new);
-    defer alloc.free(new);
-    try testing.expectEqualStrings("old\n", old);
-    try testing.expectEqualStrings("new", new);
+    const old = try buildSide(alloc, &lines, .old);
+    defer old.deinit(alloc);
+    const new = try buildSide(alloc, &lines, .new);
+    defer new.deinit(alloc);
+    try testing.expectEqualStrings("old\n", old.text);
+    try testing.expectEqualStrings("new", new.text);
 }
 
 test "mismatches rejects a porcelain hunk the diff does not have" {
@@ -559,4 +654,70 @@ test "mismatches rejects a porcelain hunk the diff does not have" {
         error.AlignFailed,
         mismatches(testing.allocator, "a.txt", &.{}, porcelain, &.{}),
     );
+}
+
+fn findLine(lines: []const diff.Line, kind: diff.LineKind, text: []const u8) !usize {
+    for (lines, 0..) |ln, i| {
+        if (ln.kind == kind and std.mem.eql(u8, ln.text, text)) return i;
+    }
+    return error.TestExpectedEqual;
+}
+
+fn expectOneSpan(changes: LineChangeList, index: usize, start: usize, end: usize) !void {
+    for (changes.items) |item| {
+        if (item.index != index) continue;
+        try testing.expectEqual(1, item.spans.len);
+        try testing.expectEqual(start, item.spans[0].start);
+        try testing.expectEqual(end, item.spans[0].end);
+        return;
+    }
+    return error.TestExpectedEqual;
+}
+
+test "lineChanges are columns of each hunk line" {
+    if (builtin.os.tag == .wasi) return error.SkipZigTest;
+
+    const alloc = testing.allocator;
+    const io = testing.io;
+    var tmp = try IsolatedTmp.init(alloc, io);
+    defer tmp.deinit(alloc, io);
+    const cwd = tmp.cwd();
+
+    const setup = [_][]const []const u8{
+        &.{ "git", "init", "-b", "main" },
+        &.{ "git", "config", "user.email", "rv@test" },
+        &.{ "git", "config", "user.name", "rv test" },
+    };
+    for (setup) |argv| {
+        const out = try gitRun(alloc, io, cwd, argv);
+        alloc.free(out);
+    }
+    try tmp.write(io, "a.txt", "hello world\nkeep me\n");
+    {
+        const out = try gitRun(alloc, io, cwd, &.{ "git", "add", "a.txt" });
+        alloc.free(out);
+    }
+    {
+        const out = try gitRun(alloc, io, cwd, &.{ "git", "commit", "-m", "init" });
+        alloc.free(out);
+    }
+    try tmp.write(io, "a.txt", "hello there\nkeep me\nadded\n");
+
+    const uni = try gitRun(alloc, io, cwd, &.{ "git", "diff", "--", "a.txt" });
+    defer alloc.free(uni);
+    const por = try gitRun(alloc, io, cwd, &.{ "git", "diff", "--word-diff=porcelain", "--", "a.txt" });
+    defer alloc.free(por);
+
+    var d = try diff.parse(alloc, uni);
+    defer d.deinit();
+    try testing.expectEqual(1, d.files[0].hunks.len);
+    const lines = d.files[0].hunks[0].lines;
+    const changes = try lineChanges(alloc, lines, por);
+    defer changes.deinit(alloc);
+
+    try testing.expectEqual(3, changes.items.len);
+    try expectOneSpan(changes, try findLine(lines, .delete, "hello world"), 6, 11);
+    try expectOneSpan(changes, try findLine(lines, .add, "hello there"), 6, 11);
+    // A pure insert is one span over the whole line.
+    try expectOneSpan(changes, try findLine(lines, .add, "added"), 0, 5);
 }
