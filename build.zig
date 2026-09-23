@@ -57,6 +57,7 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
         .imports = &.{
+            .{ .name = "diff", .module = diff_mod },
             .{ .name = "isolated_tmp", .module = isolated_tmp_mod },
         },
     });
@@ -69,6 +70,7 @@ pub fn build(b: *std.Build) void {
         .imports = &.{
             .{ .name = "diff", .module = diff_mod },
             .{ .name = "isolated_tmp", .module = isolated_tmp_mod },
+            .{ .name = "worddiff", .module = worddiff_mod },
         },
     });
 

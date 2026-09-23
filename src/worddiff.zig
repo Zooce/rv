@@ -6,6 +6,7 @@
 //! the old and new text and returns the changed byte ranges.
 
 const std = @import("std");
+const diff = @import("diff");
 const Allocator = std.mem.Allocator;
 
 pub const Error = error{
@@ -54,6 +55,23 @@ pub const SideMarks = struct {
     text: []const u8,
     git: []const Span,
     our: []const Span,
+};
+
+/// Our spans for one hunk. An empty `mismatches` `our` slice means no spans yet.
+pub const HunkMarks = struct {
+    old: []const Span,
+    new: []const Span,
+};
+
+/// Mismatch list for one file. `path` and each `text` live in `arena`.
+pub const MismatchReport = struct {
+    arena: std.heap.ArenaAllocator,
+    items: []Mismatch,
+
+    pub fn deinit(self: *MismatchReport) void {
+        self.arena.deinit();
+        self.* = undefined;
+    }
 };
 
 const RunKind = enum { common, add, delete };
@@ -255,6 +273,121 @@ fn isWordGap(c: u8) bool {
     return c == ' ' or c == '\t' or c == '\n' or c == '\r' or c == 0x0b or c == 0x0c;
 }
 
+/// Bytes of one side of `lines`. A meta line means the previous body line has
+/// no trailing newline. Every other body line ends with `\n`.
+pub fn sideText(alloc: Allocator, lines: []const diff.Line, side: Side) Error![]u8 {
+    var buf: std.ArrayList(u8) = .empty;
+    errdefer buf.deinit(alloc);
+
+    var pending: ?[]const u8 = null;
+    for (lines) |line| {
+        switch (line.kind) {
+            .meta => {
+                if (pending) |text| {
+                    try buf.appendSlice(alloc, text);
+                    pending = null;
+                }
+            },
+            .context, .add, .delete => {
+                if (pending) |text| {
+                    try buf.appendSlice(alloc, text);
+                    try buf.append(alloc, '\n');
+                    pending = null;
+                }
+                const include = switch (line.kind) {
+                    .context => true,
+                    .delete => side == .old,
+                    .add => side == .new,
+                    .meta => false,
+                };
+                if (include) pending = line.text;
+            },
+        }
+    }
+    if (pending) |text| {
+        try buf.appendSlice(alloc, text);
+        try buf.append(alloc, '\n');
+    }
+    return try buf.toOwnedSlice(alloc);
+}
+
+const Region = struct { start: usize, end: usize };
+
+fn hunkRegion(porcelain: []const u8, from: usize) ?Region {
+    const start = indexOfLine(porcelain, from, "@@") orelse return null;
+    const next = indexOfLine(porcelain, start + 2, "@@");
+    return .{ .start = start, .end = next orelse porcelain.len };
+}
+
+fn indexOfLine(text: []const u8, from: usize, prefix: []const u8) ?usize {
+    var i = from;
+    while (i < text.len) : (i += 1) {
+        const at_line = i == 0 or text[i - 1] == '\n';
+        if (at_line and std.mem.startsWith(u8, text[i..], prefix)) return i;
+    }
+    return null;
+}
+
+/// Git spans for each hunk in `porcelain`, compared with `our` (empty means
+/// no spans). Hunk counts must match. One file's porcelain, header included.
+pub fn mismatches(
+    alloc: Allocator,
+    path: []const u8,
+    hunks: []const diff.Hunk,
+    porcelain: []const u8,
+    our: []const HunkMarks,
+) Error!MismatchReport {
+    if (our.len != 0 and our.len != hunks.len) return error.AlignFailed;
+
+    var arena = std.heap.ArenaAllocator.init(alloc);
+    errdefer arena.deinit();
+    const a = arena.allocator();
+    const path_owned = try a.dupe(u8, path);
+    var items: std.ArrayList(Mismatch) = .empty;
+
+    var from: usize = 0;
+    for (hunks, 0..) |hunk, hi| {
+        const region = hunkRegion(porcelain, from) orelse return error.AlignFailed;
+        from = region.end;
+
+        const old_text = try sideText(alloc, hunk.lines, .old);
+        defer alloc.free(old_text);
+        const new_text = try sideText(alloc, hunk.lines, .new);
+        defer alloc.free(new_text);
+        const spans = try gitSpans(alloc, porcelain[region.start..region.end], old_text, new_text);
+        defer spans.deinit(alloc);
+
+        const none: []const Span = &.{};
+        const part = try compareMarks(alloc, path_owned, hi, .{
+            .text = old_text,
+            .git = spans.old,
+            .our = if (our.len == 0) none else our[hi].old,
+        }, .{
+            .text = new_text,
+            .git = spans.new,
+            .our = if (our.len == 0) none else our[hi].new,
+        });
+        defer alloc.free(part);
+        for (part) |m| {
+            try items.append(a, .{
+                .path = path_owned,
+                .hunk = m.hunk,
+                .side = m.side,
+                .line = m.line,
+                .column = m.column,
+                .kind = m.kind,
+                .text = try a.dupe(u8, m.text),
+            });
+        }
+    }
+    if (hunkRegion(porcelain, from) != null) return error.AlignFailed;
+
+    return .{
+        .arena = arena,
+        .items = try items.toOwnedSlice(a),
+    };
+}
+
 const testing = std.testing;
 const builtin = @import("builtin");
 const IsolatedTmp = if (builtin.is_test) @import("isolated_tmp").IsolatedTmp else void;
@@ -398,4 +531,32 @@ test "compareMarks reports our_only and git_only" {
     try testing.expectEqual(Side.new, got[2].side);
     try testing.expectEqual(6, got[2].column);
     try testing.expectEqualStrings("there", got[2].text);
+}
+
+test "sideText drops the newline only when meta follows that line" {
+    const lines = [_]diff.Line{
+        .{ .kind = .delete, .text = "old" },
+        .{ .kind = .add, .text = "new" },
+        .{ .kind = .meta, .text = "No newline at end of file" },
+    };
+    const alloc = testing.allocator;
+    const old = try sideText(alloc, &lines, .old);
+    defer alloc.free(old);
+    const new = try sideText(alloc, &lines, .new);
+    defer alloc.free(new);
+    try testing.expectEqualStrings("old\n", old);
+    try testing.expectEqualStrings("new", new);
+}
+
+test "mismatches rejects a porcelain hunk the diff does not have" {
+    const porcelain =
+        \\@@ -1 +1 @@
+        \\-a
+        \\+b
+        \\
+    ;
+    try testing.expectError(
+        error.AlignFailed,
+        mismatches(testing.allocator, "a.txt", &.{}, porcelain, &.{}),
+    );
 }

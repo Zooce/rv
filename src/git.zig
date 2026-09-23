@@ -130,6 +130,7 @@ pub fn loadDefaultDiff(alloc: Allocator, io: Io) Error!diff.Diff {
 
 /// Unified blobs for the local load, in group order. Empty slices (still
 /// owned by `alloc`) when that group was not run.
+/// `porcelain` adds `--word-diff=porcelain` to those same commands.
 const DefaultTexts = struct {
     unstaged: []u8,
     untracked: []u8,
@@ -142,10 +143,10 @@ const DefaultTexts = struct {
     }
 };
 
-fn loadDefaultTexts(alloc: Allocator, io: Io, cwd: std.process.Child.Cwd) Error!DefaultTexts {
+fn loadDefaultTexts(alloc: Allocator, io: Io, cwd: std.process.Child.Cwd, porcelain: bool) Error!DefaultTexts {
     try ensureInsideWorkTree(alloc, io, cwd);
 
-    const untracked = if (try untrackedDiff(alloc, io, cwd)) |text| text else try alloc.alloc(u8, 0);
+    const untracked = if (try untrackedDiff(alloc, io, cwd, porcelain)) |text| text else try alloc.alloc(u8, 0);
     errdefer alloc.free(untracked);
 
     if (!try revExists(alloc, io, cwd, "HEAD")) {
@@ -158,18 +159,26 @@ fn loadDefaultTexts(alloc: Allocator, io: Io, cwd: std.process.Child.Cwd) Error!
         };
     }
 
-    const unstaged = try git(alloc, io, cwd, .{ .argv = &.{ "git", "diff", "--find-renames" } });
+    const unstaged_argv: []const []const u8 = if (porcelain)
+        &.{ "git", "diff", "--find-renames", "--word-diff=porcelain" }
+    else
+        &.{ "git", "diff", "--find-renames" };
+    const unstaged = try git(alloc, io, cwd, .{ .argv = unstaged_argv });
     errdefer alloc.free(unstaged);
+    const staged_argv: []const []const u8 = if (porcelain)
+        &.{ "git", "diff", "--find-renames", "--word-diff=porcelain", "--cached" }
+    else
+        &.{ "git", "diff", "--find-renames", "--cached" };
     return .{
         .unstaged = unstaged,
         .untracked = untracked,
-        .staged = try git(alloc, io, cwd, .{ .argv = &.{ "git", "diff", "--find-renames", "--cached" } }),
+        .staged = try git(alloc, io, cwd, .{ .argv = staged_argv }),
     };
 }
 
 /// Same as `loadDefaultDiff`, but run git with an explicit child cwd.
 pub fn loadDefaultDiffCwd(alloc: Allocator, io: Io, cwd: std.process.Child.Cwd) Error!diff.Diff {
-    const texts = try loadDefaultTexts(alloc, io, cwd);
+    const texts = try loadDefaultTexts(alloc, io, cwd, false);
     defer texts.deinit(alloc);
     return try diff.parsePieces(alloc, &.{
         .{ .text = texts.unstaged, .group = .unstaged },
@@ -1124,7 +1133,7 @@ fn revExists(alloc: Allocator, io: Io, cwd: std.process.Child.Cwd, rev: []const 
 
 /// Unified-diff text for untracked, non-ignored paths (exclude-standard).
 /// `null` when there are none. Caller frees a non-null result.
-fn untrackedDiff(alloc: Allocator, io: Io, cwd: std.process.Child.Cwd) Error!?[]u8 {
+fn untrackedDiff(alloc: Allocator, io: Io, cwd: std.process.Child.Cwd, porcelain: bool) Error!?[]u8 {
     const listing = try git(alloc, io, cwd, .{
         .argv = &.{ "git", "ls-files", "--others", "--exclude-standard", "-z" },
     });
@@ -1138,8 +1147,12 @@ fn untrackedDiff(alloc: Allocator, io: Io, cwd: std.process.Child.Cwd) Error!?[]
     while (it.next()) |path| {
         if (path.len == 0) continue;
         // Exit 1 is normal when files differ (always for a real new file).
+        const argv: []const []const u8 = if (porcelain)
+            &.{ "git", "diff", "--no-index", "--word-diff=porcelain", "--", "/dev/null", path }
+        else
+            &.{ "git", "diff", "--no-index", "--", "/dev/null", path };
         const piece = try git(alloc, io, cwd, .{
-            .argv = &.{ "git", "diff", "--no-index", "--", "/dev/null", path },
+            .argv = argv,
             .allowed_error_code = 1,
         });
         defer alloc.free(piece);
@@ -1325,6 +1338,7 @@ fn git(alloc: Allocator, io: Io, cwd: std.process.Child.Cwd, opts: GitOpts) Erro
 const testing = std.testing;
 const builtin = @import("builtin");
 const IsolatedTmp = if (builtin.is_test) @import("isolated_tmp").IsolatedTmp else void;
+const worddiff = if (builtin.is_test) @import("worddiff") else void;
 
 /// `git init -b main` plus local user.name / user.email (required for commits).
 fn initTestRepo(alloc: Allocator, io: Io, cwd: std.process.Child.Cwd) !void {
@@ -1919,7 +1933,7 @@ test "line oracle: local rows match the unified body" {
     const rows = try view.row.flatten(alloc, &d);
     defer alloc.free(rows);
 
-    const texts = try loadDefaultTexts(alloc, io, cwd);
+    const texts = try loadDefaultTexts(alloc, io, cwd, false);
     defer texts.deinit(alloc);
     try expectLineRowsMatchStream(alloc, rows, &.{ texts.unstaged, texts.untracked, texts.staged });
     try expectLineTokens(
@@ -1989,6 +2003,89 @@ test "line oracle: commit rows match the unified body" {
     defer alloc.free(text);
     try expectLineRowsMatchStream(alloc, rows, &.{text});
     try expectLineTokens(rows, &.{ "committed-token" }, &.{ "dirty-token", "untracked-token" });
+}
+
+test "local word-diff porcelain matches the loaded hunks" {
+    if (builtin.os.tag == .wasi) return error.SkipZigTest;
+
+    const io = testing.io;
+    const alloc = testing.allocator;
+    var tmp = try IsolatedTmp.init(alloc, io);
+    defer tmp.deinit(alloc, io);
+    const cwd = tmp.cwd();
+
+    try initTestRepo(alloc, io, cwd);
+    const before =
+        \\keep0
+        \\word
+        \\keep1
+        \\keep2
+        \\keep3
+        \\keep4
+        \\keep5
+        \\keep6
+        \\keep7
+        \\keep8
+        \\keep9
+        \\other
+        \\
+    ;
+    const after =
+        \\keep0
+        \\WORD
+        \\keep1
+        \\keep2
+        \\keep3
+        \\keep4
+        \\keep5
+        \\keep6
+        \\keep7
+        \\keep8
+        \\keep9
+        \\OTHER
+        \\
+    ;
+    try tmp.write(io, "a.txt", before);
+    try expectGitOk(alloc, io, cwd, &.{ "git", "add", "a.txt" });
+    try expectGitOk(alloc, io, cwd, &.{ "git", "commit", "-m", "init" });
+    try tmp.write(io, "a.txt", after);
+
+    var d = try loadDefaultDiffCwd(alloc, io, cwd);
+    defer d.deinit();
+    const por = try loadDefaultTexts(alloc, io, cwd, true);
+    defer por.deinit(alloc);
+
+    try testing.expectEqual(1, d.files.len);
+    try testing.expectEqual(diff.Group.unstaged, d.files[0].group.?);
+    try testing.expectEqual(2, d.files[0].hunks.len);
+
+    var report = try worddiff.mismatches(
+        alloc,
+        d.files[0].displayPath(),
+        d.files[0].hunks,
+        por.unstaged,
+        &.{},
+    );
+    defer report.deinit();
+
+    var saw_word = false;
+    var saw_other = false;
+    for (report.items) |m| {
+        try testing.expectEqual(worddiff.Which.git_only, m.kind);
+        try testing.expectEqualStrings("a.txt", m.path);
+        if (std.mem.eql(u8, m.text, "WORD")) {
+            saw_word = true;
+            try testing.expectEqual(worddiff.Side.new, m.side);
+            try testing.expectEqual(0, m.hunk);
+        }
+        if (std.mem.eql(u8, m.text, "OTHER")) {
+            saw_other = true;
+            try testing.expectEqual(worddiff.Side.new, m.side);
+            try testing.expectEqual(1, m.hunk);
+        }
+    }
+    try testing.expect(saw_word);
+    try testing.expect(saw_other);
 }
 
 test "mutate file: stage, unstage, discard; refuse discard staged" {
