@@ -81,7 +81,8 @@ pub const Line = struct {
     old_no: ?u32 = null,
     /// 1-based new-file line number when this line exists in the new side.
     new_no: ?u32 = null,
-    /// Changed bytes in `text`.
+    /// Changed bytes in `text`. A span may end one past `text` when the change
+    /// is that line's newline (a blank added line).
     /// `null`: word spans were not computed; an add/delete line keeps the solid fill.
     /// Empty: word-diff found no changed bytes. The row is dim grey, with no red or green.
     spans: ?[]const Span = null,

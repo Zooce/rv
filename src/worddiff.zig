@@ -2,8 +2,9 @@
 //!
 //! `git diff --word-diff=porcelain` common runs are bytes from the new side
 //! (whitespace between words is not itself a change). `~` is a newline.
-//! Delete runs are exact old-side bytes. `gitSpans` walks those runs onto
-//! the old and new text and returns the changed byte ranges.
+//! A `~` that extends only the new side is an inserted newline: a blank
+//! added line. Delete runs are exact old-side bytes. `gitSpans` walks those
+//! runs onto the old and new text and returns the changed byte ranges.
 
 const std = @import("std");
 const diff = @import("diff");
@@ -106,10 +107,16 @@ pub fn gitSpans(
 
         if (std.mem.eql(u8, line, "~")) {
             // Newline in the run that preceded it. Context lines use the same `~`.
-            if (prev) |p| {
-                if (p == .common or p == .add) try new_buf.append(alloc, '\n');
+            // Git does not mark a newline as a word. One that exists only on the
+            // new side is still a change: the blank added line.
+            const extend_new = if (prev) |p| p == .common or p == .add else false;
+            const extend_old = oi < old_text.len and old_text[oi] == '\n';
+            if (extend_new and !extend_old) {
+                const at = new_buf.items.len;
+                try new_spans.append(alloc, .{ .start = at, .end = at + 1 });
             }
-            if (oi < old_text.len and old_text[oi] == '\n') oi += 1;
+            if (extend_new) try new_buf.append(alloc, '\n');
+            if (extend_old) oi += 1;
             continue;
         }
 
@@ -154,10 +161,15 @@ pub fn gitSpans(
 
     if (oi != old_text.len) return error.AlignFailed;
     const rebuilt = new_buf.items;
-    const new_ok = std.mem.eql(u8, rebuilt, new_text) or
-        (rebuilt.len == new_text.len + 1 and rebuilt[rebuilt.len - 1] == '\n' and
-            std.mem.eql(u8, rebuilt[0..new_text.len], new_text));
-    if (!new_ok) return error.AlignFailed;
+    // A file with no trailing newline still ends with `~`. That extra byte is
+    // not in `new_text`, and it is not an inserted blank line.
+    const phantom = rebuilt.len == new_text.len + 1 and rebuilt[rebuilt.len - 1] == '\n' and
+        std.mem.eql(u8, rebuilt[0..new_text.len], new_text);
+    if (!std.mem.eql(u8, rebuilt, new_text) and !phantom) return error.AlignFailed;
+    if (phantom and new_spans.items.len > 0) {
+        const last = new_spans.items[new_spans.items.len - 1];
+        if (last.start == new_text.len and last.end == new_text.len + 1) _ = new_spans.pop();
+    }
 
     const old_owned = try old_spans.toOwnedSlice(alloc);
     errdefer alloc.free(old_owned);
@@ -248,6 +260,8 @@ fn lineColumn(text: []const u8, offset: usize) struct { line: usize, column: usi
 
 /// Advance `oi0` over `chunk`. Common porcelain text is the new side, so a
 /// whitespace run may exist on only one side. Words themselves must match.
+/// A newline stays for `~`, unless this common run continues past it (a line
+/// join, where the break became a space).
 fn consumeCommon(old: []const u8, oi0: usize, chunk: []const u8) ?usize {
     var oi = oi0;
     var ci: usize = 0;
@@ -259,7 +273,10 @@ fn consumeCommon(old: []const u8, oi0: usize, chunk: []const u8) ?usize {
         }
         if (isWordGap(chunk[ci])) {
             while (ci < chunk.len and isWordGap(chunk[ci])) ci += 1;
-            while (oi < old.len and isWordGap(old[oi])) oi += 1;
+            while (oi < old.len and old[oi] != '\n' and isWordGap(old[oi])) oi += 1;
+            if (ci < chunk.len) {
+                while (oi < old.len and old[oi] == '\n') oi += 1;
+            }
             continue;
         }
         if (oi < old.len and isWordGap(old[oi])) {
@@ -281,6 +298,8 @@ const Part = struct {
     /// Offset of `lines[index].text` inside the joined side text.
     start: usize,
     len: usize,
+    /// The byte at `start + len` is this line's newline.
+    newline: bool,
 };
 
 const SideBuild = struct {
@@ -344,7 +363,7 @@ fn appendPart(
 ) Error!void {
     const start = buf.items.len;
     try buf.appendSlice(alloc, text);
-    try parts.append(alloc, .{ .index = index, .start = start, .len = text.len });
+    try parts.append(alloc, .{ .index = index, .start = start, .len = text.len, .newline = newline });
     if (newline) try buf.append(alloc, '\n');
 }
 
@@ -368,6 +387,7 @@ pub const LineChangeList = struct {
 /// `porcelain` is the file's word-diff output (one hunk, or a whole diff of one hunk).
 /// Context lines and whitespace-only edits are omitted: git marks no words there.
 /// A line git marks in full (a pure insert or delete) has one span over all of `text`.
+/// A blank added line has one span on the newline just past `text`.
 pub fn lineChanges(alloc: Allocator, lines: []const diff.Line, porcelain: []const u8) Error!LineChangeList {
     const old = try buildSide(alloc, lines, .old);
     defer old.deinit(alloc);
@@ -469,11 +489,22 @@ fn clipParts(alloc: Allocator, spans: []const Span, parts: []const Part, index: 
     errdefer out.deinit(alloc);
     for (parts) |part| {
         if (part.index != index) continue;
-        const end = part.start + part.len;
+        const text_end = part.start + part.len;
+        const before = out.items.len;
         for (spans) |span| {
             const lo = @max(span.start, part.start);
-            const hi = @min(span.end, end);
+            const hi = @min(span.end, text_end);
             if (lo < hi) try out.append(alloc, .{ .start = lo - part.start, .end = hi - part.start });
+        }
+        // The newline is not a byte of `text`. Record it only when the line
+        // has no word span, so a blank added line is not an empty span list.
+        if (out.items.len != before or !part.newline) continue;
+        const nl = text_end;
+        for (spans) |span| {
+            if (span.start <= nl and span.end > nl) {
+                try out.append(alloc, .{ .start = part.len, .end = part.len + 1 });
+                break;
+            }
         }
     }
     return try out.toOwnedSlice(alloc);
@@ -640,12 +671,13 @@ test "gitSpans follows word-diff porcelain" {
         "alpha beta\ngone line\nkeep\nfoo bar\n",
         "alpha BETA\nkeep\ninserted\nfoo bar baz\n",
         &.{ .{ .start = 6, .end = 10 }, .{ .start = 11, .end = 20 } },
-        &.{ .{ .start = 6, .end = 10 }, .{ .start = 16, .end = 24 }, .{ .start = 33, .end = 36 } },
+        &.{ .{ .start = 6, .end = 10 }, .{ .start = 16, .end = 24 }, .{ .start = 24, .end = 25 }, .{ .start = 33, .end = 36 } },
     );
     // Whitespace between words is not a word-diff change.
     try expectGitSpans("foo  bar\n", "foo bar\n", &.{}, &.{});
     try expectGitSpans("hello world", "hello there", &.{.{ .start = 6, .end = 11 }}, &.{.{ .start = 6, .end = 11 }});
-    try expectGitSpans("a\nb\n", "a\n\nb\n", &.{}, &.{});
+    // The blank line is an inserted newline, at the byte between the two lines.
+    try expectGitSpans("a\nb\n", "a\n\nb\n", &.{}, &.{.{ .start = 2, .end = 3 }});
 }
 
 test "gitSpans rejects a walk that misses the old text" {
@@ -810,6 +842,64 @@ test "lineChanges are columns of each hunk line" {
     try testing.expectEqual(5, inserted[0].end);
     const kept = spanned[try findLine(spanned, .context, "keep me")];
     try testing.expect(kept.spans == null);
+}
+
+test "an inserted blank line spans the newline past the text" {
+    if (builtin.os.tag == .wasi) return error.SkipZigTest;
+
+    const alloc = testing.allocator;
+    const io = testing.io;
+    var tmp = try IsolatedTmp.init(alloc, io);
+    defer tmp.deinit(alloc, io);
+    const cwd = tmp.cwd();
+
+    const setup = [_][]const []const u8{
+        &.{ "git", "init", "-b", "main" },
+        &.{ "git", "config", "user.email", "rv@test" },
+        &.{ "git", "config", "user.name", "rv test" },
+    };
+    for (setup) |argv| {
+        const out = try gitRun(alloc, io, cwd, argv);
+        alloc.free(out);
+    }
+    try tmp.write(io, "a.txt", "keep\n");
+    {
+        const out = try gitRun(alloc, io, cwd, &.{ "git", "add", "a.txt" });
+        alloc.free(out);
+    }
+    {
+        const out = try gitRun(alloc, io, cwd, &.{ "git", "commit", "-m", "init" });
+        alloc.free(out);
+    }
+    // A blank line before the added text, and another after it.
+    try tmp.write(io, "a.txt", "keep\n\nhello\n\n");
+
+    const uni = try gitRun(alloc, io, cwd, &.{ "git", "diff", "--", "a.txt" });
+    defer alloc.free(uni);
+    const por = try gitRun(alloc, io, cwd, &.{ "git", "diff", "--word-diff=porcelain", "--", "a.txt" });
+    defer alloc.free(por);
+
+    var d = try diff.parse(alloc, uni);
+    defer d.deinit();
+    try attachSpans(alloc, &d, por, null);
+    const lines = d.files[0].hunks[0].lines;
+
+    var blanks: usize = 0;
+    for (lines) |ln| {
+        if (ln.kind != .add or ln.text.len != 0) continue;
+        const sp = ln.spans orelse return error.TestExpectedEqual;
+        try testing.expectEqual(1, sp.len);
+        try testing.expectEqual(0, sp[0].start);
+        try testing.expectEqual(1, sp[0].end);
+        blanks += 1;
+    }
+    try testing.expectEqual(2, blanks);
+
+    const hello = lines[try findLine(lines, .add, "hello")].spans.?;
+    try testing.expectEqual(1, hello.len);
+    try testing.expectEqual(0, hello[0].start);
+    try testing.expectEqual(5, hello[0].end);
+    try testing.expect(lines[try findLine(lines, .context, "keep")].spans == null);
 }
 
 test "attachSpans writes nothing when porcelain hunks do not match" {

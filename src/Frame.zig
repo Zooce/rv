@@ -103,6 +103,8 @@ fn lineStyle(pal: Palette, kind: diff.LineKind, text: []const u8, spans: ?[]cons
     // An empty list means word-diff found no changed bytes on this side: the row
     // is the same dim grey as the other side, with no red or green.
     // Grey also when some byte sits outside the spans. A full cover stays solid.
+    // A blank added line has a span on the newline past `text`. Nothing on the
+    // line is an unchanged word, so the row stays the solid fill.
     if (kind == .add or kind == .delete) {
         if (spans) |sp| {
             if (sp.len == 0 or !spansCover(text, sp)) return if (is_cur) pal.change_cur else pal.change;
@@ -1535,6 +1537,34 @@ test "a side with no changed bytes keeps the dim grey and no red or green" {
     try testing.expectEqual('h', scr.getCell(2, 0).char);
     try testing.expect(scr.getCell(2, 0).style.bg.eql(palette.change.bg));
     try testing.expect(scr.getCell(19, 0).style.bg.eql(palette.change.bg));
+}
+
+test "a blank added line with a newline span keeps the solid add fill" {
+    const nl = [_]diff.Span{.{ .start = 0, .end = 1 }};
+    const row: view.row.Row = .{ .line = .{
+        .kind = .add,
+        .text = "",
+        .path = "f",
+        .new_no = 2,
+        .spans = &nl,
+    } };
+    try testing.expect(palette.rowStyle(row, false).bg.eql(palette.add.bg));
+    try testing.expect(palette.rowStyle(row, true).bg.eql(palette.add_cur.bg));
+
+    var scr = try tui.Screen.init(testing.allocator, .{ .cols = 20, .rows = 1 });
+    defer scr.deinit();
+    const pane = BodyPane{
+        .scr = &scr,
+        .x = 0,
+        .pane_w = 20,
+        .num_w = 0,
+        .numbers = .unified,
+        .col_scroll = 0,
+    };
+    scr.clear();
+    _ = pane.putRow(0, 1, row, false, false, false, palette.rowStyle(row, false), false);
+    try testing.expect(scr.getCell(0, 0).style.bg.eql(palette.add.bg));
+    try testing.expect(scr.getCell(19, 0).style.bg.eql(palette.add.bg));
 }
 
 test "putPannedBody expands a tab to the next stop" {
