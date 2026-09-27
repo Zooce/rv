@@ -33,11 +33,37 @@ zig build -Doptimize=ReleaseSafe --prefix ~/.local
 npx skills add Zooce/rv -g
 ```
 
-![Side-by-side review with the current line highlighted](docs/screenshots/review.png)
+## Screenshots
 
-![Inline comment box under the cursor](docs/screenshots/comment.png)
+### Side-by-side diff
 
-![Help overlay (`?`)](docs/screenshots/help.png)
+Changed words are colored on the line. Unchanged words on that line stay grey. A whole line that was added or deleted stays green or red.
+
+![Side-by-side diff. Changed words are colored; whole added and deleted lines stay solid.](docs/screenshots/review.png)
+
+### Writing a comment
+
+`i` opens the comment box under the diff. The box grows as the comment wraps.
+
+![Comment box open with a comment that wraps across several lines.](docs/screenshots/comment.png)
+
+### Unified diff
+
+`t` shows the same review as a unified diff.
+
+![Unified diff of the same review.](docs/screenshots/unified.png)
+
+### Comment list
+
+`Space` then `c` lists open comments.
+
+![Comment list over the diff.](docs/screenshots/comments.png)
+
+### Approved list
+
+`Space` then `a` lists approved hunks. Approving stages a hunk and hides it from the diff.
+
+![Approved list. Those hunks are staged and hidden from the diff.](docs/screenshots/approved.png)
 
 ## Use
 
