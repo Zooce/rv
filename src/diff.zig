@@ -13,7 +13,8 @@
 //!
 //! `parse` returns a `Diff` that owns an **arena**. All paths, line text, and
 //! nested slices live in that arena. Call `Diff.deinit` exactly once to free
-//! everything. Do not free individual fields.
+//! everything. Do not free individual fields. Word-diff ranges filled later
+//! (`Line.spans`) live in this same arena.
 //!
 //! ## Line text
 //!
@@ -80,6 +81,10 @@ pub const Line = struct {
     old_no: ?u32 = null,
     /// 1-based new-file line number when this line exists in the new side.
     new_no: ?u32 = null,
+    /// Changed bytes in `text`.
+    /// `null`: word spans were not computed; an add/delete line keeps the solid fill.
+    /// Empty: word-diff found no changed bytes. The row is dim grey, with no red or green.
+    spans: ?[]const Span = null,
 };
 
 /// One `@@ ... @@` hunk.

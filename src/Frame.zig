@@ -68,7 +68,7 @@ const Palette = struct {
     hunk_cur: tui.Style,
     add: tui.Style,
     del: tui.Style,
-    /// Dim grey behind a changed line whose words are highlighted separately.
+    /// Grey behind a changed line that still has unchanged bytes.
     change: tui.Style,
     change_cur: tui.Style,
     add_cur: tui.Style,
@@ -83,7 +83,7 @@ const Palette = struct {
     fn rowStyle(self: Palette, row: view.row.Row, is_cur: bool) tui.Style {
         if (is_cur) {
             return switch (row) {
-                .line => |ln| lineStyle(self, ln.kind, ln.spans, true),
+                .line => |ln| lineStyle(self, ln.kind, ln.text, ln.spans, true),
                 .section_header => self.section_cur,
                 .file_header => self.file_cur,
                 .hunk_header => self.hunk_cur,
@@ -93,14 +93,20 @@ const Palette = struct {
             .section_header => self.section,
             .file_header => self.file,
             .hunk_header => self.hunk,
-            .line => |ln| lineStyle(self, ln.kind, ln.spans, false),
+            .line => |ln| lineStyle(self, ln.kind, ln.text, ln.spans, false),
         };
     }
 };
 
-fn lineStyle(pal: Palette, kind: diff.LineKind, spans: []const diff.Span, is_cur: bool) tui.Style {
-    if (spans.len > 0 and (kind == .add or kind == .delete)) {
-        return if (is_cur) pal.change_cur else pal.change;
+fn lineStyle(pal: Palette, kind: diff.LineKind, text: []const u8, spans: ?[]const diff.Span, is_cur: bool) tui.Style {
+    // `null` spans were not computed, so the line keeps its solid add/delete fill.
+    // An empty list means word-diff found no changed bytes on this side: the row
+    // is the same dim grey as the other side, with no red or green.
+    // Grey also when some byte sits outside the spans. A full cover stays solid.
+    if (kind == .add or kind == .delete) {
+        if (spans) |sp| {
+            if (sp.len == 0 or !spansCover(text, sp)) return if (is_cur) pal.change_cur else pal.change;
+        }
     }
     if (is_cur) {
         return switch (kind) {
@@ -116,6 +122,25 @@ fn lineStyle(pal: Palette, kind: diff.LineKind, spans: []const diff.Span, is_cur
         .meta => pal.meta,
         .context => pal.body,
     };
+}
+
+/// True when every non-whitespace byte of `text` sits inside some span.
+/// Indent git counted as common does not by itself keep the line intra-line.
+fn spansCover(text: []const u8, spans: []const diff.Span) bool {
+    var i: usize = 0;
+    while (i < text.len) {
+        if (text[i] == ' ' or text[i] == '\t') {
+            i += 1;
+            continue;
+        }
+        var end = i;
+        for (spans) |sp| {
+            if (sp.start <= i and sp.end > end) end = sp.end;
+        }
+        if (end == i) return false;
+        i = end;
+    }
+    return true;
 }
 
 fn spanStyle(kind: diff.LineKind, is_cur: bool) tui.Style {
@@ -170,13 +195,14 @@ const palette: Palette = blk: {
             .bg = .{ .rgb = .{ .r = 0x44, .g = 0x44, .b = 0x48 } },
             .bold = true,
         },
+        // Small step above the body background (0x121214).
         .change = .{
             .fg = fg,
-            .bg = .{ .rgb = .{ .r = 0x2c, .g = 0x2c, .b = 0x32 } },
+            .bg = .{ .rgb = .{ .r = 0x1a, .g = 0x1a, .b = 0x1e } },
         },
         .change_cur = .{
             .fg = fg,
-            .bg = .{ .rgb = .{ .r = 0x3c, .g = 0x3c, .b = 0x44 } },
+            .bg = .{ .rgb = .{ .r = 0x26, .g = 0x26, .b = 0x2c } },
             .bold = true,
         },
         .add = .{
@@ -679,7 +705,7 @@ const BodyPane = struct {
             else => return,
         };
         const skip: usize = if (pan) self.col_scroll else 0;
-        self.putText(y, row, marked, true, ln.text, style, skip, ln.spans, is_cur);
+        self.putText(y, row, marked, true, ln.text, style, skip, ln.spans orelse &.{}, is_cur);
     }
 
     /// One wrapped visual segment at `vis`, or nothing if that segment does
@@ -700,7 +726,7 @@ const BodyPane = struct {
         const width = bodyTextCols(self.pane_w, self.num_w, self.textLayout());
         const seg = view.wrap.segmentAt(ln.text, width, vis) orelse return;
         var buf: [16]diff.Span = undefined;
-        const spans = shiftSpans(ln.spans, seg.start, seg.end, &buf);
+        const spans = shiftSpans(ln.spans orelse &.{}, seg.start, seg.end, &buf);
         self.putText(y, row, marked, vis == 0, ln.text[seg.start..seg.end], style, 0, spans, is_cur);
     }
 
@@ -1397,6 +1423,118 @@ test "word spans grey the line and color only the changed columns" {
     try testing.expectEqual('h', scr.getCell(2, 0).char);
     try testing.expect(scr.getCell(2, 1).style.bg.eql(palette.add.bg));
     try testing.expectEqual('W', scr.getCell(2, 1).char);
+}
+
+test "a fully covered line keeps the solid add or delete fill" {
+    try testing.expect(palette.change.bg.eql(.{ .rgb = .{ .r = 0x1a, .g = 0x1a, .b = 0x1e } }));
+    const whole = [_]diff.Span{.{ .start = 0, .end = 11 }};
+    const row: view.row.Row = .{ .line = .{
+        .kind = .add,
+        .text = "hello WORLD",
+        .path = "f",
+        .new_no = 1,
+        .spans = &whole,
+    } };
+    try testing.expect(palette.rowStyle(row, false).bg.eql(palette.add.bg));
+    try testing.expect(palette.rowStyle(row, true).bg.eql(palette.add_cur.bg));
+
+    const parts = [_]diff.Span{ .{ .start = 0, .end = 5 }, .{ .start = 5, .end = 11 } };
+    const joined: view.row.Row = .{ .line = .{
+        .kind = .delete,
+        .text = "hello WORLD",
+        .path = "f",
+        .old_no = 1,
+        .spans = &parts,
+    } };
+    try testing.expect(palette.rowStyle(joined, false).bg.eql(palette.del.bg));
+
+    // The only uncovered byte is the space. Whitespace does not keep intra-line mode.
+    const gap = [_]diff.Span{ .{ .start = 0, .end = 5 }, .{ .start = 6, .end = 11 } };
+    const split: view.row.Row = .{ .line = .{
+        .kind = .add,
+        .text = "hello WORLD",
+        .path = "f",
+        .new_no = 1,
+        .spans = &gap,
+    } };
+    try testing.expect(palette.rowStyle(split, false).bg.eql(palette.add.bg));
+
+    var scr = try tui.Screen.init(testing.allocator, .{ .cols = 20, .rows = 3 });
+    defer scr.deinit();
+    var pane = BodyPane{
+        .scr = &scr,
+        .x = 0,
+        .pane_w = 20,
+        .num_w = 0,
+        .numbers = .unified,
+        .col_scroll = 0,
+    };
+    const base = palette.rowStyle(row, false);
+    scr.clear();
+    _ = pane.putRow(0, 3, row, false, false, false, base, false);
+    // Gutter, text, and the rest of the row are the solid add fill.
+    try testing.expect(scr.getCell(0, 0).style.bg.eql(palette.add.bg));
+    try testing.expect(scr.getCell(2, 0).style.bg.eql(palette.add.bg));
+    try testing.expectEqual('h', scr.getCell(2, 0).char);
+    try testing.expect(scr.getCell(19, 0).style.bg.eql(palette.add.bg));
+
+    scr.clear();
+    pane.pane_w = 8;
+    _ = pane.putRow(0, 3, row, false, true, false, base, false);
+    try testing.expect(scr.getCell(0, 0).style.bg.eql(palette.add.bg));
+    try testing.expect(scr.getCell(7, 0).style.bg.eql(palette.add.bg));
+    try testing.expect(scr.getCell(0, 1).style.bg.eql(palette.add.bg));
+    try testing.expect(scr.getCell(7, 1).style.bg.eql(palette.add.bg));
+}
+
+test "indent outside the spans still uses the solid fill" {
+    const spans = [_]diff.Span{.{ .start = 4, .end = 32 }};
+    const row: view.row.Row = .{ .line = .{
+        .kind = .add,
+        .text = "    /// Changed bytes in `text`.",
+        .path = "src/diff.zig",
+        .new_no = 84,
+        .spans = &spans,
+    } };
+    try testing.expect(palette.rowStyle(row, false).bg.eql(palette.add.bg));
+}
+
+test "a side with no changed bytes keeps the dim grey and no red or green" {
+    const none: []const diff.Span = &.{};
+    const old: view.row.Row = .{ .line = .{
+        .kind = .delete,
+        .text = "hello WORLD",
+        .path = "f",
+        .old_no = 1,
+        .spans = none,
+    } };
+    try testing.expect(palette.rowStyle(old, false).bg.eql(palette.change.bg));
+    try testing.expect(palette.rowStyle(old, true).bg.eql(palette.change_cur.bg));
+
+    const unknown: view.row.Row = .{ .line = .{
+        .kind = .delete,
+        .text = "hello WORLD",
+        .path = "f",
+        .old_no = 1,
+    } };
+    try testing.expect(palette.rowStyle(unknown, false).bg.eql(palette.del.bg));
+
+    var scr = try tui.Screen.init(testing.allocator, .{ .cols = 20, .rows = 1 });
+    defer scr.deinit();
+    const pane = BodyPane{
+        .scr = &scr,
+        .x = 0,
+        .pane_w = 20,
+        .num_w = 0,
+        .numbers = .unified,
+        .col_scroll = 0,
+    };
+    scr.clear();
+    _ = pane.putRow(0, 1, old, false, false, false, palette.rowStyle(old, false), false);
+    try testing.expect(scr.getCell(0, 0).style.bg.eql(palette.change.bg));
+    try testing.expectEqual('h', scr.getCell(2, 0).char);
+    try testing.expect(scr.getCell(2, 0).style.bg.eql(palette.change.bg));
+    try testing.expect(scr.getCell(19, 0).style.bg.eql(palette.change.bg));
 }
 
 test "putPannedBody expands a tab to the next stop" {

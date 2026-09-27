@@ -51,7 +51,7 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
 
-    // Word-diff porcelain spans. Not linked into rv until paint uses them.
+    // Word-diff porcelain spans. Load copies them onto lines; the frame paints them.
     const worddiff_mod = b.addModule("worddiff", .{
         .root_source_file = b.path("src/worddiff.zig"),
         .target = target,

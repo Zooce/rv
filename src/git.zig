@@ -25,6 +25,14 @@
 //! and untracked files are omitted. The line oracle compares flattened rows
 //! to the blobs these loaders parse.
 //!
+//! ## Word spans
+//!
+//! Each loader also runs that same git command with `--word-diff=porcelain`
+//! and stores the changed byte ranges on `Line.spans`. Display rows borrow
+//! those slices. If the porcelain hunks do not line up, spans stay `null` and
+//! the line keeps the whole-line add/delete fill. An empty list means
+//! word-diff found no changed bytes, and that line is dim grey with no red or green.
+//!
 //! ## Explicit range
 //!
 //! `loadRangeDiff` runs `git diff --find-renames <range>` with the range
@@ -100,6 +108,7 @@
 const std = @import("std");
 const diff = @import("diff");
 const view = @import("view");
+const worddiff = @import("worddiff");
 const store = @import("store");
 const comments = @import("comments");
 const approve = @import("approve");
@@ -180,11 +189,27 @@ fn loadDefaultTexts(alloc: Allocator, io: Io, cwd: std.process.Child.Cwd, porcel
 pub fn loadDefaultDiffCwd(alloc: Allocator, io: Io, cwd: std.process.Child.Cwd) Error!diff.Diff {
     const texts = try loadDefaultTexts(alloc, io, cwd, false);
     defer texts.deinit(alloc);
-    return try diff.parsePieces(alloc, &.{
+    const por = try loadDefaultTexts(alloc, io, cwd, true);
+    defer por.deinit(alloc);
+    var parsed = try diff.parsePieces(alloc, &.{
         .{ .text = texts.unstaged, .group = .unstaged },
         .{ .text = texts.untracked, .group = .untracked },
         .{ .text = texts.staged, .group = .staged },
     });
+    errdefer parsed.deinit();
+    try attachWordSpans(alloc, &parsed, por.unstaged, .unstaged);
+    try attachWordSpans(alloc, &parsed, por.untracked, .untracked);
+    try attachWordSpans(alloc, &parsed, por.staged, .staged);
+    return parsed;
+}
+
+/// Store porcelain ranges on the diff. A hunk that does not line up keeps a
+/// null span list and the solid fill. The other hunks are still filled.
+fn attachWordSpans(alloc: Allocator, d: *diff.Diff, porcelain: []const u8, group: ?diff.Group) Error!void {
+    worddiff.attachSpans(alloc, d, porcelain, group) catch |err| switch (err) {
+        error.AlignFailed => {},
+        error.OutOfMemory => return error.OutOfMemory,
+    };
 }
 
 /// `git diff --find-renames <range>` stdout. Caller frees.
@@ -203,7 +228,12 @@ fn rangeDiffText(alloc: Allocator, io: Io, cwd: std.process.Child.Cwd, range: []
 pub fn loadRangeDiff(alloc: Allocator, io: Io, cwd: std.process.Child.Cwd, range: []const u8) Error!diff.Diff {
     const out = try rangeDiffText(alloc, io, cwd, range, false);
     defer alloc.free(out);
-    return try diff.parse(alloc, out);
+    const por = try rangeDiffText(alloc, io, cwd, range, true);
+    defer alloc.free(por);
+    var parsed = try diff.parse(alloc, out);
+    errdefer parsed.deinit();
+    try attachWordSpans(alloc, &parsed, por, null);
+    return parsed;
 }
 
 /// `git diff-tree` patch for `commit` (parent → commit). Caller frees.
@@ -248,7 +278,12 @@ fn commitDiffText(alloc: Allocator, io: Io, cwd: std.process.Child.Cwd, commit: 
 pub fn loadCommitDiff(alloc: Allocator, io: Io, cwd: std.process.Child.Cwd, commit: []const u8) Error!diff.Diff {
     const out = try commitDiffText(alloc, io, cwd, commit, false);
     defer alloc.free(out);
-    return try diff.parse(alloc, out);
+    const por = try commitDiffText(alloc, io, cwd, commit, true);
+    defer alloc.free(por);
+    var parsed = try diff.parse(alloc, out);
+    errdefer parsed.deinit();
+    try attachWordSpans(alloc, &parsed, por, null);
+    return parsed;
 }
 
 /// Surviving-side file bytes for expand. Caller frees.
@@ -1355,7 +1390,6 @@ fn git(alloc: Allocator, io: Io, cwd: std.process.Child.Cwd, opts: GitOpts) Erro
 const testing = std.testing;
 const builtin = @import("builtin");
 const IsolatedTmp = if (builtin.is_test) @import("isolated_tmp").IsolatedTmp else void;
-const worddiff = if (builtin.is_test) @import("worddiff") else void;
 
 /// `git init -b main` plus local user.name / user.email (required for commits).
 fn initTestRepo(alloc: Allocator, io: Io, cwd: std.process.Child.Cwd) !void {
@@ -2069,6 +2103,14 @@ test "local word-diff porcelain matches the loaded hunks" {
 
     var d = try loadDefaultDiffCwd(alloc, io, cwd);
     defer d.deinit();
+    const rows = try view.row.flatten(alloc, &d);
+    defer alloc.free(rows);
+    try expectRowSpan(rows, "word", 0, 4);
+    try expectRowSpan(rows, "WORD", 0, 4);
+    try expectRowSpan(rows, "other", 0, 5);
+    try expectRowSpan(rows, "OTHER", 0, 5);
+    try expectRowUnspanned(rows, "keep0");
+
     const por = try loadDefaultTexts(alloc, io, cwd, true);
     defer por.deinit(alloc);
 
@@ -2117,6 +2159,54 @@ fn expectGitOnly(report: *const worddiff.MismatchReport, text: []const u8, side:
     return error.TestExpectedEqual;
 }
 
+fn expectLineSpan(d: diff.Diff, text: []const u8, start: usize, end: usize) !void {
+    for (d.files) |f| {
+        for (f.hunks) |h| {
+            for (h.lines) |ln| {
+                if (!std.mem.eql(u8, ln.text, text)) continue;
+                const sp = ln.spans orelse return error.TestExpectedEqual;
+                try testing.expectEqual(1, sp.len);
+                try testing.expectEqual(start, sp[0].start);
+                try testing.expectEqual(end, sp[0].end);
+                return;
+            }
+        }
+    }
+    std.debug.print("missing line \"{s}\"\n", .{text});
+    return error.TestExpectedEqual;
+}
+
+fn expectRowSpan(rows: []const view.row.Row, text: []const u8, start: usize, end: usize) !void {
+    for (rows) |row| {
+        const ln = switch (row) {
+            .line => |l| l,
+            else => continue,
+        };
+        if (!std.mem.eql(u8, ln.text, text)) continue;
+        const sp = ln.spans orelse return error.TestExpectedEqual;
+        try testing.expectEqual(1, sp.len);
+        try testing.expectEqual(start, sp[0].start);
+        try testing.expectEqual(end, sp[0].end);
+        return;
+    }
+    std.debug.print("missing row \"{s}\"\n", .{text});
+    return error.TestExpectedEqual;
+}
+
+fn expectRowUnspanned(rows: []const view.row.Row, text: []const u8) !void {
+    for (rows) |row| {
+        const ln = switch (row) {
+            .line => |l| l,
+            else => continue,
+        };
+        if (!std.mem.eql(u8, ln.text, text)) continue;
+        try testing.expect(ln.spans == null);
+        return;
+    }
+    std.debug.print("missing row \"{s}\"\n", .{text});
+    return error.TestExpectedEqual;
+}
+
 fn expectAbsentText(report: *const worddiff.MismatchReport, text: []const u8) !void {
     for (report.items) |m| {
         if (std.mem.eql(u8, m.text, text)) {
@@ -2160,6 +2250,8 @@ test "range word-diff porcelain matches the loaded hunks" {
     try expectGitOnly(&report, "alpha", .old, 0);
     try expectAbsentText(&report, "dirt-token");
     try expectAbsentText(&report, "untracked-token");
+    try expectLineSpan(d, "keep alpha", 5, 10);
+    try expectLineSpan(d, "keep BETA", 5, 9);
 }
 
 test "commit word-diff porcelain matches the loaded hunks" {
@@ -2194,6 +2286,8 @@ test "commit word-diff porcelain matches the loaded hunks" {
     try expectGitOnly(&report, "alpha", .old, 0);
     try expectAbsentText(&report, "dirt-token");
     try expectAbsentText(&report, "untracked-token");
+    try expectLineSpan(d, "keep alpha", 5, 10);
+    try expectLineSpan(d, "keep BETA", 5, 9);
 }
 
 test "mutate file: stage, unstage, discard; refuse discard staged" {

@@ -41,8 +41,10 @@ pub const Row = union(enum) {
         old_no: ?u32 = null,
         /// 1-based new-file line when this line exists on the new side.
         new_no: ?u32 = null,
-        /// Changed bytes in `text`. Empty keeps the whole-line add/delete fill.
-        spans: []const diff.Span = &.{},
+        /// Changed bytes in `text`. Borrowed from the diff line.
+        /// `null`: word spans were not computed; an add/delete line keeps the solid fill.
+        /// Empty: word-diff found no changed bytes. The row is dim grey, with no red or green.
+        spans: ?[]const diff.Span = null,
     },
 };
 
@@ -104,13 +106,15 @@ pub fn appendFile(
                 .path = path,
                 .old_no = ln.old_no,
                 .new_no = ln.new_no,
+                .spans = ln.spans,
             } });
         }
     }
 }
 
 /// Build an owned list of rows from `d`. Caller's `alloc` owns the slice;
-/// free with `alloc.free(rows)`. Nested string data is borrowed from `d`.
+/// free with `alloc.free(rows)`. Nested string data and span slices are
+/// borrowed from `d`.
 pub fn flatten(alloc: Allocator, d: *const diff.Diff) Allocator.Error![]Row {
     var rows: std.ArrayList(Row) = .empty;
     errdefer rows.deinit(alloc);

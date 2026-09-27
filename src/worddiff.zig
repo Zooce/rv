@@ -130,6 +130,11 @@ pub fn gitSpans(
                     prev = kind;
                     continue;
                 }
+                // A space before a deleted word is often only on the old side.
+                // Git does not emit it. Do not skip a newline; `~` consumes that.
+                if (oi < old_text.len and (old_text[oi] == ' ' or old_text[oi] == '\t') and !isWordGap(text[0])) {
+                    while (oi < old_text.len and (old_text[oi] == ' ' or old_text[oi] == '\t')) oi += 1;
+                }
                 if (!std.mem.startsWith(u8, old_text[oi..], text)) return error.AlignFailed;
                 try old_spans.append(alloc, .{ .start = oi, .end = oi + text.len });
                 oi += text.len;
@@ -386,6 +391,77 @@ pub fn lineChanges(alloc: Allocator, lines: []const diff.Line, porcelain: []cons
         try items.append(alloc, .{ .index = i, .spans = try alloc.dupe(Span, chosen) });
     }
     return .{ .items = try items.toOwnedSlice(alloc) };
+}
+
+/// Write git's changed ranges onto add/delete lines of files in `group`.
+/// `group == null` selects untagged files (a range or commit load).
+/// Spans are copied into the diff arena. Rows borrow them.
+/// A hunk that does not line up is left untouched. Other hunks are still filled.
+pub fn attachSpans(
+    alloc: Allocator,
+    d: *diff.Diff,
+    porcelain: []const u8,
+    group: ?diff.Group,
+) Error!void {
+    // One slot per selected hunk. `null` means this hunk did not line up, so its
+    // lines stay `null` and keep the solid fill. Later hunks are still recorded.
+    var slots: std.ArrayList(?LineChangeList) = .empty;
+    defer {
+        for (slots.items) |slot| if (slot) |list| list.deinit(alloc);
+        slots.deinit(alloc);
+    }
+
+    var from: usize = 0;
+    var stopped = false;
+    for (d.files) |file| {
+        if (file.group != group) continue;
+        for (file.hunks) |hunk| {
+            if (stopped) {
+                try slots.append(alloc, null);
+                continue;
+            }
+            const region = hunkRegion(porcelain, from) orelse {
+                stopped = true;
+                try slots.append(alloc, null);
+                continue;
+            };
+            from = region.end;
+            const changes = lineChanges(alloc, hunk.lines, porcelain[region.start..region.end]) catch {
+                try slots.append(alloc, null);
+                continue;
+            };
+            slots.append(alloc, changes) catch |err| {
+                changes.deinit(alloc);
+                return err;
+            };
+        }
+    }
+
+    // Copy into the diff arena. Each add/delete line in a matched hunk is
+    // recorded: a real span list, or an empty one when this side has no
+    // changed bytes. Context lines stay `null`.
+    const arena = d.arena.allocator();
+    const none: []const Span = &.{};
+    var n: usize = 0;
+    for (d.files) |*file| {
+        if (file.group != group) continue;
+        for (file.hunks) |*hunk| {
+            const changes = slots.items[n] orelse {
+                n += 1;
+                continue;
+            };
+            n += 1;
+            const lines = try arena.alloc(diff.Line, hunk.lines.len);
+            for (hunk.lines, 0..) |ln, i| {
+                lines[i] = ln;
+                if (ln.kind == .add or ln.kind == .delete) lines[i].spans = none;
+            }
+            for (changes.items) |ch| {
+                lines[ch.index].spans = try arena.dupe(Span, ch.spans);
+            }
+            hunk.lines = lines;
+        }
+    }
 }
 
 fn clipParts(alloc: Allocator, spans: []const Span, parts: []const Part, index: usize) Error![]Span {
@@ -717,4 +793,164 @@ test "lineChanges are columns of each hunk line" {
     try expectOneSpan(changes, try findLine(lines, .add, "hello there"), 6, 11);
     // A pure insert is one span over the whole line.
     try expectOneSpan(changes, try findLine(lines, .add, "added"), 0, 5);
+
+    try attachSpans(alloc, &d, por, null);
+    const spanned = d.files[0].hunks[0].lines;
+    const deleted = spanned[try findLine(spanned, .delete, "hello world")].spans.?;
+    try testing.expectEqual(1, deleted.len);
+    try testing.expectEqual(6, deleted[0].start);
+    try testing.expectEqual(11, deleted[0].end);
+    const added = spanned[try findLine(spanned, .add, "hello there")].spans.?;
+    try testing.expectEqual(1, added.len);
+    try testing.expectEqual(6, added[0].start);
+    try testing.expectEqual(11, added[0].end);
+    const inserted = spanned[try findLine(spanned, .add, "added")].spans.?;
+    try testing.expectEqual(1, inserted.len);
+    try testing.expectEqual(0, inserted[0].start);
+    try testing.expectEqual(5, inserted[0].end);
+    const kept = spanned[try findLine(spanned, .context, "keep me")];
+    try testing.expect(kept.spans == null);
+}
+
+test "attachSpans writes nothing when porcelain hunks do not match" {
+    const fixture =
+        \\diff --git a/a.txt b/a.txt
+        \\--- a/a.txt
+        \\+++ b/a.txt
+        \\@@ -1 +1 @@
+        \\-a
+        \\+b
+        \\
+    ;
+    var d = try diff.parse(testing.allocator, fixture);
+    defer d.deinit();
+    try attachSpans(testing.allocator, &d, "", null);
+    try testing.expect(d.files[0].hunks[0].lines[0].spans == null);
+}
+
+test "a mismatched hunk does not drop spans on the hunks that lined up" {
+    const fixture =
+        \\diff --git a/a.txt b/a.txt
+        \\--- a/a.txt
+        \\+++ b/a.txt
+        \\@@ -1 +1 @@
+        \\-a
+        \\+b
+        \\@@ -1 +1 @@
+        \\-c
+        \\+d
+        \\
+    ;
+    const porcelain =
+        \\@@ -1 +1 @@
+        \\-a
+        \\+b
+        \\~
+        \\@@ -1 +1 @@
+        \\-nope
+        \\+d
+        \\~
+        \\
+    ;
+    var d = try diff.parse(testing.allocator, fixture);
+    defer d.deinit();
+    try attachSpans(testing.allocator, &d, porcelain, null);
+    const hunks = d.files[0].hunks;
+    const first = hunks[0].lines[0].spans.?;
+    try testing.expectEqual(1, first.len);
+    try testing.expectEqual(0, first[0].start);
+    try testing.expectEqual(1, first[0].end);
+    try testing.expect(hunks[1].lines[0].spans == null);
+}
+
+test "an insertion leaves the old line with no changed bytes" {
+    if (builtin.os.tag == .wasi) return error.SkipZigTest;
+
+    const alloc = testing.allocator;
+    const io = testing.io;
+    var tmp = try IsolatedTmp.init(alloc, io);
+    defer tmp.deinit(alloc, io);
+    const cwd = tmp.cwd();
+
+    const setup = [_][]const []const u8{
+        &.{ "git", "init", "-b", "main" },
+        &.{ "git", "config", "user.email", "rv@test" },
+        &.{ "git", "config", "user.name", "rv test" },
+    };
+    for (setup) |argv| {
+        const out = try gitRun(alloc, io, cwd, argv);
+        alloc.free(out);
+    }
+    try tmp.write(io, "a.txt", "hello world\n");
+    {
+        const out = try gitRun(alloc, io, cwd, &.{ "git", "add", "a.txt" });
+        alloc.free(out);
+    }
+    {
+        const out = try gitRun(alloc, io, cwd, &.{ "git", "commit", "-m", "init" });
+        alloc.free(out);
+    }
+    try tmp.write(io, "a.txt", "hello ln.text world\n");
+
+    const uni = try gitRun(alloc, io, cwd, &.{ "git", "diff", "--", "a.txt" });
+    defer alloc.free(uni);
+    const por = try gitRun(alloc, io, cwd, &.{ "git", "diff", "--word-diff=porcelain", "--", "a.txt" });
+    defer alloc.free(por);
+
+    var d = try diff.parse(alloc, uni);
+    defer d.deinit();
+    try attachSpans(alloc, &d, por, null);
+    const lines = d.files[0].hunks[0].lines;
+    const old = lines[try findLine(lines, .delete, "hello world")].spans.?;
+    try testing.expectEqual(0, old.len);
+    const new = lines[try findLine(lines, .add, "hello ln.text world")].spans.?;
+    try testing.expect(new.len > 0);
+}
+
+test "a space before a deleted word still lines up" {
+    if (builtin.os.tag == .wasi) return error.SkipZigTest;
+
+    const alloc = testing.allocator;
+    const io = testing.io;
+    var tmp = try IsolatedTmp.init(alloc, io);
+    defer tmp.deinit(alloc, io);
+    const cwd = tmp.cwd();
+
+    const setup = [_][]const []const u8{
+        &.{ "git", "init", "-b", "main" },
+        &.{ "git", "config", "user.email", "rv@test" },
+        &.{ "git", "config", "user.name", "rv test" },
+    };
+    for (setup) |argv| {
+        const out = try gitRun(alloc, io, cwd, argv);
+        alloc.free(out);
+    }
+    const before = "    if (spans.len > 0 and (kind == .add or kind == .delete)) {\n";
+    const after = "    if (kind == .add or kind == .delete) {\n";
+    try tmp.write(io, "a.txt", before);
+    {
+        const out = try gitRun(alloc, io, cwd, &.{ "git", "add", "a.txt" });
+        alloc.free(out);
+    }
+    {
+        const out = try gitRun(alloc, io, cwd, &.{ "git", "commit", "-m", "init" });
+        alloc.free(out);
+    }
+    try tmp.write(io, "a.txt", after);
+
+    const uni = try gitRun(alloc, io, cwd, &.{ "git", "diff", "--", "a.txt" });
+    defer alloc.free(uni);
+    const por = try gitRun(alloc, io, cwd, &.{ "git", "diff", "--word-diff=porcelain", "--", "a.txt" });
+    defer alloc.free(por);
+
+    var d = try diff.parse(alloc, uni);
+    defer d.deinit();
+    try attachSpans(alloc, &d, por, null);
+    const lines = d.files[0].hunks[0].lines;
+    const old = lines[try findLine(lines, .delete, "    if (spans.len > 0 and (kind == .add or kind == .delete)) {")].spans.?;
+    try testing.expect(old.len > 0);
+    const new = lines[try findLine(lines, .add, "    if (kind == .add or kind == .delete) {")].spans.?;
+    try testing.expect(new.len > 0);
+    // The leading "    if" is unchanged, so the line is not one solid span.
+    try testing.expect(old[0].start > 0);
 }
