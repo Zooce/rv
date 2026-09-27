@@ -1,5 +1,6 @@
 # Pushing an annotated v* tag publishes the GitHub Release.
 # The tag message is the release notes.
+# The release name is vX.Y. A tag vX.Y.0 drops the trailing .0.
 # After bumping .version in build.zig.zon and committing:
 #   git tag -a vX.Y.Z && git push origin vX.Y.Z
 name: release
@@ -53,10 +54,19 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
+          # checkout replaces the annotated tag with a lightweight tag at the
+          # commit, so --notes-from-tag would publish the commit subject.
+          git fetch origin "+refs/tags/${GITHUB_REF_NAME}:refs/tags/${GITHUB_REF_NAME}"
+          # An empty name is shown as "tag: first note line" (v2.0.0: rv 2.0.0).
+          name="$GITHUB_REF_NAME"
+          case "$name" in
+            *.*.0) name="${name%.0}" ;;
+          esac
           gh release create "$GITHUB_REF_NAME" \
             dist/rv-linux-x86_64.tar.gz \
             dist/rv-linux-aarch64.tar.gz \
             dist/rv-macos-x86_64.tar.gz \
             dist/rv-macos-aarch64.tar.gz \
             dist/SHA256SUMS \
+            --title "$name" \
             --notes-from-tag
