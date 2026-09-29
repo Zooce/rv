@@ -3,8 +3,10 @@
 //! `git diff --word-diff=porcelain` common runs are bytes from the new side
 //! (whitespace between words is not itself a change). `~` is a newline.
 //! A `~` that extends only the new side is an inserted newline: a blank
-//! added line. Delete runs are exact old-side bytes. `gitSpans` walks those
-//! runs onto the old and new text and returns the changed byte ranges.
+//! added line. A `~` after a common or added run that the new side does not
+//! take is a deleted blank line. Delete runs are exact old-side bytes.
+//! `gitSpans` walks those runs onto the old and new text and returns the
+//! changed byte ranges.
 
 const std = @import("std");
 const diff = @import("diff");
@@ -108,14 +110,23 @@ pub fn gitSpans(
         if (std.mem.eql(u8, line, "~")) {
             // Newline in the run that preceded it. Context lines use the same `~`.
             // Git does not mark a newline as a word. One that exists only on the
-            // new side is still a change: the blank added line.
+            // new side is still a change: the blank added line. One that follows
+            // a common or added run, and that the new side does not take, is a
+            // deleted blank line. The newline that closes a deleted word is not:
+            // that line already has its own span.
             const extend_new = if (prev) |p| p == .common or p == .add else false;
             const extend_old = oi < old_text.len and old_text[oi] == '\n';
-            if (extend_new and !extend_old) {
+            const take_new = extend_new and
+                new_buf.items.len < new_text.len and
+                new_text[new_buf.items.len] == '\n';
+            if (take_new and !extend_old) {
                 const at = new_buf.items.len;
                 try new_spans.append(alloc, .{ .start = at, .end = at + 1 });
             }
-            if (extend_new) try new_buf.append(alloc, '\n');
+            if (extend_old and extend_new and !take_new) {
+                try old_spans.append(alloc, .{ .start = oi, .end = oi + 1 });
+            }
+            if (take_new) try new_buf.append(alloc, '\n');
             if (extend_old) oi += 1;
             continue;
         }
@@ -139,16 +150,18 @@ pub fn gitSpans(
                 }
                 // A space or tab before a deleted word is often only on the old side.
                 // Git does not emit it. One newline is the same gap when a joined
-                // line deletes the next line's prefix. Skip that newline only when
-                // the delete matches on the next byte. A blank line stays a `~`.
-                if (oi < old_text.len and (old_text[oi] == ' ' or old_text[oi] == '\t') and !isWordGap(text[0])) {
-                    while (oi < old_text.len and (old_text[oi] == ' ' or old_text[oi] == '\t')) oi += 1;
-                }
-                if (oi < old_text.len and old_text[oi] == '\n' and
-                    !std.mem.startsWith(u8, old_text[oi..], text) and
-                    std.mem.startsWith(u8, old_text[oi + 1 ..], text))
-                {
-                    oi += 1;
+                // line deletes the next line's prefix, including that line's indent.
+                // Skip the gap only when the delete matches after it.
+                // A blank line stays a `~`.
+                if (!isWordGap(text[0])) {
+                    if (oi < old_text.len and (old_text[oi] == ' ' or old_text[oi] == '\t')) {
+                        while (oi < old_text.len and (old_text[oi] == ' ' or old_text[oi] == '\t')) oi += 1;
+                    }
+                    if (oi < old_text.len and old_text[oi] == '\n') {
+                        var j = oi + 1;
+                        while (j < old_text.len and (old_text[j] == ' ' or old_text[j] == '\t')) j += 1;
+                        if (std.mem.startsWith(u8, old_text[j..], text)) oi = j;
+                    }
                 }
                 if (!std.mem.startsWith(u8, old_text[oi..], text)) return error.AlignFailed;
                 try old_spans.append(alloc, .{ .start = oi, .end = oi + text.len });
@@ -395,7 +408,12 @@ pub const LineChangeList = struct {
 /// `porcelain` is the file's word-diff output (one hunk, or a whole diff of one hunk).
 /// Context lines and whitespace-only edits are omitted: git marks no words there.
 /// A line git marks in full (a pure insert or delete) has one span over all of `text`.
-/// A blank added line has one span on the newline just past `text`.
+/// A blank added or deleted line has one span on the newline just past `text`.
+///
+/// Git can mark a repeated token as the change when a phrase moved onto the
+/// next line. The token is then highlighted on both of the paired lines even
+/// though those bytes still match, and the old line does not show the phrase
+/// that left. That delete/add run is replaced with a word diff of each pair.
 pub fn lineChanges(alloc: Allocator, lines: []const diff.Line, porcelain: []const u8) Error!LineChangeList {
     const old = try buildSide(alloc, lines, .old);
     defer old.deinit(alloc);
@@ -418,7 +436,192 @@ pub fn lineChanges(alloc: Allocator, lines: []const diff.Line, porcelain: []cons
         if (chosen.len == 0) continue;
         try items.append(alloc, .{ .index = i, .spans = try alloc.dupe(Span, chosen) });
     }
+    try retieMovedWords(alloc, lines, &items);
     return .{ .items = try items.toOwnedSlice(alloc) };
+}
+
+/// Replace a delete/add run when git marked the same bytes on both lines of a pair.
+fn retieMovedWords(alloc: Allocator, lines: []const diff.Line, items: *std.ArrayList(LineChange)) Error!void {
+    var i: usize = 0;
+    while (i < lines.len) {
+        if (lines[i].kind != .delete) {
+            i += 1;
+            continue;
+        }
+        const d0 = i;
+        while (i < lines.len and lines[i].kind == .delete) i += 1;
+        const d1 = i;
+        if (i >= lines.len or lines[i].kind != .add) continue;
+        const a0 = i;
+        while (i < lines.len and lines[i].kind == .add) i += 1;
+        const a1 = i;
+        const n = @min(d1 - d0, a1 - a0);
+        var moved = false;
+        var j: usize = 0;
+        while (j < n) : (j += 1) {
+            const old_line = lines[d0 + j];
+            const new_line = lines[a0 + j];
+            if (sameBytesMarked(old_line.text, spansAt(items.items, d0 + j), new_line.text, spansAt(items.items, a0 + j)))
+                moved = true;
+            if (sameBytesMarked(new_line.text, spansAt(items.items, a0 + j), old_line.text, spansAt(items.items, d0 + j)))
+                moved = true;
+        }
+        if (!moved) continue;
+        j = 0;
+        while (j < n) : (j += 1) {
+            const oi = d0 + j;
+            const ai = a0 + j;
+            const old_spans = spansAt(items.items, oi);
+            const new_spans = spansAt(items.items, ai);
+            if (newlineSpan(lines[oi].text, old_spans) or newlineSpan(lines[ai].text, new_spans)) continue;
+            const paired = try pairedWordSpans(alloc, lines[oi].text, lines[ai].text) orelse continue;
+            {
+                var old_owned: ?[]Span = paired.old;
+                var new_owned: ?[]Span = paired.new;
+                errdefer if (old_owned) |s| alloc.free(s);
+                errdefer if (new_owned) |s| alloc.free(s);
+                try putLineSpans(alloc, items, oi, old_owned.?);
+                old_owned = null;
+                try putLineSpans(alloc, items, ai, new_owned.?);
+                new_owned = null;
+            }
+        }
+    }
+}
+
+fn spansAt(items: []const LineChange, index: usize) []const Span {
+    for (items) |item| if (item.index == index) return item.spans;
+    return &.{};
+}
+
+/// True when `a_spans` marks a range that is the same bytes at the same place in `b`,
+/// and `b_spans` marks that range too.
+fn sameBytesMarked(a: []const u8, a_spans: []const Span, b: []const u8, b_spans: []const Span) bool {
+    for (a_spans) |sp| {
+        if (sp.start >= sp.end or sp.end > a.len or sp.end > b.len) continue;
+        if (!std.mem.eql(u8, a[sp.start..sp.end], b[sp.start..sp.end])) continue;
+        for (b_spans) |other| {
+            if (other.start <= sp.start and other.end >= sp.end) return true;
+        }
+    }
+    return false;
+}
+
+fn newlineSpan(text: []const u8, spans: []const Span) bool {
+    for (spans) |sp| if (sp.start >= text.len and sp.end > sp.start) return true;
+    return false;
+}
+
+const PairedSpans = struct { old: []Span, new: []Span };
+
+/// Word diff of two paired lines. `null` when a line has too many words to compare here.
+/// Spans cover consecutive words that are only on that line, including the spaces between them.
+fn pairedWordSpans(alloc: Allocator, old_text: []const u8, new_text: []const u8) Error!?PairedSpans {
+    const old_words = try wordOffsets(alloc, old_text);
+    defer alloc.free(old_words);
+    const new_words = try wordOffsets(alloc, new_text);
+    defer alloc.free(new_words);
+    if (old_words.len > 512 or new_words.len > 512) return null;
+
+    const cols = new_words.len + 1;
+    const dp = try alloc.alloc(u32, (old_words.len + 1) * cols);
+    defer alloc.free(dp);
+    @memset(dp, 0);
+    var i: usize = 0;
+    while (i < old_words.len) : (i += 1) {
+        var j: usize = 0;
+        while (j < new_words.len) : (j += 1) {
+            const at = (i + 1) * cols + (j + 1);
+            if (std.mem.eql(u8, old_text[old_words[i].start..old_words[i].end], new_text[new_words[j].start..new_words[j].end])) {
+                dp[at] = dp[i * cols + j] + 1;
+            } else {
+                const drop_old = dp[i * cols + (j + 1)];
+                const drop_new = dp[(i + 1) * cols + j];
+                dp[at] = @max(drop_old, drop_new);
+            }
+        }
+    }
+
+    const old_keep = try alloc.alloc(bool, old_words.len);
+    defer alloc.free(old_keep);
+    const new_keep = try alloc.alloc(bool, new_words.len);
+    defer alloc.free(new_keep);
+    @memset(old_keep, false);
+    @memset(new_keep, false);
+    i = old_words.len;
+    var j: usize = new_words.len;
+    while (i > 0 and j > 0) {
+        const ow = old_words[i - 1];
+        const nw = new_words[j - 1];
+        if (std.mem.eql(u8, old_text[ow.start..ow.end], new_text[nw.start..nw.end])) {
+            old_keep[i - 1] = true;
+            new_keep[j - 1] = true;
+            i -= 1;
+            j -= 1;
+        } else if (dp[(i - 1) * cols + j] >= dp[i * cols + (j - 1)]) {
+            i -= 1;
+        } else {
+            j -= 1;
+        }
+    }
+
+    const old_spans = try spansOfUnkept(alloc, old_words, old_keep);
+    errdefer alloc.free(old_spans);
+    return .{
+        .old = old_spans,
+        .new = try spansOfUnkept(alloc, new_words, new_keep),
+    };
+}
+
+fn wordOffsets(alloc: Allocator, text: []const u8) Error![]Span {
+    var out: std.ArrayList(Span) = .empty;
+    errdefer out.deinit(alloc);
+    var i: usize = 0;
+    while (i < text.len) {
+        while (i < text.len and isWordGap(text[i])) i += 1;
+        if (i >= text.len) break;
+        const start = i;
+        while (i < text.len and !isWordGap(text[i])) i += 1;
+        try out.append(alloc, .{ .start = start, .end = i });
+    }
+    if (out.items.len == 0) {
+        out.deinit(alloc);
+        return try alloc.alloc(Span, 0);
+    }
+    return try out.toOwnedSlice(alloc);
+}
+
+fn spansOfUnkept(alloc: Allocator, words: []const Span, keep: []const bool) Error![]Span {
+    var out: std.ArrayList(Span) = .empty;
+    errdefer out.deinit(alloc);
+    var i: usize = 0;
+    while (i < words.len) {
+        if (keep[i]) {
+            i += 1;
+            continue;
+        }
+        const start = words[i].start;
+        var end = words[i].end;
+        i += 1;
+        while (i < words.len and !keep[i]) : (i += 1) end = words[i].end;
+        try out.append(alloc, .{ .start = start, .end = end });
+    }
+    if (out.items.len == 0) {
+        out.deinit(alloc);
+        return try alloc.alloc(Span, 0);
+    }
+    return try out.toOwnedSlice(alloc);
+}
+
+fn putLineSpans(alloc: Allocator, items: *std.ArrayList(LineChange), index: usize, spans: []Span) Error!void {
+    for (items.items) |*item| {
+        if (item.index != index) continue;
+        const prev = item.spans;
+        item.spans = spans;
+        alloc.free(prev);
+        return;
+    }
+    try items.append(alloc, .{ .index = index, .spans = spans });
 }
 
 /// Write git's changed ranges onto add/delete lines of files in `group`.
@@ -505,7 +708,7 @@ fn clipParts(alloc: Allocator, spans: []const Span, parts: []const Part, index: 
             if (lo < hi) try out.append(alloc, .{ .start = lo - part.start, .end = hi - part.start });
         }
         // The newline is not a byte of `text`. Record it only when the line
-        // has no word span, so a blank added line is not an empty span list.
+        // has no word span, so a blank added or deleted line is not an empty span list.
         if (out.items.len != before or !part.newline) continue;
         const nl = text_end;
         for (spans) |span| {
@@ -686,6 +889,9 @@ test "gitSpans follows word-diff porcelain" {
     try expectGitSpans("hello world", "hello there", &.{.{ .start = 6, .end = 11 }}, &.{.{ .start = 6, .end = 11 }});
     // The blank line is an inserted newline, at the byte between the two lines.
     try expectGitSpans("a\nb\n", "a\n\nb\n", &.{}, &.{.{ .start = 2, .end = 3 }});
+    // A deleted blank line is that newline on the old side only.
+    try expectGitSpans("keep\n\ngone\n", "keep\ngone\n", &.{.{ .start = 5, .end = 6 }}, &.{});
+    try expectGitSpans("keep\n\n", "keep\n", &.{.{ .start = 5, .end = 6 }}, &.{});
 }
 
 test "gitSpans does not skip a blank line to reach a deleted word" {
@@ -1141,6 +1347,79 @@ test "a joined line keeps the later word change" {
     try testing.expectEqualStrings("error.Name;", new_ret.text[new_sp[0].start..new_sp[0].end]);
 }
 
+test "a reflowed comment marks the words that moved" {
+    if (builtin.os.tag == .wasi) return error.SkipZigTest;
+
+    const alloc = testing.allocator;
+    const io = testing.io;
+    var tmp = try IsolatedTmp.init(alloc, io);
+    defer tmp.deinit(alloc, io);
+    const cwd = tmp.cwd();
+
+    const setup = [_][]const []const u8{
+        &.{ "git", "init", "-b", "main" },
+        &.{ "git", "config", "user.email", "rv@test" },
+        &.{ "git", "config", "user.name", "rv test" },
+    };
+    for (setup) |argv| {
+        const out = try gitRun(alloc, io, cwd, argv);
+        alloc.free(out);
+    }
+    const before =
+        \\    // A blank added line has a span on the newline past `text`. Nothing on the
+        \\    // line is an unchanged word, so the row stays the solid fill.
+        \\
+    ;
+    const after =
+        \\    // A blank added or deleted line has a span on the newline past `text`.
+        \\    // Nothing on the line is an unchanged word, so the row stays the solid fill.
+        \\
+    ;
+    try tmp.write(io, "a.txt", before);
+    {
+        const out = try gitRun(alloc, io, cwd, &.{ "git", "add", "a.txt" });
+        alloc.free(out);
+    }
+    {
+        const out = try gitRun(alloc, io, cwd, &.{ "git", "commit", "-m", "init" });
+        alloc.free(out);
+    }
+    try tmp.write(io, "a.txt", after);
+
+    const uni = try gitRun(alloc, io, cwd, &.{ "git", "diff", "--", "a.txt" });
+    defer alloc.free(uni);
+    const por = try gitRun(alloc, io, cwd, &.{ "git", "diff", "--word-diff=porcelain", "--", "a.txt" });
+    defer alloc.free(por);
+
+    var d = try diff.parse(alloc, uni);
+    defer d.deinit();
+    try attachSpans(alloc, &d, por, null);
+    const lines = d.files[0].hunks[0].lines;
+
+    const old_head = "    // A blank added line has a span on the newline past `text`. Nothing on the";
+    const removed = lines[try findLine(lines, .delete, old_head)];
+    const removed_sp = removed.spans orelse return error.TestExpectedEqual;
+    try testing.expectEqual(1, removed_sp.len);
+    try testing.expectEqualStrings("Nothing on the", removed.text[removed_sp[0].start..removed_sp[0].end]);
+
+    const new_head = "    // A blank added or deleted line has a span on the newline past `text`.";
+    const added = lines[try findLine(lines, .add, new_head)];
+    const added_sp = added.spans orelse return error.TestExpectedEqual;
+    try testing.expectEqual(1, added_sp.len);
+    try testing.expectEqualStrings("or deleted", added.text[added_sp[0].start..added_sp[0].end]);
+
+    const old_tail = "    // line is an unchanged word, so the row stays the solid fill.";
+    const old_tail_line = lines[try findLine(lines, .delete, old_tail)];
+    const old_tail_sp = old_tail_line.spans orelse return error.TestExpectedEqual;
+    try testing.expectEqual(0, old_tail_sp.len);
+
+    const new_tail = "    // Nothing on the line is an unchanged word, so the row stays the solid fill.";
+    const moved = lines[try findLine(lines, .add, new_tail)];
+    const moved_sp = moved.spans orelse return error.TestExpectedEqual;
+    try testing.expectEqual(1, moved_sp.len);
+    try testing.expectEqualStrings("Nothing on the", moved.text[moved_sp[0].start..moved_sp[0].end]);
+}
+
 test "a deleted blank line is not an empty span list" {
     if (builtin.os.tag == .wasi) return error.SkipZigTest;
 
@@ -1179,6 +1458,42 @@ test "a deleted blank line is not an empty span list" {
     defer d.deinit();
     try attachSpans(alloc, &d, por, null);
     const blank = d.files[0].hunks[0].lines[try findLine(d.files[0].hunks[0].lines, .delete, "")];
-    // Null keeps the solid fill. A recorded newline span does too. Empty does not.
-    if (blank.spans) |sp| try testing.expect(sp.len > 0);
+    // An empty span list paints grey. The newline span keeps the solid fill.
+    const mid = blank.spans orelse return error.TestExpectedEqual;
+    try testing.expectEqual(1, mid.len);
+    try testing.expectEqual(0, mid[0].start);
+    try testing.expectEqual(1, mid[0].end);
+
+    // A trailing blank line aligns as an extra `~`. It must still be a span.
+    {
+        const out = try gitRun(alloc, io, cwd, &.{ "git", "add", "a.txt" });
+        alloc.free(out);
+    }
+    {
+        const out = try gitRun(alloc, io, cwd, &.{ "git", "commit", "-m", "drop middle" });
+        alloc.free(out);
+    }
+    try tmp.write(io, "a.txt", "keep\ngone\n\n");
+    {
+        const out = try gitRun(alloc, io, cwd, &.{ "git", "add", "a.txt" });
+        alloc.free(out);
+    }
+    {
+        const out = try gitRun(alloc, io, cwd, &.{ "git", "commit", "-m", "trailing blank" });
+        alloc.free(out);
+    }
+    try tmp.write(io, "a.txt", "keep\ngone\n");
+
+    const uni2 = try gitRun(alloc, io, cwd, &.{ "git", "diff", "--", "a.txt" });
+    defer alloc.free(uni2);
+    const por2 = try gitRun(alloc, io, cwd, &.{ "git", "diff", "--word-diff=porcelain", "--", "a.txt" });
+    defer alloc.free(por2);
+    var d2 = try diff.parse(alloc, uni2);
+    defer d2.deinit();
+    try attachSpans(alloc, &d2, por2, null);
+    const end = d2.files[0].hunks[0].lines[try findLine(d2.files[0].hunks[0].lines, .delete, "")];
+    const end_sp = end.spans orelse return error.TestExpectedEqual;
+    try testing.expectEqual(1, end_sp.len);
+    try testing.expectEqual(0, end_sp[0].start);
+    try testing.expectEqual(1, end_sp[0].end);
 }

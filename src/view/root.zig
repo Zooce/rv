@@ -18,7 +18,7 @@ pub const wrap = @import("wrap.zig");
 /// File header: path-only (both sides the same). Hunk header: both starts,
 /// no side (old and new keys are the same). Unified: current row.
 /// Side-by-side: slot left (`old`) / right (`new`); file-header, hunk-header,
-/// and one-sided body slots use the row itself. Section headers are not
+/// and full-width body slots use the row itself. Section headers are not
 /// commentable. Line anchors carry only the chosen side’s line number.
 pub fn commentAnchor(
     rows: []const row.Row,
@@ -551,4 +551,3 @@ test "commentAnchor binary and section header" {
     try testing.expect(grouped.old_line == null);
     try testing.expect(grouped.new_line == null);
 }
-

@@ -86,10 +86,10 @@ pub fn sbsPaneWidths(cols: u16) SbsPanes {
 pub const SbsSlot = union(enum) {
     /// Full-width file, hunk, or section header.
     header: usize,
-    /// Full-width body line of a one-sided file (no old side or no new side).
+    /// Full-width body line: a one-sided file, or a hunk that only adds or only deletes.
     body: usize,
-    /// Two-pane body of a mixed file. Context uses the same index on both
-    /// sides. An empty pane is `null`.
+    /// Two-pane body of a hunk that both adds and deletes. Context uses the
+    /// same index on both sides. An empty pane is `null`.
     pair: struct {
         left: ?usize = null,
         right: ?usize = null,
@@ -156,6 +156,41 @@ fn isAddLine(row: Row) bool {
     };
 }
 
+/// True when the lines from `start` until the next header belong in one column.
+/// Adds and no deletes, or deletes and no adds. Also when both kinds are
+/// present but every line on one side has an empty span list: word-diff found
+/// no changed bytes there. Context and meta do not count. `null` spans are a
+/// whole-line change. A run with neither kind is false.
+pub fn addOnlyOrDeleteOnly(rows: []const Row, start: usize) bool {
+    var add = false;
+    var delete = false;
+    var add_bytes = false;
+    var delete_bytes = false;
+    var i = start;
+    while (i < rows.len) : (i += 1) {
+        switch (rows[i]) {
+            .line => |ln| {
+                const bytes = if (ln.spans) |sp| sp.len > 0 else true;
+                switch (ln.kind) {
+                    .add => {
+                        add = true;
+                        add_bytes = add_bytes or bytes;
+                    },
+                    .delete => {
+                        delete = true;
+                        delete_bytes = delete_bytes or bytes;
+                    },
+                    .context, .meta => {},
+                }
+            },
+            else => break,
+        }
+    }
+    if (add and !delete) return true;
+    if (delete and !add) return true;
+    return add and delete and add_bytes != delete_bytes;
+}
+
 /// Build side-by-side display slots from unified `rows`.
 ///
 /// Pairing within a change run (git-style `-` then `+` block):
@@ -166,7 +201,10 @@ fn isAddLine(row: Row) bool {
 ///
 /// A file with no old side (`old_path == null`) or no new side
 /// (`new_path == null`) emits a full-width `body` slot per line instead
-/// of pairing. Mixed files (both sides, including renames) pair as above.
+/// of pairing. A mixed file (both sides, including a rename) does the same
+/// for a hunk that only adds or only deletes, and for a hunk whose word-diff
+/// changed bytes are all on one side. Context and meta lines in that hunk
+/// are included. A hunk with changed bytes on both sides pairs as above.
 ///
 /// Caller owns the returned slice (`alloc.free`). Nested indices borrow `rows`.
 pub fn pairSideBySide(alloc: Allocator, rows: []const Row) Allocator.Error![]SbsSlot {
@@ -182,9 +220,19 @@ pub fn pairSideBySide(alloc: Allocator, rows: []const Row) Allocator.Error![]Sbs
                 try out.append(alloc, .{ .header = i });
                 i += 1;
             },
-            .hunk_header, .section_header => {
+            .section_header => {
                 try out.append(alloc, .{ .header = i });
                 i += 1;
+            },
+            .hunk_header => {
+                try out.append(alloc, .{ .header = i });
+                i += 1;
+                // One column when a side has no lines, or no changed bytes.
+                if (!one_sided and addOnlyOrDeleteOnly(rows, i)) {
+                    while (i < rows.len and rows[i] == .line) : (i += 1) {
+                        try out.append(alloc, .{ .body = i });
+                    }
+                }
             },
             .line => |ln| if (one_sided) {
                 try out.append(alloc, .{ .body = i });
@@ -414,10 +462,8 @@ test "pairSideBySide pure adds and pure deletes" {
     defer testing.allocator.free(slots);
 
     try testing.expectEqual(4, slots.len);
-    try testing.expect(slots[2].pair.left == null);
-    try testing.expectEqual(2, slots[2].pair.right.?);
-    try testing.expect(slots[3].pair.left == null);
-    try testing.expectEqual(3, slots[3].pair.right.?);
+    try testing.expectEqual(2, slots[2].body);
+    try testing.expectEqual(3, slots[3].body);
 
     const dels_only =
         \\diff --git a/g b/g
@@ -435,10 +481,105 @@ test "pairSideBySide pure adds and pure deletes" {
     defer testing.allocator.free(slots2);
 
     try testing.expectEqual(4, slots2.len);
-    try testing.expectEqual(2, slots2[2].pair.left.?);
-    try testing.expect(slots2[2].pair.right == null);
-    try testing.expectEqual(3, slots2[3].pair.left.?);
-    try testing.expect(slots2[3].pair.right == null);
+    try testing.expectEqual(2, slots2[2].body);
+    try testing.expectEqual(3, slots2[3].body);
+}
+
+test "pairSideBySide add-only and delete-only hunks are full-width body" {
+    const fixture =
+        \\diff --git a/f b/f
+        \\--- a/f
+        \\+++ b/f
+        \\@@ -1 +1,2 @@
+        \\ keep
+        \\+a
+        \\\ No newline at end of file
+        \\@@ -10,2 +11,2 @@
+        \\-old
+        \\+new
+        \\@@ -20,2 +21 @@
+        \\ ctx
+        \\-gone
+        \\\ No newline at end of file
+    ;
+    var d = try diff.parse(testing.allocator, fixture);
+    defer d.deinit();
+    const rows = try row_mod.flatten(testing.allocator, &d);
+    defer testing.allocator.free(rows);
+    const slots = try pairSideBySide(testing.allocator, rows);
+    defer testing.allocator.free(slots);
+
+    // rows: 0 file, 1 hunk, 2 ctx, 3 add, 4 meta,
+    // 5 hunk, 6 del, 7 add, 8 hunk, 9 ctx, 10 del, 11 meta.
+    // The del|add pair is one slot, so the delete-only hunk starts at slot 7.
+    try testing.expectEqual(11, slots.len);
+    try testing.expectEqual(2, slots[2].body);
+    try testing.expectEqual(3, slots[3].body);
+    try testing.expectEqual(4, slots[4].body);
+    try testing.expectEqual(5, slots[5].header);
+    try testing.expectEqual(6, slots[6].pair.left.?);
+    try testing.expectEqual(7, slots[6].pair.right.?);
+    try testing.expectEqual(8, slots[7].header);
+    try testing.expectEqual(9, slots[8].body);
+    try testing.expectEqual(10, slots[9].body);
+    try testing.expectEqual(11, slots[10].body);
+}
+
+test "pairSideBySide one side with no changed bytes is full width" {
+    const none: []const diff.Span = &.{};
+    const ins = [_]diff.Span{.{ .start = 42, .end = 53 }};
+    const rows = [_]Row{
+        .{ .file_header = .{ .path = "f", .is_binary = false, .old_path = "f", .new_path = "f" } },
+        .{ .hunk_header = .{
+            .path = "f",
+            .old_start = 1,
+            .old_count = 1,
+            .new_start = 1,
+            .new_count = 1,
+            .section = "",
+        } },
+        .{ .line = .{
+            .kind = .delete,
+            .text = "blank added line",
+            .path = "f",
+            .spans = none,
+        } },
+        .{ .line = .{
+            .kind = .add,
+            .text = "blank added or deleted line",
+            .path = "f",
+            .spans = &ins,
+        } },
+    };
+    const slots = try pairSideBySide(testing.allocator, &rows);
+    defer testing.allocator.free(slots);
+    try testing.expectEqual(4, slots.len);
+    try testing.expectEqual(2, slots[2].body);
+    try testing.expectEqual(3, slots[3].body);
+
+    const del = [_]diff.Span{.{ .start = 0, .end = 2 }};
+    const rows_del = [_]Row{
+        rows[0],
+        rows[1],
+        .{ .line = .{ .kind = .delete, .text = "// line", .path = "f", .spans = &del } },
+        .{ .line = .{ .kind = .add, .text = "line", .path = "f", .spans = none } },
+    };
+    const slots_del = try pairSideBySide(testing.allocator, &rows_del);
+    defer testing.allocator.free(slots_del);
+    try testing.expectEqual(2, slots_del[2].body);
+    try testing.expectEqual(3, slots_del[3].body);
+
+    const both = [_]diff.Span{.{ .start = 0, .end = 3 }};
+    const rows_both = [_]Row{
+        rows[0],
+        rows[1],
+        .{ .line = .{ .kind = .delete, .text = "old", .path = "f", .spans = &both } },
+        .{ .line = .{ .kind = .add, .text = "new", .path = "f", .spans = &both } },
+    };
+    const slots_both = try pairSideBySide(testing.allocator, &rows_both);
+    defer testing.allocator.free(slots_both);
+    try testing.expectEqual(2, slots_both[2].pair.left.?);
+    try testing.expectEqual(3, slots_both[2].pair.right.?);
 }
 
 test "pairSideBySide one-sided files are full-width body" {

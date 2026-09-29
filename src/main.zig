@@ -1873,16 +1873,22 @@ pub const Viewport = struct {
     /// Columns available for horizontal pan of the file at `at`: text area after the gutter.
     fn panViewportCols(self: *const Viewport, cols: u16, rows: []const view.row.Row, at: usize) u16 {
         const layout = view.layout.effectiveLayout(self.layout_pref, cols);
-        const one_sided = if (view.nav.currentFileStart(rows, at)) |fi| switch (rows[fi]) {
+        const one_sided_file = if (view.nav.currentFileStart(rows, at)) |fi| switch (rows[fi]) {
             .file_header => |fh| fh.old_path == null or fh.new_path == null,
             else => false,
         } else false;
+        // Same rule as pairing: an add-only or delete-only hunk is full width.
+        const one_kind_hunk = if (view.nav.currentHunkInFile(rows, at)) |header|
+            view.layout.addOnlyOrDeleteOnly(rows, header + 1)
+        else
+            false;
+        const full_body = one_sided_file or one_kind_hunk;
         const full: u16 = switch (layout) {
             .unified => cols,
-            .side_by_side => if (one_sided) cols else view.layout.sbsPaneWidths(cols).left_w,
+            .side_by_side => if (full_body) cols else view.layout.sbsPaneWidths(cols).left_w,
         };
         const num_w = if (self.show_line_numbers) Frame.lineNumberWidth(rows) else 0;
-        const gw_layout: view.layout.EffectiveLayout = if (one_sided) .unified else layout;
+        const gw_layout: view.layout.EffectiveLayout = if (full_body) .unified else layout;
         const gw = Frame.lineGutterCols(num_w, gw_layout);
         const gw_u16: u16 = std.math.cast(u16, gw) orelse std.math.maxInt(u16);
         return full -| gw_u16;
@@ -3324,6 +3330,38 @@ test "pan viewport one-sided side-by-side uses full width" {
     const expected: usize = left - gw;
     const got: usize = mixed_sbs;
     try std.testing.expectEqual(expected, got);
+}
+
+test "pan viewport add-only and delete-only hunks use full width" {
+    const fixture =
+        \\diff --git a/f b/f
+        \\--- a/f
+        \\+++ b/f
+        \\@@ -1 +1,2 @@
+        \\ keep
+        \\+added
+        \\@@ -10,2 +11,2 @@
+        \\-old
+        \\+new
+        \\@@ -20 +20,0 @@
+        \\-gone
+    ;
+    var d = try diff.parse(std.testing.allocator, fixture);
+    defer d.deinit();
+    const rows = try view.row.flatten(std.testing.allocator, &d);
+    defer std.testing.allocator.free(rows);
+    const cols: u16 = 80;
+    // 0 file, 1 hunk, 2 ctx, 3 add, 4 hunk, 5 del, 6 add, 7 hunk, 8 del
+    var sbs: Viewport = .{ .layout_pref = .side_by_side };
+    var uni: Viewport = .{ .layout_pref = .unified };
+    for ([_]usize{ 1, 2, 3, 7, 8 }) |at| {
+        try std.testing.expectEqual(uni.panViewportCols(cols, rows, at), sbs.panViewportCols(cols, rows, at));
+    }
+    const paired = sbs.panViewportCols(cols, rows, 5);
+    const paired_uni = uni.panViewportCols(cols, rows, 5);
+    try std.testing.expect(paired < paired_uni);
+    try std.testing.expectEqual(sbs.panViewportCols(cols, rows, 4), paired);
+    try std.testing.expectEqual(sbs.panViewportCols(cols, rows, 6), paired);
 }
 
 test "wheel scrolls the window and leaves the selected line" {
