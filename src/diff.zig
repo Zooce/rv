@@ -331,6 +331,47 @@ pub const Diff = struct {
         }
         self.hunk_count = n;
     }
+
+    /// Copy of `self` with `paths` replaced by `fresh`.
+    ///
+    /// A file is replaced when its old or new path is in `paths`. Fresh files
+    /// land at the first replaced file of that group, or at the end of the group
+    /// when the path is new there. Every other file keeps its text, word spans,
+    /// and expand state. Hunk indexes are reassigned in file order.
+    pub fn replacePaths(
+        self: *const Diff,
+        alloc: Allocator,
+        paths: []const []const u8,
+        fresh: *const Diff,
+    ) Allocator.Error!Diff {
+        var arena = ArenaAllocator.init(alloc);
+        errdefer arena.deinit();
+
+        var files: std.ArrayList(File) = .empty;
+        defer files.deinit(arena.allocator());
+
+        // Bits already inserted: unstaged, untracked, staged.
+        var emitted: u8 = 0;
+        for (self.files) |f| {
+            if (mentionsPath(f, paths)) {
+                if (f.group) |g| try emitGroup(arena.allocator(), &files, fresh, g, &emitted);
+                continue;
+            }
+            if (groupPlace(f.group)) |place| {
+                try emitGroupsBefore(arena.allocator(), &files, fresh, place, &emitted);
+            }
+            try files.append(arena.allocator(), try dupeFile(arena.allocator(), f));
+        }
+        try emitGroupsBefore(arena.allocator(), &files, fresh, 3, &emitted);
+
+        var out: Diff = .{
+            .arena = arena,
+            .files = try files.toOwnedSlice(arena.allocator()),
+            .hunk_count = 0,
+        };
+        out.reindex();
+        return out;
+    }
 };
 
 /// How many context lines `Diff.expandHunk` adds on each side per call.
@@ -510,6 +551,86 @@ pub fn parsePieces(alloc: Allocator, pieces: []const ParsePiece) ParseError!Diff
         .files = owned,
         .hunk_count = hunk_index,
     };
+}
+
+fn mentionsPath(file: File, paths: []const []const u8) bool {
+    for (paths) |p| {
+        if (file.old_path) |op| if (std.mem.eql(u8, op, p)) return true;
+        if (file.new_path) |np| if (std.mem.eql(u8, np, p)) return true;
+    }
+    return false;
+}
+
+fn groupPlace(group: ?Group) ?usize {
+    return switch (group orelse return null) {
+        .unstaged => 0,
+        .untracked => 1,
+        .staged => 2,
+    };
+}
+
+fn emitGroup(
+    alloc: Allocator,
+    out: *std.ArrayList(File),
+    fresh: *const Diff,
+    group: Group,
+    emitted: *u8,
+) Allocator.Error!void {
+    const bit: u8 = switch (group) {
+        .unstaged => 1,
+        .untracked => 2,
+        .staged => 4,
+    };
+    if ((emitted.* & bit) != 0) return;
+    emitted.* |= bit;
+    for (fresh.files) |f| {
+        if (f.group == group) try out.append(alloc, try dupeFile(alloc, f));
+    }
+}
+
+fn emitGroupsBefore(
+    alloc: Allocator,
+    out: *std.ArrayList(File),
+    fresh: *const Diff,
+    before: usize,
+    emitted: *u8,
+) Allocator.Error!void {
+    const order = [_]Group{ .unstaged, .untracked, .staged };
+    for (order, 0..) |g, i| {
+        if (i >= before) break;
+        try emitGroup(alloc, out, fresh, g, emitted);
+    }
+}
+
+fn dupeLine(alloc: Allocator, line: Line) Allocator.Error!Line {
+    var out = line;
+    out.text = try alloc.dupe(u8, line.text);
+    if (line.spans) |sp| out.spans = try alloc.dupe(Span, sp);
+    return out;
+}
+
+fn dupeHunk(alloc: Allocator, hunk: Hunk) Allocator.Error!Hunk {
+    var out = hunk;
+    out.section = try alloc.dupe(u8, hunk.section);
+    const lines = try alloc.alloc(Line, hunk.lines.len);
+    for (hunk.lines, lines) |src, *dst| dst.* = try dupeLine(alloc, src);
+    out.lines = lines;
+    if (hunk.originals.len > 0) {
+        const originals = try alloc.alloc(Hunk, hunk.originals.len);
+        for (hunk.originals, originals) |src, *dst| dst.* = try dupeHunk(alloc, src);
+        out.originals = originals;
+    }
+    return out;
+}
+
+fn dupeFile(alloc: Allocator, file: File) Allocator.Error!File {
+    var out = file;
+    if (file.old_path) |p| out.old_path = try alloc.dupe(u8, p);
+    if (file.new_path) |p| out.new_path = try alloc.dupe(u8, p);
+    const hunks = try alloc.alloc(Hunk, file.hunks.len);
+    for (file.hunks, hunks) |src, *dst| dst.* = try dupeHunk(alloc, src);
+    out.hunks = hunks;
+    return out;
 }
 
 fn parseAppend(
@@ -976,6 +1097,107 @@ test "parsePieces tags groups and continues hunk indexes" {
     try testing.expectEqualStrings("a.txt", d.files[1].displayPath());
     try testing.expectEqual(Group.staged, d.files[1].group.?);
     try testing.expectEqual(1, d.files[1].hunks[0].index);
+}
+
+test "replacePaths keeps other files and puts a new group at the end" {
+    const unstaged =
+        \\diff --git a/a.txt b/a.txt
+        \\--- a/a.txt
+        \\+++ b/a.txt
+        \\@@ -1 +1 @@
+        \\-a0
+        \\+a1
+        \\diff --git a/b.txt b/b.txt
+        \\--- a/b.txt
+        \\+++ b/b.txt
+        \\@@ -1 +1 @@
+        \\-b0
+        \\+b1
+    ;
+    const staged =
+        \\diff --git a/c.txt b/c.txt
+        \\--- a/c.txt
+        \\+++ b/c.txt
+        \\@@ -1 +1 @@
+        \\-c0
+        \\+c1
+    ;
+    var old = try parsePieces(testing.allocator, &.{
+        .{ .text = unstaged, .group = .unstaged },
+        .{ .text = staged, .group = .staged },
+    });
+    defer old.deinit();
+    old.files[0].hunks[0].can_grow = false;
+    const spans = try old.arena.allocator().dupe(Span, &.{.{ .start = 1, .end = 2 }});
+    const marked = try old.arena.allocator().alloc(Line, old.files[0].hunks[0].lines.len);
+    for (old.files[0].hunks[0].lines, marked) |ln, *out| out.* = ln;
+    marked[1].spans = spans;
+    old.files[0].hunks[0].lines = marked;
+
+    const fresh_unstaged =
+        \\diff --git a/b.txt b/b.txt
+        \\--- a/b.txt
+        \\+++ b/b.txt
+        \\@@ -1 +1 @@
+        \\-b0
+        \\+b2
+    ;
+    const fresh_staged =
+        \\diff --git a/b.txt b/b.txt
+        \\--- a/b.txt
+        \\+++ b/b.txt
+        \\@@ -1 +1 @@
+        \\-b0
+        \\+b3
+    ;
+    var fresh = try parsePieces(testing.allocator, &.{
+        .{ .text = fresh_unstaged, .group = .unstaged },
+        .{ .text = fresh_staged, .group = .staged },
+    });
+    defer fresh.deinit();
+
+    var got = try old.replacePaths(testing.allocator, &.{"b.txt"}, &fresh);
+    defer got.deinit();
+
+    try testing.expectEqual(4, got.files.len);
+    try testing.expectEqual(4, got.hunk_count);
+    try testing.expectEqualStrings("a.txt", got.files[0].displayPath());
+    try testing.expectEqual(Group.unstaged, got.files[0].group.?);
+    try testing.expect(!got.files[0].hunks[0].can_grow);
+    try testing.expectEqualStrings("a1", got.files[0].hunks[0].lines[1].text);
+    const sp = got.files[0].hunks[0].lines[1].spans.?;
+    try testing.expectEqual(1, sp.len);
+    try testing.expectEqual(1, sp[0].start);
+    try testing.expectEqual(2, sp[0].end);
+    try testing.expectEqual(0, got.files[0].hunks[0].index);
+
+    try testing.expectEqualStrings("b.txt", got.files[1].displayPath());
+    try testing.expectEqual(Group.unstaged, got.files[1].group.?);
+    try testing.expectEqualStrings("b2", got.files[1].hunks[0].lines[1].text);
+    try testing.expectEqual(1, got.files[1].hunks[0].index);
+
+    try testing.expectEqualStrings("c.txt", got.files[2].displayPath());
+    try testing.expectEqual(Group.staged, got.files[2].group.?);
+    try testing.expectEqualStrings("c1", got.files[2].hunks[0].lines[1].text);
+    try testing.expectEqual(2, got.files[2].hunks[0].index);
+
+    try testing.expectEqualStrings("b.txt", got.files[3].displayPath());
+    try testing.expectEqual(Group.staged, got.files[3].group.?);
+    try testing.expectEqualStrings("b3", got.files[3].hunks[0].lines[1].text);
+    try testing.expectEqual(3, got.files[3].hunks[0].index);
+
+    var staged_only = try parsePieces(testing.allocator, &.{
+        .{ .text = fresh_staged, .group = .staged },
+    });
+    defer staged_only.deinit();
+    var dropped = try old.replacePaths(testing.allocator, &.{"b.txt"}, &staged_only);
+    defer dropped.deinit();
+    try testing.expectEqual(3, dropped.files.len);
+    try testing.expectEqualStrings("a.txt", dropped.files[0].displayPath());
+    try testing.expectEqualStrings("c.txt", dropped.files[1].displayPath());
+    try testing.expectEqualStrings("b.txt", dropped.files[2].displayPath());
+    try testing.expectEqual(Group.staged, dropped.files[2].group.?);
+    try testing.expect(!dropped.files[0].hunks[0].can_grow);
 }
 
 test "single file multi-hunk with context add delete" {

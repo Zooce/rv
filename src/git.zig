@@ -89,11 +89,16 @@
 //! blob for a range or commit load; deleted files use the old side. Does not
 //! re-run `git diff`.
 //!
-//! `applyAtCursor` / `applyGroupAtCursor` run `mutate`, reload the local diff
-//! (hiding approved hunks), restore the cursor, and call comment remap (and
-//! discard comment delete). Local TUI `a` / `A` stages through `applyAtCursor`
-//! (same hunk vs file as `gs` / `gS`), then hides; already staged skips
-//! mutate. Unapprove does not unstage.
+//! `applyAtCursor` / `applyGroupAtCursor` run `mutate`, reload, restore the
+//! cursor, and call comment remap (and discard comment delete). A one-path
+//! mutate reloads only that path (old and new names when they differ). Other
+//! files stay as loaded, including word spans and expanded hunks. The
+//! reloaded path keeps word spans when its add and delete lines still match
+//! a loaded hunk; otherwise those lines use the solid fill until a full
+//! reload. A group mutate still reloads the whole local diff. Approved hunks
+//! stay hidden. Local TUI `a` / `A` stages through `applyAtCursor` (same hunk
+//! vs file as `gs` / `gS`), then hides; already staged skips mutate.
+//! Unapprove does not unstage.
 //! `discardTargetAt` is the allowed discard; staged is a no-op. `stagePlan` /
 //! `approveHasComments` / `confirmNext` are what the app loop dispatches.
 //! Overlay paint stays in the TUI.
@@ -152,10 +157,18 @@ const DefaultTexts = struct {
     }
 };
 
-fn loadDefaultTexts(alloc: Allocator, io: Io, cwd: std.process.Child.Cwd, porcelain: bool) Error!DefaultTexts {
-    try ensureInsideWorkTree(alloc, io, cwd);
+/// `only` limits every command to those paths. `null` is the whole work tree
+/// and checks that cwd is inside one. A one-path reload passes the path.
+fn loadDefaultTexts(
+    alloc: Allocator,
+    io: Io,
+    cwd: std.process.Child.Cwd,
+    porcelain: bool,
+    only: ?[]const []const u8,
+) Error!DefaultTexts {
+    if (only == null) try ensureInsideWorkTree(alloc, io, cwd);
 
-    const untracked = if (try untrackedDiff(alloc, io, cwd, porcelain)) |text| text else try alloc.alloc(u8, 0);
+    const untracked = if (try untrackedDiff(alloc, io, cwd, porcelain, only)) |text| text else try alloc.alloc(u8, 0);
     errdefer alloc.free(untracked);
 
     if (!try revExists(alloc, io, cwd, "HEAD")) {
@@ -168,28 +181,41 @@ fn loadDefaultTexts(alloc: Allocator, io: Io, cwd: std.process.Child.Cwd, porcel
         };
     }
 
-    const unstaged_argv: []const []const u8 = if (porcelain)
-        &.{ "git", "diff", "--find-renames", "--word-diff=porcelain" }
-    else
-        &.{ "git", "diff", "--find-renames" };
-    const unstaged = try git(alloc, io, cwd, .{ .argv = unstaged_argv });
+    const unstaged = try worktreeDiff(alloc, io, cwd, porcelain, false, only);
     errdefer alloc.free(unstaged);
-    const staged_argv: []const []const u8 = if (porcelain)
-        &.{ "git", "diff", "--find-renames", "--word-diff=porcelain", "--cached" }
-    else
-        &.{ "git", "diff", "--find-renames", "--cached" };
     return .{
         .unstaged = unstaged,
         .untracked = untracked,
-        .staged = try git(alloc, io, cwd, .{ .argv = staged_argv }),
+        .staged = try worktreeDiff(alloc, io, cwd, porcelain, true, only),
     };
+}
+
+/// `git diff --find-renames` (or `--cached`) stdout. `only` adds a pathspec.
+fn worktreeDiff(
+    alloc: Allocator,
+    io: Io,
+    cwd: std.process.Child.Cwd,
+    porcelain: bool,
+    cached: bool,
+    only: ?[]const []const u8,
+) Error![]u8 {
+    var argv: std.ArrayList([]const u8) = .empty;
+    defer argv.deinit(alloc);
+    try argv.appendSlice(alloc, &.{ "git", "diff", "--find-renames" });
+    if (porcelain) try argv.append(alloc, "--word-diff=porcelain");
+    if (cached) try argv.append(alloc, "--cached");
+    if (only) |paths| {
+        try argv.append(alloc, "--");
+        try argv.appendSlice(alloc, paths);
+    }
+    return try git(alloc, io, cwd, .{ .argv = argv.items });
 }
 
 /// Same as `loadDefaultDiff`, but run git with an explicit child cwd.
 pub fn loadDefaultDiffCwd(alloc: Allocator, io: Io, cwd: std.process.Child.Cwd) Error!diff.Diff {
-    const texts = try loadDefaultTexts(alloc, io, cwd, false);
+    const texts = try loadDefaultTexts(alloc, io, cwd, false, null);
     defer texts.deinit(alloc);
-    const por = try loadDefaultTexts(alloc, io, cwd, true);
+    const por = try loadDefaultTexts(alloc, io, cwd, true, null);
     defer por.deinit(alloc);
     var parsed = try diff.parsePieces(alloc, &.{
         .{ .text = texts.unstaged, .group = .unstaged },
@@ -909,10 +935,10 @@ pub const MutationStatus = union(enum) {
 };
 
 /// Stage, unstage, or discard the file or hunk at `cursor`. On success, reload
-/// the local diff and restore onto the neighbor change. Stage/unstage remaps
-/// live comments on the target. `delete_comments` (discard only) removes
-/// matching live comments after a successful mutate. Mutate failure leaves
-/// the list and store unchanged.
+/// that path and restore onto the neighbor change. Other files stay as loaded.
+/// Stage/unstage remaps live comments on the target. `delete_comments`
+/// (discard only) removes matching live comments after a successful mutate.
+/// Mutate failure leaves the list and store unchanged.
 pub fn applyAtCursor(
     alloc: Allocator,
     io: Io,
@@ -971,7 +997,16 @@ pub fn applyAtCursor(
         save_failed = !removeMatchingComments(review, alloc, io, ids.items, saved.items);
     }
 
-    const reloaded = reloadLocal(alloc, io, cwd) catch |err| {
+    var path_buf: [2][]const u8 = undefined;
+    path_buf[0] = file.displayPath();
+    var path_n: usize = 1;
+    if (file.old_path) |old_p| {
+        if (!std.mem.eql(u8, old_p, path_buf[0])) {
+            path_buf[1] = old_p;
+            path_n = 2;
+        }
+    }
+    const reloaded = reloadPaths(alloc, io, cwd, d, path_buf[0..path_n]) catch |err| {
         return .{ .result = .{ .reload_err = err, .save_failed = save_failed } };
     };
     var new_diff = reloaded.diff;
@@ -1103,6 +1138,98 @@ fn reloadLocal(alloc: Allocator, io: Io, cwd: std.process.Child.Cwd) Error!struc
     return .{ .diff = new_diff, .rows = vis.rows, .approved_n = vis.approved_n };
 }
 
+/// Replace `paths` in `old` with a fresh diff of those paths. Other files are
+/// copied. Word spans on the fresh hunks are copied from `old` when the add
+/// and delete lines still match.
+fn reloadPaths(
+    alloc: Allocator,
+    io: Io,
+    cwd: std.process.Child.Cwd,
+    old: *const diff.Diff,
+    paths: []const []const u8,
+) Error!struct {
+    diff: diff.Diff,
+    rows: []view.row.Row,
+    approved_n: usize,
+} {
+    const texts = try loadDefaultTexts(alloc, io, cwd, false, paths);
+    defer texts.deinit(alloc);
+    var fresh = try diff.parsePieces(alloc, &.{
+        .{ .text = texts.unstaged, .group = .unstaged },
+        .{ .text = texts.untracked, .group = .untracked },
+        .{ .text = texts.staged, .group = .staged },
+    });
+    defer fresh.deinit();
+    try copyMatchingSpans(old, &fresh);
+
+    var spliced = try old.replacePaths(alloc, paths, &fresh);
+    errdefer spliced.deinit();
+    const vis = visibleLocal(alloc, io, cwd, &spliced) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => {
+            const new_rows = view.row.flatten(alloc, &spliced) catch return error.OutOfMemory;
+            return .{ .diff = spliced, .rows = new_rows, .approved_n = 0 };
+        },
+    };
+    return .{ .diff = spliced, .rows = vis.rows, .approved_n = vis.approved_n };
+}
+
+/// Same add and delete lines, in order. Context and `@@` numbers are ignored.
+fn sameChanges(a: diff.Hunk, b: diff.Hunk) bool {
+    var ia: usize = 0;
+    var ib: usize = 0;
+    while (true) {
+        while (ia < a.lines.len and a.lines[ia].kind != .add and a.lines[ia].kind != .delete) ia += 1;
+        while (ib < b.lines.len and b.lines[ib].kind != .add and b.lines[ib].kind != .delete) ib += 1;
+        if (ia >= a.lines.len and ib >= b.lines.len) return true;
+        if (ia >= a.lines.len or ib >= b.lines.len) return false;
+        if (a.lines[ia].kind != b.lines[ib].kind) return false;
+        if (!std.mem.eql(u8, a.lines[ia].text, b.lines[ib].text)) return false;
+        ia += 1;
+        ib += 1;
+    }
+}
+
+fn matchingHunk(old: *const diff.Diff, path: []const u8, group: ?diff.Group, want: diff.Hunk) ?diff.Hunk {
+    var fallback: ?diff.Hunk = null;
+    for (old.files) |of| {
+        if (!std.mem.eql(u8, of.displayPath(), path)) continue;
+        for (of.hunks) |oh| {
+            if (!sameChanges(oh, want)) continue;
+            if (of.group == group) return oh;
+            if (fallback == null) fallback = oh;
+        }
+    }
+    return fallback;
+}
+
+fn copyChangeSpans(alloc: Allocator, src: diff.Hunk, dst: *diff.Hunk) Allocator.Error!void {
+    const lines = try alloc.alloc(diff.Line, dst.lines.len);
+    for (dst.lines, lines) |ln, *out| out.* = ln;
+    var si: usize = 0;
+    for (lines) |*ln| {
+        if (ln.kind != .add and ln.kind != .delete) continue;
+        while (si < src.lines.len and src.lines[si].kind != .add and src.lines[si].kind != .delete) si += 1;
+        if (si >= src.lines.len) break;
+        if (src.lines[si].spans) |sp| ln.spans = try alloc.dupe(diff.Span, sp);
+        si += 1;
+    }
+    dst.lines = lines;
+}
+
+/// Copy word spans onto `fresh` hunks whose add and delete lines still match
+/// `old`. Same group wins; another group of that path is the fallback (a
+/// staged copy of a hunk that was unstaged). Anything else stays unspanned.
+fn copyMatchingSpans(old: *const diff.Diff, fresh: *diff.Diff) Allocator.Error!void {
+    const alloc = fresh.arena.allocator();
+    for (fresh.files) |*ff| {
+        for (ff.hunks) |*fh| {
+            const src = matchingHunk(old, ff.displayPath(), ff.group, fh.*) orelse continue;
+            try copyChangeSpans(alloc, src, fh);
+        }
+    }
+}
+
 fn visibleLocal(
     alloc: Allocator,
     io: Io,
@@ -1184,11 +1311,23 @@ fn revExists(alloc: Allocator, io: Io, cwd: std.process.Child.Cwd, rev: []const 
 }
 
 /// Unified-diff text for untracked, non-ignored paths (exclude-standard).
-/// `null` when there are none. Caller frees a non-null result.
-fn untrackedDiff(alloc: Allocator, io: Io, cwd: std.process.Child.Cwd, porcelain: bool) Error!?[]u8 {
-    const listing = try git(alloc, io, cwd, .{
-        .argv = &.{ "git", "ls-files", "--others", "--exclude-standard", "-z" },
-    });
+/// `only` limits the listing to those paths. `null` lists the whole tree.
+/// Returns `null` when there are none. Caller frees a non-null result.
+fn untrackedDiff(
+    alloc: Allocator,
+    io: Io,
+    cwd: std.process.Child.Cwd,
+    porcelain: bool,
+    only: ?[]const []const u8,
+) Error!?[]u8 {
+    var list_argv: std.ArrayList([]const u8) = .empty;
+    defer list_argv.deinit(alloc);
+    try list_argv.appendSlice(alloc, &.{ "git", "ls-files", "--others", "--exclude-standard", "-z" });
+    if (only) |paths| {
+        try list_argv.append(alloc, "--");
+        try list_argv.appendSlice(alloc, paths);
+    }
+    const listing = try git(alloc, io, cwd, .{ .argv = list_argv.items });
     defer alloc.free(listing);
     if (listing.len == 0) return null;
 
@@ -1984,7 +2123,7 @@ test "line oracle: local rows match the unified body" {
     const rows = try view.row.flatten(alloc, &d);
     defer alloc.free(rows);
 
-    const texts = try loadDefaultTexts(alloc, io, cwd, false);
+    const texts = try loadDefaultTexts(alloc, io, cwd, false, null);
     defer texts.deinit(alloc);
     try expectLineRowsMatchStream(alloc, rows, &.{ texts.unstaged, texts.untracked, texts.staged });
     try expectLineTokens(
@@ -2025,7 +2164,7 @@ test "line oracle: range rows match the unified body" {
     const text = try rangeDiffText(alloc, io, cwd, "main...HEAD", false);
     defer alloc.free(text);
     try expectLineRowsMatchStream(alloc, rows, &.{text});
-    try expectLineTokens(rows, &.{ "feature-token" }, &.{ "dirty-token", "untracked-token" });
+    try expectLineTokens(rows, &.{"feature-token"}, &.{ "dirty-token", "untracked-token" });
 }
 
 test "line oracle: commit rows match the unified body" {
@@ -2053,7 +2192,7 @@ test "line oracle: commit rows match the unified body" {
     const text = try commitDiffText(alloc, io, cwd, "HEAD", false);
     defer alloc.free(text);
     try expectLineRowsMatchStream(alloc, rows, &.{text});
-    try expectLineTokens(rows, &.{ "committed-token" }, &.{ "dirty-token", "untracked-token" });
+    try expectLineTokens(rows, &.{"committed-token"}, &.{ "dirty-token", "untracked-token" });
 }
 
 test "local word-diff porcelain matches the loaded hunks" {
@@ -2111,7 +2250,7 @@ test "local word-diff porcelain matches the loaded hunks" {
     try expectRowSpan(rows, "OTHER", 0, 5);
     try expectRowUnspanned(rows, "keep0");
 
-    const por = try loadDefaultTexts(alloc, io, cwd, true);
+    const por = try loadDefaultTexts(alloc, io, cwd, true, null);
     defer por.deinit(alloc);
 
     try testing.expectEqual(1, d.files.len);
@@ -2955,6 +3094,132 @@ test "survivingFileText unstaged is worktree, staged is index" {
     defer alloc.free(idx);
     try testing.expectEqualStrings("worktree body\n", wt);
     try testing.expectEqualStrings("staged body\n", idx);
+}
+
+fn fileHasLine(f: diff.File, text: []const u8) bool {
+    for (f.hunks) |h| {
+        for (h.lines) |ln| {
+            if (std.mem.eql(u8, ln.text, text)) return true;
+        }
+    }
+    return false;
+}
+
+test "copyMatchingSpans keeps word spans when context shifts" {
+    const old_txt =
+        \\diff --git a/f.txt b/f.txt
+        \\--- a/f.txt
+        \\+++ b/f.txt
+        \\@@ -1,3 +1,3 @@
+        \\ ctx
+        \\-old
+        \\+new
+        \\ ctx
+    ;
+    const fresh_txt =
+        \\diff --git a/f.txt b/f.txt
+        \\--- a/f.txt
+        \\+++ b/f.txt
+        \\@@ -8,3 +8,3 @@
+        \\ other
+        \\-old
+        \\+new
+        \\ other
+        \\diff --git a/g.txt b/g.txt
+        \\--- a/g.txt
+        \\+++ b/g.txt
+        \\@@ -1 +1 @@
+        \\-gone
+        \\+else
+    ;
+    const alloc = testing.allocator;
+    var old = try diff.parsePieces(alloc, &.{.{ .text = old_txt, .group = .unstaged }});
+    defer old.deinit();
+    const spans = try old.arena.allocator().dupe(diff.Span, &.{.{ .start = 1, .end = 3 }});
+    const marked = try old.arena.allocator().alloc(diff.Line, old.files[0].hunks[0].lines.len);
+    for (old.files[0].hunks[0].lines, marked) |ln, *out| out.* = ln;
+    marked[2].spans = spans;
+    old.files[0].hunks[0].lines = marked;
+
+    var fresh = try diff.parsePieces(alloc, &.{.{ .text = fresh_txt, .group = .unstaged }});
+    defer fresh.deinit();
+    try copyMatchingSpans(&old, &fresh);
+
+    const kept = fresh.files[0].hunks[0].lines[2].spans.?;
+    try testing.expectEqual(1, kept.len);
+    try testing.expectEqual(1, kept[0].start);
+    try testing.expectEqual(3, kept[0].end);
+    try testing.expect(fresh.files[0].hunks[0].lines[0].spans == null);
+    try testing.expect(fresh.files[1].hunks[0].lines[1].spans == null);
+}
+
+test "applyAtCursor reloads the mutated path and leaves other files" {
+    if (builtin.os.tag == .wasi) return error.SkipZigTest;
+
+    const io = testing.io;
+    const alloc = testing.allocator;
+    var tmp = try IsolatedTmp.init(alloc, io);
+    defer tmp.deinit(alloc, io);
+    const cwd = tmp.cwd();
+
+    try initTestRepo(alloc, io, cwd);
+    const before = "one\ntwo\nthree\nfour\nfive\nsix\nseven\neight\nnine\nten\neleven\ntwelve\nthirteen\nfourteen\nfifteen\nsixteen\nseventeen\neighteen\n";
+    const after = "one\nTWO\nthree\nfour\nfive\nsix\nseven\neight\nnine\nten\neleven\ntwelve\nthirteen\nfourteen\nfifteen\nsixteen\nSEVENTEEN\neighteen\n";
+    try tmp.write(io, "keep.txt", "keep\n");
+    try tmp.write(io, "target.txt", before);
+    try expectGitOk(alloc, io, cwd, &.{ "git", "add", "keep.txt", "target.txt" });
+    try expectGitOk(alloc, io, cwd, &.{ "git", "commit", "-m", "init" });
+    try tmp.write(io, "keep.txt", "keep-me\n");
+    try tmp.write(io, "target.txt", after);
+
+    var d = try loadDefaultDiffCwd(alloc, io, cwd);
+    defer d.deinit();
+    const rows = try view.row.flatten(alloc, &d);
+    defer alloc.free(rows);
+    const cursor: usize = blk: {
+        for (rows, 0..) |row, i| {
+            switch (row) {
+                .hunk_header => |h| if (std.mem.eql(u8, h.path, "target.txt")) break :blk i,
+                else => {},
+            }
+        }
+        return error.TestExpectedEqual;
+    };
+    for (d.files) |*f| {
+        if (f.group == .unstaged and std.mem.eql(u8, f.displayPath(), "keep.txt")) {
+            f.hunks[0].can_grow = false;
+        }
+    }
+    const marked = try alloc.alloc(diff.File, d.files.len + 1);
+    defer alloc.free(marked);
+    @memcpy(marked[0..d.files.len], d.files);
+    marked[d.files.len] = .{ .new_path = "zzz-kept.txt", .group = .unstaged };
+    d.files = marked;
+
+    var review = try store.initEmpty(alloc, store.default_review_id);
+    defer review.deinit();
+    const status = try applyAtCursor(alloc, io, cwd, &d, rows, cursor, &review, false, .stage_unstage, false);
+    const snap = switch (status) {
+        .noop => return error.TestExpectedEqual,
+        .result => |r| blk: {
+            defer if (r.fail_message) |msg| alloc.free(msg);
+            break :blk r.snapshot orelse return error.TestExpectedEqual;
+        },
+    };
+    defer snap.deinit(alloc);
+
+    try testing.expect(hasFile(snap.diff, "zzz-kept.txt", .unstaged));
+    const keep = try findFile(snap.diff, "keep.txt", .unstaged);
+    try testing.expect(!hasFile(snap.diff, "keep.txt", .staged));
+    try testing.expect(!keep.hunks[0].can_grow);
+    try testing.expect(fileHasLine(keep, "keep-me"));
+
+    const unstaged = try findFile(snap.diff, "target.txt", .unstaged);
+    const staged = try findFile(snap.diff, "target.txt", .staged);
+    try testing.expect(fileHasLine(unstaged, "SEVENTEEN"));
+    try testing.expect(!fileHasLine(unstaged, "TWO"));
+    try testing.expect(fileHasLine(staged, "TWO"));
+    try testing.expect(!fileHasLine(staged, "SEVENTEEN"));
 }
 
 fn twoHunkUnstaged(alloc: Allocator) !struct { d: diff.Diff, rows: []view.row.Row } {
