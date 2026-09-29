@@ -40,6 +40,9 @@ pub const Size = tty.Size;
 
 pub const Event = event.Event;
 pub const Key = event.Key;
+pub const Mouse = event.Mouse;
+pub const MouseButton = event.MouseButton;
+pub const MouseAction = event.MouseAction;
 
 pub const Screen = screen.Screen;
 pub const Cell = screen.Cell;

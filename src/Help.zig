@@ -18,6 +18,7 @@ const rows = [_]Row{
     .{ .group = "Motion" },
     .{ .item = .{ .key = "j/k", .label = "line (also arrows)" } },
     .{ .item = .{ .key = "h/l", .label = "pan current hunk" } },
+    .{ .item = .{ .key = "wheel", .label = "scroll the window; shift or sideways pans the hunk under the pointer" } },
     .{ .item = .{ .key = "0/$", .label = "pan home / end" } },
     .{ .item = .{ .key = "J/K", .label = "next / prev change" } },
     .{ .item = .{ .key = "[/]", .label = "hunk header" } },

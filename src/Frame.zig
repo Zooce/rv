@@ -322,22 +322,20 @@ pub fn paint(
     const num_w = if (viewport.show_line_numbers) lineNumberWidth(rows) else 0;
 
     var line_buf: [512]u8 = undefined;
-    // Only lines in the cursor's hunk pan; file/hunk headers never pan.
-    const pan_span = view.viewport.hunkSpanAt(rows, cur);
     const sticky = switch (layout) {
         .unified => view.viewport.stickyHeaders(rows, viewport.scroll, area.rows),
         .side_by_side => view.viewport.stickyHeadersSbs(sbs_slots, rows, viewport.scroll, area.rows),
     };
-    const cs = viewport.col_scroll;
     const hints = rowHints(rows, cur, source, focus);
     var hint_buf: [160]u8 = undefined;
-    const full_pane = BodyPane{
+    // Each body line pans by its own hunk. Headers stay put.
+    var full_pane = BodyPane{
         .scr = scr,
         .x = 0,
         .pane_w = size.cols,
         .num_w = num_w,
         .numbers = .unified,
-        .col_scroll = cs,
+        .col_scroll = 0,
     };
 
     switch (layout) {
@@ -361,16 +359,19 @@ pub fn paint(
                 const marked = rowMarked(rows[i], review);
                 const st = pal.rowStyle(rows[i], is_cur);
                 switch (rows[i]) {
-                    .line => screen_y = full_pane.putRow(
-                        screen_y,
-                        area.bottom,
-                        rows[i],
-                        marked,
-                        viewport.wrap,
-                        pan_span.containsBody(i),
-                        st,
-                        is_cur,
-                    ),
+                    .line => {
+                        full_pane.col_scroll = viewport.columnAt(rows, i);
+                        screen_y = full_pane.putRow(
+                            screen_y,
+                            area.bottom,
+                            rows[i],
+                            marked,
+                            viewport.wrap,
+                            true,
+                            st,
+                            is_cur,
+                        );
+                    },
                     .section_header => {
                         scr.fillRect(.{ .x = 0, .y = screen_y, .w = scr.cols, .h = 1 }, '─', st);
                         const text = formatRow(&line_buf, rows[i], marked);
@@ -389,21 +390,21 @@ pub fn paint(
         .side_by_side => {
             const panes = view.layout.sbsPaneWidths(size.cols);
             const right_x: u16 = panes.gutter_x + 1;
-            const left_pane = BodyPane{
+            var left_pane = BodyPane{
                 .scr = scr,
                 .x = 0,
                 .pane_w = panes.left_w,
                 .num_w = num_w,
                 .numbers = .old,
-                .col_scroll = cs,
+                .col_scroll = 0,
             };
-            const right_pane = BodyPane{
+            var right_pane = BodyPane{
                 .scr = scr,
                 .x = right_x,
                 .pane_w = panes.right_w,
                 .num_w = num_w,
                 .numbers = .new,
-                .col_scroll = cs,
+                .col_scroll = 0,
             };
             var screen_y: u16 = area.top;
 
@@ -435,13 +436,14 @@ pub fn paint(
                     .body => |ri| {
                         const marked = rowMarked(rows[ri], review);
                         const st = pal.rowStyle(rows[ri], ri == cur);
+                        full_pane.col_scroll = viewport.columnAt(rows, ri);
                         screen_y = full_pane.putRow(
                             screen_y,
                             area.bottom,
                             rows[ri],
                             marked,
                             viewport.wrap,
-                            pan_span.containsBody(ri),
+                            true,
                             st,
                             ri == cur,
                         );
@@ -471,20 +473,20 @@ pub fn paint(
                             fillSpan(scr, right_x, size.cols, screen_y, right_st);
                             if (p.left) |ri| {
                                 const marked = rowMarked(rows[ri], review);
-                                const pan = pan_span.containsBody(ri);
+                                left_pane.col_scroll = viewport.columnAt(rows, ri);
                                 if (viewport.wrap) {
                                     left_pane.putSegment(screen_y, rows[ri], marked, vis, left_st, slot_cur);
                                 } else {
-                                    left_pane.putPanned(screen_y, rows[ri], marked, pan, left_st, slot_cur);
+                                    left_pane.putPanned(screen_y, rows[ri], marked, true, left_st, slot_cur);
                                 }
                             }
                             if (p.right) |ri| {
                                 const marked = rowMarked(rows[ri], review);
-                                const pan = pan_span.containsBody(ri);
+                                right_pane.col_scroll = viewport.columnAt(rows, ri);
                                 if (viewport.wrap) {
                                     right_pane.putSegment(screen_y, rows[ri], marked, vis, right_st, slot_cur);
                                 } else {
-                                    right_pane.putPanned(screen_y, rows[ri], marked, pan, right_st, slot_cur);
+                                    right_pane.putPanned(screen_y, rows[ri], marked, true, right_st, slot_cur);
                                 }
                             }
                             screen_y += 1;

@@ -36,6 +36,11 @@ pub const seq = struct {
     pub const hide_cursor = "\x1b[?25l";
     /// Mode 25 on: show the cursor again.
     pub const show_cursor = "\x1b[?25h";
+    /// DEC 1000: button presses and the wheel. DEC 1006: SGR mouse
+    /// (`CSI < btn ; x ; y M/m`) instead of legacy X10 bytes.
+    pub const enable_mouse = "\x1b[?1000h\x1b[?1006h";
+    /// Pair of `enable_mouse`. Must run on every restore path.
+    pub const disable_mouse = "\x1b[?1000l\x1b[?1006l";
     /// CSI `2J` = erase entire display (cursor position unchanged).
     pub const clear_screen = "\x1b[2J";
     /// **CUP** (Cursor Position) with omitted args → row 1, col 1 (home).
@@ -43,7 +48,7 @@ pub const seq = struct {
     /// **SGR** (Select Graphic Rendition) param 0: reset colors / bold / etc.
     pub const reset_attrs = "\x1b[0m";
     /// Concatenated restore bytes for signal handlers (must be one static blob).
-    pub const emergency_restore = show_cursor ++ leave_alt_screen ++ reset_attrs;
+    pub const emergency_restore = disable_mouse ++ show_cursor ++ leave_alt_screen ++ reset_attrs;
 };
 
 /// Signal handlers cannot take a `*Tty` pointer from the stack safely.
@@ -150,6 +155,7 @@ pub const Tty = struct {
         try self.writeAllUnbuffered(
             seq.enter_alt_screen ++ // private full-screen buffer
                 seq.hide_cursor ++ // no blinking cursor while we draw
+                seq.enable_mouse ++ // wheel and clicks as SGR, not arrow keys
                 seq.clear_screen ++ // blank the alt buffer
                 seq.cursor_home, // cursor to top-left
         );
@@ -586,6 +592,14 @@ pub const TestingPipe = if (builtin.is_test) struct {
 test "Size layout" {
     const s = Size{ .cols = 80, .rows = 24 };
     try std.testing.expect(s.cols == 80);
+}
+
+test "restore turns mouse tracking off" {
+    try std.testing.expect(std.mem.indexOf(u8, seq.emergency_restore, seq.disable_mouse) != null);
+    try std.testing.expect(std.mem.indexOf(u8, seq.enable_mouse, "\x1b[?1000h") != null);
+    try std.testing.expect(std.mem.indexOf(u8, seq.enable_mouse, "\x1b[?1006h") != null);
+    try std.testing.expect(std.mem.indexOf(u8, seq.disable_mouse, "\x1b[?1000l") != null);
+    try std.testing.expect(std.mem.indexOf(u8, seq.disable_mouse, "\x1b[?1006l") != null);
 }
 
 // Contract: poll-ready + read(0) is hangup/EOF, not a soft timeout.

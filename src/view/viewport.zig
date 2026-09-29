@@ -104,19 +104,28 @@ fn ensureByHeight(
     if (cur < s) s = cur;
     if (s < min_s) s = min_s;
 
+    const max_s = maxStart(height, n, ctx, itemHeight);
+    if (s > max_s) s = max_s;
+    return s;
+}
+
+/// Largest first-visible index whose items still fill `height` (0 when the
+/// whole list fits, or when `height` is 0).
+fn maxStart(
+    height: usize,
+    n: usize,
+    ctx: anytype,
+    comptime itemHeight: fn (@TypeOf(ctx), usize) usize,
+) usize {
+    if (height == 0 or n == 0) return 0;
     var acc: usize = 0;
-    var max_s: usize = 0;
     var i = n;
     while (i > 0) {
         i -= 1;
         acc += itemHeight(ctx, i);
-        if (acc >= height) {
-            max_s = i;
-            break;
-        }
+        if (acc >= height) return i;
     }
-    if (s > max_s) s = max_s;
-    return s;
+    return 0;
 }
 
 /// Largest first-visible display column for content of `content_w` columns
@@ -171,6 +180,74 @@ pub fn hunkSpanAt(rows: []const Row, cursor: usize) HunkSpan {
     };
 }
 
+/// Pointer and window used to find the display row under the pointer.
+/// Matches the paint walk: sticky file header, then items from `scroll`,
+/// each as tall as `rowScreenHeight` / `slotScreenHeight`.
+pub const WindowPointer = struct {
+    /// 0-based terminal row.
+    y: u16,
+    /// First content row (the row under the title).
+    top: u16,
+    /// First row past the content (the footer).
+    bottom: u16,
+    scroll: usize,
+    wrap_on: bool,
+    /// Text columns of a full-width body line.
+    full_tw: usize,
+    left_tw: usize,
+    right_tw: usize,
+    layout: layout_mod.EffectiveLayout,
+};
+
+/// Display row under `at`, or null when the pointer is on the title, the
+/// footer, or past the last item. A side-by-side pair returns the left row,
+/// or the right row when the left pane is empty (both belong to one hunk).
+pub fn rowAtY(at: WindowPointer, rows: []const Row, slots: []const SbsSlot) ?usize {
+    if (at.y < at.top or at.y >= at.bottom) return null;
+    const limit: usize = at.bottom;
+    const y: usize = at.y;
+    const content_h = limit - at.top;
+    const sticky: Sticky = switch (at.layout) {
+        .unified => stickyHeaders(rows, at.scroll, content_h),
+        .side_by_side => stickyHeadersSbs(slots, rows, at.scroll, content_h),
+    };
+
+    var screen_y: usize = at.top;
+    if (sticky.file_idx) |fi| {
+        if (screen_y >= limit) return null;
+        if (y == screen_y) return fi;
+        screen_y += 1;
+    }
+
+    switch (at.layout) {
+        .unified => {
+            var i = at.scroll;
+            while (i < rows.len and screen_y < limit) : (i += 1) {
+                const h = rowScreenHeight(rows[i], at.full_tw, at.wrap_on);
+                const end = std.math.add(usize, screen_y, h) catch std.math.maxInt(usize);
+                if (y >= screen_y and y < end) return i;
+                screen_y = end;
+            }
+        },
+        .side_by_side => {
+            var si = at.scroll;
+            while (si < slots.len and screen_y < limit) : (si += 1) {
+                const h = slotScreenHeight(slots[si], rows, at.left_tw, at.right_tw, at.full_tw, at.wrap_on);
+                const end = std.math.add(usize, screen_y, h) catch std.math.maxInt(usize);
+                if (y >= screen_y and y < end) {
+                    return switch (slots[si]) {
+                        .header => |ri| ri,
+                        .body => |ri| ri,
+                        .pair => |p| p.left orelse p.right,
+                    };
+                }
+                screen_y = end;
+            }
+        },
+    }
+    return null;
+}
+
 /// Display-row index to pin above the scrollable content area.
 /// `file_idx` is `null` when nothing is sticky. Hunk headers are never sticky
 /// (they scroll with the body so transitions stay one row at a time).
@@ -205,7 +282,7 @@ pub fn stickyHeaders(
     if (rows.len == 0 or content_height == 0 or scroll == 0) return .{};
     var s: Sticky = .{};
     var i: usize = 0;
-    while (i < scroll) : (i += 1) {
+    while (i < scroll and i < rows.len) : (i += 1) {
         if (rows[i] == .file_header) s.file_idx = i;
     }
     return s.clampedToHeight(content_height);
@@ -305,6 +382,61 @@ pub fn ensureVisibleStickySbs(
     return .{ .scroll = s, .sticky = sticky };
 }
 
+/// Clamp `scroll` so the window stays inside the list. Does not pull a cursor
+/// into view. Sticky file headers shrink the body the same way `ensureVisibleSticky` does.
+pub fn clampScrollSticky(
+    scroll: usize,
+    content_height: usize,
+    rows: []const Row,
+    wrap_on: bool,
+    text_w: usize,
+) usize {
+    if (content_height == 0 or rows.len == 0) return 0;
+    const heights = RowHeights{ .rows = rows, .text_w = text_w, .wrap_on = wrap_on };
+    var s = @min(scroll, rows.len);
+    var n: usize = 0;
+    while (n < 4) : (n += 1) {
+        const sticky = stickyHeaders(rows, s, content_height);
+        const h = content_height - sticky.reserved();
+        const next = @min(s, maxStart(h, rows.len, heights, rowHeightAt));
+        if (next == s) return s;
+        s = next;
+    }
+    return s;
+}
+
+/// Like `clampScrollSticky`, in side-by-side slot index space.
+pub fn clampScrollStickySbs(
+    scroll: usize,
+    content_height: usize,
+    slots: []const SbsSlot,
+    rows: []const Row,
+    wrap_on: bool,
+    left_tw: usize,
+    right_tw: usize,
+    full_tw: usize,
+) usize {
+    if (content_height == 0 or slots.len == 0) return 0;
+    const heights = SlotHeights{
+        .slots = slots,
+        .rows = rows,
+        .left_tw = left_tw,
+        .right_tw = right_tw,
+        .full_tw = full_tw,
+        .wrap_on = wrap_on,
+    };
+    var s = @min(scroll, slots.len);
+    var n: usize = 0;
+    while (n < 4) : (n += 1) {
+        const sticky = stickyHeadersSbs(slots, rows, s, content_height);
+        const h = content_height - sticky.reserved();
+        const next = @min(s, maxStart(h, slots.len, heights, slotHeightAt));
+        if (next == s) return s;
+        s = next;
+    }
+    return s;
+}
+
 const testing = std.testing;
 const Allocator = std.mem.Allocator;
 
@@ -349,6 +481,29 @@ test "ensureVisibleSticky wrap pins a tall body row" {
     const sbs = ensureVisibleStickySbs(0, 4, 3, slots, rows, true, text_w, text_w, text_w);
     const add_slot = sbsSlotForRow(slots, 4).?;
     try testing.expectEqual(add_slot, sbs.scroll);
+}
+
+test "clampScrollSticky keeps a window scroll and stops at the last page" {
+    var fix = try twoFileFixture(testing.allocator);
+    defer fix.d.deinit();
+    defer testing.allocator.free(fix.rows);
+    const rows = fix.rows;
+
+    try testing.expectEqual(0, clampScrollSticky(0, 4, rows, false, 80));
+    try testing.expectEqual(2, clampScrollSticky(2, 4, rows, false, 80));
+    try testing.expectEqual(0, clampScrollSticky(2, 40, rows, false, 80));
+    const end = clampScrollSticky(100, 4, rows, false, 80);
+    try testing.expect(end < rows.len);
+    try testing.expectEqual(end, clampScrollSticky(end, 4, rows, false, 80));
+    try testing.expect(end > 2);
+
+    const slots = try layout_mod.pairSideBySide(testing.allocator, rows);
+    defer testing.allocator.free(slots);
+    try testing.expectEqual(0, clampScrollStickySbs(0, 4, slots, rows, false, 40, 40, 80));
+    try testing.expectEqual(2, clampScrollStickySbs(2, 4, slots, rows, false, 40, 40, 80));
+    const sbs_end = clampScrollStickySbs(100, 4, slots, rows, false, 40, 40, 80);
+    try testing.expect(sbs_end < slots.len);
+    try testing.expectEqual(sbs_end, clampScrollStickySbs(sbs_end, 4, slots, rows, false, 40, 40, 80));
 }
 
 test "maxColScroll and clampColScroll" {
@@ -578,4 +733,67 @@ test "hunkSpanAt body excludes headers and stops at next hunk/file" {
     try testing.expectEqual(4, h1.header.?);
     try testing.expectEqual(5, h1.body_start);
     try testing.expectEqual(7, h1.body_end);
+}
+
+test "rowAtY follows the paint walk" {
+    var fix = try twoHunkFixture(testing.allocator);
+    defer fix.d.deinit();
+    defer testing.allocator.free(fix.rows);
+    const rows = fix.rows;
+    const slots = try layout_mod.pairSideBySide(testing.allocator, rows);
+    defer testing.allocator.free(slots);
+
+    const uni = WindowPointer{
+        .y = 0,
+        .top = 1,
+        .bottom = 10,
+        .scroll = 0,
+        .wrap_on = false,
+        .full_tw = 80,
+        .left_tw = 40,
+        .right_tw = 39,
+        .layout = .unified,
+    };
+    var at = uni;
+    try testing.expect(rowAtY(at, rows, slots) == null);
+    at.y = 1;
+    try testing.expectEqual(0, rowAtY(at, rows, slots).?);
+    at.y = 3;
+    try testing.expectEqual(2, rowAtY(at, rows, slots).?);
+    at.y = 7;
+    try testing.expectEqual(6, rowAtY(at, rows, slots).?);
+    at.y = 8;
+    try testing.expect(rowAtY(at, rows, slots) == null);
+    at.y = 10;
+    try testing.expect(rowAtY(at, rows, slots) == null);
+
+    // Scroll past the file header: it pins, and the window starts at row 2.
+    at.y = 1;
+    at.scroll = 2;
+    try testing.expectEqual(0, rowAtY(at, rows, slots).?);
+    at.y = 2;
+    try testing.expectEqual(2, rowAtY(at, rows, slots).?);
+
+    var sbs = uni;
+    sbs.layout = .side_by_side;
+    sbs.scroll = 0;
+    sbs.y = 3;
+    try testing.expectEqual(2, rowAtY(sbs, rows, slots).?);
+    sbs.y = 5;
+    try testing.expectEqual(5, rowAtY(sbs, rows, slots).?);
+
+    // A wrapped body line occupies more than one screen row.
+    const body_h = rowScreenHeight(rows[2], 2, true);
+    try testing.expect(body_h > 1);
+    var wrapped = uni;
+    wrapped.wrap_on = true;
+    wrapped.full_tw = 2;
+    wrapped.scroll = 0;
+    wrapped.y = 3;
+    try testing.expectEqual(2, rowAtY(wrapped, rows, slots).?);
+    const body_h_u16: u16 = @intCast(body_h);
+    wrapped.y = 3 + body_h_u16 - 1;
+    try testing.expectEqual(2, rowAtY(wrapped, rows, slots).?);
+    wrapped.y = 3 + body_h_u16;
+    try testing.expectEqual(3, rowAtY(wrapped, rows, slots).?);
 }

@@ -123,6 +123,21 @@ pub fn main() !void {
                 try draw(&scr, size, counter, last_key, show_panels);
                 try scr.present(&term);
             },
+
+            .mouse => |mouse| {
+                counter += 1;
+                last_key = switch (mouse.button) {
+                    .left => "click",
+                    .middle => "middle",
+                    .right => "right",
+                    .wheel_up => "wheel up",
+                    .wheel_down => "wheel down",
+                    .wheel_left => "wheel left",
+                    .wheel_right => "wheel right",
+                };
+                try draw(&scr, size, counter, last_key, show_panels);
+                try scr.present(&term);
+            },
         }
     }
     // falling out of main → defers run → terminal restored

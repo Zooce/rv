@@ -43,14 +43,14 @@ Requires Zig **0.16+** (0.14/0.15 APIs may need small adjustments).
 ## What works now
 
 1. **Terminal ownership** — opens `/dev/tty` (works with redirected stdio), saves termios, raw mode (`ECHO`/`ICANON`/`ISIG`/`IXON`/`IEXTEN`/`ICRNL` cleared, `VMIN=1`/`VTIME=0`), alt screen + hidden cursor. Restore on normal exit, `SIGINT`/`SIGTERM` (immediate exit after restore), and `SIGHUP`/`SIGQUIT`/`SIGABRT` (restore + re-raise). `SIGWINCH` sets a flag for the event loop.
-2. **Events** — printable ASCII, Enter, Esc, Tab, Backspace, arrows; resize events from `SIGWINCH`. Hangup/EOF on the input fd (`poll`-ready + `read` 0, e.g. PTY torn down without a delivered SIGHUP) is `error.EndOfStream` from `Tty.readTimeout` and surfaces as `.quit` from `event.poll` / `event.next` so wait loops exit instead of busy-spinning.
+2. **Events** — printable ASCII, Enter, Esc, Tab, Backspace, arrows; SGR mouse clicks and wheel (buttons 64–67, including shift); resize events from `SIGWINCH`. Hangup/EOF on the input fd (`poll`-ready + `read` 0, e.g. PTY torn down without a delivered SIGHUP) is `error.EndOfStream` from `Tty.readTimeout` and surfaces as `.quit` from `event.poll` / `event.next` so wait loops exit instead of busy-spinning.
 3. **Screen** — 2D cells (`codepoint` + style + width), front/back buffers, diff present (only changed cells emit CUP + SGR + glyph). No full clear each frame. Overlay helpers (`Rect`, `fillRect`, `drawBox`; `putStr` clips to an optional rect) paint an opaque panel on the same buffer; still not a widget library.
 4. **Demo** — counter / status line, two floating panels (`o` toggles), resize-safe, quit on `q`.
 
 ## Known limitations (intentional for v1)
 
 - Unicode width / grapheme clusters are simplified (ASCII + rough wide ranges). Real East Asian Width + combining marks come later.
-- No Kitty keyboard protocol, mouse, focus, or bracketed paste.
+- No Kitty keyboard protocol, drag, focus, or bracketed paste. Mouse is SGR clicks and wheel (`CSI < btn ; x ; y M/m`).
 - No widgets, layout, or focus management.
 - Fatal SEGV/ILL/BUS still use Zig’s debug handler (tty may not restore on those).
 
@@ -59,7 +59,7 @@ Requires Zig **0.16+** (0.14/0.15 APIs may need small adjustments).
 1. UTF-8 multi-byte input in the key decoder
 2. Better Unicode width (table or small dependency-free subset)
 3. Optional non-blocking / frame-rate-driven loop for animations
-4. Mouse and richer key modifiers when `rv` needs them
+4. Richer key modifiers when `rv` needs them
 5. Build the actual review TUI on this foundation
 
 ## Design notes

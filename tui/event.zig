@@ -7,6 +7,10 @@
 //! - **ESC** = escape character `0x1b`
 //! - **CSI** = Control Sequence Introducer = `ESC [` (what arrows use)
 //!
+//! Mouse is SGR (`ESC [ < btn ; x ; y M` press, `m` release), enabled with
+//! the tty. Wheel buttons are 64 up, 65 down, 66 left, 67 right. Shift is
+//! +4 on that button code. Coordinates in the sequence are 1-based cells.
+//!
 //! ESC alone vs ESC-as-prefix: wait a few ms for more input; if none, it was Esc.
 
 const std = @import("std");
@@ -33,9 +37,35 @@ pub const Key = union(enum) {
     unknown,
 };
 
+/// Which mouse button, or which wheel direction.
+pub const MouseButton = enum {
+    left,
+    middle,
+    right,
+    wheel_up,
+    wheel_down,
+    wheel_left,
+    wheel_right,
+};
+
+/// `M` is a press (wheels use this). `m` is a release.
+pub const MouseAction = enum { press, release };
+
+/// One SGR mouse report. `x` and `y` are 0-based cells.
+pub const Mouse = struct {
+    button: MouseButton,
+    action: MouseAction,
+    x: u16,
+    y: u16,
+    shift: bool = false,
+    alt: bool = false,
+    ctrl: bool = false,
+};
+
 /// Anything the event loop can report to the app.
 pub const Event = union(enum) {
     key: Key, // user pressed something
+    mouse: Mouse,
     /// Terminal was resized (after SIGWINCH). Payload = new size from ioctl.
     resize: Size,
     quit, // soft quit flag (rare with current tty handlers that exit immediately)
@@ -175,7 +205,8 @@ fn decodeEsc(t: *Tty) PollError!Event {
 /// Format: optional parameter bytes, then a final byte in 0x40–0x7E.
 /// Arrows (common case): final byte A/B/C/D.
 fn decodeCsi(t: *Tty) PollError!Event {
-    var param_buf: [16]u8 = undefined; // holds digits/semicolons before the final
+    // SGR mouse is `<btn;x;y` plus a final. 48 holds that with room to spare.
+    var param_buf: [48]u8 = undefined; // holds digits/semicolons before the final
     var len: usize = 0; // how many param bytes we stored
 
     while (true) {
@@ -202,10 +233,12 @@ fn decodeCsi(t: *Tty) PollError!Event {
     }
 }
 
-/// Map the CSI final byte (+ optional params) to a Key event.
+/// Map the CSI final byte (+ optional params) to an event.
+/// A leading `<` is SGR mouse. Other params (Ctrl+Arrow `1;5`, …) stay keys.
 fn mapCsiFinal(final: u8, params: []const u8) Event {
-    // params might be "1;5" for Ctrl+Arrow, etc. — ignored in this iteration.
-    _ = params;
+    if (params.len > 0 and params[0] == '<') {
+        return mapSgrMouse(final, params[1..]);
+    }
     return .{
         .key = switch (final) {
             'A' => .up, // CSI A
@@ -217,6 +250,78 @@ fn mapCsiFinal(final: u8, params: []const u8) Event {
     };
 }
 
+/// `CSI < btn ; x ; y M/m`. Bad or truncated params become `.unknown`.
+fn mapSgrMouse(final: u8, params: []const u8) Event {
+    if (final != 'M' and final != 'm') return .{ .key = .unknown };
+    const btn_s = csiField(params, 0) orelse return .{ .key = .unknown };
+    const x_s = csiField(params, 1) orelse return .{ .key = .unknown };
+    const y_s = csiField(params, 2) orelse return .{ .key = .unknown };
+    const btn = parseU16(btn_s) orelse return .{ .key = .unknown };
+    const x = parseU16(x_s) orelse return .{ .key = .unknown };
+    const y = parseU16(y_s) orelse return .{ .key = .unknown };
+    const decoded = decodeMouseButton(btn) orelse return .{ .key = .unknown };
+    return .{ .mouse = .{
+        .button = decoded.button,
+        .action = if (final == 'm') .release else .press,
+        .x = if (x == 0) 0 else x - 1,
+        .y = if (y == 0) 0 else y - 1,
+        .shift = decoded.shift,
+        .alt = decoded.alt,
+        .ctrl = decoded.ctrl,
+    } };
+}
+
+/// Field `which` of a semicolon-separated CSI parameter list.
+fn csiField(params: []const u8, which: usize) ?[]const u8 {
+    var rest = params;
+    var i: usize = 0;
+    while (i < which) : (i += 1) {
+        const semi = std.mem.indexOfScalar(u8, rest, ';') orelse return null;
+        rest = rest[semi + 1 ..];
+    }
+    if (std.mem.indexOfScalar(u8, rest, ';')) |semi| return rest[0..semi];
+    if (rest.len == 0) return null;
+    return rest;
+}
+
+fn parseU16(s: []const u8) ?u16 {
+    if (s.len == 0) return null;
+    var n: u16 = 0;
+    for (s) |c| {
+        if (c < '0' or c > '9') return null;
+        const d: u16 = c - '0';
+        n = std.math.mul(u16, n, 10) catch return null;
+        n = std.math.add(u16, n, d) catch return null;
+    }
+    return n;
+}
+
+/// xterm button code: low bits are the button, 4/8/16 are shift/alt/ctrl,
+/// 32 is motion, 64+ is the wheel (64 up, 65 down, 66 left, 67 right).
+fn decodeMouseButton(pb: u16) ?struct {
+    button: MouseButton,
+    shift: bool,
+    alt: bool,
+    ctrl: bool,
+} {
+    const shift = (pb & 4) != 0;
+    const alt = (pb & 8) != 0;
+    const ctrl = (pb & 16) != 0;
+    const mods: u16 = 4 | 8 | 16 | 32;
+    const base = pb & ~mods;
+    const button: MouseButton = switch (base) {
+        0 => .left,
+        1 => .middle,
+        2 => .right,
+        64 => .wheel_up,
+        65 => .wheel_down,
+        66 => .wheel_left,
+        67 => .wheel_right,
+        else => return null,
+    };
+    return .{ .button = button, .shift = shift, .alt = alt, .ctrl = ctrl };
+}
+
 // Keep a reference so the type is "used" if we lean on it later.
 comptime {
     _ = posix.pollfd;
@@ -225,6 +330,79 @@ comptime {
 test "Key tags" {
     const k: Key = .{ .char = 'a' };
     try std.testing.expect(k == .char);
+}
+
+test "sgr wheel and click" {
+    const up = mapCsiFinal('M', "<64;3;5");
+    try std.testing.expect(up == .mouse);
+    try std.testing.expectEqual(MouseButton.wheel_up, up.mouse.button);
+    try std.testing.expectEqual(MouseAction.press, up.mouse.action);
+    try std.testing.expectEqual(2, up.mouse.x);
+    try std.testing.expectEqual(4, up.mouse.y);
+    try std.testing.expect(!up.mouse.shift);
+
+    const down = mapCsiFinal('M', "<65;1;1");
+    try std.testing.expectEqual(MouseButton.wheel_down, down.mouse.button);
+    try std.testing.expectEqual(0, down.mouse.x);
+    try std.testing.expectEqual(0, down.mouse.y);
+
+    const left = mapCsiFinal('M', "<66;8;2");
+    try std.testing.expectEqual(MouseButton.wheel_left, left.mouse.button);
+    try std.testing.expectEqual(7, left.mouse.x);
+
+    const right = mapCsiFinal('M', "<67;1;1");
+    try std.testing.expectEqual(MouseButton.wheel_right, right.mouse.button);
+
+    // Shift is +4 on the wheel button. Up+shift is horizontal in the app.
+    const shift_up = mapCsiFinal('M', "<68;4;9");
+    try std.testing.expectEqual(MouseButton.wheel_up, shift_up.mouse.button);
+    try std.testing.expect(shift_up.mouse.shift);
+    try std.testing.expect(!shift_up.mouse.ctrl);
+    try std.testing.expectEqual(3, shift_up.mouse.x);
+    try std.testing.expectEqual(8, shift_up.mouse.y);
+
+    const shift_down = mapCsiFinal('M', "<69;1;1");
+    try std.testing.expectEqual(MouseButton.wheel_down, shift_down.mouse.button);
+    try std.testing.expect(shift_down.mouse.shift);
+
+    const click = mapCsiFinal('M', "<0;2;3");
+    try std.testing.expectEqual(MouseButton.left, click.mouse.button);
+    try std.testing.expectEqual(MouseAction.press, click.mouse.action);
+    try std.testing.expectEqual(1, click.mouse.x);
+    try std.testing.expectEqual(2, click.mouse.y);
+
+    const release = mapCsiFinal('m', "<0;2;3");
+    try std.testing.expectEqual(MouseAction.release, release.mouse.action);
+
+    try std.testing.expect(mapCsiFinal('M', "<128;1;1") == .key);
+    try std.testing.expect(mapCsiFinal('M', "<64;1") == .key);
+    try std.testing.expect(mapCsiFinal('~', "<64;1;1") == .key);
+
+    // Arrows still win when the parameter list is not SGR mouse.
+    try std.testing.expectEqual(Key.up, mapCsiFinal('A', "").key);
+    try std.testing.expectEqual(Key.up, mapCsiFinal('A', "1;5").key);
+}
+
+test "poll decodes an sgr wheel sequence" {
+    if (@import("builtin").os.tag != .linux) return error.SkipZigTest;
+
+    const pipe = try tty_mod.TestingPipe.open();
+    defer pipe.closeRead();
+    defer pipe.closeWrite();
+
+    const seq = "\x1b[<64;2;4M";
+    const rc = posix.system.write(pipe.write, seq.ptr, seq.len);
+    try std.testing.expectEqual(posix.E.SUCCESS, posix.errno(rc));
+
+    var t: Tty = .{
+        .fd = pipe.read,
+        .original = undefined,
+    };
+    const ev = (try poll(&t, 100)).?;
+    try std.testing.expect(ev == .mouse);
+    try std.testing.expectEqual(MouseButton.wheel_up, ev.mouse.button);
+    try std.testing.expectEqual(1, ev.mouse.x);
+    try std.testing.expectEqual(3, ev.mouse.y);
 }
 
 // Contract: hangup/EOF on the input fd must surface as .quit (not spin / null forever).
