@@ -137,10 +137,18 @@ pub fn gitSpans(
                     prev = kind;
                     continue;
                 }
-                // A space before a deleted word is often only on the old side.
-                // Git does not emit it. Do not skip a newline; `~` consumes that.
+                // A space or tab before a deleted word is often only on the old side.
+                // Git does not emit it. One newline is the same gap when a joined
+                // line deletes the next line's prefix. Skip that newline only when
+                // the delete matches on the next byte. A blank line stays a `~`.
                 if (oi < old_text.len and (old_text[oi] == ' ' or old_text[oi] == '\t') and !isWordGap(text[0])) {
                     while (oi < old_text.len and (old_text[oi] == ' ' or old_text[oi] == '\t')) oi += 1;
+                }
+                if (oi < old_text.len and old_text[oi] == '\n' and
+                    !std.mem.startsWith(u8, old_text[oi..], text) and
+                    std.mem.startsWith(u8, old_text[oi + 1 ..], text))
+                {
+                    oi += 1;
                 }
                 if (!std.mem.startsWith(u8, old_text[oi..], text)) return error.AlignFailed;
                 try old_spans.append(alloc, .{ .start = oi, .end = oi + text.len });
@@ -680,6 +688,23 @@ test "gitSpans follows word-diff porcelain" {
     try expectGitSpans("a\nb\n", "a\n\nb\n", &.{}, &.{.{ .start = 2, .end = 3 }});
 }
 
+test "gitSpans does not skip a blank line to reach a deleted word" {
+    // Two newlines sit in front of the delete. Skipping both would eat the
+    // blank line and still rebuild the new side. One newline must not.
+    const porcelain =
+        \\@@ -1 +1 @@
+        \\ keep
+        \\-///
+        \\ and each id.
+        \\~
+        \\
+    ;
+    try testing.expectError(
+        error.AlignFailed,
+        gitSpans(testing.allocator, porcelain, "keep\n\n/// and each id.\n", "keep and each id.\n"),
+    );
+}
+
 test "gitSpans rejects a walk that misses the old text" {
     const porcelain =
         \\@@ -1 +1 @@
@@ -1043,4 +1068,117 @@ test "a space before a deleted word still lines up" {
     try testing.expect(new.len > 0);
     // The leading "    if" is unchanged, so the line is not one solid span.
     try testing.expect(old[0].start > 0);
+}
+
+test "a joined line keeps the later word change" {
+    if (builtin.os.tag == .wasi) return error.SkipZigTest;
+
+    const alloc = testing.allocator;
+    const io = testing.io;
+    var tmp = try IsolatedTmp.init(alloc, io);
+    defer tmp.deinit(alloc, io);
+    const cwd = tmp.cwd();
+
+    const setup = [_][]const []const u8{
+        &.{ "git", "init", "-b", "main" },
+        &.{ "git", "config", "user.email", "rv@test" },
+        &.{ "git", "config", "user.name", "rv test" },
+    };
+    for (setup) |argv| {
+        const out = try gitRun(alloc, io, cwd, argv);
+        alloc.free(out);
+    }
+    const before =
+        \\/// Old note. Caller frees the list
+        \\/// and each id.
+        \\    return null;
+        \\
+    ;
+    const after =
+        \\/// Old note. Caller frees the list and each id.
+        \\    return error.Name;
+        \\
+    ;
+    try tmp.write(io, "a.txt", before);
+    {
+        const out = try gitRun(alloc, io, cwd, &.{ "git", "add", "a.txt" });
+        alloc.free(out);
+    }
+    {
+        const out = try gitRun(alloc, io, cwd, &.{ "git", "commit", "-m", "init" });
+        alloc.free(out);
+    }
+    try tmp.write(io, "a.txt", after);
+
+    const uni = try gitRun(alloc, io, cwd, &.{ "git", "diff", "--", "a.txt" });
+    defer alloc.free(uni);
+    const por = try gitRun(alloc, io, cwd, &.{ "git", "diff", "--word-diff=porcelain", "--", "a.txt" });
+    defer alloc.free(por);
+
+    var d = try diff.parse(alloc, uni);
+    defer d.deinit();
+    try attachSpans(alloc, &d, por, null);
+    const lines = d.files[0].hunks[0].lines;
+
+    const moved = lines[try findLine(lines, .delete, "/// Old note. Caller frees the list")];
+    try testing.expectEqual(0, moved.spans.?.len);
+    const joined = lines[try findLine(lines, .add, "/// Old note. Caller frees the list and each id.")];
+    try testing.expectEqual(0, joined.spans.?.len);
+
+    const prefix = lines[try findLine(lines, .delete, "/// and each id.")];
+    const prefix_sp = prefix.spans.?;
+    try testing.expectEqual(1, prefix_sp.len);
+    try testing.expectEqualStrings("///", prefix.text[prefix_sp[0].start..prefix_sp[0].end]);
+
+    const old_ret = lines[try findLine(lines, .delete, "    return null;")];
+    const old_sp = old_ret.spans.?;
+    try testing.expectEqual(1, old_sp.len);
+    try testing.expectEqualStrings("null;", old_ret.text[old_sp[0].start..old_sp[0].end]);
+
+    const new_ret = lines[try findLine(lines, .add, "    return error.Name;")];
+    const new_sp = new_ret.spans.?;
+    try testing.expectEqual(1, new_sp.len);
+    try testing.expectEqualStrings("error.Name;", new_ret.text[new_sp[0].start..new_sp[0].end]);
+}
+
+test "a deleted blank line is not an empty span list" {
+    if (builtin.os.tag == .wasi) return error.SkipZigTest;
+
+    const alloc = testing.allocator;
+    const io = testing.io;
+    var tmp = try IsolatedTmp.init(alloc, io);
+    defer tmp.deinit(alloc, io);
+    const cwd = tmp.cwd();
+
+    const setup = [_][]const []const u8{
+        &.{ "git", "init", "-b", "main" },
+        &.{ "git", "config", "user.email", "rv@test" },
+        &.{ "git", "config", "user.name", "rv test" },
+    };
+    for (setup) |argv| {
+        const out = try gitRun(alloc, io, cwd, argv);
+        alloc.free(out);
+    }
+    try tmp.write(io, "a.txt", "keep\n\ngone\n");
+    {
+        const out = try gitRun(alloc, io, cwd, &.{ "git", "add", "a.txt" });
+        alloc.free(out);
+    }
+    {
+        const out = try gitRun(alloc, io, cwd, &.{ "git", "commit", "-m", "init" });
+        alloc.free(out);
+    }
+    try tmp.write(io, "a.txt", "keep\ngone\n");
+
+    const uni = try gitRun(alloc, io, cwd, &.{ "git", "diff", "--", "a.txt" });
+    defer alloc.free(uni);
+    const por = try gitRun(alloc, io, cwd, &.{ "git", "diff", "--word-diff=porcelain", "--", "a.txt" });
+    defer alloc.free(por);
+
+    var d = try diff.parse(alloc, uni);
+    defer d.deinit();
+    try attachSpans(alloc, &d, por, null);
+    const blank = d.files[0].hunks[0].lines[try findLine(d.files[0].hunks[0].lines, .delete, "")];
+    // Null keeps the solid fill. A recorded newline span does too. Empty does not.
+    if (blank.spans) |sp| try testing.expect(sp.len > 0);
 }
