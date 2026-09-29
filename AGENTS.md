@@ -38,30 +38,9 @@ For command details, load the `goal` skill / playbook when available.
   - Prefer peer resolution and typed locals/constants: `try testing.expectEqual(2, d.files.len)`, not `expectEqual(@as(usize, 2), …)`.
   - For `?T` assertions: unwrap when non-null (`expectEqual(2, opt.?)`), or `expect(opt == null)`. Do **not** write `@as(?usize, 2)` (or any `@as(?T, …)`) just to feed `expectEqual`.
   - Prefer a typed local over a cast at the call: `const n: usize = 2;` then use `n`.
-  - **Allowed only when** the compiler errors without a cast **and** no typed local / peer-type rewrite / different API is cleaner. If you reach for `@as`, stop and try those first. Needless `@as` in a review batch is a rule violation — fix before asking for review.
+  - **Allowed only when** the compiler errors without a cast **and** no typed local / peer-type rewrite / different API is cleaner. If you reach for `@as`, stop and try those first. Needless `@as` is a rule violation. Fix it before asking for review.
 - **Test utilities stay out of the production build.** Helpers, fixtures, and fake fds used only by tests must not live on production types (e.g. not nested in `Tty` / public app APIs) and must not ship real implementation into `zig build` artifacts. Prefer file-scope helpers gated with `if (builtin.is_test)` (or equivalent), or code that exists only inside `test` blocks. Production builds may expose an empty stub type at most — never pipe/PTY open helpers, injectable globals meant only for tests, or other harness code.
-- **Self-check AGENTS.md before review.** Before asking the user to review a batch, re-read the relevant rules in this file and scan your own diff for violations (needless `@as`, trivial wrappers, wrong allocator names, oversized batch, banned terms, and the rest). Fix them first; do not hand the user a batch that still breaks project rules.
-
-## Change size (review batches)
-
-**Purpose:** keep each unapproved diff small so the user can review it easily. Fewer changes per batch means easier review. Prefer small, coherent batches. If you reach about 250 lines changed, treat that as a signal to consider reworking your approach into smaller slices — not as a target to aim for.
-
-**Plan first, then implement one batch.** Break the work down *before* coding. Do not implement everything and then try to split or undo it into “batches.” A little planning up front is required.
-
-**How to keep batches small** (examples, not a fixed recipe):
-- **Tests as their own batch** — implement behavior first and add tests later, or write tests first as a separate batch when that fits (e.g. bug/test-first goals). Either way, tests need not ship in the same review as the implementation.
-- **Stub, then implement** — one batch introduces types, signatures, stubs/boilerplate and wires call sites so the project still builds; a later batch fills in real behavior; tests can be a third batch.
-- Prefer the smallest slice that is still a complete, reviewable unit over packing toward any line limit.
-
-**Rules:**
-- **Stop and ask for review** after each batch. Do not start the next slice until the user has reviewed and approved the current one.
-- **Each batch must be a complete, buildable change.** Stopping mid-edit is not allowed if it leaves the project broken. Every batch should leave the project building and tests runnable.
-- Count net diff size for the unapproved batch only (not the whole goal). Prefer smaller, coherent batches over packing to a limit.
-- **Exceptions** (a larger single batch is OK when splitting would be worse or impossible):
-  - Deleting a whole file (or a few whole files) as one intentional removal
-  - Mechanical mass renames / bulk renames that are the same edit repeated
-  - Generated or vendored content the agent did not hand-author (still prefer not dumping huge generated blobs without need)
-  When an exception applies, still stop for review after that batch before unrelated follow-up work.
+- **Self-check AGENTS.md before review.** Before asking the user to review, re-read the relevant rules in this file and scan your own diff for violations (needless `@as`, trivial wrappers, wrong allocator names, banned terms, and the rest). Fix them first; do not hand the user a change that still breaks project rules.
 
 ## Language (project)
 
