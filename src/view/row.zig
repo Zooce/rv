@@ -62,14 +62,17 @@ pub const CommentSide = enum { old, new };
 /// Append one file: a group divider when `f.group` changes, the file header,
 /// then each kept hunk and its lines. `keep_hunks == null` keeps every hunk.
 /// Otherwise it is one flag per hunk in `f.hunks`; false omits that hunk.
-/// The caller skips a file that should not appear at all.
-/// `flatten` and approved omission both call this, so a line row is built once.
+/// `omit_lines == null` keeps every line of a kept hunk. Otherwise one slice
+/// per hunk; a true bit skips that line. The caller skips a file that should
+/// not appear at all. `flatten` and approved omission both call this, so a
+/// line row is built once.
 pub fn appendFile(
     alloc: Allocator,
     rows: *std.ArrayList(Row),
     f: diff.File,
     prev_group: *?diff.Group,
     keep_hunks: ?[]const bool,
+    omit_lines: ?[]const []const bool,
 ) Allocator.Error!void {
     if (f.group) |g| {
         if (prev_group.* == null or prev_group.*.? != g) {
@@ -99,7 +102,10 @@ pub fn appendFile(
             .group = f.group,
             .can_grow = h.can_grow,
         } });
-        for (h.lines) |ln| {
+        for (h.lines, 0..) |ln, li| {
+            if (omit_lines) |masks| {
+                if (i < masks.len and li < masks[i].len and masks[i][li]) continue;
+            }
             try rows.append(alloc, .{ .line = .{
                 .kind = ln.kind,
                 .text = ln.text,
@@ -121,7 +127,7 @@ pub fn flatten(alloc: Allocator, d: *const diff.Diff) Allocator.Error![]Row {
 
     var prev_group: ?diff.Group = null;
     for (d.files) |f| {
-        try appendFile(alloc, &rows, f, &prev_group, null);
+        try appendFile(alloc, &rows, f, &prev_group, null, null);
     }
     return try rows.toOwnedSlice(alloc);
 }

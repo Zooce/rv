@@ -336,11 +336,7 @@ fn cmdUnapprove(
     live.approved.unapprove(item.path, item.hash) catch return cmdFail(err_w, "index out of range");
 
     // Same prune+save as TUI Enter on the approved list.
-    const identities = approve.collectLive(alloc, io, root, &live.d) catch {
-        return cmdFail(err_w, "out of memory");
-    };
-    defer alloc.free(identities);
-    live.approved.prune(alloc, identities) catch return cmdFail(err_w, "out of memory");
+    live.approved.prune(alloc, io, root, &live.d) catch return cmdFail(err_w, "out of memory");
     approve.save(&live.approved, alloc, io, root) catch |err| switch (err) {
         error.OutOfMemory => return cmdFail(err_w, "out of memory"),
         else => return cmdFail(err_w, "failed to save .rv approved store"),
