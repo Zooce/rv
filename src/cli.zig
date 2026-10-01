@@ -12,9 +12,16 @@ const store = @import("store");
 const git = @import("git");
 const approve = @import("approve");
 const diff = @import("diff");
-const build_options = @import("build_options");
+const version = @import("build.zig.zon").version;
 const Allocator = std.mem.Allocator;
 const Io = std.Io;
+
+/// Zig stores major.minor.patch. The release version is major.minor (`v2.3`).
+fn releaseVersion(zon_version: []const u8) []const u8 {
+    const parsed = std.SemanticVersion.parse(zon_version) catch return zon_version;
+    if (parsed.patch != 0 or parsed.pre != null or parsed.build != null) return zon_version;
+    return zon_version[0 .. zon_version.len - 2];
+}
 
 pub const exit_success: u8 = 0;
 pub const exit_operational: u8 = 1;
@@ -201,7 +208,7 @@ pub fn run(alloc: Allocator, io: Io, cmd: Command, root: Io.Dir) u8 {
     switch (cmd) {
         .help => return cmdHelp(io),
         .version => {
-            out_w.interface.print("rv {s}\n", .{build_options.version}) catch return writeFail();
+            out_w.interface.print("rv {s}\n", .{releaseVersion(version)}) catch return writeFail();
             return exit_success;
         },
         .status => return cmdStatus(alloc, io, root, &out_w.interface, &err_w.interface),
@@ -743,10 +750,20 @@ test "usage_text names approved commands and status approved lines" {
 }
 
 test "build version is major.minor.0" {
-    const v = try std.SemanticVersion.parse(build_options.version);
+    const v = try std.SemanticVersion.parse(version);
     try testing.expectEqual(0, v.patch);
     try testing.expect(v.pre == null);
     try testing.expect(v.build == null);
+    try testing.expectEqualStrings(version[0 .. version.len - 2], releaseVersion(version));
+}
+
+test "release version drops a zero patch" {
+    try testing.expectEqualStrings("2.3", releaseVersion("2.3.0"));
+    try testing.expectEqualStrings("2.10", releaseVersion("2.10.0"));
+    try testing.expectEqualStrings("2.3.1", releaseVersion("2.3.1"));
+    try testing.expectEqualStrings("2.3.0-pre", releaseVersion("2.3.0-pre"));
+    try testing.expectEqualStrings("2.3.0+build", releaseVersion("2.3.0+build"));
+    try testing.expectEqualStrings("not-a-version", releaseVersion("not-a-version"));
 }
 
 test "sourceLabel local range commit" {

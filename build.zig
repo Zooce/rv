@@ -156,9 +156,10 @@ pub fn build(b: *std.Build) void {
             .{ .name = "isolated_tmp", .module = isolated_tmp_mod },
         },
     });
-    const build_opts = b.addOptions();
-    build_opts.addOption([]const u8, "version", @import("build.zig.zon").version);
-    cli_mod.addOptions("build_options", build_opts);
+    // Product version lives in build.zig.zon; the binary imports it at compile time.
+    cli_mod.addAnonymousImport("build.zig.zon", .{
+        .root_source_file = b.path("build.zig.zon"),
+    });
 
     // `rv` binary: full-screen read-only diff review TUI.
     const rv = b.addExecutable(.{
@@ -288,4 +289,20 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&run_comments_tests.step);
     test_step.dependOn(&run_cli_tests.step);
     test_step.dependOn(&run_main_tests.step);
+
+    // rv --version prints major.minor. A .0 patch in build.zig.zon is left off.
+    // Same rule as releaseVersion in src/cli.zig.
+    const zon_version = @import("build.zig.zon").version;
+    const parsed = std.SemanticVersion.parse(zon_version) catch {
+        @panic("build.zig.zon .version is not a semantic version");
+    };
+    const release_version = if (parsed.patch == 0 and parsed.pre == null and parsed.build == null)
+        zon_version[0 .. zon_version.len - 2]
+    else
+        zon_version;
+    const version_run = b.addRunArtifact(rv);
+    version_run.addArg("--version");
+    version_run.expectStdOutEqual(b.fmt("rv {s}\n", .{release_version}));
+    version_run.expectStdErrEqual("");
+    test_step.dependOn(&version_run.step);
 }

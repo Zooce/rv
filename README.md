@@ -12,7 +12,13 @@ Linux and macOS. No Windows builds yet.
 curl -fsSL https://raw.githubusercontent.com/Zooce/rv/master/install.sh | sh
 ```
 
-Puts `rv` in `~/.local/bin`. If that directory is not on `PATH`:
+Puts `rv` in `~/.local/bin`. A specific release (published tags such as `v2.2.0`; the next tag is `v2.3`):
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/Zooce/rv/master/install.sh | RV_VERSION=v2.2.0 sh
+```
+
+If `~/.local/bin` is not on `PATH`:
 
 ```sh
 export PATH="$HOME/.local/bin:$PATH"
@@ -32,6 +38,8 @@ Zig 0.16.0.
 zig build -Doptimize=ReleaseSafe --prefix ~/.local
 npx skills add Zooce/rv -g
 ```
+
+`rv --version` prints `major.minor` (zon `2.2.0` prints `rv 2.2`).
 
 ## Screenshots
 
@@ -91,6 +99,17 @@ rv unapprove <n>
 ```
 
 `rv` keeps your approvals and your comments. Your agent changes the code.
+
+## Releases
+
+Pushing a git tag `v<major>.<minor>` (zon `2.3.0` is tag `v2.3`) publishes a GitHub Release with Linux and macOS tarballs (x86_64 and aarch64) and SHA256 checksums. The Linux binaries are musl builds. The release name is the tag. The tag message is the release notes.
+
+1. Bump `.version` in `build.zig.zon` to `major.minor.0` (for example `2.3.0`).
+2. Commit that change.
+3. Tag `v<major>.<minor>`: `git tag -a v2.3`
+4. Push the tag: `git push origin v2.3`
+
+The release action checks that the tag matches `build.zig.zon` and `rv --version`, then publishes the Release.
 
 ## License
 

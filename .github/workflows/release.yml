@@ -1,8 +1,9 @@
-# Pushing an annotated v* tag publishes the GitHub Release.
-# The tag message is the release notes.
-# The release name is vX.Y. A tag vX.Y.0 drops the trailing .0.
+# Pushing an annotated vX.Y tag publishes the GitHub Release.
+# zon 2.3.0 is tag v2.3. The tag message is the release notes.
+# The release name is the tag.
+# The job checks the tag against build.zig.zon and `rv --version`.
 # After bumping .version in build.zig.zon and committing:
-#   git tag -a vX.Y.Z && git push origin vX.Y.Z
+#   git tag -a vX.Y && git push origin vX.Y
 name: release
 
 on:
@@ -12,17 +13,50 @@ on:
 
 jobs:
   release:
-    runs-on: ubuntu-latest
+    # ubuntu-24.04 is x86_64. We run the Linux x86_64 binary to check
+    # --version, so the runner must match that one artifact. ubuntu-latest
+    # could become ARM. The macOS and Linux aarch64 binaries are not run here.
+    runs-on: ubuntu-24.04
     permissions:
       contents: write
     steps:
       - uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
 
       - uses: mlugg/setup-zig@v2
         with:
-          version: 0.16.0
+          version: "0.16.0"
+
+      - name: Check tag matches build.zig.zon
+        run: |
+          tag="$GITHUB_REF_NAME"
+          version="${tag#v}"
+          major="${version%%.*}"
+          minor="${version#*.}"
+          case "$tag" in
+            v*.*) ;;
+            *)
+              echo "tag must look like v2.3: $tag" >&2
+              exit 1
+              ;;
+          esac
+          case "$major$minor" in
+            *[!0-9]*) bad=1 ;;
+            *) bad= ;;
+          esac
+          if [ -n "$bad" ] || [ -z "$major" ] || [ -z "$minor" ] || [ "$minor" != "${minor%%.*}" ]; then
+            echo "tag must look like v2.3: $tag" >&2
+            exit 1
+          fi
+          zon_version=$(sed -n 's/^[[:space:]]*\.version[[:space:]]*=[[:space:]]*"\([^"]*\)".*/\1/p' build.zig.zon | head -n1)
+          if [ -z "$zon_version" ]; then
+            echo "could not read .version from build.zig.zon" >&2
+            exit 1
+          fi
+          # Package version keeps a 0 patch. The tag leaves it off: zon 2.3.0 is tag v2.3.
+          if [ "$zon_version" != "${version}.0" ]; then
+            echo "tag $tag needs build.zig.zon version ${version}.0, found $zon_version" >&2
+            exit 1
+          fi
 
       - name: Build and pack
         run: |
@@ -30,7 +64,7 @@ jobs:
           pack() {
             target="$1"
             asset="$2"
-            stage="$RUNNER_TEMP/stage-$asset"
+            stage="$RUNNER_TEMP/stage-$target"
             packdir="$RUNNER_TEMP/pack-$asset"
             rm -rf "$stage" "$packdir"
             zig build -Doptimize=ReleaseSafe -Dtarget="$target" --prefix "$stage"
@@ -50,23 +84,28 @@ jobs:
             rv-macos-aarch64.tar.gz \
             > SHA256SUMS
 
+      - name: Check Linux x86_64 version
+        run: |
+          version="${GITHUB_REF_NAME#v}"
+          got=$("$RUNNER_TEMP/stage-x86_64-linux-musl/bin/rv" --version)
+          want="rv $version"
+          if [ "$got" != "$want" ]; then
+            echo "rv --version was '$got', expected '$want'" >&2
+            exit 1
+          fi
+
       - name: Publish GitHub Release
         env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           # checkout replaces the annotated tag with a lightweight tag at the
           # commit, so --notes-from-tag would publish the commit subject.
           git fetch origin "+refs/tags/${GITHUB_REF_NAME}:refs/tags/${GITHUB_REF_NAME}"
-          # An empty name is shown as "tag: first note line" (v2.0.0: rv 2.0.0).
-          name="$GITHUB_REF_NAME"
-          case "$name" in
-            *.*.0) name="${name%.0}" ;;
-          esac
           gh release create "$GITHUB_REF_NAME" \
             dist/rv-linux-x86_64.tar.gz \
             dist/rv-linux-aarch64.tar.gz \
             dist/rv-macos-x86_64.tar.gz \
             dist/rv-macos-aarch64.tar.gz \
             dist/SHA256SUMS \
-            --title "$name" \
+            --title "$GITHUB_REF_NAME" \
             --notes-from-tag

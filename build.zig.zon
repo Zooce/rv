@@ -1,8 +1,8 @@
 .{
     .name = .rv,
-    // Bump this, commit, then `git tag -a vX.Y.Z && git push origin vX.Y.Z`.
-    // The annotated tag message is the GitHub release notes.
-    // The GitHub release name is vX.Y.
+    // Bump this to major.minor.0, commit, then `git tag -a vX.Y && git push origin vX.Y`.
+    // zon 2.3.0 is tag v2.3. `rv --version` prints 2.3.
+    // The annotated tag message is the GitHub release notes. The release name is the tag.
     .version = "2.2.0",
     .fingerprint = 0xe5b6dd825d0e580a,
     .minimum_zig_version = "0.16.0",

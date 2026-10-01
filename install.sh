@@ -23,7 +23,36 @@ esac
 asset="rv-${os}-${arch}.tar.gz"
 
 prefix="${RV_PREFIX:-$HOME/.local}"
+
+# RV_VERSION is v2.3. Older releases used v2.2.0. Unset means the latest release.
 if [ -n "${RV_VERSION:-}" ]; then
+    case "$RV_VERSION" in
+        v*.*) version="${RV_VERSION#v}" ;;
+        *)
+            printf '%s\n' "rv: RV_VERSION must look like v2.3" >&2
+            exit 1
+            ;;
+    esac
+    # Two components (v2.3) or three (v2.2.0). Each component is digits.
+    major="${version%%.*}"
+    rest="${version#*.}"
+    minor="${rest%%.*}"
+    patch=""
+    if [ "$rest" != "$minor" ]; then
+        patch="${rest#*.}"
+        if [ -z "$patch" ] || [ "$patch" != "${patch%%.*}" ]; then
+            printf '%s\n' "rv: RV_VERSION must look like v2.3" >&2
+            exit 1
+        fi
+    fi
+    case "$major$minor$patch" in
+        *[!0-9]*) bad=1 ;;
+        *) bad= ;;
+    esac
+    if [ -n "$bad" ] || [ -z "$major" ] || [ -z "$minor" ]; then
+        printf '%s\n' "rv: RV_VERSION must look like v2.3" >&2
+        exit 1
+    fi
     base="https://github.com/Zooce/rv/releases/download/${RV_VERSION}"
 else
     base="https://github.com/Zooce/rv/releases/latest/download"
@@ -72,6 +101,7 @@ tar -x -C "$prefix" -f "$tmpdir/$asset"
 chmod 755 "$prefix/bin/rv"
 
 printf '%s\n' "rv: installed $prefix/bin/rv"
+"$prefix/bin/rv" --version
 case ":$PATH:" in
 *":$prefix/bin:"*) ;;
 *)
