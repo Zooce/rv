@@ -22,8 +22,8 @@
 //! no fall-through to branch-vs-base (`git diff <base>...HEAD`).
 //!
 //! `git diff HEAD` is a different patch: staged and unstaged are one blob,
-//! and untracked files are omitted. The line oracle compares flattened rows
-//! to the blobs these loaders parse.
+//! and untracked files are omitted. The line oracle compares parsed hunk
+//! lines to the blobs these loaders parse.
 //!
 //! ## Word spans
 //!
@@ -75,33 +75,20 @@
 //! `GitFailed`. On `GitFailed` from git itself, `MutateOpts.fail_output` (when
 //! set) receives owned stderr, or stdout if stderr is empty.
 //!
-//! ## Cursor targeting
-//!
-//! `indexTargetAt` and `groupSpanAt` map a flatten cursor to the file, hunk,
-//! or group to mutate. Neighbor marks restore the cursor after that span is
-//! gone. Rows answer structure and geometry; these types are not a view API.
-//!
 //! ## Expand
 //!
-//! `expandTargetAt` maps a flatten cursor to a file+hunk in the loaded `Diff`
-//! (local, range, or commit). `survivingFileText` is the bytes `Diff.expandHunk`
-//! needs: worktree for unstaged/untracked, index blob for staged, new-side
-//! blob for a range or commit load; deleted files use the old side. Does not
-//! re-run `git diff`.
+//! `survivingFileText` is the bytes `Diff.expandHunk` needs: worktree for
+//! unstaged/untracked, index blob for staged, new-side blob for a range or
+//! commit load; deleted files use the old side. Does not re-run `git diff`.
+//! `Origin` is this load (`local` / range / commit).
 //!
-//! `applyAtCursor` / `applyGroupAtCursor` run `mutate`, reload, restore the
-//! cursor, and call comment remap (and discard comment delete). A one-path
-//! mutate reloads only that path (old and new names when they differ). Other
-//! files stay as loaded, including word spans and expanded hunks. The
-//! reloaded path keeps word spans when its add and delete lines still match
-//! a loaded hunk; otherwise those lines use the solid fill until a full
-//! reload. A group mutate still reloads the whole local diff. Approved hunks
-//! stay hidden. Local TUI `a` / `A` stages through `applyAtCursor` (same hunk
-//! vs file as `gs` / `gS`), then hides; already staged skips mutate.
-//! Unapprove does not unstage.
-//! `discardTargetAt` is the allowed discard; staged is a no-op. `stagePlan` /
-//! `approveHasComments` / `confirmNext` are what the app loop dispatches.
-//! Overlay paint stays in the TUI.
+//! ## Path reload
+//!
+//! `reloadPaths` loads a fresh local diff of those paths and splices them
+//! into the previous `Diff`. Other files stay as loaded, including word
+//! spans and expanded hunks. The reloaded path keeps word spans when its
+//! add and delete lines still match a loaded hunk; otherwise those lines
+//! use the solid fill until a full reload.
 //!
 //! ## Errors
 //!
@@ -112,13 +99,16 @@
 
 const std = @import("std");
 const diff = @import("diff");
-const view = @import("view");
 const worddiff = @import("worddiff");
-const store = @import("store");
-const comments = @import("comments");
-const approve = @import("approve");
 const Allocator = std.mem.Allocator;
 const Io = std.Io;
+
+/// Where this diff was loaded from. Range and commit strings are as given.
+pub const Origin = union(enum) {
+    local,
+    range: []const u8,
+    commit: []const u8,
+};
 
 pub const Error = error{
     NotARepository,
@@ -324,7 +314,7 @@ pub fn survivingFileText(
     io: Io,
     cwd: std.process.Child.Cwd,
     file: *const diff.File,
-    origin: store.Source,
+    origin: Origin,
 ) Error![]u8 {
     switch (origin) {
         .range => |r| return rangeFileText(alloc, io, cwd, file, r),
@@ -517,641 +507,16 @@ pub fn mutate(alloc: Allocator, io: Io, cwd: std.process.Child.Cwd, opts: Mutate
     alloc.free(out);
 }
 
-/// File or hunk to stage/unstage at `cursor`. `path` borrows from `rows`.
-/// `whole_file` selects the containing file (`gS` / `gU` / `gD`). On a file
-/// header, the target is always the file. `null` on empty lists, section
-/// headers, and untagged (range) rows.
-pub const IndexTarget = struct {
-    path: []const u8,
-    group: diff.Group,
-    /// 0-based hunk in this file; `null` means the whole file.
-    hunk_i: ?usize,
-    first: usize,
-    last: usize,
-};
-
-pub fn indexTargetAt(rows: []const view.row.Row, cursor: usize, whole_file: bool) ?IndexTarget {
-    if (rows.len == 0) return null;
-    const cur = view.row.clampCursor(cursor, rows.len);
-    if (rows[cur] == .section_header) return null;
-    const fi = view.nav.currentFileStart(rows, cur) orelse return null;
-    const fh = rows[fi].file_header;
-    const group = fh.group orelse return null;
-    const in_hunk = view.nav.currentHunkInFile(rows, cur);
-    if (whole_file or in_hunk == null) {
-        return .{
-            .path = fh.path,
-            .group = group,
-            .hunk_i = null,
-            .first = fi,
-            .last = rowSpanLast(rows, fi, true),
-        };
-    }
-    const hi = in_hunk.?;
-    return .{
-        .path = fh.path,
-        .group = group,
-        .hunk_i = hunkIndexInFile(rows, fi, hi),
-        .first = hi,
-        .last = rowSpanLast(rows, hi, false),
-    };
-}
-
-/// File and hunk in `d` under `cursor`. `null` on empty lists, sections,
-/// file headers, binary files, and hunk-less files. Works for local and range.
-pub const ExpandTarget = struct {
-    file_i: usize,
-    hunk_i: usize,
-};
-
-pub fn expandTargetAt(d: *const diff.Diff, rows: []const view.row.Row, cursor: usize) ?ExpandTarget {
-    if (rows.len == 0) return null;
-    const cur = view.row.clampCursor(cursor, rows.len);
-    if (rows[cur] == .section_header) return null;
-    const fi_row = view.nav.currentFileStart(rows, cur) orelse return null;
-    const fh = rows[fi_row].file_header;
-    if (fh.is_binary) return null;
-    const hunk_row = view.nav.currentHunkInFile(rows, cur) orelse return null;
-    const hunk_i = hunkIndexInFile(rows, fi_row, hunk_row);
-    for (d.files, 0..) |f, file_i| {
-        if (f.group != fh.group) continue;
-        if (!std.mem.eql(u8, f.displayPath(), fh.path)) continue;
-        if (hunk_i >= f.hunks.len) return null;
-        return .{ .file_i = file_i, .hunk_i = hunk_i };
-    }
-    return null;
-}
-
-/// Remaining change to land on after the target is removed from this load.
-/// `path` borrows from `rows`. `hunk_i` is the index in that file *after*
-/// removing a same-file hunk target (unchanged for a different file).
-pub const NeighborMark = struct {
-    path: []const u8,
-    group: diff.Group,
-    hunk_i: ?usize,
-};
-
-/// Prefer the next file/hunk header after `target.last`; else the previous
-/// header before `target.first`. `null` when the target is the only change.
-pub fn neighborMark(rows: []const view.row.Row, target: IndexTarget) ?NeighborMark {
-    if (headerAfter(rows, target.last)) |idx| {
-        return markAtHeader(rows, idx, target);
-    }
-    if (target.first > 0) {
-        if (headerBefore(rows, target.first)) |idx| {
-            return markAtHeader(rows, idx, target);
-        }
-    }
-    return null;
-}
-
-/// Section under the cursor and the last row of its last file. `null` when
-/// `cursor` is not a section header.
-pub const GroupSpan = struct {
-    group: diff.Group,
-    first: usize,
-    last: usize,
-};
-
-pub fn groupSpanAt(rows: []const view.row.Row, cursor: usize) ?GroupSpan {
-    if (rows.len == 0) return null;
-    const cur = view.row.clampCursor(cursor, rows.len);
-    const group = switch (rows[cur]) {
-        .section_header => |g| g,
-        else => return null,
-    };
-    var i = cur + 1;
-    while (i < rows.len) : (i += 1) {
-        switch (rows[i]) {
-            .section_header => return .{ .group = group, .first = cur, .last = i - 1 },
-            else => {},
-        }
-    }
-    return .{ .group = group, .first = cur, .last = rows.len - 1 };
-}
-
-/// Remaining section or file after a whole-group mutation. `path` borrows
-/// from `rows`.
-pub const GroupNeighborMark = union(enum) {
-    section: diff.Group,
-    file: struct { path: []const u8, group: diff.Group },
-};
-
-/// Prefer the following section or file after `span.last`; else the previous
-/// section or file before `span.first`. `null` when this group is the only
-/// change.
-pub fn groupNeighborMark(rows: []const view.row.Row, span: GroupSpan) ?GroupNeighborMark {
-    var i = span.last + 1;
-    while (i < rows.len) : (i += 1) {
-        if (sectionOrFileMark(rows, i)) |m| return m;
-    }
-    i = span.first;
-    while (i > 0) {
-        i -= 1;
-        if (sectionOrFileMark(rows, i)) |m| return m;
-    }
-    return null;
-}
-
-/// Land on `mark`'s section or file after reload. Missing mark → row 0.
-pub fn restoreGroupNeighbor(rows: []const view.row.Row, mark: GroupNeighborMark) usize {
-    if (rows.len == 0) return 0;
-    switch (mark) {
-        .section => |g| {
-            for (rows, 0..) |row, i| {
-                switch (row) {
-                    .section_header => |sg| if (sg == g) return i,
-                    else => {},
-                }
-            }
-        },
-        .file => |f| {
-            for (rows, 0..) |row, i| {
-                switch (row) {
-                    .file_header => |fh| {
-                        const g = fh.group orelse continue;
-                        if (g == f.group and std.mem.eql(u8, fh.path, f.path)) return i;
-                    },
-                    else => {},
-                }
-            }
-        },
-    }
-    return 0;
-}
-
-/// Land on `mark`'s file (and hunk, if set) after reload. Missing hunk → that
-/// file's header. Missing file → row 0.
-pub fn restoreNeighbor(rows: []const view.row.Row, mark: NeighborMark) usize {
-    if (rows.len == 0) return 0;
-    for (rows, 0..) |row, i| {
-        switch (row) {
-            .file_header => |fh| {
-                const g = fh.group orelse continue;
-                if (g != mark.group or !std.mem.eql(u8, fh.path, mark.path)) continue;
-                const want = mark.hunk_i orelse return i;
-                var n: usize = 0;
-                var j = i + 1;
-                while (j < rows.len) : (j += 1) {
-                    switch (rows[j]) {
-                        .hunk_header => {
-                            if (n == want) return j;
-                            n += 1;
-                        },
-                        .file_header, .section_header => break,
-                        .line => {},
-                    }
-                }
-                return i;
-            },
-            else => {},
-        }
-    }
-    return 0;
-}
-
-fn sectionOrFileMark(rows: []const view.row.Row, idx: usize) ?GroupNeighborMark {
-    switch (rows[idx]) {
-        .section_header => |g| return .{ .section = g },
-        .file_header => |fh| {
-            const g = fh.group orelse return null;
-            return .{ .file = .{ .path = fh.path, .group = g } };
-        },
-        .hunk_header, .line => return null,
-    }
-}
-
-fn rowSpanLast(rows: []const view.row.Row, start: usize, whole_file: bool) usize {
-    var i = start + 1;
-    while (i < rows.len) : (i += 1) {
-        switch (rows[i]) {
-            .file_header, .section_header => return i - 1,
-            .hunk_header => if (!whole_file) return i - 1,
-            .line => {},
-        }
-    }
-    return rows.len - 1;
-}
-
-fn hunkIndexInFile(rows: []const view.row.Row, file_start: usize, hunk_row: usize) usize {
-    var n: usize = 0;
-    var i = file_start;
-    while (i < rows.len) : (i += 1) {
-        switch (rows[i]) {
-            .hunk_header => {
-                if (i == hunk_row) return n;
-                n += 1;
-            },
-            .file_header => if (i != file_start) return n,
-            .section_header => return n,
-            .line => {},
-        }
-    }
-    return n;
-}
-
-fn headerAfter(rows: []const view.row.Row, last: usize) ?usize {
-    var i = last + 1;
-    while (i < rows.len) : (i += 1) {
-        switch (rows[i]) {
-            .file_header, .hunk_header => return i,
-            .section_header, .line => {},
-        }
-    }
-    return null;
-}
-
-fn headerBefore(rows: []const view.row.Row, first: usize) ?usize {
-    var i = first;
-    while (i > 0) {
-        i -= 1;
-        switch (rows[i]) {
-            .file_header, .hunk_header => return i,
-            .section_header, .line => {},
-        }
-    }
-    return null;
-}
-
-fn markAtHeader(rows: []const view.row.Row, idx: usize, target: IndexTarget) ?NeighborMark {
-    const fi = view.nav.currentFileStart(rows, idx) orelse return null;
-    const fh = rows[fi].file_header;
-    const group = fh.group orelse return null;
-    var hunk_i: ?usize = null;
-    if (rows[idx] == .hunk_header) {
-        hunk_i = hunkIndexInFile(rows, fi, idx);
-        if (target.hunk_i) |t| {
-            if (std.mem.eql(u8, fh.path, target.path) and group == target.group) {
-                if (hunk_i.? > t) hunk_i = hunk_i.? - 1;
-            }
-        }
-    }
-    return .{ .path = fh.path, .group = group, .hunk_i = hunk_i };
-}
-
-/// File or hunk at `cursor` that discard may run. `null` on empty, section,
-/// untagged, or staged rows (unstage first).
-pub fn discardTargetAt(rows: []const view.row.Row, cursor: usize, whole_file: bool) ?IndexTarget {
-    const target = indexTargetAt(rows, cursor, whole_file) orelse return null;
-    return switch (target.group) {
-        .staged => null,
-        .unstaged, .untracked => target,
-    };
-}
-
-/// Whether discard of the cursor target would also delete live comments.
-pub fn discardHasComments(
-    review: *const store.Review,
-    d: *const diff.Diff,
-    rows: []const view.row.Row,
-    cursor: usize,
-    whole_file: bool,
-) bool {
-    const target = discardTargetAt(rows, cursor, whole_file) orelse return false;
-    const file = fileForTarget(d, target) orelse return false;
-    return comments.hasMatching(review, file, diffHunkIndex(file, rows, target));
-}
-
-/// Whether approve of the cursor target should confirm because of live comments.
-/// Hunk `a` (`whole_file == false`) requires a hunk; file-header comments and
-/// other hunks do not count. File `A` matches the file header plus every hunk.
-pub fn approveHasComments(
-    review: *const store.Review,
-    d: *const diff.Diff,
-    rows: []const view.row.Row,
-    cursor: usize,
-    whole_file: bool,
-) bool {
-    const target = indexTargetAt(rows, cursor, whole_file) orelse return false;
-    if (!whole_file and target.hunk_i == null) return false;
-    const file = fileForTarget(d, target) orelse return false;
-    return comments.hasMatching(review, file, diffHunkIndex(file, rows, target));
-}
-
-/// What stage/unstage at `cursor` should do. Section header (when not
-/// `whole_file`) is a group confirm; otherwise the file or hunk under the
-/// cursor. `none` when there is no target.
-pub const StagePlan = union(enum) {
-    none,
-    group: diff.Group,
-    cursor,
-};
-
-pub fn stagePlan(rows: []const view.row.Row, cursor: usize, whole_file: bool) StagePlan {
-    if (!whole_file) {
-        if (groupSpanAt(rows, cursor)) |span| return .{ .group = span.group };
-    }
-    if (indexTargetAt(rows, cursor, whole_file) != null) return .cursor;
-    return .none;
-}
-
-pub const ConfirmKind = enum { discard, group, approve };
-
-/// Next step after the user answers a confirm overlay (`yes` is the selected
-/// choice). `comments_phase` is whether the comments question is already showing.
-pub const ConfirmNext = union(enum) {
-    close,
-    comments,
-    group,
-    discard: bool,
-    approve,
-};
-
-pub fn confirmNext(
-    kind: ConfirmKind,
-    comments_phase: bool,
-    yes: bool,
-    review: *const store.Review,
-    d: *const diff.Diff,
-    rows: []const view.row.Row,
-    cursor: usize,
-    whole_file: bool,
-) ConfirmNext {
-    return switch (kind) {
-        .group => if (yes) .group else .close,
-        .approve => if (yes) .approve else .close,
-        .discard => {
-            if (!comments_phase and !yes) return .close;
-            if (!comments_phase and discardHasComments(review, d, rows, cursor, whole_file)) return .comments;
-            return .{ .discard = comments_phase and yes };
-        },
-    };
-}
-
-/// Diff hunk index for a hunk `target` (match `@@` starts on the row). `null`
-/// when the target is the whole file or the header is gone from `rows`.
-fn diffHunkIndex(file: *const diff.File, rows: []const view.row.Row, target: IndexTarget) ?usize {
-    if (target.hunk_i == null) return null;
-    if (target.first >= rows.len) return null;
-    return switch (rows[target.first]) {
-        .hunk_header => |hh| approve.hunkAt(file.*, hh.old_start, hh.new_start),
-        else => null,
-    };
-}
-
-/// Parsed file matching `target`. `null` when path/group is missing or the hunk is out of range.
-fn fileForTarget(d: *const diff.Diff, target: IndexTarget) ?*const diff.File {
-    for (d.files) |*f| {
-        const g = f.group orelse continue;
-        if (g != target.group) continue;
-        if (!std.mem.eql(u8, f.displayPath(), target.path)) continue;
-        if (target.hunk_i) |hi| {
-            if (hi >= f.hunks.len) return null;
-        }
-        return f;
-    }
-    return null;
-}
-
-pub const MutationKind = enum { stage_unstage, discard };
-
-/// Local diff, rows, and restored cursor after a successful mutate.
-/// Caller owns `diff` and `rows`. `approved_n` is live approved identities
-/// still in `diff` after prune (0 when the store could not be loaded).
-pub const Snapshot = struct {
-    diff: diff.Diff,
-    rows: []view.row.Row,
-    cursor: usize,
-    approved_n: usize = 0,
-
-    pub fn deinit(self: Snapshot, alloc: Allocator) void {
-        alloc.free(self.rows);
-        var parsed = self.diff;
-        parsed.deinit();
-    }
-};
-
-pub const MutationResult = struct {
-    snapshot: ?Snapshot = null,
-    /// Owned git stderr (or fallback). Caller frees.
-    fail_message: ?[]u8 = null,
-    reload_err: ?Error = null,
-    save_failed: bool = false,
-};
-
-pub const MutationStatus = union(enum) {
-    noop,
-    result: MutationResult,
-};
-
-/// Stage, unstage, or discard the file or hunk at `cursor`. On success, reload
-/// that path and restore onto the neighbor change. Other files stay as loaded.
-/// Stage/unstage remaps live comments on the target. `delete_comments`
-/// (discard only) removes matching live comments after a successful mutate.
-/// Mutate failure leaves the list and store unchanged.
-pub fn applyAtCursor(
-    alloc: Allocator,
-    io: Io,
-    cwd: std.process.Child.Cwd,
-    d: *const diff.Diff,
-    rows: []const view.row.Row,
-    cursor: usize,
-    review: *store.Review,
-    whole_file: bool,
-    kind: MutationKind,
-    delete_comments: bool,
-) Allocator.Error!MutationStatus {
-    const target = indexTargetAt(rows, cursor, whole_file) orelse return .noop;
-    const file = fileForTarget(d, target) orelse return .noop;
-    const diff_hunk_i = diffHunkIndex(file, rows, target);
-    if (target.hunk_i != null and diff_hunk_i == null) return .noop;
-    const action: Action = switch (kind) {
-        .stage_unstage => switch (target.group) {
-            .unstaged, .untracked => .stage,
-            .staged => .unstage,
-        },
-        .discard => switch (target.group) {
-            .unstaged, .untracked => .discard,
-            .staged => return .noop,
-        },
-    };
-    const neighbor = neighborMark(rows, target);
-    var ids: std.ArrayList([]const u8) = .empty;
-    defer ids.deinit(alloc);
-    var saved: std.ArrayList(comments.RemoveSnap) = .empty;
-    defer saved.deinit(alloc);
-    if (delete_comments and kind == .discard) {
-        try comments.collectMatching(review, file, diff_hunk_i, alloc, &ids, &saved);
-    }
-    var fail: []u8 = &.{};
-    mutate(alloc, io, cwd, .{
-        .action = action,
-        .path = file.displayPath(),
-        .group = target.group,
-        .hunk = if (diff_hunk_i) |hi| &file.hunks[hi] else null,
-        .file = if (diff_hunk_i != null) file else null,
-        .fail_output = &fail,
-    }) catch |err| switch (err) {
-        error.OutOfMemory => {
-            if (fail.len > 0) alloc.free(fail);
-            return error.OutOfMemory;
-        },
-        error.NotARepository, error.GitNotFound, error.GitFailed, error.BadHunkHeader => {
-            defer if (fail.len > 0) alloc.free(fail);
-            return .{ .result = .{ .fail_message = try failMessage(alloc, fail, err) } };
-        },
-    };
-
-    var save_failed = false;
-    if (ids.items.len > 0) {
-        save_failed = !removeMatchingComments(review, alloc, io, ids.items, saved.items);
-    }
-
-    var path_buf: [2][]const u8 = undefined;
-    path_buf[0] = file.displayPath();
-    var path_n: usize = 1;
-    if (file.old_path) |old_p| {
-        if (!std.mem.eql(u8, old_p, path_buf[0])) {
-            path_buf[1] = old_p;
-            path_n = 2;
-        }
-    }
-    const reloaded = reloadPaths(alloc, io, cwd, d, path_buf[0..path_n]) catch |err| {
-        return .{ .result = .{ .reload_err = err, .save_failed = save_failed } };
-    };
-    var new_diff = reloaded.diff;
-    const new_rows = reloaded.rows;
-    errdefer {
-        alloc.free(new_rows);
-        new_diff.deinit();
-    }
-
-    if (kind == .stage_unstage) {
-        var priors: std.ArrayList(comments.AnchorSnap) = .empty;
-        defer priors.deinit(alloc);
-        try comments.remapMatching(review, file, &new_diff, diff_hunk_i, alloc, &priors);
-        if (!saveCommentRemap(review, alloc, io, priors.items)) save_failed = true;
-    }
-
-    const new_cursor: usize = if (neighbor) |m| restoreNeighbor(new_rows, m) else 0;
-    return .{ .result = .{
-        .snapshot = .{
-            .diff = new_diff,
-            .rows = new_rows,
-            .cursor = new_cursor,
-            .approved_n = reloaded.approved_n,
-        },
-        .save_failed = save_failed,
-    } };
-}
-
-/// Stage or unstage every file in the section at `cursor`. File-level mutate
-/// in flatten order. Always reload after the loop (list matches git). A git
-/// error is returned with that reload so the overlay can open.
-pub fn applyGroupAtCursor(
-    alloc: Allocator,
-    io: Io,
-    cwd: std.process.Child.Cwd,
-    d: *const diff.Diff,
-    rows: []const view.row.Row,
-    cursor: usize,
-    review: *store.Review,
-) Allocator.Error!MutationStatus {
-    const span = groupSpanAt(rows, cursor) orelse return .noop;
-    const action: Action = switch (span.group) {
-        .unstaged, .untracked => .stage,
-        .staged => .unstage,
-    };
-    const neighbor = groupNeighborMark(rows, span);
-    var fail: []u8 = &.{};
-    const first_err: ?Error = blk: {
-        for (d.files) |f| {
-            const g = f.group orelse continue;
-            if (g != span.group) continue;
-            mutate(alloc, io, cwd, .{
-                .action = action,
-                .path = f.displayPath(),
-                .group = span.group,
-                .fail_output = &fail,
-            }) catch |err| switch (err) {
-                error.OutOfMemory => {
-                    if (fail.len > 0) alloc.free(fail);
-                    return error.OutOfMemory;
-                },
-                error.NotARepository, error.GitNotFound, error.GitFailed, error.BadHunkHeader => break :blk err,
-            };
-        }
-        break :blk null;
-    };
-
-    var reload_err: ?Error = null;
-    var next: ?Snapshot = null;
-    var group_save_failed = false;
-    if (reloadLocal(alloc, io, cwd)) |loaded| {
-        var new_diff = loaded.diff;
-        const new_rows = loaded.rows;
-        var priors: std.ArrayList(comments.AnchorSnap) = .empty;
-        defer priors.deinit(alloc);
-        for (d.files) |*f| {
-            const g = f.group orelse continue;
-            if (g != span.group) continue;
-            comments.remapMatching(review, f, &new_diff, null, alloc, &priors) catch |err| {
-                alloc.free(new_rows);
-                new_diff.deinit();
-                if (fail.len > 0) alloc.free(fail);
-                return err;
-            };
-        }
-        const save_failed = !saveCommentRemap(review, alloc, io, priors.items);
-        const new_cursor: usize = if (neighbor) |m| restoreGroupNeighbor(new_rows, m) else 0;
-        next = .{
-            .diff = new_diff,
-            .rows = new_rows,
-            .cursor = new_cursor,
-            .approved_n = loaded.approved_n,
-        };
-        group_save_failed = save_failed;
-    } else |err| {
-        reload_err = err;
-    }
-
-    const fail_message: ?[]u8 = if (first_err) |err| try failMessage(alloc, fail, err) else null;
-    if (fail.len > 0) alloc.free(fail);
-    return .{ .result = .{
-        .snapshot = next,
-        .fail_message = fail_message,
-        .reload_err = reload_err,
-        .save_failed = group_save_failed,
-    } };
-}
-
-fn failMessage(alloc: Allocator, fail: []const u8, err: Error) Allocator.Error![]u8 {
-    const trimmed = std.mem.trim(u8, fail, " \t\r\n");
-    if (trimmed.len > 0) return try alloc.dupe(u8, trimmed);
-    return try alloc.dupe(u8, errorMessage(err));
-}
-
-fn reloadLocal(alloc: Allocator, io: Io, cwd: std.process.Child.Cwd) Error!struct {
-    diff: diff.Diff,
-    rows: []view.row.Row,
-    approved_n: usize,
-} {
-    var new_diff = try loadDefaultDiffCwd(alloc, io, cwd);
-    errdefer new_diff.deinit();
-    const vis = visibleLocal(alloc, io, cwd, &new_diff) catch |err| switch (err) {
-        error.OutOfMemory => return error.OutOfMemory,
-        else => {
-            const new_rows = view.row.flatten(alloc, &new_diff) catch return error.OutOfMemory;
-            return .{ .diff = new_diff, .rows = new_rows, .approved_n = 0 };
-        },
-    };
-    return .{ .diff = new_diff, .rows = vis.rows, .approved_n = vis.approved_n };
-}
-
-/// Replace `paths` in `old` with a fresh diff of those paths. Other files are
-/// copied. Word spans on the fresh hunks are copied from `old` when the add
-/// and delete lines still match.
-fn reloadPaths(
+/// Replace `paths` in `old` with a fresh local diff of those paths. Other
+/// files are copied. Word spans on the fresh hunks are copied from `old`
+/// when the add and delete lines still match.
+pub fn reloadPaths(
     alloc: Allocator,
     io: Io,
     cwd: std.process.Child.Cwd,
     old: *const diff.Diff,
     paths: []const []const u8,
-) Error!struct {
-    diff: diff.Diff,
-    rows: []view.row.Row,
-    approved_n: usize,
-} {
+) Error!diff.Diff {
     const texts = try loadDefaultTexts(alloc, io, cwd, false, paths);
     defer texts.deinit(alloc);
     var fresh = try diff.parsePieces(alloc, &.{
@@ -1161,17 +526,7 @@ fn reloadPaths(
     });
     defer fresh.deinit();
     try copyMatchingSpans(old, &fresh);
-
-    var spliced = try old.replacePaths(alloc, paths, &fresh);
-    errdefer spliced.deinit();
-    const vis = visibleLocal(alloc, io, cwd, &spliced) catch |err| switch (err) {
-        error.OutOfMemory => return error.OutOfMemory,
-        else => {
-            const new_rows = view.row.flatten(alloc, &spliced) catch return error.OutOfMemory;
-            return .{ .diff = spliced, .rows = new_rows, .approved_n = 0 };
-        },
-    };
-    return .{ .diff = spliced, .rows = vis.rows, .approved_n = vis.approved_n };
+    return try old.replacePaths(alloc, paths, &fresh);
 }
 
 /// Same add and delete lines, in order. Context and `@@` numbers are ignored.
@@ -1228,57 +583,6 @@ fn copyMatchingSpans(old: *const diff.Diff, fresh: *diff.Diff) Allocator.Error!v
             try copyChangeSpans(alloc, src, fh);
         }
     }
-}
-
-fn visibleLocal(
-    alloc: Allocator,
-    io: Io,
-    cwd: std.process.Child.Cwd,
-    d: *const diff.Diff,
-) approve.LoadError!approve.Visible {
-    switch (cwd) {
-        .inherit => return approve.loadVisible(alloc, io, .cwd(), d),
-        .path => |p| {
-            const dir = try Io.Dir.openDirAbsolute(io, p, .{});
-            defer dir.close(io);
-            return approve.loadVisible(alloc, io, dir, d);
-        },
-        .dir => |dir| return approve.loadVisible(alloc, io, dir, d),
-    }
-}
-
-fn removeMatchingComments(
-    review: *store.Review,
-    alloc: Allocator,
-    io: Io,
-    ids: []const []const u8,
-    saved: []const comments.RemoveSnap,
-) bool {
-    if (ids.len == 0) return true;
-    review.remove(ids) catch return true;
-    store.save(review, alloc, io, .cwd()) catch {
-        for (saved) |s| {
-            review.comments.insert(review.arena.allocator(), s.idx, s.comment) catch {};
-        }
-        return false;
-    };
-    return true;
-}
-
-fn saveCommentRemap(
-    review: *store.Review,
-    alloc: Allocator,
-    io: Io,
-    priors: []const comments.AnchorSnap,
-) bool {
-    if (priors.len == 0) return true;
-    store.save(review, alloc, io, .cwd()) catch {
-        for (priors) |p| {
-            review.setLines(p.id, p.old_line, p.new_line, p.side) catch {};
-        }
-        return false;
-    };
-    return true;
 }
 
 // --- internals -----------------------------------------------------------
@@ -1862,13 +1166,6 @@ test "load finds rename when diff.renames is false" {
         const f = try findFile(d, "new_name.txt", .staged);
         try testing.expectEqualStrings("old_name.txt", f.old_path.?);
         try testing.expectEqualStrings("new_name.txt", f.new_path.?);
-        const rows = try view.row.flatten(alloc, &d);
-        defer alloc.free(rows);
-        var buf: [64]u8 = undefined;
-        try testing.expectEqualStrings(
-            "old_name.txt -> new_name.txt",
-            view.row.fileHeaderPathLabel(rows[1].file_header, &buf),
-        );
     }
 
     try expectGitOk(alloc, io, cwd, &.{ "git", "commit", "-m", "rename" });
@@ -1990,7 +1287,7 @@ test "invalid commit: GitFailed" {
     );
 }
 
-// Line oracle: flattened body lines vs the unified blobs the loaders parse.
+// Line oracle: parsed hunk lines vs the unified blobs the loaders parse.
 // A body line is ` `, `+`, `-`, or `\` after `@@`, until the next `diff --git`.
 // The marker is stripped. A blank line is not body text.
 
@@ -2032,69 +1329,70 @@ fn appendUnifiedBody(alloc: Allocator, lines: *std.ArrayList(BodyLine), text: []
     }
 }
 
-fn expectLineRowsMatchStream(alloc: Allocator, rows: []const view.row.Row, parts: []const []const u8) !void {
+fn expectDiffMatchesStream(alloc: Allocator, d: *const diff.Diff, parts: []const []const u8) !void {
     var body: std.ArrayList(BodyLine) = .empty;
     defer body.deinit(alloc);
     for (parts) |text| try appendUnifiedBody(alloc, &body, text);
 
     var seen: usize = 0;
-    for (rows) |row| {
-        const ln = switch (row) {
-            .line => |line| line,
-            else => continue,
-        };
-        if (seen >= body.items.len) {
-            std.debug.print(
-                "line oracle: row body line {d} past unified stream ({d} lines)\n",
-                .{ seen, body.items.len },
-            );
-            return error.TestExpectedEqual;
+    for (d.files) |f| {
+        for (f.hunks) |h| {
+            for (h.lines) |ln| {
+                if (seen >= body.items.len) {
+                    std.debug.print(
+                        "line oracle: diff body line {d} past unified stream ({d} lines)\n",
+                        .{ seen, body.items.len },
+                    );
+                    return error.TestExpectedEqual;
+                }
+                const want = body.items[seen];
+                if (want.kind != ln.kind or !std.mem.eql(u8, want.text, ln.text)) {
+                    std.debug.print(
+                        "line oracle mismatch at body line {d}\n  unified: {t} \"{s}\"\n  diff:    {t} \"{s}\"\n",
+                        .{ seen, want.kind, want.text, ln.kind, ln.text },
+                    );
+                    return error.TestExpectedEqual;
+                }
+                seen += 1;
+            }
         }
-        const want = body.items[seen];
-        if (want.kind != ln.kind or !std.mem.eql(u8, want.text, ln.text)) {
-            std.debug.print(
-                "line oracle mismatch at body line {d}\n  unified: {t} \"{s}\"\n  row:     {t} \"{s}\"\n",
-                .{ seen, want.kind, want.text, ln.kind, ln.text },
-            );
-            return error.TestExpectedEqual;
-        }
-        seen += 1;
     }
     if (seen != body.items.len) {
         std.debug.print(
-            "line oracle: unified stream has {d} body lines, rows have {d}\n",
+            "line oracle: unified stream has {d} body lines, diff has {d}\n",
             .{ body.items.len, seen },
         );
         return error.TestExpectedEqual;
     }
 }
 
-fn rowHasText(rows: []const view.row.Row, text: []const u8) bool {
-    for (rows) |row| {
-        switch (row) {
-            .line => |ln| if (std.mem.eql(u8, ln.text, text)) return true,
-            else => {},
+fn diffHasText(d: *const diff.Diff, text: []const u8) bool {
+    for (d.files) |f| {
+        for (f.hunks) |h| {
+            for (h.lines) |ln| {
+                if (std.mem.eql(u8, ln.text, text)) return true;
+            }
         }
     }
     return false;
 }
 
-fn expectLineTokens(rows: []const view.row.Row, present: []const []const u8, absent: []const []const u8) !void {
+fn expectLineTokens(d: *const diff.Diff, present: []const []const u8, absent: []const []const u8) !void {
     for (present) |text| {
-        if (!rowHasText(rows, text)) {
-            std.debug.print("line oracle: missing row text \"{s}\"\n", .{text});
+        if (!diffHasText(d, text)) {
+            std.debug.print("line oracle: missing diff text \"{s}\"\n", .{text});
             return error.TestExpectedEqual;
         }
     }
     for (absent) |text| {
-        if (rowHasText(rows, text)) {
-            std.debug.print("line oracle: unexpected row text \"{s}\"\n", .{text});
+        if (diffHasText(d, text)) {
+            std.debug.print("line oracle: unexpected diff text \"{s}\"\n", .{text});
             return error.TestExpectedEqual;
         }
     }
 }
 
-test "line oracle: local rows match the unified body" {
+test "line oracle: local diff matches the unified body" {
     if (builtin.os.tag == .wasi) return error.SkipZigTest;
 
     const io = testing.io;
@@ -2120,20 +1418,18 @@ test "line oracle: local rows match the unified body" {
 
     var d = try loadDefaultDiffCwd(alloc, io, cwd);
     defer d.deinit();
-    const rows = try view.row.flatten(alloc, &d);
-    defer alloc.free(rows);
 
     const texts = try loadDefaultTexts(alloc, io, cwd, false, null);
     defer texts.deinit(alloc);
-    try expectLineRowsMatchStream(alloc, rows, &.{ texts.unstaged, texts.untracked, texts.staged });
+    try expectDiffMatchesStream(alloc, &d, &.{ texts.unstaged, texts.untracked, texts.staged });
     try expectLineTokens(
-        rows,
+        &d,
         &.{ "unstaged-token", "staged-token", "untracked-token", "No newline at end of file" },
         &.{},
     );
 }
 
-test "line oracle: range rows match the unified body" {
+test "line oracle: range diff matches the unified body" {
     if (builtin.os.tag == .wasi) return error.SkipZigTest;
 
     const io = testing.io;
@@ -2158,16 +1454,14 @@ test "line oracle: range rows match the unified body" {
 
     var d = try loadRangeDiff(alloc, io, cwd, "main...HEAD");
     defer d.deinit();
-    const rows = try view.row.flatten(alloc, &d);
-    defer alloc.free(rows);
 
     const text = try rangeDiffText(alloc, io, cwd, "main...HEAD", false);
     defer alloc.free(text);
-    try expectLineRowsMatchStream(alloc, rows, &.{text});
-    try expectLineTokens(rows, &.{"feature-token"}, &.{ "dirty-token", "untracked-token" });
+    try expectDiffMatchesStream(alloc, &d, &.{text});
+    try expectLineTokens(&d, &.{"feature-token"}, &.{ "dirty-token", "untracked-token" });
 }
 
-test "line oracle: commit rows match the unified body" {
+test "line oracle: commit diff matches the unified body" {
     if (builtin.os.tag == .wasi) return error.SkipZigTest;
 
     const io = testing.io;
@@ -2186,13 +1480,11 @@ test "line oracle: commit rows match the unified body" {
 
     var d = try loadCommitDiff(alloc, io, cwd, "HEAD");
     defer d.deinit();
-    const rows = try view.row.flatten(alloc, &d);
-    defer alloc.free(rows);
 
     const text = try commitDiffText(alloc, io, cwd, "HEAD", false);
     defer alloc.free(text);
-    try expectLineRowsMatchStream(alloc, rows, &.{text});
-    try expectLineTokens(rows, &.{"committed-token"}, &.{ "dirty-token", "untracked-token" });
+    try expectDiffMatchesStream(alloc, &d, &.{text});
+    try expectLineTokens(&d, &.{"committed-token"}, &.{ "dirty-token", "untracked-token" });
 }
 
 test "local word-diff porcelain matches the loaded hunks" {
@@ -2242,13 +1534,11 @@ test "local word-diff porcelain matches the loaded hunks" {
 
     var d = try loadDefaultDiffCwd(alloc, io, cwd);
     defer d.deinit();
-    const rows = try view.row.flatten(alloc, &d);
-    defer alloc.free(rows);
-    try expectRowSpan(rows, "word", 0, 4);
-    try expectRowSpan(rows, "WORD", 0, 4);
-    try expectRowSpan(rows, "other", 0, 5);
-    try expectRowSpan(rows, "OTHER", 0, 5);
-    try expectRowUnspanned(rows, "keep0");
+    try expectLineSpan(d, "word", 0, 4);
+    try expectLineSpan(d, "WORD", 0, 4);
+    try expectLineSpan(d, "other", 0, 5);
+    try expectLineSpan(d, "OTHER", 0, 5);
+    try expectLineUnspanned(d, "keep0");
 
     const por = try loadDefaultTexts(alloc, io, cwd, true, null);
     defer por.deinit(alloc);
@@ -2315,34 +1605,17 @@ fn expectLineSpan(d: diff.Diff, text: []const u8, start: usize, end: usize) !voi
     return error.TestExpectedEqual;
 }
 
-fn expectRowSpan(rows: []const view.row.Row, text: []const u8, start: usize, end: usize) !void {
-    for (rows) |row| {
-        const ln = switch (row) {
-            .line => |l| l,
-            else => continue,
-        };
-        if (!std.mem.eql(u8, ln.text, text)) continue;
-        const sp = ln.spans orelse return error.TestExpectedEqual;
-        try testing.expectEqual(1, sp.len);
-        try testing.expectEqual(start, sp[0].start);
-        try testing.expectEqual(end, sp[0].end);
-        return;
+fn expectLineUnspanned(d: diff.Diff, text: []const u8) !void {
+    for (d.files) |f| {
+        for (f.hunks) |h| {
+            for (h.lines) |ln| {
+                if (!std.mem.eql(u8, ln.text, text)) continue;
+                try testing.expect(ln.spans == null);
+                return;
+            }
+        }
     }
-    std.debug.print("missing row \"{s}\"\n", .{text});
-    return error.TestExpectedEqual;
-}
-
-fn expectRowUnspanned(rows: []const view.row.Row, text: []const u8) !void {
-    for (rows) |row| {
-        const ln = switch (row) {
-            .line => |l| l,
-            else => continue,
-        };
-        if (!std.mem.eql(u8, ln.text, text)) continue;
-        try testing.expect(ln.spans == null);
-        return;
-    }
-    std.debug.print("missing row \"{s}\"\n", .{text});
+    std.debug.print("missing line \"{s}\"\n", .{text});
     return error.TestExpectedEqual;
 }
 
@@ -2723,349 +1996,6 @@ test "mutate hunk: apply mismatch leaves prior content" {
     try testing.expectEqualStrings(changed, got);
 }
 
-fn threeGroupRows(alloc: Allocator) !struct { d: diff.Diff, rows: []view.row.Row } {
-    const unstaged_txt =
-        \\diff --git a/a b/a
-        \\--- a/a
-        \\+++ b/a
-        \\@@ -1 +1 @@
-        \\-old
-        \\+new
-    ;
-    const untracked_txt =
-        \\diff --git a/u b/u
-        \\new file mode 100644
-        \\--- /dev/null
-        \\+++ b/u
-        \\@@ -0,0 +1 @@
-        \\+hi
-    ;
-    const staged_txt =
-        \\diff --git a/a b/a
-        \\--- a/a
-        \\+++ b/a
-        \\@@ -1 +1,2 @@
-        \\ same
-        \\+staged
-    ;
-    var d = try diff.parsePieces(alloc, &.{
-        .{ .text = unstaged_txt, .group = .unstaged },
-        .{ .text = untracked_txt, .group = .untracked },
-        .{ .text = staged_txt, .group = .staged },
-    });
-    errdefer d.deinit();
-    const rows = try view.row.flatten(alloc, &d);
-    return .{ .d = d, .rows = rows };
-}
-
-test "indexTargetAt empty section and untagged" {
-    try testing.expect(indexTargetAt(&.{}, 0, false) == null);
-
-    const fixture =
-        \\diff --git a/f b/f
-        \\--- a/f
-        \\+++ b/f
-        \\@@ -1 +1 @@
-        \\-old
-        \\+new
-    ;
-    var d = try diff.parse(testing.allocator, fixture);
-    defer d.deinit();
-    const rows = try view.row.flatten(testing.allocator, &d);
-    defer testing.allocator.free(rows);
-    try testing.expect(indexTargetAt(rows, 0, false) == null);
-    try testing.expect(indexTargetAt(rows, 2, false) == null);
-
-    var fix = try threeGroupRows(testing.allocator);
-    defer fix.d.deinit();
-    defer testing.allocator.free(fix.rows);
-    try testing.expect(indexTargetAt(fix.rows, 0, false) == null);
-    try testing.expect(indexTargetAt(fix.rows, 5, true) == null);
-}
-
-test "indexTargetAt file hunk and file-from-hunk" {
-    var fix = try threeGroupRows(testing.allocator);
-    defer fix.d.deinit();
-    defer testing.allocator.free(fix.rows);
-    const rows = fix.rows;
-    // 0 Unstaged, 1 file a, 2 hunk, 3 del, 4 add, 5 Untracked, 6 file u, …
-    // 9 Staged, 10 file a, 11 hunk, 12 ctx, 13 add.
-
-    const file = indexTargetAt(rows, 1, false).?;
-    try testing.expectEqualStrings("a", file.path);
-    try testing.expectEqual(diff.Group.unstaged, file.group);
-    try testing.expect(file.hunk_i == null);
-    try testing.expectEqual(1, file.first);
-    try testing.expectEqual(4, file.last);
-
-    const hunk = indexTargetAt(rows, 3, false).?;
-    try testing.expectEqualStrings("a", hunk.path);
-    try testing.expectEqual(diff.Group.unstaged, hunk.group);
-    try testing.expectEqual(0, hunk.hunk_i.?);
-    try testing.expectEqual(2, hunk.first);
-    try testing.expectEqual(4, hunk.last);
-
-    const from_hunk = indexTargetAt(rows, 3, true).?;
-    try testing.expect(from_hunk.hunk_i == null);
-    try testing.expectEqual(1, from_hunk.first);
-    try testing.expectEqual(4, from_hunk.last);
-
-    const staged = indexTargetAt(rows, 12, false).?;
-    try testing.expectEqualStrings("a", staged.path);
-    try testing.expectEqual(diff.Group.staged, staged.group);
-    try testing.expectEqual(0, staged.hunk_i.?);
-}
-
-test "neighborMark following hunk next file and only change" {
-    const two_hunks =
-        \\diff --git a/a b/a
-        \\--- a/a
-        \\+++ b/a
-        \\@@ -1 +1 @@
-        \\-old1
-        \\+new1
-        \\@@ -10 +10 @@
-        \\-old2
-        \\+new2
-    ;
-    var d = try diff.parsePieces(testing.allocator, &.{
-        .{ .text = two_hunks, .group = .unstaged },
-    });
-    defer d.deinit();
-    const rows = try view.row.flatten(testing.allocator, &d);
-    defer testing.allocator.free(rows);
-    // 0 Unstaged, 1 file, 2 h0, 3 del, 4 add, 5 h1, 6 del, 7 add.
-
-    const first = indexTargetAt(rows, 3, false).?;
-    const after_first = neighborMark(rows, first).?;
-    try testing.expectEqualStrings("a", after_first.path);
-    try testing.expectEqual(diff.Group.unstaged, after_first.group);
-    try testing.expectEqual(0, after_first.hunk_i.?);
-
-    const second = indexTargetAt(rows, 6, false).?;
-    const before_second = neighborMark(rows, second).?;
-    try testing.expectEqualStrings("a", before_second.path);
-    try testing.expectEqual(0, before_second.hunk_i.?);
-
-    var fix = try threeGroupRows(testing.allocator);
-    defer fix.d.deinit();
-    defer testing.allocator.free(fix.rows);
-    const next_file = neighborMark(fix.rows, indexTargetAt(fix.rows, 3, false).?).?;
-    try testing.expectEqualStrings("u", next_file.path);
-    try testing.expectEqual(diff.Group.untracked, next_file.group);
-    try testing.expect(next_file.hunk_i == null);
-
-    const only =
-        \\diff --git a/u b/u
-        \\new file mode 100644
-        \\--- /dev/null
-        \\+++ b/u
-        \\@@ -0,0 +1 @@
-        \\+hi
-    ;
-    var d_only = try diff.parsePieces(testing.allocator, &.{
-        .{ .text = only, .group = .untracked },
-    });
-    defer d_only.deinit();
-    const only_rows = try view.row.flatten(testing.allocator, &d_only);
-    defer testing.allocator.free(only_rows);
-    // Whole file is the only change: no following or previous header.
-    try testing.expect(neighborMark(only_rows, indexTargetAt(only_rows, 1, false).?) == null);
-    // Only hunk: previous header is that file’s row.
-    const prev_file = neighborMark(only_rows, indexTargetAt(only_rows, 2, false).?).?;
-    try testing.expectEqualStrings("u", prev_file.path);
-    try testing.expectEqual(diff.Group.untracked, prev_file.group);
-    try testing.expect(prev_file.hunk_i == null);
-}
-
-test "restoreNeighbor dest hunk file fallback and gone" {
-    try testing.expectEqual(0, restoreNeighbor(&.{}, .{
-        .path = "a",
-        .group = .unstaged,
-        .hunk_i = 0,
-    }));
-
-    const remaining =
-        \\diff --git a/a b/a
-        \\--- a/a
-        \\+++ b/a
-        \\@@ -10 +10 @@
-        \\-old2
-        \\+new2
-    ;
-    var d = try diff.parsePieces(testing.allocator, &.{
-        .{ .text = remaining, .group = .unstaged },
-    });
-    defer d.deinit();
-    const rows = try view.row.flatten(testing.allocator, &d);
-    defer testing.allocator.free(rows);
-    // 0 Unstaged, 1 file, 2 hunk, 3 del, 4 add.
-
-    try testing.expectEqual(2, restoreNeighbor(rows, .{
-        .path = "a",
-        .group = .unstaged,
-        .hunk_i = 0,
-    }));
-    try testing.expectEqual(1, restoreNeighbor(rows, .{
-        .path = "a",
-        .group = .unstaged,
-        .hunk_i = 4,
-    }));
-    try testing.expectEqual(1, restoreNeighbor(rows, .{
-        .path = "a",
-        .group = .unstaged,
-        .hunk_i = null,
-    }));
-    try testing.expectEqual(0, restoreNeighbor(rows, .{
-        .path = "a",
-        .group = .staged,
-        .hunk_i = 0,
-    }));
-    try testing.expectEqual(0, restoreNeighbor(rows, .{
-        .path = "gone",
-        .group = .unstaged,
-        .hunk_i = null,
-    }));
-}
-
-test "groupSpanAt empty untagged and three groups" {
-    try testing.expect(groupSpanAt(&.{}, 0) == null);
-
-    const untagged =
-        \\diff --git a/f b/f
-        \\--- a/f
-        \\+++ b/f
-        \\@@ -1 +1 @@
-        \\-old
-        \\+new
-    ;
-    var d = try diff.parse(testing.allocator, untagged);
-    defer d.deinit();
-    const rows = try view.row.flatten(testing.allocator, &d);
-    defer testing.allocator.free(rows);
-    try testing.expect(groupSpanAt(rows, 0) == null);
-
-    var fix = try threeGroupRows(testing.allocator);
-    defer fix.d.deinit();
-    defer testing.allocator.free(fix.rows);
-    // 0 Unstaged, 1-4 file a, 5 Untracked, 6-8 file u, 9 Staged, 10-13 file a.
-    try testing.expect(groupSpanAt(fix.rows, 1) == null);
-
-    const unstaged = groupSpanAt(fix.rows, 0).?;
-    try testing.expectEqual(diff.Group.unstaged, unstaged.group);
-    try testing.expectEqual(0, unstaged.first);
-    try testing.expectEqual(4, unstaged.last);
-
-    const untracked = groupSpanAt(fix.rows, 5).?;
-    try testing.expectEqual(diff.Group.untracked, untracked.group);
-    try testing.expectEqual(5, untracked.first);
-    try testing.expectEqual(8, untracked.last);
-
-    const staged = groupSpanAt(fix.rows, 9).?;
-    try testing.expectEqual(diff.Group.staged, staged.group);
-    try testing.expectEqual(9, staged.first);
-    try testing.expectEqual(13, staged.last);
-}
-
-test "groupNeighborMark following section previous file and only group" {
-    var fix = try threeGroupRows(testing.allocator);
-    defer fix.d.deinit();
-    defer testing.allocator.free(fix.rows);
-
-    const after_unstaged = groupNeighborMark(fix.rows, groupSpanAt(fix.rows, 0).?).?;
-    try testing.expect(after_unstaged == .section);
-    try testing.expectEqual(diff.Group.untracked, after_unstaged.section);
-
-    const after_untracked = groupNeighborMark(fix.rows, groupSpanAt(fix.rows, 5).?).?;
-    try testing.expect(after_untracked == .section);
-    try testing.expectEqual(diff.Group.staged, after_untracked.section);
-
-    const before_staged = groupNeighborMark(fix.rows, groupSpanAt(fix.rows, 9).?).?;
-    try testing.expect(before_staged == .file);
-    try testing.expectEqualStrings("u", before_staged.file.path);
-    try testing.expectEqual(diff.Group.untracked, before_staged.file.group);
-
-    const only =
-        \\diff --git a/u b/u
-        \\new file mode 100644
-        \\--- /dev/null
-        \\+++ b/u
-        \\@@ -0,0 +1 @@
-        \\+hi
-    ;
-    var d_only = try diff.parsePieces(testing.allocator, &.{
-        .{ .text = only, .group = .untracked },
-    });
-    defer d_only.deinit();
-    const only_rows = try view.row.flatten(testing.allocator, &d_only);
-    defer testing.allocator.free(only_rows);
-    try testing.expect(groupNeighborMark(only_rows, groupSpanAt(only_rows, 0).?) == null);
-}
-
-test "restoreGroupNeighbor dest section file fallback and gone" {
-    try testing.expectEqual(0, restoreGroupNeighbor(&.{}, .{ .section = .unstaged }));
-
-    var fix = try threeGroupRows(testing.allocator);
-    defer fix.d.deinit();
-    defer testing.allocator.free(fix.rows);
-
-    try testing.expectEqual(5, restoreGroupNeighbor(fix.rows, .{ .section = .untracked }));
-    try testing.expectEqual(6, restoreGroupNeighbor(fix.rows, .{
-        .file = .{ .path = "u", .group = .untracked },
-    }));
-    try testing.expectEqual(0, restoreGroupNeighbor(fix.rows, .{
-        .file = .{ .path = "gone", .group = .unstaged },
-    }));
-
-    const remaining =
-        \\diff --git a/a b/a
-        \\--- a/a
-        \\+++ b/a
-        \\@@ -1 +1,2 @@
-        \\ same
-        \\+staged
-    ;
-    var d = try diff.parsePieces(testing.allocator, &.{
-        .{ .text = remaining, .group = .staged },
-    });
-    defer d.deinit();
-    const rows = try view.row.flatten(testing.allocator, &d);
-    defer testing.allocator.free(rows);
-    try testing.expectEqual(0, restoreGroupNeighbor(rows, .{ .section = .untracked }));
-}
-
-test "expandTargetAt hunk not file or section" {
-    var fix = try threeGroupRows(testing.allocator);
-    defer fix.d.deinit();
-    defer testing.allocator.free(fix.rows);
-    const rows = fix.rows;
-
-    try testing.expect(expandTargetAt(&fix.d, rows, 0) == null);
-    try testing.expect(expandTargetAt(&fix.d, rows, 1) == null);
-    const unstaged = expandTargetAt(&fix.d, rows, 3).?;
-    try testing.expectEqual(0, unstaged.file_i);
-    try testing.expectEqual(0, unstaged.hunk_i);
-    const staged = expandTargetAt(&fix.d, rows, 12).?;
-    try testing.expectEqual(2, staged.file_i);
-    try testing.expectEqual(0, staged.hunk_i);
-
-    var range_d = try diff.parse(testing.allocator,
-        \\diff --git a/f b/f
-        \\--- a/f
-        \\+++ b/f
-        \\@@ -1 +1 @@
-        \\-old
-        \\+new
-    );
-    defer range_d.deinit();
-    const range_rows = try view.row.flatten(testing.allocator, &range_d);
-    defer testing.allocator.free(range_rows);
-    try testing.expect(expandTargetAt(&range_d, range_rows, 0) == null);
-    const in_hunk = expandTargetAt(&range_d, range_rows, 2).?;
-    try testing.expectEqual(0, in_hunk.file_i);
-    try testing.expectEqual(0, in_hunk.hunk_i);
-}
-
 test "survivingFileText unstaged is worktree, staged is index" {
     if (builtin.os.tag == .wasi) return error.SkipZigTest;
 
@@ -3094,15 +2024,6 @@ test "survivingFileText unstaged is worktree, staged is index" {
     defer alloc.free(idx);
     try testing.expectEqualStrings("worktree body\n", wt);
     try testing.expectEqualStrings("staged body\n", idx);
-}
-
-fn fileHasLine(f: diff.File, text: []const u8) bool {
-    for (f.hunks) |h| {
-        for (h.lines) |ln| {
-            if (std.mem.eql(u8, ln.text, text)) return true;
-        }
-    }
-    return false;
 }
 
 test "copyMatchingSpans keeps word spans when context shifts" {
@@ -3153,138 +2074,3 @@ test "copyMatchingSpans keeps word spans when context shifts" {
     try testing.expect(fresh.files[1].hunks[0].lines[1].spans == null);
 }
 
-test "applyAtCursor reloads the mutated path and leaves other files" {
-    if (builtin.os.tag == .wasi) return error.SkipZigTest;
-
-    const io = testing.io;
-    const alloc = testing.allocator;
-    var tmp = try IsolatedTmp.init(alloc, io);
-    defer tmp.deinit(alloc, io);
-    const cwd = tmp.cwd();
-
-    try initTestRepo(alloc, io, cwd);
-    const before = "one\ntwo\nthree\nfour\nfive\nsix\nseven\neight\nnine\nten\neleven\ntwelve\nthirteen\nfourteen\nfifteen\nsixteen\nseventeen\neighteen\n";
-    const after = "one\nTWO\nthree\nfour\nfive\nsix\nseven\neight\nnine\nten\neleven\ntwelve\nthirteen\nfourteen\nfifteen\nsixteen\nSEVENTEEN\neighteen\n";
-    try tmp.write(io, "keep.txt", "keep\n");
-    try tmp.write(io, "target.txt", before);
-    try expectGitOk(alloc, io, cwd, &.{ "git", "add", "keep.txt", "target.txt" });
-    try expectGitOk(alloc, io, cwd, &.{ "git", "commit", "-m", "init" });
-    try tmp.write(io, "keep.txt", "keep-me\n");
-    try tmp.write(io, "target.txt", after);
-
-    var d = try loadDefaultDiffCwd(alloc, io, cwd);
-    defer d.deinit();
-    const rows = try view.row.flatten(alloc, &d);
-    defer alloc.free(rows);
-    const cursor: usize = blk: {
-        for (rows, 0..) |row, i| {
-            switch (row) {
-                .hunk_header => |h| if (std.mem.eql(u8, h.path, "target.txt")) break :blk i,
-                else => {},
-            }
-        }
-        return error.TestExpectedEqual;
-    };
-    for (d.files) |*f| {
-        if (f.group == .unstaged and std.mem.eql(u8, f.displayPath(), "keep.txt")) {
-            f.hunks[0].can_grow = false;
-        }
-    }
-    const marked = try alloc.alloc(diff.File, d.files.len + 1);
-    defer alloc.free(marked);
-    @memcpy(marked[0..d.files.len], d.files);
-    marked[d.files.len] = .{ .new_path = "zzz-kept.txt", .group = .unstaged };
-    d.files = marked;
-
-    var review = try store.initEmpty(alloc, store.default_review_id);
-    defer review.deinit();
-    const status = try applyAtCursor(alloc, io, cwd, &d, rows, cursor, &review, false, .stage_unstage, false);
-    const snap = switch (status) {
-        .noop => return error.TestExpectedEqual,
-        .result => |r| blk: {
-            defer if (r.fail_message) |msg| alloc.free(msg);
-            break :blk r.snapshot orelse return error.TestExpectedEqual;
-        },
-    };
-    defer snap.deinit(alloc);
-
-    try testing.expect(hasFile(snap.diff, "zzz-kept.txt", .unstaged));
-    const keep = try findFile(snap.diff, "keep.txt", .unstaged);
-    try testing.expect(!hasFile(snap.diff, "keep.txt", .staged));
-    try testing.expect(!keep.hunks[0].can_grow);
-    try testing.expect(fileHasLine(keep, "keep-me"));
-
-    const unstaged = try findFile(snap.diff, "target.txt", .unstaged);
-    const staged = try findFile(snap.diff, "target.txt", .staged);
-    try testing.expect(fileHasLine(unstaged, "SEVENTEEN"));
-    try testing.expect(!fileHasLine(unstaged, "TWO"));
-    try testing.expect(fileHasLine(staged, "TWO"));
-    try testing.expect(!fileHasLine(staged, "SEVENTEEN"));
-}
-
-fn twoHunkUnstaged(alloc: Allocator) !struct { d: diff.Diff, rows: []view.row.Row } {
-    const txt =
-        \\diff --git a/f b/f
-        \\--- a/f
-        \\+++ b/f
-        \\@@ -1 +1 @@
-        \\-old1
-        \\+new1
-        \\@@ -10 +10 @@
-        \\-old2
-        \\+new2
-    ;
-    var d = try diff.parsePieces(alloc, &.{.{ .text = txt, .group = .unstaged }});
-    errdefer d.deinit();
-    const rows = try view.row.flatten(alloc, &d);
-    return .{ .d = d, .rows = rows };
-}
-
-test "approveHasComments hunk vs other hunk vs file" {
-    const alloc = testing.allocator;
-    var fix = try twoHunkUnstaged(alloc);
-    defer fix.d.deinit();
-    defer alloc.free(fix.rows);
-    const rows = fix.rows;
-    // 0 Unstaged, 1 file f, 2 hunk0, 3 del, 4 add, 5 hunk1, 6 del, 7 add.
-    try testing.expect(rows[2] == .hunk_header);
-    try testing.expect(rows[5] == .hunk_header);
-
-    var review = try store.initEmpty(alloc, "t");
-    defer review.deinit();
-    _ = try review.addOpen("f", null, 10, .new, "hunk1", .local);
-
-    try testing.expect(!approveHasComments(&review, &fix.d, rows, 4, false));
-    try testing.expect(approveHasComments(&review, &fix.d, rows, 7, false));
-    try testing.expect(approveHasComments(&review, &fix.d, rows, 4, true));
-    try testing.expect(approveHasComments(&review, &fix.d, rows, 1, true));
-    try testing.expect(!approveHasComments(&review, &fix.d, rows, 1, false));
-    try testing.expect(!approveHasComments(&review, &fix.d, rows, 0, false));
-}
-
-test "approveHasComments file header does not trigger hunk a" {
-    const alloc = testing.allocator;
-    var fix = try twoHunkUnstaged(alloc);
-    defer fix.d.deinit();
-    defer alloc.free(fix.rows);
-    const rows = fix.rows;
-
-    var review = try store.initEmpty(alloc, "t");
-    defer review.deinit();
-    _ = try review.addOpen("f", null, null, null, "file", .local);
-
-    try testing.expect(!approveHasComments(&review, &fix.d, rows, 4, false));
-    try testing.expect(!approveHasComments(&review, &fix.d, rows, 7, false));
-    try testing.expect(approveHasComments(&review, &fix.d, rows, 1, true));
-    try testing.expect(approveHasComments(&review, &fix.d, rows, 4, true));
-}
-
-test "confirmNext approve yes and no" {
-    const alloc = testing.allocator;
-    var review = try store.initEmpty(alloc, "t");
-    defer review.deinit();
-    var d = try diff.parse(alloc, "");
-    defer d.deinit();
-    try testing.expect(confirmNext(.approve, false, true, &review, &d, &.{}, 0, false) == .approve);
-    try testing.expect(confirmNext(.approve, false, false, &review, &d, &.{}, 0, false) == .close);
-}

@@ -9,7 +9,7 @@ const store = @import("store");
 const cli = @import("cli");
 const diff = @import("diff");
 const root = @import("root");
-const DiffView = root.DiffView;
+const OpenDiff = root.OpenDiff;
 const Viewport = root.Viewport;
 const Focus = root.Focus;
 
@@ -297,7 +297,7 @@ pub fn paint(
     self: *const Frame,
     scr: *tui.Screen,
     size: tui.Size,
-    diff_view: *const DiffView,
+    diff_view: *const OpenDiff,
     viewport: *const Viewport,
     review: *const store.Review,
     source: cli.Source,

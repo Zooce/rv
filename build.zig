@@ -84,8 +84,6 @@ pub fn build(b: *std.Build) void {
             .{ .name = "tui", .module = tui_mod },
         },
     });
-    // Mutate targeting uses flatten rows as a tool; load does not.
-    git_mod.addImport("view", view_mod);
 
     // Soft-wrapped multi-line comment footer layout (goal #53).
     const comment_input_mod = b.addModule("comment_input", .{
@@ -138,10 +136,6 @@ pub fn build(b: *std.Build) void {
             .{ .name = "diff", .module = diff_mod },
         },
     });
-    // Cursor apply remaps live comments after a successful mutate.
-    git_mod.addImport("store", store_mod);
-    git_mod.addImport("comments", comments_mod);
-    git_mod.addImport("approve", approve_mod);
 
     // Headless CLI: status / approved / unapprove / list / show / export / version.
     const cli_mod = b.addModule("cli", .{

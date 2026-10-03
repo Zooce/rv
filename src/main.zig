@@ -135,7 +135,7 @@ fn presentFrame(
     frame: *Frame,
     scr: *tui.Screen,
     size: tui.Size,
-    diff_view: *const DiffView,
+    diff_view: *const OpenDiff,
     viewport: *Viewport,
     review: *const store.Review,
     source: cli.Source,
@@ -161,8 +161,8 @@ fn presentFrame(
 
 fn runTui(alloc: std.mem.Allocator, io: std.Io, source: cli.Source) !u8 {
     // Load before any TTY setup so error paths never touch the terminal.
-    var diff_view: DiffView = switch (loadDiffView(alloc, io, source)) {
-        .view => |loaded| loaded,
+    var diff_view: OpenDiff = switch (loadOpenDiff(alloc, io, source)) {
+        .open => |loaded| loaded,
         .git => |err| {
             std.debug.print("rv: {s}\n", .{git.errorMessage(err)});
             return 1;
@@ -234,13 +234,6 @@ fn runTui(alloc: std.mem.Allocator, io: std.Io, source: cli.Source) !u8 {
     var frame: Frame = .{};
     var failure: Failure = .{};
     defer failure.buf.deinit(alloc);
-    const ui = ReviewUi{
-        .diff_view = &diff_view,
-        .cursor = &viewport.cursor,
-        .note = &frame.note,
-        .focus = &focus,
-        .failure = &failure,
-    };
 
     presentFrame(&frame, &scr, size, &diff_view, &viewport, &review, source, focus, &draft, discard_confirm);
     try scr.present(&term);
@@ -334,7 +327,11 @@ fn runTui(alloc: std.mem.Allocator, io: std.Io, source: cli.Source) !u8 {
                             alloc,
                             io,
                             source,
-                            ui,
+                            &diff_view,
+                            &viewport.cursor,
+                            &frame.note,
+                            &focus,
+                            &failure,
                             &review,
                             &discard_confirm,
                             &file_list,
@@ -384,7 +381,11 @@ fn runTui(alloc: std.mem.Allocator, io: std.Io, source: cli.Source) !u8 {
                                 alloc,
                                 io,
                                 source,
-                                ui,
+                                &diff_view,
+                                &viewport.cursor,
+                                &frame.note,
+                                &focus,
+                                &failure,
                                 &review,
                             );
                         },
@@ -394,7 +395,11 @@ fn runTui(alloc: std.mem.Allocator, io: std.Io, source: cli.Source) !u8 {
                                 alloc,
                                 io,
                                 source,
-                                ui,
+                                &diff_view,
+                                &viewport.cursor,
+                                &frame.note,
+                                &focus,
+                                &failure,
                                 &review,
                                 discard_confirm.whole_file,
                                 .discard,
@@ -406,7 +411,11 @@ fn runTui(alloc: std.mem.Allocator, io: std.Io, source: cli.Source) !u8 {
                                 alloc,
                                 io,
                                 source,
-                                ui,
+                                &diff_view,
+                                &viewport.cursor,
+                                &frame.note,
+                                &focus,
+                                &failure,
                                 &review,
                                 .inherit,
                                 .cwd(),
@@ -455,21 +464,29 @@ fn runTui(alloc: std.mem.Allocator, io: std.Io, source: cli.Source) !u8 {
                                         }
                                     }
                                 } else if (pending == .git and c == 's') {
-                                    try dispatchGitIndex(
+                                    try dispatchStage(
                                         alloc,
                                         io,
                                         source,
-                                        ui,
+                                        &diff_view,
+                                        &viewport.cursor,
+                                        &frame.note,
+                                        &focus,
+                                        &failure,
                                         &review,
                                         false,
                                         true,
                                     );
                                 } else if (pending == .git and c == 'u') {
-                                    try dispatchGitIndex(
+                                    try dispatchStage(
                                         alloc,
                                         io,
                                         source,
-                                        ui,
+                                        &diff_view,
+                                        &viewport.cursor,
+                                        &frame.note,
+                                        &focus,
+                                        &failure,
                                         &review,
                                         false,
                                         false,
@@ -477,21 +494,29 @@ fn runTui(alloc: std.mem.Allocator, io: std.Io, source: cli.Source) !u8 {
                                 } else if (pending == .git and c == 'd') {
                                     beginGitDiscard(source, diff_view.rows, viewport.cursor, &discard_confirm, &focus, false);
                                 } else if (pending == .git and c == 'S') {
-                                    try dispatchGitIndex(
+                                    try dispatchStage(
                                         alloc,
                                         io,
                                         source,
-                                        ui,
+                                        &diff_view,
+                                        &viewport.cursor,
+                                        &frame.note,
+                                        &focus,
+                                        &failure,
                                         &review,
                                         true,
                                         true,
                                     );
                                 } else if (pending == .git and c == 'U') {
-                                    try dispatchGitIndex(
+                                    try dispatchStage(
                                         alloc,
                                         io,
                                         source,
-                                        ui,
+                                        &diff_view,
+                                        &viewport.cursor,
+                                        &frame.note,
+                                        &focus,
+                                        &failure,
                                         &review,
                                         true,
                                         false,
@@ -559,7 +584,11 @@ fn runTui(alloc: std.mem.Allocator, io: std.Io, source: cli.Source) !u8 {
                                         alloc,
                                         io,
                                         source,
-                                        ui,
+                                        &diff_view,
+                                        &viewport.cursor,
+                                        &frame.note,
+                                        &focus,
+                                        &failure,
                                         &review,
                                         &discard_confirm,
                                         false,
@@ -569,7 +598,11 @@ fn runTui(alloc: std.mem.Allocator, io: std.Io, source: cli.Source) !u8 {
                                         alloc,
                                         io,
                                         source,
-                                        ui,
+                                        &diff_view,
+                                        &viewport.cursor,
+                                        &frame.note,
+                                        &focus,
+                                        &failure,
                                         &review,
                                         &discard_confirm,
                                         true,
@@ -653,9 +686,9 @@ fn runTui(alloc: std.mem.Allocator, io: std.Io, source: cli.Source) !u8 {
 
 /// Parsed diff and the flatten the TUI walks. Local load omits approved hunks.
 /// Reload builds another and swaps it in.
-pub const DiffView = struct {
+pub const OpenDiff = struct {
     diff: diff.Diff,
-    /// Flatten rows (paint, nav, git targeting). Strings borrow from `diff`.
+    /// Flatten rows (paint, nav, mutate targeting). Strings borrow from `diff`.
     rows: []view.row.Row,
     sbs_slots: []view.layout.SbsSlot,
     /// Live approved identities still in `diff` after prune. 0 on range/commit loads.
@@ -666,9 +699,9 @@ pub const DiffView = struct {
         io: std.Io,
         source: cli.Source,
         note: *StatusNote,
-    ) ?DiffView {
-        switch (loadDiffView(alloc, io, source)) {
-            .view => |loaded| return loaded,
+    ) ?OpenDiff {
+        switch (loadOpenDiff(alloc, io, source)) {
+            .open => |loaded| return loaded,
             .git => |err| note.set(git.errorMessage(err)),
             .approved => |err| note.set(approvedLoadMessage(err)),
             .build => note.set("out of memory"),
@@ -681,7 +714,7 @@ pub const DiffView = struct {
         parsed: diff.Diff,
         rows: []view.row.Row,
         approved_n: usize,
-    ) std.mem.Allocator.Error!DiffView {
+    ) std.mem.Allocator.Error!OpenDiff {
         const sbs = try view.layout.pairSideBySide(alloc, rows);
         return .{
             .diff = parsed,
@@ -691,7 +724,7 @@ pub const DiffView = struct {
         };
     }
 
-    fn deinit(self: DiffView, alloc: std.mem.Allocator) void {
+    fn deinit(self: OpenDiff, alloc: std.mem.Allocator) void {
         alloc.free(self.rows);
         alloc.free(self.sbs_slots);
         var parsed = self.diff;
@@ -699,7 +732,7 @@ pub const DiffView = struct {
     }
 
     fn replaceRows(
-        self: *DiffView,
+        self: *OpenDiff,
         alloc: std.mem.Allocator,
         new_rows: []view.row.Row,
         approved_n: usize,
@@ -713,17 +746,683 @@ pub const DiffView = struct {
     }
 };
 
+/// File or hunk to stage/unstage at `cursor`. `path` borrows from `rows`.
+/// `whole_file` selects the containing file (`gS` / `gU` / `gD`). On a file
+/// header, the target is always the file. `null` on empty lists, section
+/// headers, and untagged (range) rows.
+const MutateTarget = struct {
+    path: []const u8,
+    group: diff.Group,
+    /// 0-based hunk in this file; `null` means the whole file.
+    hunk_i: ?usize,
+    first: usize,
+    last: usize,
+};
+
+fn targetAt(rows: []const view.row.Row, cursor: usize, whole_file: bool) ?MutateTarget {
+    if (rows.len == 0) return null;
+    const cur = view.row.clampCursor(cursor, rows.len);
+    if (rows[cur] == .section_header) return null;
+    const fi = view.nav.currentFileStart(rows, cur) orelse return null;
+    const fh = rows[fi].file_header;
+    const group = fh.group orelse return null;
+    const in_hunk = view.nav.currentHunkInFile(rows, cur);
+    if (whole_file or in_hunk == null) {
+        return .{
+            .path = fh.path,
+            .group = group,
+            .hunk_i = null,
+            .first = fi,
+            .last = rowSpanLast(rows, fi, true),
+        };
+    }
+    const hi = in_hunk.?;
+    return .{
+        .path = fh.path,
+        .group = group,
+        .hunk_i = hunkIndexInFile(rows, fi, hi),
+        .first = hi,
+        .last = rowSpanLast(rows, hi, false),
+    };
+}
+
+/// File and hunk in `d` under `cursor`. `null` on empty lists, sections,
+/// file headers, binary files, and hunk-less files. Works for local and range.
+const ExpandTarget = struct {
+    file_i: usize,
+    hunk_i: usize,
+};
+
+fn expandTargetAt(d: *const diff.Diff, rows: []const view.row.Row, cursor: usize) ?ExpandTarget {
+    if (rows.len == 0) return null;
+    const cur = view.row.clampCursor(cursor, rows.len);
+    if (rows[cur] == .section_header) return null;
+    const fi_row = view.nav.currentFileStart(rows, cur) orelse return null;
+    const fh = rows[fi_row].file_header;
+    if (fh.is_binary) return null;
+    const hunk_row = view.nav.currentHunkInFile(rows, cur) orelse return null;
+    const hunk_i = hunkIndexInFile(rows, fi_row, hunk_row);
+    for (d.files, 0..) |f, file_i| {
+        if (f.group != fh.group) continue;
+        if (!std.mem.eql(u8, f.displayPath(), fh.path)) continue;
+        if (hunk_i >= f.hunks.len) return null;
+        return .{ .file_i = file_i, .hunk_i = hunk_i };
+    }
+    return null;
+}
+
+/// Remaining change to land on after the target is removed from this load.
+/// `path` borrows from `rows`. `hunk_i` is the index in that file *after*
+/// removing a same-file hunk target (unchanged for a different file).
+const NeighborMark = struct {
+    path: []const u8,
+    group: diff.Group,
+    hunk_i: ?usize,
+};
+
+/// Prefer the next file/hunk header after `target.last`; else the previous
+/// header before `target.first`. `null` when the target is the only change.
+fn neighborMark(rows: []const view.row.Row, target: MutateTarget) ?NeighborMark {
+    if (headerAfter(rows, target.last)) |idx| {
+        return markAtHeader(rows, idx, target);
+    }
+    if (target.first > 0) {
+        if (headerBefore(rows, target.first)) |idx| {
+            return markAtHeader(rows, idx, target);
+        }
+    }
+    return null;
+}
+
+/// Section under the cursor and the last row of its last file. `null` when
+/// `cursor` is not a section header.
+const GroupSpan = struct {
+    group: diff.Group,
+    first: usize,
+    last: usize,
+};
+
+fn groupSpanAt(rows: []const view.row.Row, cursor: usize) ?GroupSpan {
+    if (rows.len == 0) return null;
+    const cur = view.row.clampCursor(cursor, rows.len);
+    const group = switch (rows[cur]) {
+        .section_header => |g| g,
+        else => return null,
+    };
+    var i = cur + 1;
+    while (i < rows.len) : (i += 1) {
+        switch (rows[i]) {
+            .section_header => return .{ .group = group, .first = cur, .last = i - 1 },
+            else => {},
+        }
+    }
+    return .{ .group = group, .first = cur, .last = rows.len - 1 };
+}
+
+/// Remaining section or file after a whole-group mutation. `path` borrows
+/// from `rows`.
+const GroupNeighborMark = union(enum) {
+    section: diff.Group,
+    file: struct { path: []const u8, group: diff.Group },
+};
+
+/// Prefer the following section or file after `span.last`; else the previous
+/// section or file before `span.first`. `null` when this group is the only
+/// change.
+fn groupNeighborMark(rows: []const view.row.Row, span: GroupSpan) ?GroupNeighborMark {
+    var i = span.last + 1;
+    while (i < rows.len) : (i += 1) {
+        if (sectionOrFileMark(rows, i)) |m| return m;
+    }
+    i = span.first;
+    while (i > 0) {
+        i -= 1;
+        if (sectionOrFileMark(rows, i)) |m| return m;
+    }
+    return null;
+}
+
+/// Land on `mark`'s section or file after reload. Missing mark → row 0.
+fn restoreGroupNeighbor(rows: []const view.row.Row, mark: GroupNeighborMark) usize {
+    if (rows.len == 0) return 0;
+    switch (mark) {
+        .section => |g| {
+            for (rows, 0..) |row, i| {
+                switch (row) {
+                    .section_header => |sg| if (sg == g) return i,
+                    else => {},
+                }
+            }
+        },
+        .file => |f| {
+            for (rows, 0..) |row, i| {
+                switch (row) {
+                    .file_header => |fh| {
+                        const g = fh.group orelse continue;
+                        if (g == f.group and std.mem.eql(u8, fh.path, f.path)) return i;
+                    },
+                    else => {},
+                }
+            }
+        },
+    }
+    return 0;
+}
+
+/// Land on `mark`'s file (and hunk, if set) after reload. Missing hunk → that
+/// file's header. Missing file → row 0.
+fn restoreNeighbor(rows: []const view.row.Row, mark: NeighborMark) usize {
+    if (rows.len == 0) return 0;
+    for (rows, 0..) |row, i| {
+        switch (row) {
+            .file_header => |fh| {
+                const g = fh.group orelse continue;
+                if (g != mark.group or !std.mem.eql(u8, fh.path, mark.path)) continue;
+                const want = mark.hunk_i orelse return i;
+                var n: usize = 0;
+                var j = i + 1;
+                while (j < rows.len) : (j += 1) {
+                    switch (rows[j]) {
+                        .hunk_header => {
+                            if (n == want) return j;
+                            n += 1;
+                        },
+                        .file_header, .section_header => break,
+                        .line => {},
+                    }
+                }
+                return i;
+            },
+            else => {},
+        }
+    }
+    return 0;
+}
+
+fn sectionOrFileMark(rows: []const view.row.Row, idx: usize) ?GroupNeighborMark {
+    switch (rows[idx]) {
+        .section_header => |g| return .{ .section = g },
+        .file_header => |fh| {
+            const g = fh.group orelse return null;
+            return .{ .file = .{ .path = fh.path, .group = g } };
+        },
+        .hunk_header, .line => return null,
+    }
+}
+
+fn rowSpanLast(rows: []const view.row.Row, start: usize, whole_file: bool) usize {
+    var i = start + 1;
+    while (i < rows.len) : (i += 1) {
+        switch (rows[i]) {
+            .file_header, .section_header => return i - 1,
+            .hunk_header => if (!whole_file) return i - 1,
+            .line => {},
+        }
+    }
+    return rows.len - 1;
+}
+
+fn hunkIndexInFile(rows: []const view.row.Row, file_start: usize, hunk_row: usize) usize {
+    var n: usize = 0;
+    var i = file_start;
+    while (i < rows.len) : (i += 1) {
+        switch (rows[i]) {
+            .hunk_header => {
+                if (i == hunk_row) return n;
+                n += 1;
+            },
+            .file_header => if (i != file_start) return n,
+            .section_header => return n,
+            .line => {},
+        }
+    }
+    return n;
+}
+
+fn headerAfter(rows: []const view.row.Row, last: usize) ?usize {
+    var i = last + 1;
+    while (i < rows.len) : (i += 1) {
+        switch (rows[i]) {
+            .file_header, .hunk_header => return i,
+            .section_header, .line => {},
+        }
+    }
+    return null;
+}
+
+fn headerBefore(rows: []const view.row.Row, first: usize) ?usize {
+    var i = first;
+    while (i > 0) {
+        i -= 1;
+        switch (rows[i]) {
+            .file_header, .hunk_header => return i,
+            .section_header, .line => {},
+        }
+    }
+    return null;
+}
+
+fn markAtHeader(rows: []const view.row.Row, idx: usize, target: MutateTarget) ?NeighborMark {
+    const fi = view.nav.currentFileStart(rows, idx) orelse return null;
+    const fh = rows[fi].file_header;
+    const group = fh.group orelse return null;
+    var hunk_i: ?usize = null;
+    if (rows[idx] == .hunk_header) {
+        hunk_i = hunkIndexInFile(rows, fi, idx);
+        if (target.hunk_i) |t| {
+            if (std.mem.eql(u8, fh.path, target.path) and group == target.group) {
+                if (hunk_i.? > t) hunk_i = hunk_i.? - 1;
+            }
+        }
+    }
+    return .{ .path = fh.path, .group = group, .hunk_i = hunk_i };
+}
+
+/// File or hunk at `cursor` that discard may run. `null` on empty, section,
+/// untagged, or staged rows (unstage first).
+fn discardTargetAt(rows: []const view.row.Row, cursor: usize, whole_file: bool) ?MutateTarget {
+    const target = targetAt(rows, cursor, whole_file) orelse return null;
+    return switch (target.group) {
+        .staged => null,
+        .unstaged, .untracked => target,
+    };
+}
+
+/// Whether discard of the cursor target would also delete live comments.
+fn discardHasComments(
+    review: *const store.Review,
+    d: *const diff.Diff,
+    rows: []const view.row.Row,
+    cursor: usize,
+    whole_file: bool,
+) bool {
+    const target = discardTargetAt(rows, cursor, whole_file) orelse return false;
+    const file = fileForTarget(d, target) orelse return false;
+    return comments.hasMatching(review, file, diffHunkIndex(file, rows, target));
+}
+
+/// Whether approve of the cursor target should confirm because of live comments.
+/// Hunk `a` (`whole_file == false`) requires a hunk; file-header comments and
+/// other hunks do not count. File `A` matches the file header plus every hunk.
+fn approveHasComments(
+    review: *const store.Review,
+    d: *const diff.Diff,
+    rows: []const view.row.Row,
+    cursor: usize,
+    whole_file: bool,
+) bool {
+    const target = targetAt(rows, cursor, whole_file) orelse return false;
+    if (!whole_file and target.hunk_i == null) return false;
+    const file = fileForTarget(d, target) orelse return false;
+    return comments.hasMatching(review, file, diffHunkIndex(file, rows, target));
+}
+
+const ConfirmKind = enum { discard, group, approve };
+
+/// Next step after the user answers a confirm overlay (`yes` is the selected
+/// choice). `comments_phase` is whether the comments question is already showing.
+const ConfirmNext = union(enum) {
+    close,
+    comments,
+    group,
+    discard: bool,
+    approve,
+};
+
+fn confirmNext(
+    kind: ConfirmKind,
+    comments_phase: bool,
+    yes: bool,
+    review: *const store.Review,
+    d: *const diff.Diff,
+    rows: []const view.row.Row,
+    cursor: usize,
+    whole_file: bool,
+) ConfirmNext {
+    return switch (kind) {
+        .group => if (yes) .group else .close,
+        .approve => if (yes) .approve else .close,
+        .discard => {
+            if (!comments_phase and !yes) return .close;
+            if (!comments_phase and discardHasComments(review, d, rows, cursor, whole_file)) return .comments;
+            return .{ .discard = comments_phase and yes };
+        },
+    };
+}
+
+/// Diff hunk index for a hunk `target` (match `@@` starts on the row). `null`
+/// when the target is the whole file or the header is gone from `rows`.
+fn diffHunkIndex(file: *const diff.File, rows: []const view.row.Row, target: MutateTarget) ?usize {
+    if (target.hunk_i == null) return null;
+    if (target.first >= rows.len) return null;
+    return switch (rows[target.first]) {
+        .hunk_header => |hh| approve.hunkAt(file.*, hh.old_start, hh.new_start),
+        else => null,
+    };
+}
+
+/// Parsed file matching `target`. `null` when path/group is missing or the hunk is out of range.
+fn fileForTarget(d: *const diff.Diff, target: MutateTarget) ?*const diff.File {
+    for (d.files) |*f| {
+        const g = f.group orelse continue;
+        if (g != target.group) continue;
+        if (!std.mem.eql(u8, f.displayPath(), target.path)) continue;
+        if (target.hunk_i) |hi| {
+            if (hi >= f.hunks.len) return null;
+        }
+        return f;
+    }
+    return null;
+}
+
+const MutationKind = enum { stage_unstage, discard };
+
+/// Local diff, rows, paired slots, and restored cursor after a successful mutate.
+const Apply = struct {
+    open: ?OpenDiff = null,
+    cursor: usize = 0,
+    fail_message: ?[]u8 = null,
+    reload_err: ?git.Error = null,
+    save_failed: bool = false,
+};
+
+const ApplyStatus = union(enum) {
+    noop,
+    result: Apply,
+};
+
+fn gitFailText(alloc: std.mem.Allocator, fail: []const u8, err: git.Error) std.mem.Allocator.Error![]u8 {
+    const trimmed = std.mem.trim(u8, fail, " \t\r\n");
+    if (trimmed.len > 0) return try alloc.dupe(u8, trimmed);
+    return try alloc.dupe(u8, git.errorMessage(err));
+}
+
+fn localVisible(
+    alloc: std.mem.Allocator,
+    io: std.Io,
+    root: std.Io.Dir,
+    d: *const diff.Diff,
+) std.mem.Allocator.Error!approve.Visible {
+    return approve.loadVisible(alloc, io, root, d) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => .{ .rows = try view.row.flatten(alloc, d), .approved_n = 0 },
+    };
+}
+
+fn openFromDiff(
+    alloc: std.mem.Allocator,
+    io: std.Io,
+    root: std.Io.Dir,
+    parsed: diff.Diff,
+) git.Error!OpenDiff {
+    var d = parsed;
+    errdefer d.deinit();
+    const vis = try localVisible(alloc, io, root, &d);
+    errdefer alloc.free(vis.rows);
+    return OpenDiff.build(alloc, d, vis.rows, vis.approved_n) catch return error.OutOfMemory;
+}
+
+fn finishApply(
+    alloc: std.mem.Allocator,
+    open: *OpenDiff,
+    cursor: *usize,
+    note: *StatusNote,
+    focus: *Focus,
+    failure: *Failure,
+    result: Apply,
+) std.mem.Allocator.Error!void {
+    if (result.open) |loaded| {
+        open.deinit(alloc);
+        open.* = loaded;
+        cursor.* = result.cursor;
+    } else if (result.reload_err) |err| {
+        note.set(git.errorMessage(err));
+    }
+    if (result.save_failed) note.set("failed to save .rv comment store");
+    if (result.fail_message) |msg| {
+        defer alloc.free(msg);
+        failure.buf.clearRetainingCapacity();
+        try failure.buf.appendSlice(alloc, msg);
+        focus.* = .git_error;
+    }
+}
+
+fn removeMatchingComments(
+    review: *store.Review,
+    alloc: std.mem.Allocator,
+    io: std.Io,
+    ids: []const []const u8,
+    saved: []const comments.RemoveSnap,
+) bool {
+    if (ids.len == 0) return true;
+    review.remove(ids) catch return true;
+    store.save(review, alloc, io, .cwd()) catch {
+        for (saved) |s| {
+            review.comments.insert(review.arena.allocator(), s.idx, s.comment) catch {};
+        }
+        return false;
+    };
+    return true;
+}
+
+fn saveCommentRemap(
+    review: *store.Review,
+    alloc: std.mem.Allocator,
+    io: std.Io,
+    priors: []const comments.AnchorSnap,
+) bool {
+    if (priors.len == 0) return true;
+    store.save(review, alloc, io, .cwd()) catch {
+        for (priors) |p| {
+            review.setLines(p.id, p.old_line, p.new_line, p.side) catch {};
+        }
+        return false;
+    };
+    return true;
+}
+
+/// Stage, unstage, or discard the file or hunk at `cursor`. On success, reload
+/// that path, pair slots once, and restore onto the neighbor change. Other
+/// files stay as loaded. Stage/unstage remaps live comments only after that
+/// visible diff is built. `delete_comments` (discard only) removes matching
+/// live comments after a successful mutate. Mutate failure, and a failed
+/// rebuild, leave the list and comment anchors unchanged.
+fn applyAtCursor(
+    alloc: std.mem.Allocator,
+    io: std.Io,
+    cwd: std.process.Child.Cwd,
+    root: std.Io.Dir,
+    d: *const diff.Diff,
+    rows: []const view.row.Row,
+    cursor: usize,
+    review: *store.Review,
+    whole_file: bool,
+    kind: MutationKind,
+    delete_comments: bool,
+) std.mem.Allocator.Error!ApplyStatus {
+    const target = targetAt(rows, cursor, whole_file) orelse return .noop;
+    const file = fileForTarget(d, target) orelse return .noop;
+    const diff_hunk_i = diffHunkIndex(file, rows, target);
+    if (target.hunk_i != null and diff_hunk_i == null) return .noop;
+    const action: git.Action = switch (kind) {
+        .stage_unstage => switch (target.group) {
+            .unstaged, .untracked => .stage,
+            .staged => .unstage,
+        },
+        .discard => switch (target.group) {
+            .unstaged, .untracked => .discard,
+            .staged => return .noop,
+        },
+    };
+    const neighbor = neighborMark(rows, target);
+
+    // Collect comments to delete after a successful discard.
+    var ids: std.ArrayList([]const u8) = .empty;
+    defer ids.deinit(alloc);
+    var saved: std.ArrayList(comments.RemoveSnap) = .empty;
+    defer saved.deinit(alloc);
+    if (delete_comments and kind == .discard) {
+        try comments.collectMatching(review, file, diff_hunk_i, alloc, &ids, &saved);
+    }
+
+    var fail: []u8 = &.{};
+    git.mutate(alloc, io, cwd, .{
+        .action = action,
+        .path = file.displayPath(),
+        .group = target.group,
+        .hunk = if (diff_hunk_i) |hi| &file.hunks[hi] else null,
+        .file = if (diff_hunk_i != null) file else null,
+        .fail_output = &fail,
+    }) catch |err| switch (err) {
+        error.OutOfMemory => {
+            if (fail.len > 0) alloc.free(fail);
+            return error.OutOfMemory;
+        },
+        error.NotARepository, error.GitNotFound, error.GitFailed, error.BadHunkHeader => {
+            defer if (fail.len > 0) alloc.free(fail);
+            return .{ .result = .{ .fail_message = try gitFailText(alloc, fail, err) } };
+        },
+    };
+
+    var save_failed = false;
+    if (ids.items.len > 0) {
+        save_failed = !removeMatchingComments(review, alloc, io, ids.items, saved.items);
+    }
+
+    // Reload only the mutated path; other files stay as loaded.
+    var path_buf: [2][]const u8 = undefined;
+    path_buf[0] = file.displayPath();
+    var path_n: usize = 1;
+    if (file.old_path) |old_p| {
+        if (!std.mem.eql(u8, old_p, path_buf[0])) {
+            path_buf[1] = old_p;
+            path_n = 2;
+        }
+    }
+    const spliced = git.reloadPaths(alloc, io, cwd, d, path_buf[0..path_n]) catch |err| {
+        return .{ .result = .{ .reload_err = err, .save_failed = save_failed } };
+    };
+
+    // Visible diff first. A failure here leaves comment anchors unchanged.
+    const loaded = openFromDiff(alloc, io, root, spliced) catch |err| {
+        return .{ .result = .{ .reload_err = err, .save_failed = save_failed } };
+    };
+
+    // Stage/unstage: re-anchor live comments onto the new diff, then save.
+    if (kind == .stage_unstage) {
+        var priors: std.ArrayList(comments.AnchorSnap) = .empty;
+        defer priors.deinit(alloc);
+        comments.remapMatching(review, file, &loaded.diff, diff_hunk_i, alloc, &priors) catch |err| {
+            for (priors.items) |p| {
+                review.setLines(p.id, p.old_line, p.new_line, p.side) catch {};
+            }
+            loaded.deinit(alloc);
+            return err;
+        };
+        if (!saveCommentRemap(review, alloc, io, priors.items)) save_failed = true;
+    }
+
+    const new_cursor: usize = if (neighbor) |m| restoreNeighbor(loaded.rows, m) else 0;
+    return .{ .result = .{
+        .open = loaded,
+        .cursor = new_cursor,
+        .save_failed = save_failed,
+    } };
+}
+
+/// Stage or unstage every file in the section at `cursor`. File-level mutate
+/// in flatten order. Always reload after the loop (list matches git). A git
+/// error is returned with that reload so the overlay can open. Comment
+/// anchors move only after the visible diff is built.
+fn applyGroupAtCursor(
+    alloc: std.mem.Allocator,
+    io: std.Io,
+    cwd: std.process.Child.Cwd,
+    root: std.Io.Dir,
+    d: *const diff.Diff,
+    rows: []const view.row.Row,
+    cursor: usize,
+    review: *store.Review,
+) std.mem.Allocator.Error!ApplyStatus {
+    const span = groupSpanAt(rows, cursor) orelse return .noop;
+    const action: git.Action = switch (span.group) {
+        .unstaged, .untracked => .stage,
+        .staged => .unstage,
+    };
+    const neighbor = groupNeighborMark(rows, span);
+    var fail: []u8 = &.{};
+    const first_err: ?git.Error = blk: {
+        for (d.files) |f| {
+            const g = f.group orelse continue;
+            if (g != span.group) continue;
+            git.mutate(alloc, io, cwd, .{
+                .action = action,
+                .path = f.displayPath(),
+                .group = span.group,
+                .fail_output = &fail,
+            }) catch |err| switch (err) {
+                error.OutOfMemory => {
+                    if (fail.len > 0) alloc.free(fail);
+                    return error.OutOfMemory;
+                },
+                error.NotARepository, error.GitNotFound, error.GitFailed, error.BadHunkHeader => break :blk err,
+            };
+        }
+        break :blk null;
+    };
+
+    var reload_err: ?git.Error = null;
+    var next: ?OpenDiff = null;
+    var new_cursor: usize = 0;
+    var group_save_failed = false;
+    if (git.loadDefaultDiffCwd(alloc, io, cwd)) |loaded_diff| {
+        if (openFromDiff(alloc, io, root, loaded_diff)) |opened| {
+            var priors: std.ArrayList(comments.AnchorSnap) = .empty;
+            defer priors.deinit(alloc);
+            for (d.files) |*f| {
+                const g = f.group orelse continue;
+                if (g != span.group) continue;
+                comments.remapMatching(review, f, &opened.diff, null, alloc, &priors) catch |err| {
+                    for (priors.items) |p| {
+                        review.setLines(p.id, p.old_line, p.new_line, p.side) catch {};
+                    }
+                    opened.deinit(alloc);
+                    if (fail.len > 0) alloc.free(fail);
+                    return err;
+                };
+            }
+            group_save_failed = !saveCommentRemap(review, alloc, io, priors.items);
+            new_cursor = if (neighbor) |m| restoreGroupNeighbor(opened.rows, m) else 0;
+            next = opened;
+        } else |err| {
+            reload_err = err;
+        }
+    } else |err| {
+        reload_err = err;
+    }
+
+    const fail_message: ?[]u8 = if (first_err) |err| try gitFailText(alloc, fail, err) else null;
+    if (fail.len > 0) alloc.free(fail);
+    return .{ .result = .{
+        .open = next,
+        .cursor = new_cursor,
+        .fail_message = fail_message,
+        .reload_err = reload_err,
+        .save_failed = group_save_failed,
+    } };
+}
+
 /// A loaded review, or the step that failed. On failure any partial
 /// allocation is already freed. Startup and reload report the failure
-/// differently; both call `loadDiffView`.
+/// differently; both call `loadOpenDiff`.
 const DiffLoad = union(enum) {
-    view: DiffView,
+    open: OpenDiff,
     git: git.Error,
     approved: approve.LoadError,
     build: std.mem.Allocator.Error,
 };
 
-fn loadDiffView(
+fn loadOpenDiff(
     alloc: std.mem.Allocator,
     io: std.Io,
     source: cli.Source,
@@ -738,12 +1437,12 @@ fn loadDiffView(
         parsed.deinit();
         return .{ .approved = err };
     };
-    const loaded = DiffView.build(alloc, parsed, vis.rows, vis.approved_n) catch |err| {
+    const loaded = OpenDiff.build(alloc, parsed, vis.rows, vis.approved_n) catch |err| {
         alloc.free(vis.rows);
         parsed.deinit();
         return .{ .build = err };
     };
-    return .{ .view = loaded };
+    return .{ .open = loaded };
 }
 
 fn flattenSource(
@@ -793,7 +1492,7 @@ fn reloadReview(
     review.* = loaded;
 }
 
-/// Re-run the startup load. On success, replace the live DiffView and restore
+/// Re-run the startup load. On success, replace the live OpenDiff and restore
 /// the cursor to the same path+line. On failure, leave the previous list and
 /// set `note`. Does not touch the comment store. `r` is only bound in normal
 /// focus.
@@ -801,11 +1500,11 @@ fn reloadDiff(
     alloc: std.mem.Allocator,
     io: std.Io,
     source: cli.Source,
-    diff_view: *DiffView,
+    diff_view: *OpenDiff,
     cursor: *usize,
     note: *StatusNote,
 ) void {
-    const loaded = DiffView.maybeInit(alloc, io, source, note) orelse return;
+    const loaded = OpenDiff.maybeInit(alloc, io, source, note) orelse return;
     const new_cursor: usize = blk: {
         const mark = view.nav.cursorMarkAt(diff_view.rows, cursor.*);
         break :blk if (mark) |m| view.nav.restoreCursor(loaded.rows, m) else 0;
@@ -823,13 +1522,13 @@ fn expandCurrentHunk(
     alloc: std.mem.Allocator,
     io: std.Io,
     source: cli.Source,
-    diff_view: *DiffView,
+    diff_view: *OpenDiff,
     cursor: *usize,
     note: *StatusNote,
 ) std.mem.Allocator.Error!void {
     const rows = diff_view.rows;
     const cur = view.row.clampCursor(cursor.*, rows.len);
-    const target = git.expandTargetAt(&diff_view.diff, rows, cur) orelse return;
+    const target = expandTargetAt(&diff_view.diff, rows, cur) orelse return;
 
     // Snapshot the current line/hunk so we can land after the flatten grows.
     const mark = view.nav.cursorMarkAt(rows, cur);
@@ -900,46 +1599,6 @@ fn restoreExpandCursor(
     return if (mark) |m| view.nav.restoreCursor(rows, m) else 0;
 }
 
-/// The open diff, cursor, footer note, focus, and git-error text.
-/// Stage, discard, and approve write these together.
-const ReviewUi = struct {
-    diff_view: *DiffView,
-    cursor: *usize,
-    note: *StatusNote,
-    focus: *Focus,
-    failure: *Failure,
-
-    fn commit(
-        self: ReviewUi,
-        alloc: std.mem.Allocator,
-        status: git.MutationStatus,
-    ) std.mem.Allocator.Error!void {
-        const result = switch (status) {
-            .noop => return,
-            .result => |r| r,
-        };
-        if (result.snapshot) |snap| {
-            if (DiffView.build(alloc, snap.diff, snap.rows, snap.approved_n)) |loaded| {
-                self.diff_view.deinit(alloc);
-                self.diff_view.* = loaded;
-                self.cursor.* = snap.cursor;
-            } else |_| {
-                snap.deinit(alloc);
-                self.note.set("out of memory");
-            }
-        } else if (result.reload_err) |err| {
-            self.note.set(git.errorMessage(err));
-        }
-        if (result.save_failed) self.note.set("failed to save .rv comment store");
-        if (result.fail_message) |msg| {
-            defer alloc.free(msg);
-            self.failure.buf.clearRetainingCapacity();
-            try self.failure.buf.appendSlice(alloc, msg);
-            self.focus.* = .git_error;
-        }
-    }
-};
-
 /// Approve the hunk (`whole_file == false`, requires a hunk) or the remaining
 /// hunks of that file in this group (`true`, from a hunk or the file header).
 /// Local only. No-op on a section, on a file header for hunk approve, and
@@ -951,18 +1610,19 @@ fn applyApprove(
     alloc: std.mem.Allocator,
     io: std.Io,
     source: cli.Source,
-    ui: ReviewUi,
+    diff_view: *OpenDiff,
+    cursor: *usize,
+    note: *StatusNote,
+    focus: *Focus,
+    failure: *Failure,
     review: *store.Review,
     cwd: std.process.Child.Cwd,
     root: std.Io.Dir,
     whole_file: bool,
 ) std.mem.Allocator.Error!void {
-    const diff_view = ui.diff_view;
-    const cursor = ui.cursor;
-    const note = ui.note;
     if (source != .local) return;
     const rows = diff_view.rows;
-    const target = git.indexTargetAt(rows, cursor.*, whole_file) orelse return;
+    const target = targetAt(rows, cursor.*, whole_file) orelse return;
     if (!whole_file and target.hunk_i == null) return;
     const file = groupedFile(&diff_view.diff, target.path, target.group) orelse return;
 
@@ -979,7 +1639,7 @@ fn applyApprove(
             try hashes.append(alloc, approve.fingerprintHunk(id));
         }
     }
-    const hunk_mark = git.neighborMark(rows, target);
+    const hunk_mark = neighborMark(rows, target);
     const mark_path = if (hunk_mark) |m| try alloc.dupe(u8, m.path) else null;
     defer if (mark_path) |p| alloc.free(p);
     const path = try alloc.dupe(u8, file.displayPath());
@@ -988,10 +1648,11 @@ fn applyApprove(
 
     // Stage first. GitFailed opens the git-error overlay and does not write the store.
     if (needs_stage) {
-        const status = try git.applyAtCursor(
+        switch (try applyAtCursor(
             alloc,
             io,
             cwd,
+            root,
             &diff_view.diff,
             diff_view.rows,
             cursor.*,
@@ -999,13 +1660,14 @@ fn applyApprove(
             whole_file,
             .stage_unstage,
             false,
-        );
-        const stage_ok: bool = switch (status) {
-            .noop => false,
-            .result => |*r| r.snapshot != null,
-        };
-        try ui.commit(alloc, status);
-        if (!stage_ok) return;
+        )) {
+            .noop => return,
+            .result => |r| {
+                const stage_ok = r.open != null;
+                try finishApply(alloc, diff_view, cursor, note, focus, failure, r);
+                if (!stage_ok) return;
+            },
+        }
     }
 
     const live_file = groupedFile(&diff_view.diff, path, .staged) orelse return;
@@ -1037,7 +1699,7 @@ fn applyApprove(
 
     const new_rows = try approve.hide(alloc, &diff_view.diff, &approved, io, root);
     const restored: usize = if (hunk_mark) |m|
-        git.restoreNeighbor(new_rows, .{
+        restoreNeighbor(new_rows, .{
             .path = mark_path.?,
             .group = m.group,
             .hunk_i = m.hunk_i,
@@ -1058,7 +1720,7 @@ fn unapproveRebuild(
     alloc: std.mem.Allocator,
     io: std.Io,
     source: cli.Source,
-    diff_view: *DiffView,
+    diff_view: *OpenDiff,
     note: *StatusNote,
     root: std.Io.Dir,
     item: approve.Hidden,
@@ -1098,7 +1760,7 @@ fn applyUnapprove(
     alloc: std.mem.Allocator,
     io: std.Io,
     source: cli.Source,
-    diff_view: *DiffView,
+    diff_view: *OpenDiff,
     cursor: *usize,
     note: *StatusNote,
     root: std.Io.Dir,
@@ -1131,25 +1793,33 @@ fn applyIndex(
     alloc: std.mem.Allocator,
     io: std.Io,
     source: cli.Source,
-    ui: ReviewUi,
+    diff_view: *OpenDiff,
+    cursor: *usize,
+    note: *StatusNote,
+    focus: *Focus,
+    failure: *Failure,
     review: *store.Review,
     whole_file: bool,
-    kind: git.MutationKind,
+    kind: MutationKind,
     delete_comments: bool,
 ) std.mem.Allocator.Error!void {
     if (source != .local) return;
-    try ui.commit(alloc, try git.applyAtCursor(
+    switch (try applyAtCursor(
         alloc,
         io,
         .inherit,
-        &ui.diff_view.diff,
-        ui.diff_view.rows,
-        ui.cursor.*,
+        .cwd(),
+        &diff_view.diff,
+        diff_view.rows,
+        cursor.*,
         review,
         whole_file,
         kind,
         delete_comments,
-    ));
+    )) {
+        .noop => {},
+        .result => |r| try finishApply(alloc, diff_view, cursor, note, focus, failure, r),
+    }
 }
 
 /// Stage or unstage every file in the section under the cursor (local only).
@@ -1157,34 +1827,46 @@ fn applyGroupIndex(
     alloc: std.mem.Allocator,
     io: std.Io,
     source: cli.Source,
-    ui: ReviewUi,
+    diff_view: *OpenDiff,
+    cursor: *usize,
+    note: *StatusNote,
+    focus: *Focus,
+    failure: *Failure,
     review: *store.Review,
 ) std.mem.Allocator.Error!void {
     if (source != .local) return;
-    try ui.commit(alloc, try git.applyGroupAtCursor(
+    switch (try applyGroupAtCursor(
         alloc,
         io,
         .inherit,
-        &ui.diff_view.diff,
-        ui.diff_view.rows,
-        ui.cursor.*,
+        .cwd(),
+        &diff_view.diff,
+        diff_view.rows,
+        cursor.*,
         review,
-    ));
+    )) {
+        .noop => {},
+        .result => |r| try finishApply(alloc, diff_view, cursor, note, focus, failure, r),
+    }
 }
 
 /// Stage (`stage`) or unstage (`!stage`) the hunk or file at the cursor.
 /// Hunk chords require a hunk (no-op on a file header). Already-staged
 /// stage and not-staged unstage are no-ops. Local only.
-fn dispatchGitIndex(
+fn dispatchStage(
     alloc: std.mem.Allocator,
     io: std.Io,
     source: cli.Source,
-    ui: ReviewUi,
+    diff_view: *OpenDiff,
+    cursor: *usize,
+    note: *StatusNote,
+    focus: *Focus,
+    failure: *Failure,
     review: *store.Review,
     whole_file: bool,
     stage: bool,
 ) std.mem.Allocator.Error!void {
-    const target = git.indexTargetAt(ui.diff_view.rows, ui.cursor.*, whole_file) orelse return;
+    const target = targetAt(diff_view.rows, cursor.*, whole_file) orelse return;
     if (!whole_file and target.hunk_i == null) return;
     if (stage) {
         if (target.group == .staged) return;
@@ -1193,7 +1875,11 @@ fn dispatchGitIndex(
         alloc,
         io,
         source,
-        ui,
+        diff_view,
+        cursor,
+        note,
+        focus,
+        failure,
         review,
         whole_file,
         .stage_unstage,
@@ -1208,18 +1894,22 @@ fn dispatchApprove(
     alloc: std.mem.Allocator,
     io: std.Io,
     source: cli.Source,
-    ui: ReviewUi,
+    diff_view: *OpenDiff,
+    cursor: *usize,
+    note: *StatusNote,
+    focus: *Focus,
+    failure: *Failure,
     review: *store.Review,
     confirm: *DiscardConfirm,
     whole_file: bool,
 ) std.mem.Allocator.Error!void {
     if (source != .local) return;
-    if (git.approveHasComments(review, &ui.diff_view.diff, ui.diff_view.rows, ui.cursor.*, whole_file)) {
+    if (approveHasComments(review, &diff_view.diff, diff_view.rows, cursor.*, whole_file)) {
         confirm.* = .{ .kind = .approve, .whole_file = whole_file, .yes = false, .comments = false };
-        ui.focus.* = .discard_confirm;
+        focus.* = .discard_confirm;
         return;
     }
-    try applyApprove(alloc, io, source, ui, review, .inherit, .cwd(), whole_file);
+    try applyApprove(alloc, io, source, diff_view, cursor, note, focus, failure, review, .inherit, .cwd(), whole_file);
 }
 
 /// Open the discard confirm for the hunk or file at the cursor. Hunk
@@ -1233,7 +1923,7 @@ fn beginGitDiscard(
     whole_file: bool,
 ) void {
     if (source != .local) return;
-    const target = git.discardTargetAt(rows, cursor, whole_file) orelse return;
+    const target = discardTargetAt(rows, cursor, whole_file) orelse return;
     if (!whole_file and target.hunk_i == null) return;
     discard.* = .{ .whole_file = whole_file, .yes = false, .comments = false };
     focus.* = .discard_confirm;
@@ -1259,7 +1949,7 @@ pub const DiscardConfirm = struct {
         approve,
     };
 
-    kind: git.ConfirmKind = .discard,
+    kind: ConfirmKind = .discard,
     group: diff.Group = .unstaged,
     whole_file: bool = false,
     yes: bool = false,
@@ -1298,7 +1988,7 @@ pub const DiscardConfirm = struct {
         }
         if (abort) return .closed;
         if (!answered) return .open;
-        switch (git.confirmNext(
+        switch (confirmNext(
             self.kind,
             self.comments,
             self.yes,
@@ -1347,7 +2037,7 @@ pub const DiscardConfirm = struct {
         const hunk_text: []const u8, const path: []const u8 = if (question_only)
             .{ "", "" }
         else blk: {
-            const target = git.indexTargetAt(rows, cursor, self.whole_file);
+            const target = targetAt(rows, cursor, self.whole_file);
             const hunk_row: ?view.row.Row = if (target) |t|
                 if (t.hunk_i != null) rows[t.first] else null
             else
@@ -1590,7 +2280,11 @@ pub const Draft = struct {
                             self.anchor.new_line,
                             side,
                             self.buf.items,
-                            source,
+                            switch (source) {
+                                .local => .local,
+                                .range => |r| .{ .range = r },
+                                .commit => |c| .{ .commit = c },
+                            },
                         );
                         store.save(review, alloc, io, .cwd()) catch {
                             // Stay in review; next save can retry. Marker is in-memory.
@@ -2341,7 +3035,7 @@ fn landComment(
     alloc: std.mem.Allocator,
     io: std.Io,
     source: cli.Source,
-    diff_view: *DiffView,
+    diff_view: *OpenDiff,
     cursor: *usize,
     note: *StatusNote,
     loc: view.CommentLoc,
@@ -2378,7 +3072,7 @@ fn landComment(
 
 fn jumpLiveComment(
     review: *const store.Review,
-    diff_view: *DiffView,
+    diff_view: *OpenDiff,
     alloc: std.mem.Allocator,
     io: std.Io,
     source: cli.Source,
@@ -2502,7 +3196,11 @@ fn applyListApprove(
     alloc: std.mem.Allocator,
     io: std.Io,
     source: cli.Source,
-    ui: ReviewUi,
+    diff_view: *OpenDiff,
+    cursor: *usize,
+    note: *StatusNote,
+    focus: *Focus,
+    failure: *Failure,
     review: *store.Review,
     confirm: *DiscardConfirm,
     list: *FileList,
@@ -2510,14 +3208,14 @@ fn applyListApprove(
     if (source != .local) return;
     const idx = list.cursor;
     if (idx >= list.items.items.len) return;
-    ui.cursor.* = list.items.items[idx];
-    try dispatchApprove(alloc, io, source, ui, review, confirm, true);
-    if (ui.focus.* == .discard_confirm) {
+    cursor.* = list.items.items[idx];
+    try dispatchApprove(alloc, io, source, diff_view, cursor, note, focus, failure, review, confirm, true);
+    if (focus.* == .discard_confirm) {
         confirm.return_to_files = true;
         return;
     }
-    if (ui.focus.* == .git_error) return;
-    try list.reload(alloc, ui.diff_view.rows, idx);
+    if (focus.* == .git_error) return;
+    try list.reload(alloc, diff_view.rows, idx);
 }
 
 /// Centered overlay. Width up to 120; height grows with rows, clamped to
@@ -3907,12 +4605,12 @@ fn initTrackedRepo(io: std.Io, tmp: IsolatedTmp) !void {
     try expectGitOk(io, cwd, &.{ "git", "commit", "-m", "init" });
 }
 
-fn loadLocalView(alloc: std.mem.Allocator, io: std.Io, cwd: std.process.Child.Cwd, root: std.Io.Dir) !DiffView {
+fn loadLocalView(alloc: std.mem.Allocator, io: std.Io, cwd: std.process.Child.Cwd, root: std.Io.Dir) !OpenDiff {
     var parsed = try git.loadDefaultDiffCwd(alloc, io, cwd);
     errdefer parsed.deinit();
     const vis = try approve.loadVisible(alloc, io, root, &parsed);
     errdefer alloc.free(vis.rows);
-    return try DiffView.build(alloc, parsed, vis.rows, vis.approved_n);
+    return try OpenDiff.build(alloc, parsed, vis.rows, vis.approved_n);
 }
 
 fn firstHunkRow(rows: []const view.row.Row) ?usize {
@@ -4013,15 +4711,7 @@ test "applyApprove stages an unstaged hunk and hides it; nearby edit is unstaged
     defer failure.buf.deinit(alloc);
     var review = try store.initEmpty(alloc, store.default_review_id);
     defer review.deinit();
-    const ui = ReviewUi{
-        .diff_view = &diff_view,
-        .cursor = &cursor,
-        .note = &note,
-        .focus = &focus,
-        .failure = &failure,
-    };
-
-    try applyApprove(alloc, io, .local, ui, &review, tmp.cwd(), tmp.dir, false);
+    try applyApprove(alloc, io, .local, &diff_view, &cursor, &note, &focus, &failure, &review, tmp.cwd(), tmp.dir, false);
     try std.testing.expect(focus != .git_error);
     try std.testing.expect(!hasRowFile(diff_view.rows, "f.txt", .unstaged));
     try std.testing.expect(!hasRowFile(diff_view.rows, "f.txt", .staged));
@@ -4083,15 +4773,7 @@ test "applyApprove hides approved lines when git merges them with a staged neigh
     defer failure.buf.deinit(alloc);
     var review = try store.initEmpty(alloc, store.default_review_id);
     defer review.deinit();
-    const ui = ReviewUi{
-        .diff_view = &diff_view,
-        .cursor = &cursor,
-        .note = &note,
-        .focus = &focus,
-        .failure = &failure,
-    };
-
-    try applyApprove(alloc, io, .local, ui, &review, cwd, tmp.dir, false);
+    try applyApprove(alloc, io, .local, &diff_view, &cursor, &note, &focus, &failure, &review, cwd, tmp.dir, false);
     try std.testing.expect(focus != .git_error);
     try std.testing.expect(rowsHaveLine(diff_view.rows, "STAGED"));
     try std.testing.expect(!rowsHaveLine(diff_view.rows, "UNSTAGED"));
@@ -4136,15 +4818,7 @@ test "applyApprove on already-staged only hides" {
     defer failure.buf.deinit(alloc);
     var review = try store.initEmpty(alloc, store.default_review_id);
     defer review.deinit();
-    const ui = ReviewUi{
-        .diff_view = &diff_view,
-        .cursor = &cursor,
-        .note = &note,
-        .focus = &focus,
-        .failure = &failure,
-    };
-
-    try applyApprove(alloc, io, .local, ui, &review, tmp.cwd(), tmp.dir, false);
+    try applyApprove(alloc, io, .local, &diff_view, &cursor, &note, &focus, &failure, &review, tmp.cwd(), tmp.dir, false);
     try std.testing.expect(focus != .git_error);
     try std.testing.expect(!hasRowFile(diff_view.rows, "f.txt", .staged));
     {
@@ -4175,18 +4849,10 @@ test "applyApprove GitFailed does not write the store" {
     defer failure.buf.deinit(alloc);
     var review = try store.initEmpty(alloc, store.default_review_id);
     defer review.deinit();
-    const ui = ReviewUi{
-        .diff_view = &diff_view,
-        .cursor = &cursor,
-        .note = &note,
-        .focus = &focus,
-        .failure = &failure,
-    };
-
     // Index no longer matches the loaded hunk's old side, so apply --cached fails.
     try tmp.write(io, "f.txt", "this no longer matches the loaded hunk\n");
     try expectGitOk(io, tmp.cwd(), &.{ "git", "add", "f.txt" });
-    try applyApprove(alloc, io, .local, ui, &review, tmp.cwd(), tmp.dir, false);
+    try applyApprove(alloc, io, .local, &diff_view, &cursor, &note, &focus, &failure, &review, tmp.cwd(), tmp.dir, false);
     try std.testing.expectEqual(Focus.git_error, focus);
     try std.testing.expect(failure.buf.items.len > 0);
     try std.testing.expectEqual(before_len, diff_view.rows.len);
@@ -4217,15 +4883,7 @@ test "applyUnapprove restores the row under Staged and leaves the index" {
     defer failure.buf.deinit(alloc);
     var review = try store.initEmpty(alloc, store.default_review_id);
     defer review.deinit();
-    const ui = ReviewUi{
-        .diff_view = &diff_view,
-        .cursor = &cursor,
-        .note = &note,
-        .focus = &focus,
-        .failure = &failure,
-    };
-
-    try applyApprove(alloc, io, .local, ui, &review, tmp.cwd(), tmp.dir, false);
+    try applyApprove(alloc, io, .local, &diff_view, &cursor, &note, &focus, &failure, &review, tmp.cwd(), tmp.dir, false);
     try std.testing.expect(focus != .git_error);
 
     var stored = try approve.load(alloc, io, tmp.dir);
@@ -4250,4 +4908,502 @@ test "applyUnapprove restores the row under Staged and leaves the index" {
         try std.testing.expect(hasDiffFile(raw, "f.txt", .staged));
         try std.testing.expect(!hasDiffFile(raw, "f.txt", .unstaged));
     }
+}
+
+fn threeGroupRows(alloc: std.mem.Allocator) !struct { d: diff.Diff, rows: []view.row.Row } {
+    const unstaged_txt =
+        \\diff --git a/a b/a
+        \\--- a/a
+        \\+++ b/a
+        \\@@ -1 +1 @@
+        \\-old
+        \\+new
+    ;
+    const untracked_txt =
+        \\diff --git a/u b/u
+        \\new file mode 100644
+        \\--- /dev/null
+        \\+++ b/u
+        \\@@ -0,0 +1 @@
+        \\+hi
+    ;
+    const staged_txt =
+        \\diff --git a/a b/a
+        \\--- a/a
+        \\+++ b/a
+        \\@@ -1 +1,2 @@
+        \\ same
+        \\+staged
+    ;
+    var d = try diff.parsePieces(alloc, &.{
+        .{ .text = unstaged_txt, .group = .unstaged },
+        .{ .text = untracked_txt, .group = .untracked },
+        .{ .text = staged_txt, .group = .staged },
+    });
+    errdefer d.deinit();
+    const rows = try view.row.flatten(alloc, &d);
+    return .{ .d = d, .rows = rows };
+}
+
+test "targetAt empty section and untagged" {
+    try std.testing.expect(targetAt(&.{}, 0, false) == null);
+
+    const fixture =
+        \\diff --git a/f b/f
+        \\--- a/f
+        \\+++ b/f
+        \\@@ -1 +1 @@
+        \\-old
+        \\+new
+    ;
+    var d = try diff.parse(std.testing.allocator, fixture);
+    defer d.deinit();
+    const rows = try view.row.flatten(std.testing.allocator, &d);
+    defer std.testing.allocator.free(rows);
+    try std.testing.expect(targetAt(rows, 0, false) == null);
+    try std.testing.expect(targetAt(rows, 2, false) == null);
+
+    var fix = try threeGroupRows(std.testing.allocator);
+    defer fix.d.deinit();
+    defer std.testing.allocator.free(fix.rows);
+    try std.testing.expect(targetAt(fix.rows, 0, false) == null);
+    try std.testing.expect(targetAt(fix.rows, 5, true) == null);
+}
+
+test "targetAt file hunk and file-from-hunk" {
+    var fix = try threeGroupRows(std.testing.allocator);
+    defer fix.d.deinit();
+    defer std.testing.allocator.free(fix.rows);
+    const rows = fix.rows;
+    // 0 Unstaged, 1 file a, 2 hunk, 3 del, 4 add, 5 Untracked, 6 file u, …
+    // 9 Staged, 10 file a, 11 hunk, 12 ctx, 13 add.
+
+    const file = targetAt(rows, 1, false).?;
+    try std.testing.expectEqualStrings("a", file.path);
+    try std.testing.expectEqual(diff.Group.unstaged, file.group);
+    try std.testing.expect(file.hunk_i == null);
+    try std.testing.expectEqual(1, file.first);
+    try std.testing.expectEqual(4, file.last);
+
+    const hunk = targetAt(rows, 3, false).?;
+    try std.testing.expectEqualStrings("a", hunk.path);
+    try std.testing.expectEqual(diff.Group.unstaged, hunk.group);
+    try std.testing.expectEqual(0, hunk.hunk_i.?);
+    try std.testing.expectEqual(2, hunk.first);
+    try std.testing.expectEqual(4, hunk.last);
+
+    const from_hunk = targetAt(rows, 3, true).?;
+    try std.testing.expect(from_hunk.hunk_i == null);
+    try std.testing.expectEqual(1, from_hunk.first);
+    try std.testing.expectEqual(4, from_hunk.last);
+
+    const staged = targetAt(rows, 12, false).?;
+    try std.testing.expectEqualStrings("a", staged.path);
+    try std.testing.expectEqual(diff.Group.staged, staged.group);
+    try std.testing.expectEqual(0, staged.hunk_i.?);
+}
+
+test "neighborMark following hunk next file and only change" {
+    const two_hunks =
+        \\diff --git a/a b/a
+        \\--- a/a
+        \\+++ b/a
+        \\@@ -1 +1 @@
+        \\-old1
+        \\+new1
+        \\@@ -10 +10 @@
+        \\-old2
+        \\+new2
+    ;
+    var d = try diff.parsePieces(std.testing.allocator, &.{
+        .{ .text = two_hunks, .group = .unstaged },
+    });
+    defer d.deinit();
+    const rows = try view.row.flatten(std.testing.allocator, &d);
+    defer std.testing.allocator.free(rows);
+    // 0 Unstaged, 1 file, 2 h0, 3 del, 4 add, 5 h1, 6 del, 7 add.
+
+    const first = targetAt(rows, 3, false).?;
+    const after_first = neighborMark(rows, first).?;
+    try std.testing.expectEqualStrings("a", after_first.path);
+    try std.testing.expectEqual(diff.Group.unstaged, after_first.group);
+    try std.testing.expectEqual(0, after_first.hunk_i.?);
+
+    const second = targetAt(rows, 6, false).?;
+    const before_second = neighborMark(rows, second).?;
+    try std.testing.expectEqualStrings("a", before_second.path);
+    try std.testing.expectEqual(0, before_second.hunk_i.?);
+
+    var fix = try threeGroupRows(std.testing.allocator);
+    defer fix.d.deinit();
+    defer std.testing.allocator.free(fix.rows);
+    const next_file = neighborMark(fix.rows, targetAt(fix.rows, 3, false).?).?;
+    try std.testing.expectEqualStrings("u", next_file.path);
+    try std.testing.expectEqual(diff.Group.untracked, next_file.group);
+    try std.testing.expect(next_file.hunk_i == null);
+
+    const only =
+        \\diff --git a/u b/u
+        \\new file mode 100644
+        \\--- /dev/null
+        \\+++ b/u
+        \\@@ -0,0 +1 @@
+        \\+hi
+    ;
+    var d_only = try diff.parsePieces(std.testing.allocator, &.{
+        .{ .text = only, .group = .untracked },
+    });
+    defer d_only.deinit();
+    const only_rows = try view.row.flatten(std.testing.allocator, &d_only);
+    defer std.testing.allocator.free(only_rows);
+    // Whole file is the only change: no following or previous header.
+    try std.testing.expect(neighborMark(only_rows, targetAt(only_rows, 1, false).?) == null);
+    // Only hunk: previous header is that file’s row.
+    const prev_file = neighborMark(only_rows, targetAt(only_rows, 2, false).?).?;
+    try std.testing.expectEqualStrings("u", prev_file.path);
+    try std.testing.expectEqual(diff.Group.untracked, prev_file.group);
+    try std.testing.expect(prev_file.hunk_i == null);
+}
+
+test "restoreNeighbor dest hunk file fallback and gone" {
+    try std.testing.expectEqual(0, restoreNeighbor(&.{}, .{
+        .path = "a",
+        .group = .unstaged,
+        .hunk_i = 0,
+    }));
+
+    const remaining =
+        \\diff --git a/a b/a
+        \\--- a/a
+        \\+++ b/a
+        \\@@ -10 +10 @@
+        \\-old2
+        \\+new2
+    ;
+    var d = try diff.parsePieces(std.testing.allocator, &.{
+        .{ .text = remaining, .group = .unstaged },
+    });
+    defer d.deinit();
+    const rows = try view.row.flatten(std.testing.allocator, &d);
+    defer std.testing.allocator.free(rows);
+    // 0 Unstaged, 1 file, 2 hunk, 3 del, 4 add.
+
+    try std.testing.expectEqual(2, restoreNeighbor(rows, .{
+        .path = "a",
+        .group = .unstaged,
+        .hunk_i = 0,
+    }));
+    try std.testing.expectEqual(1, restoreNeighbor(rows, .{
+        .path = "a",
+        .group = .unstaged,
+        .hunk_i = 4,
+    }));
+    try std.testing.expectEqual(1, restoreNeighbor(rows, .{
+        .path = "a",
+        .group = .unstaged,
+        .hunk_i = null,
+    }));
+    try std.testing.expectEqual(0, restoreNeighbor(rows, .{
+        .path = "a",
+        .group = .staged,
+        .hunk_i = 0,
+    }));
+    try std.testing.expectEqual(0, restoreNeighbor(rows, .{
+        .path = "gone",
+        .group = .unstaged,
+        .hunk_i = null,
+    }));
+}
+
+test "groupSpanAt empty untagged and three groups" {
+    try std.testing.expect(groupSpanAt(&.{}, 0) == null);
+
+    const untagged =
+        \\diff --git a/f b/f
+        \\--- a/f
+        \\+++ b/f
+        \\@@ -1 +1 @@
+        \\-old
+        \\+new
+    ;
+    var d = try diff.parse(std.testing.allocator, untagged);
+    defer d.deinit();
+    const rows = try view.row.flatten(std.testing.allocator, &d);
+    defer std.testing.allocator.free(rows);
+    try std.testing.expect(groupSpanAt(rows, 0) == null);
+
+    var fix = try threeGroupRows(std.testing.allocator);
+    defer fix.d.deinit();
+    defer std.testing.allocator.free(fix.rows);
+    // 0 Unstaged, 1-4 file a, 5 Untracked, 6-8 file u, 9 Staged, 10-13 file a.
+    try std.testing.expect(groupSpanAt(fix.rows, 1) == null);
+
+    const unstaged = groupSpanAt(fix.rows, 0).?;
+    try std.testing.expectEqual(diff.Group.unstaged, unstaged.group);
+    try std.testing.expectEqual(0, unstaged.first);
+    try std.testing.expectEqual(4, unstaged.last);
+
+    const untracked = groupSpanAt(fix.rows, 5).?;
+    try std.testing.expectEqual(diff.Group.untracked, untracked.group);
+    try std.testing.expectEqual(5, untracked.first);
+    try std.testing.expectEqual(8, untracked.last);
+
+    const staged = groupSpanAt(fix.rows, 9).?;
+    try std.testing.expectEqual(diff.Group.staged, staged.group);
+    try std.testing.expectEqual(9, staged.first);
+    try std.testing.expectEqual(13, staged.last);
+}
+
+test "groupNeighborMark following section previous file and only group" {
+    var fix = try threeGroupRows(std.testing.allocator);
+    defer fix.d.deinit();
+    defer std.testing.allocator.free(fix.rows);
+
+    const after_unstaged = groupNeighborMark(fix.rows, groupSpanAt(fix.rows, 0).?).?;
+    try std.testing.expect(after_unstaged == .section);
+    try std.testing.expectEqual(diff.Group.untracked, after_unstaged.section);
+
+    const after_untracked = groupNeighborMark(fix.rows, groupSpanAt(fix.rows, 5).?).?;
+    try std.testing.expect(after_untracked == .section);
+    try std.testing.expectEqual(diff.Group.staged, after_untracked.section);
+
+    const before_staged = groupNeighborMark(fix.rows, groupSpanAt(fix.rows, 9).?).?;
+    try std.testing.expect(before_staged == .file);
+    try std.testing.expectEqualStrings("u", before_staged.file.path);
+    try std.testing.expectEqual(diff.Group.untracked, before_staged.file.group);
+
+    const only =
+        \\diff --git a/u b/u
+        \\new file mode 100644
+        \\--- /dev/null
+        \\+++ b/u
+        \\@@ -0,0 +1 @@
+        \\+hi
+    ;
+    var d_only = try diff.parsePieces(std.testing.allocator, &.{
+        .{ .text = only, .group = .untracked },
+    });
+    defer d_only.deinit();
+    const only_rows = try view.row.flatten(std.testing.allocator, &d_only);
+    defer std.testing.allocator.free(only_rows);
+    try std.testing.expect(groupNeighborMark(only_rows, groupSpanAt(only_rows, 0).?) == null);
+}
+
+test "restoreGroupNeighbor dest section file fallback and gone" {
+    try std.testing.expectEqual(0, restoreGroupNeighbor(&.{}, .{ .section = .unstaged }));
+
+    var fix = try threeGroupRows(std.testing.allocator);
+    defer fix.d.deinit();
+    defer std.testing.allocator.free(fix.rows);
+
+    try std.testing.expectEqual(5, restoreGroupNeighbor(fix.rows, .{ .section = .untracked }));
+    try std.testing.expectEqual(6, restoreGroupNeighbor(fix.rows, .{
+        .file = .{ .path = "u", .group = .untracked },
+    }));
+    try std.testing.expectEqual(0, restoreGroupNeighbor(fix.rows, .{
+        .file = .{ .path = "gone", .group = .unstaged },
+    }));
+
+    const remaining =
+        \\diff --git a/a b/a
+        \\--- a/a
+        \\+++ b/a
+        \\@@ -1 +1,2 @@
+        \\ same
+        \\+staged
+    ;
+    var d = try diff.parsePieces(std.testing.allocator, &.{
+        .{ .text = remaining, .group = .staged },
+    });
+    defer d.deinit();
+    const rows = try view.row.flatten(std.testing.allocator, &d);
+    defer std.testing.allocator.free(rows);
+    try std.testing.expectEqual(0, restoreGroupNeighbor(rows, .{ .section = .untracked }));
+}
+
+test "expandTargetAt hunk not file or section" {
+    var fix = try threeGroupRows(std.testing.allocator);
+    defer fix.d.deinit();
+    defer std.testing.allocator.free(fix.rows);
+    const rows = fix.rows;
+
+    try std.testing.expect(expandTargetAt(&fix.d, rows, 0) == null);
+    try std.testing.expect(expandTargetAt(&fix.d, rows, 1) == null);
+    const unstaged = expandTargetAt(&fix.d, rows, 3).?;
+    try std.testing.expectEqual(0, unstaged.file_i);
+    try std.testing.expectEqual(0, unstaged.hunk_i);
+    const staged = expandTargetAt(&fix.d, rows, 12).?;
+    try std.testing.expectEqual(2, staged.file_i);
+    try std.testing.expectEqual(0, staged.hunk_i);
+
+    var range_d = try diff.parse(std.testing.allocator,
+        \\diff --git a/f b/f
+        \\--- a/f
+        \\+++ b/f
+        \\@@ -1 +1 @@
+        \\-old
+        \\+new
+    );
+    defer range_d.deinit();
+    const range_rows = try view.row.flatten(std.testing.allocator, &range_d);
+    defer std.testing.allocator.free(range_rows);
+    try std.testing.expect(expandTargetAt(&range_d, range_rows, 0) == null);
+    const in_hunk = expandTargetAt(&range_d, range_rows, 2).?;
+    try std.testing.expectEqual(0, in_hunk.file_i);
+    try std.testing.expectEqual(0, in_hunk.hunk_i);
+}
+
+
+fn findDiffFile(d: diff.Diff, path: []const u8, group: diff.Group) !diff.File {
+    for (d.files) |f| {
+        const g = f.group orelse continue;
+        if (g == group and std.mem.eql(u8, f.displayPath(), path)) return f;
+    }
+    return error.TestExpectedEqual;
+}
+
+fn fileHasLine(f: diff.File, text: []const u8) bool {
+    for (f.hunks) |h| {
+        for (h.lines) |ln| {
+            if (std.mem.eql(u8, ln.text, text)) return true;
+        }
+    }
+    return false;
+}
+
+test "applyAtCursor reloads the mutated path and leaves other files" {
+    if (builtin.os.tag == .wasi) return error.SkipZigTest;
+
+    const io = std.testing.io;
+    const alloc = std.testing.allocator;
+    var tmp = try IsolatedTmp.init(alloc, io);
+    defer tmp.deinit(alloc, io);
+    const cwd = tmp.cwd();
+
+    try expectGitOk(io, cwd, &.{ "git", "init", "-b", "main" });
+    try expectGitOk(io, cwd, &.{ "git", "config", "user.email", "rv@test" });
+    try expectGitOk(io, cwd, &.{ "git", "config", "user.name", "rv test" });
+    const before = "one\ntwo\nthree\nfour\nfive\nsix\nseven\neight\nnine\nten\neleven\ntwelve\nthirteen\nfourteen\nfifteen\nsixteen\nseventeen\neighteen\n";
+    const after = "one\nTWO\nthree\nfour\nfive\nsix\nseven\neight\nnine\nten\neleven\ntwelve\nthirteen\nfourteen\nfifteen\nsixteen\nSEVENTEEN\neighteen\n";
+    try tmp.write(io, "keep.txt", "keep\n");
+    try tmp.write(io, "target.txt", before);
+    try expectGitOk(io, cwd, &.{ "git", "add", "keep.txt", "target.txt" });
+    try expectGitOk(io, cwd, &.{ "git", "commit", "-m", "init" });
+    try tmp.write(io, "keep.txt", "keep-me\n");
+    try tmp.write(io, "target.txt", after);
+
+    var d = try git.loadDefaultDiffCwd(alloc, io, cwd);
+    defer d.deinit();
+    const rows = try view.row.flatten(alloc, &d);
+    defer alloc.free(rows);
+    const cursor: usize = blk: {
+        for (rows, 0..) |row, i| {
+            switch (row) {
+                .hunk_header => |h| if (std.mem.eql(u8, h.path, "target.txt")) break :blk i,
+                else => {},
+            }
+        }
+        return error.TestExpectedEqual;
+    };
+    for (d.files) |*f| {
+        if (f.group == .unstaged and std.mem.eql(u8, f.displayPath(), "keep.txt")) {
+            f.hunks[0].can_grow = false;
+        }
+    }
+    const marked = try alloc.alloc(diff.File, d.files.len + 1);
+    defer alloc.free(marked);
+    @memcpy(marked[0..d.files.len], d.files);
+    marked[d.files.len] = .{ .new_path = "zzz-kept.txt", .group = .unstaged };
+    d.files = marked;
+
+    var review = try store.initEmpty(alloc, store.default_review_id);
+    defer review.deinit();
+    const status = try applyAtCursor(alloc, io, cwd, tmp.dir, &d, rows, cursor, &review, false, .stage_unstage, false);
+    const loaded = switch (status) {
+        .noop => return error.TestExpectedEqual,
+        .result => |r| blk: {
+            defer if (r.fail_message) |msg| alloc.free(msg);
+            break :blk r.open orelse return error.TestExpectedEqual;
+        },
+    };
+    defer loaded.deinit(alloc);
+
+    try std.testing.expect(hasDiffFile(loaded.diff, "zzz-kept.txt", .unstaged));
+    const keep = try findDiffFile(loaded.diff, "keep.txt", .unstaged);
+    try std.testing.expect(!hasDiffFile(loaded.diff, "keep.txt", .staged));
+    try std.testing.expect(!keep.hunks[0].can_grow);
+    try std.testing.expect(fileHasLine(keep, "keep-me"));
+
+    const unstaged = try findDiffFile(loaded.diff, "target.txt", .unstaged);
+    const staged = try findDiffFile(loaded.diff, "target.txt", .staged);
+    try std.testing.expect(fileHasLine(unstaged, "SEVENTEEN"));
+    try std.testing.expect(!fileHasLine(unstaged, "TWO"));
+    try std.testing.expect(fileHasLine(staged, "TWO"));
+    try std.testing.expect(!fileHasLine(staged, "SEVENTEEN"));
+}
+
+fn twoHunkUnstaged(alloc: std.mem.Allocator) !struct { d: diff.Diff, rows: []view.row.Row } {
+    const txt =
+        \\diff --git a/f b/f
+        \\--- a/f
+        \\+++ b/f
+        \\@@ -1 +1 @@
+        \\-old1
+        \\+new1
+        \\@@ -10 +10 @@
+        \\-old2
+        \\+new2
+    ;
+    var d = try diff.parsePieces(alloc, &.{.{ .text = txt, .group = .unstaged }});
+    errdefer d.deinit();
+    const rows = try view.row.flatten(alloc, &d);
+    return .{ .d = d, .rows = rows };
+}
+
+test "approveHasComments hunk vs other hunk vs file" {
+    const alloc = std.testing.allocator;
+    var fix = try twoHunkUnstaged(alloc);
+    defer fix.d.deinit();
+    defer alloc.free(fix.rows);
+    const rows = fix.rows;
+    try std.testing.expect(rows[2] == .hunk_header);
+    try std.testing.expect(rows[5] == .hunk_header);
+
+    var review = try store.initEmpty(alloc, "t");
+    defer review.deinit();
+    _ = try review.addOpen("f", null, 10, .new, "hunk1", .local);
+
+    try std.testing.expect(!approveHasComments(&review, &fix.d, rows, 4, false));
+    try std.testing.expect(approveHasComments(&review, &fix.d, rows, 7, false));
+    try std.testing.expect(approveHasComments(&review, &fix.d, rows, 4, true));
+    try std.testing.expect(approveHasComments(&review, &fix.d, rows, 1, true));
+    try std.testing.expect(!approveHasComments(&review, &fix.d, rows, 1, false));
+    try std.testing.expect(!approveHasComments(&review, &fix.d, rows, 0, false));
+}
+
+test "approveHasComments file header does not trigger hunk a" {
+    const alloc = std.testing.allocator;
+    var fix = try twoHunkUnstaged(alloc);
+    defer fix.d.deinit();
+    defer alloc.free(fix.rows);
+    const rows = fix.rows;
+
+    var review = try store.initEmpty(alloc, "t");
+    defer review.deinit();
+    _ = try review.addOpen("f", null, null, null, "file", .local);
+
+    try std.testing.expect(!approveHasComments(&review, &fix.d, rows, 4, false));
+    try std.testing.expect(!approveHasComments(&review, &fix.d, rows, 7, false));
+    try std.testing.expect(approveHasComments(&review, &fix.d, rows, 1, true));
+    try std.testing.expect(approveHasComments(&review, &fix.d, rows, 4, true));
+}
+
+test "confirmNext approve yes and no" {
+    const alloc = std.testing.allocator;
+    var review = try store.initEmpty(alloc, "t");
+    defer review.deinit();
+    var d = try diff.parse(alloc, "");
+    defer d.deinit();
+    try std.testing.expect(confirmNext(.approve, false, true, &review, &d, &.{}, 0, false) == .approve);
+    try std.testing.expect(confirmNext(.approve, false, false, &review, &d, &.{}, 0, false) == .close);
 }

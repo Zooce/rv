@@ -46,8 +46,9 @@ pub const Command = union(enum) {
     @"export": ExportOpts,
 };
 
-/// Where the TUI diff came from. Same type as `store.Source` (comments record it).
-pub const Source = store.Source;
+/// Where the TUI diff came from (`local` / range / commit). Comments store
+/// the same shape as `store.Source`.
+pub const Source = git.Origin;
 
 /// Status-strip text for `source`. `empty` is a clean worktree (no local
 /// changes), not an approved-only hide. Local is `HEAD`; an explicit range
