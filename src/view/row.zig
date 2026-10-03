@@ -1,8 +1,10 @@
-//! Display row model: flatten a parsed `Diff` into `[]Row`. A row answers
-//! kind, searchable text, and commentable location. Pure data — no TTY.
+//! Display row model: flatten a parsed `Diff` into `[]Row`. `flattenPlaced`
+//! drops lines an approved claim covers. A row answers kind, searchable
+//! text, and commentable location. Pure data — no TTY.
 
 const std = @import("std");
 const diff = @import("diff");
+const approve = @import("approve");
 const Allocator = std.mem.Allocator;
 
 /// File-header payload. `path` is identity (`File.displayPath()`). `old_path`
@@ -64,7 +66,7 @@ pub const CommentSide = enum { old, new };
 /// Otherwise it is one flag per hunk in `f.hunks`; false omits that hunk.
 /// `omit_lines == null` keeps every line of a kept hunk. Otherwise one slice
 /// per hunk; a true bit skips that line. The caller skips a file that should
-/// not appear at all. `flatten` and approved omission both call this, so a
+/// not appear at all. `flatten` and `flattenPlaced` both call this, so a
 /// line row is built once.
 pub fn appendFile(
     alloc: Allocator,
@@ -128,6 +130,91 @@ pub fn flatten(alloc: Allocator, d: *const diff.Diff) Allocator.Error![]Row {
     var prev_group: ?diff.Group = null;
     for (d.files) |f| {
         try appendFile(alloc, &rows, f, &prev_group, null, null);
+    }
+    return try rows.toOwnedSlice(alloc);
+}
+
+/// Rows for `d` with `placed` claims removed. `placed` is `approve.place`
+/// (file, then hunk, then the run's first line). A null span drops that
+/// hunk. A hunk whose add and delete lines are all claimed is dropped, then
+/// a file with nothing left, then an empty section. A partial claim leaves
+/// the hunk header, context, and the other changes. Same row shape as `flatten`.
+pub fn flattenPlaced(
+    alloc: Allocator,
+    d: *const diff.Diff,
+    placed: []const approve.Placement,
+) Allocator.Error![]Row {
+    var rows: std.ArrayList(Row) = .empty;
+    errdefer rows.deinit(alloc);
+    var prev_group: ?diff.Group = null;
+    var pi: usize = 0;
+
+    for (d.files, 0..) |f, fi| {
+        while (pi < placed.len and placed[pi].file_i < fi) pi += 1;
+        const begin = pi;
+        while (pi < placed.len and placed[pi].file_i == fi) pi += 1;
+        const file_places = placed[begin..pi];
+
+        // A claimed hunk-less file does not appear.
+        if (f.hunks.len == 0) {
+            if (file_places.len > 0) continue;
+            try appendFile(alloc, &rows, f, &prev_group, null, null);
+            continue;
+        }
+
+        const keep = try alloc.alloc(bool, f.hunks.len);
+        defer alloc.free(keep);
+        @memset(keep, true);
+
+        const masks = try alloc.alloc([]bool, f.hunks.len);
+        defer alloc.free(masks);
+        var allocated: usize = 0;
+        defer for (masks[0..allocated]) |m| alloc.free(m);
+        for (f.hunks, 0..) |h, hi| {
+            masks[hi] = try alloc.alloc(bool, h.lines.len);
+            allocated += 1;
+            @memset(masks[hi], false);
+        }
+
+        // Mark claimed lines. A null span drops the whole hunk.
+        for (file_places) |p| {
+            const hi = p.hunk_i orelse continue;
+            if (p.span == null) {
+                keep[hi] = false;
+                continue;
+            }
+            p.mark(masks[hi], f.hunks[hi].lines);
+        }
+
+        // Drop a hunk only when every add/delete line is claimed. A context-only
+        // hunk stays unless its own tag-only hash was claimed above.
+        for (f.hunks, 0..) |h, hi| {
+            if (!keep[hi]) continue;
+            var changes: usize = 0;
+            var visible: usize = 0;
+            for (h.lines, 0..) |ln, li| {
+                switch (ln.kind) {
+                    .add, .delete => {
+                        changes += 1;
+                        if (!masks[hi][li]) visible += 1;
+                    },
+                    .context, .meta => {},
+                }
+            }
+            if (changes > 0 and visible == 0) keep[hi] = false;
+        }
+
+        var any = false;
+        for (keep) |k| if (k) {
+            any = true;
+            break;
+        };
+        if (!any) continue;
+
+        const omit = try alloc.alloc([]const bool, f.hunks.len);
+        defer alloc.free(omit);
+        for (masks, 0..) |m, hi| omit[hi] = m;
+        try appendFile(alloc, &rows, f, &prev_group, keep, omit);
     }
     return try rows.toOwnedSlice(alloc);
 }
@@ -541,4 +628,370 @@ test "rowPathMatches rename hits old new and label" {
     try testing.expect(rowPathMatches(rows[0], "old_name.txt -> new_name.txt"));
     try testing.expect(!rowPathMatches(rows[0], "oldBody"));
     try testing.expect(!rowPathMatches(rows[2], "old_name"));
+}
+
+const builtin = @import("builtin");
+const IsolatedTmp = if (builtin.is_test) @import("isolated_tmp").IsolatedTmp else void;
+
+fn rowsFor(
+    alloc: Allocator,
+    root: std.Io.Dir,
+    d: *const diff.Diff,
+    approved: *const approve.Approved,
+) ![]Row {
+    const placed = try approve.place(alloc, testing.io, root, d, approved);
+    defer alloc.free(placed);
+    return flattenPlaced(alloc, d, placed);
+}
+
+fn twoHunkDiff(alloc: Allocator) !diff.Diff {
+    const txt =
+        \\diff --git a/f.txt b/f.txt
+        \\--- a/f.txt
+        \\+++ b/f.txt
+        \\@@ -1 +1 @@
+        \\-old
+        \\+new
+        \\@@ -10 +10 @@
+        \\-old2
+        \\+new2
+    ;
+    var d = try diff.parse(alloc, txt);
+    errdefer d.deinit();
+    try testing.expectEqual(1, d.files.len);
+    try testing.expectEqual(2, d.files[0].hunks.len);
+    return d;
+}
+
+fn threeGroupDiff(alloc: Allocator) !diff.Diff {
+    const unstaged_txt =
+        \\diff --git a/a b/a
+        \\--- a/a
+        \\+++ b/a
+        \\@@ -1 +1 @@
+        \\-old
+        \\+new
+    ;
+    const untracked_txt =
+        \\diff --git a/u b/u
+        \\new file mode 100644
+        \\--- /dev/null
+        \\+++ b/u
+        \\@@ -0,0 +1 @@
+        \\+hi
+    ;
+    const staged_txt =
+        \\diff --git a/a b/a
+        \\--- a/a
+        \\+++ b/a
+        \\@@ -1 +1,2 @@
+        \\ same
+        \\+staged
+    ;
+    return try diff.parsePieces(alloc, &.{
+        .{ .text = unstaged_txt, .group = .unstaged },
+        .{ .text = untracked_txt, .group = .untracked },
+        .{ .text = staged_txt, .group = .staged },
+    });
+}
+
+fn lineHas(rows: []const Row, text: []const u8) bool {
+    for (rows) |row| {
+        switch (row) {
+            .line => |ln| if (std.mem.eql(u8, ln.text, text)) return true,
+            else => {},
+        }
+    }
+    return false;
+}
+
+fn mergedNeighborDiff() []const u8 {
+    return
+        \\diff --git a/f.txt b/f.txt
+        \\--- a/f.txt
+        \\+++ b/f.txt
+        \\@@ -5 +5 @@
+        \\-l5
+        \\+STAGED
+    ;
+}
+
+fn mergedPieceDiff() []const u8 {
+    return
+        \\diff --git a/f.txt b/f.txt
+        \\--- a/f.txt
+        \\+++ b/f.txt
+        \\@@ -6 +6 @@
+        \\-l6
+        \\+UNSTAGED
+    ;
+}
+
+fn mergedHunkDiff() []const u8 {
+    return
+        \\diff --git a/f.txt b/f.txt
+        \\--- a/f.txt
+        \\+++ b/f.txt
+        \\@@ -4,5 +4,5 @@
+        \\ l4
+        \\-l5
+        \\-l6
+        \\+STAGED
+        \\+UNSTAGED
+        \\ l7
+    ;
+}
+
+fn parseOneHunk(input: []const u8) !diff.Diff {
+    var d = try diff.parse(testing.allocator, input);
+    errdefer d.deinit();
+    try testing.expectEqual(1, d.files.len);
+    try testing.expectEqual(1, d.files[0].hunks.len);
+    return d;
+}
+
+test "flattenPlaced with an empty store matches flatten" {
+    var d = try twoHunkDiff(testing.allocator);
+    defer d.deinit();
+    var approved = approve.initEmpty(testing.allocator);
+    defer approved.deinit();
+    const hidden = try rowsFor(testing.allocator, .cwd(), &d, &approved);
+    defer testing.allocator.free(hidden);
+    const full = try flatten(testing.allocator, &d);
+    defer testing.allocator.free(full);
+    try testing.expectEqual(full.len, hidden.len);
+    for (full, hidden) |a, b| {
+        try testing.expectEqual(std.meta.activeTag(a), std.meta.activeTag(b));
+    }
+}
+
+test "flattenPlaced one hunk keeps the file and the other hunk" {
+    var d = try twoHunkDiff(testing.allocator);
+    defer d.deinit();
+    var approved = approve.initEmpty(testing.allocator);
+    defer approved.deinit();
+    try approved.append(d.files[0].displayPath(), approve.fingerprintHunk(d.files[0].hunks[0]));
+    const hidden = try rowsFor(testing.allocator, .cwd(), &d, &approved);
+    defer testing.allocator.free(hidden);
+    try testing.expectEqual(4, hidden.len);
+    try testing.expect(hidden[0] == .file_header);
+    try testing.expect(hidden[1] == .hunk_header);
+    try testing.expectEqual(d.files[0].hunks[1].old_start, hidden[1].hunk_header.old_start);
+    try testing.expect(hidden[2] == .line);
+    try testing.expectEqualStrings("old2", hidden[2].line.text);
+    try testing.expect(hidden[3] == .line);
+    try testing.expectEqualStrings("new2", hidden[3].line.text);
+}
+
+test "flattenPlaced omits an approved run and keeps the other changes" {
+    const alloc = testing.allocator;
+    var piece = try parseOneHunk(mergedPieceDiff());
+    defer piece.deinit();
+    var merged = try parseOneHunk(mergedHunkDiff());
+    defer merged.deinit();
+    const path = merged.files[0].displayPath();
+    const hash = approve.fingerprintHunk(piece.files[0].hunks[0]);
+
+    var approved = approve.initEmpty(alloc);
+    defer approved.deinit();
+    try approved.append(path, hash);
+
+    const hidden = try rowsFor(alloc, .cwd(), &merged, &approved);
+    defer alloc.free(hidden);
+    try testing.expectEqual(6, hidden.len);
+    try testing.expect(hidden[0] == .file_header);
+    try testing.expect(hidden[1] == .hunk_header);
+    try testing.expectEqualStrings("l4", hidden[2].line.text);
+    try testing.expectEqualStrings("l5", hidden[3].line.text);
+    try testing.expectEqualStrings("STAGED", hidden[4].line.text);
+    try testing.expectEqualStrings("l7", hidden[5].line.text);
+    try testing.expect(!lineHas(hidden, "UNSTAGED"));
+    try testing.expect(!lineHas(hidden, "l6"));
+}
+
+test "flattenPlaced drops a hunk when every change run is approved" {
+    const alloc = testing.allocator;
+    var neighbor = try parseOneHunk(mergedNeighborDiff());
+    defer neighbor.deinit();
+    var piece = try parseOneHunk(mergedPieceDiff());
+    defer piece.deinit();
+    var merged = try parseOneHunk(mergedHunkDiff());
+    defer merged.deinit();
+    const path = merged.files[0].displayPath();
+
+    var approved = approve.initEmpty(alloc);
+    defer approved.deinit();
+    try approved.append(path, approve.fingerprintHunk(piece.files[0].hunks[0]));
+    try approved.append(path, approve.fingerprintHunk(neighbor.files[0].hunks[0]));
+
+    const hidden = try rowsFor(alloc, .cwd(), &merged, &approved);
+    defer alloc.free(hidden);
+    try testing.expectEqual(0, hidden.len);
+}
+
+test "flattenPlaced keeps a replacement that no longer matches" {
+    const alloc = testing.allocator;
+    const was =
+        \\diff --git a/f.txt b/f.txt
+        \\--- a/f.txt
+        \\+++ b/f.txt
+        \\@@ -1 +1 @@
+        \\-old
+        \\+new
+    ;
+    const now =
+        \\diff --git a/f.txt b/f.txt
+        \\--- a/f.txt
+        \\+++ b/f.txt
+        \\@@ -1 +1 @@
+        \\-old
+        \\+newer
+    ;
+    var dw = try parseOneHunk(was);
+    defer dw.deinit();
+    var dn = try parseOneHunk(now);
+    defer dn.deinit();
+
+    var approved = approve.initEmpty(alloc);
+    defer approved.deinit();
+    try approved.append(dn.files[0].displayPath(), approve.fingerprintHunk(dw.files[0].hunks[0]));
+
+    const hidden = try rowsFor(alloc, .cwd(), &dn, &approved);
+    defer alloc.free(hidden);
+    try testing.expect(lineHas(hidden, "old"));
+    try testing.expect(lineHas(hidden, "newer"));
+    try testing.expect(!lineHas(hidden, "new"));
+}
+
+test "flattenPlaced drops a file when every hunk is approved" {
+    var d = try twoHunkDiff(testing.allocator);
+    defer d.deinit();
+    var approved = approve.initEmpty(testing.allocator);
+    defer approved.deinit();
+    try approved.append(d.files[0].displayPath(), approve.fingerprintHunk(d.files[0].hunks[0]));
+    try approved.append(d.files[0].displayPath(), approve.fingerprintHunk(d.files[0].hunks[1]));
+    const hidden = try rowsFor(testing.allocator, .cwd(), &d, &approved);
+    defer testing.allocator.free(hidden);
+    try testing.expectEqual(0, hidden.len);
+}
+
+test "flattenPlaced drops an empty section and keeps a mixed file" {
+    var d = try threeGroupDiff(testing.allocator);
+    defer d.deinit();
+    var approved = approve.initEmpty(testing.allocator);
+    defer approved.deinit();
+    try approved.append("a", approve.fingerprintHunk(d.files[0].hunks[0]));
+    try approved.append("u", approve.fingerprintHunk(d.files[1].hunks[0]));
+    const hidden = try rowsFor(testing.allocator, .cwd(), &d, &approved);
+    defer testing.allocator.free(hidden);
+    try testing.expect(hidden[0] == .section_header);
+    try testing.expectEqual(diff.Group.staged, hidden[0].section_header);
+    try testing.expect(hidden[1] == .file_header);
+    try testing.expectEqualStrings("a", hidden[1].file_header.path);
+    try testing.expect(hidden[2] == .hunk_header);
+}
+
+test "flattenPlaced one store entry hides the first matching file only" {
+    const txt =
+        \\diff --git a/f.txt b/f.txt
+        \\--- a/f.txt
+        \\+++ b/f.txt
+        \\@@ -1 +1 @@
+        \\-old
+        \\+new
+    ;
+    var d = try diff.parsePieces(testing.allocator, &.{
+        .{ .text = txt, .group = .unstaged },
+        .{ .text = txt, .group = .staged },
+    });
+    defer d.deinit();
+    var approved = approve.initEmpty(testing.allocator);
+    defer approved.deinit();
+    try approved.append("f.txt", approve.fingerprintHunk(d.files[0].hunks[0]));
+    const hidden = try rowsFor(testing.allocator, .cwd(), &d, &approved);
+    defer testing.allocator.free(hidden);
+    try testing.expect(hidden[0] == .section_header);
+    try testing.expectEqual(diff.Group.staged, hidden[0].section_header);
+    try testing.expect(hidden[1] == .file_header);
+}
+
+test "flattenPlaced drops a hunk-less file when worktree bytes match" {
+    if (builtin.os.tag == .wasi) return;
+    const alloc = testing.allocator;
+    const io = testing.io;
+    var tmp = try IsolatedTmp.init(alloc, io);
+    defer tmp.deinit(alloc, io);
+    try tmp.write(io, "pic.png", "abc");
+    const binary =
+        \\diff --git a/pic.png b/pic.png
+        \\Binary files a/pic.png and b/pic.png differ
+    ;
+    var d = try diff.parse(alloc, binary);
+    defer d.deinit();
+    var approved = approve.initEmpty(alloc);
+    defer approved.deinit();
+    try approved.append("pic.png", approve.fingerprintFile("abc"));
+    const hidden = try rowsFor(alloc, tmp.dir, &d, &approved);
+    defer alloc.free(hidden);
+    try testing.expectEqual(0, hidden.len);
+}
+
+test "flattenPlaced approving one group leaves the other groups" {
+    const alloc = testing.allocator;
+    const io = testing.io;
+    var d = try threeGroupDiff(alloc);
+    defer d.deinit();
+    var approved = approve.initEmpty(alloc);
+    defer approved.deinit();
+    try approved.appendGroup(alloc, io, .cwd(), &d, .unstaged);
+    const hidden = try rowsFor(alloc, .cwd(), &d, &approved);
+    defer alloc.free(hidden);
+    try testing.expect(hidden[0] == .section_header);
+    try testing.expectEqual(diff.Group.untracked, hidden[0].section_header);
+}
+
+test "flattenPlaced after unapprove restores one hunk" {
+    const alloc = testing.allocator;
+    var d = try twoHunkDiff(alloc);
+    defer d.deinit();
+    const path = d.files[0].displayPath();
+    const h0 = approve.fingerprintHunk(d.files[0].hunks[0]);
+    const h1 = approve.fingerprintHunk(d.files[0].hunks[1]);
+    var approved = approve.initEmpty(alloc);
+    defer approved.deinit();
+    try approved.append(path, h0);
+    try approved.append(path, h1);
+    try approved.unapprove(path, h0);
+    const rows = try rowsFor(alloc, .cwd(), &d, &approved);
+    defer alloc.free(rows);
+    try testing.expectEqual(4, rows.len);
+    try testing.expectEqual(d.files[0].hunks[0].old_start, rows[1].hunk_header.old_start);
+}
+
+test "flattenPlaced identical hunks: unapprove restores the later hunk" {
+    const alloc = testing.allocator;
+    const txt =
+        \\diff --git a/f.txt b/f.txt
+        \\--- a/f.txt
+        \\+++ b/f.txt
+        \\@@ -1 +1 @@
+        \\-a
+        \\+b
+        \\@@ -10 +10 @@
+        \\-a
+        \\+b
+    ;
+    var d = try diff.parse(alloc, txt);
+    defer d.deinit();
+    const path = d.files[0].displayPath();
+    const hash = approve.fingerprintHunk(d.files[0].hunks[0]);
+    var approved = approve.initEmpty(alloc);
+    defer approved.deinit();
+    try approved.append(path, hash);
+    try approved.append(path, hash);
+    try approved.unapprove(path, hash);
+    const rows = try rowsFor(alloc, .cwd(), &d, &approved);
+    defer alloc.free(rows);
+    try testing.expectEqual(4, rows.len);
+    try testing.expectEqual(d.files[0].hunks[1].old_start, rows[1].hunk_header.old_start);
 }

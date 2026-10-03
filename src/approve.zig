@@ -12,17 +12,15 @@
 //! consumed once. `unapprove` removes one match; `prune` drops entries that
 //! cannot be placed. Group is not part of identity.
 //!
-//! Local load hides those runs: a hunk with no add/delete lines left is
-//! dropped, then a file with nothing left, then an empty section. A partial
-//! match leaves the hunk header, context, and the other changes. Hunk-less
-//! files hash worktree bytes; unreadable files stay visible.
+//! `place` reports each consumed entry: file, hunk, and the claimed line
+//! span. A null span is the whole hunk (context-only) or a hunk-less file.
+//! Hunk-less files hash worktree bytes; unreadable files are not placed.
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 const ArenaAllocator = std.heap.ArenaAllocator;
 const Io = std.Io;
 const diff = @import("diff");
-const view = @import("view");
 const Sha256 = std.crypto.hash.sha2.Sha256;
 
 pub const Hash = [Sha256.digest_length]u8;
@@ -258,14 +256,14 @@ fn stringify(self: *const Approved, alloc: Allocator) Allocator.Error![]u8 {
 
 const hunkless_max = 8 * 1024 * 1024;
 
-/// Worktree bytes for a hunk-less file, or `null` if missing/unreadable/too big.
-fn hunklessHash(alloc: Allocator, io: Io, root: Io.Dir, file: diff.File) ?Hash {
+/// Worktree bytes for a hunk-less file, or `null` if missing, unreadable, or too big.
+pub fn hunklessHash(alloc: Allocator, io: Io, root: Io.Dir, file: diff.File) ?Hash {
     const bytes = root.readFileAlloc(io, file.displayPath(), alloc, .limited(hunkless_max)) catch return null;
     defer alloc.free(bytes);
     return fingerprintFile(bytes);
 }
 
-const Placement = struct {
+pub const Placement = struct {
     entry_i: usize,
     file_i: usize,
     /// Null for a hunk-less file.
@@ -277,6 +275,13 @@ const Placement = struct {
     /// Addition side, when git placed it after the other change's lines.
     add_span: ?[2]usize = null,
     preview: []const u8,
+
+    /// Set `bits` for this claim's add/delete lines. A null `span` marks
+    /// nothing; the caller drops that whole hunk or hunk-less file.
+    pub fn mark(self: Placement, bits: []bool, lines: []const diff.Line) void {
+        const span = self.span orelse return;
+        markClaim(bits, lines, span, self.add_span);
+    }
 };
 
 fn markKind(bits: []bool, lines: []const diff.Line, span: [2]usize, kind: diff.LineKind) void {
@@ -514,7 +519,9 @@ fn earliest(
     return best;
 }
 
-fn hunkContains(hunk: diff.Hunk, hash: Hash) bool {
+/// True when `hash` is this hunk, a contiguous run inside it, or a regrouped
+/// deletion/addition pair inside it.
+pub fn hunkContains(hunk: diff.Hunk, hash: Hash) bool {
     var changes: usize = 0;
     for (hunk.lines) |ln| {
         switch (ln.kind) {
@@ -527,9 +534,10 @@ fn hunkContains(hunk: diff.Hunk, hash: Hash) bool {
     return firstRegrouped(hunk.lines, null, hash) != null;
 }
 
-/// Where each entry sits in `d`. Order is file, then hunk, then the run's
-/// first line. One entry is used once. `preview` borrows from `d`.
-fn place(
+/// Where each consumed entry sits in `d`. Order is file, then hunk, then
+/// the run's first line. One entry is used once. `preview` borrows from `d`.
+/// Caller frees the slice.
+pub fn place(
     alloc: Allocator,
     io: Io,
     root: Io.Dir,
@@ -686,227 +694,12 @@ pub fn collectApproved(
     return try list.toOwnedSlice(alloc);
 }
 
-/// First flatten row of this identity (hunk header, or file header if hunk-less).
-pub fn rowForIdentity(
-    rows: []const view.row.Row,
-    d: *const diff.Diff,
-    path: []const u8,
-    hash: Hash,
-    kind: Hidden.Kind,
-) ?usize {
-    var cur_path: []const u8 = "";
-    var cur_group: ?diff.Group = null;
-    for (rows, 0..) |item, i| {
-        switch (item) {
-            .file_header => |fh| {
-                cur_path = fh.path;
-                cur_group = fh.group;
-                if (kind == .hunk) continue;
-                if (!std.mem.eql(u8, fh.path, path)) continue;
-                const file = fileAt(d, fh.path, fh.group) orelse continue;
-                if (file.hunks.len == 0) return i;
-            },
-            .hunk_header => |hh| {
-                if (kind != .hunk) continue;
-                if (!std.mem.eql(u8, cur_path, path)) continue;
-                const file = fileAt(d, cur_path, cur_group) orelse continue;
-                const hi = hunkAt(file.*, hh.old_start, hh.new_start) orelse continue;
-                if (hunkContains(file.hunks[hi], hash)) return i;
-            },
-            .section_header, .line => {},
-        }
-    }
-    return null;
-}
-
-/// Hunk (or hunk-less file) that owns `row_i`. A file-header row of a file
-/// with hunks is the first hunk — used when the whole file is hidden.
-pub fn identityAtRow(
-    alloc: Allocator,
-    d: *const diff.Diff,
-    io: Io,
-    root: Io.Dir,
-    rows: []const view.row.Row,
-    row_i: usize,
-) ?Hidden {
-    if (rows.len == 0) return null;
-    const start = if (row_i >= rows.len) rows.len - 1 else row_i;
-    var i = start;
-    while (true) {
-        switch (rows[i]) {
-            .hunk_header => |hh| {
-                const file = blk: {
-                    var j = i;
-                    while (j > 0) {
-                        j -= 1;
-                        switch (rows[j]) {
-                            .file_header => |fh| break :blk fileAt(d, fh.path, fh.group),
-                            else => {},
-                        }
-                    }
-                    break :blk null;
-                } orelse return null;
-                const hi = hunkAt(file.*, hh.old_start, hh.new_start) orelse return null;
-                return .{
-                    .path = file.displayPath(),
-                    .hash = fingerprintHunk(file.hunks[hi].identityHunks()[0]),
-                    .group = file.group,
-                    .kind = .hunk,
-                    .preview = "",
-                };
-            },
-            .file_header => |fh| {
-                const file = fileAt(d, fh.path, fh.group) orelse return null;
-                if (file.hunks.len == 0) {
-                    const hash = hunklessHash(alloc, io, root, file.*) orelse return null;
-                    return .{
-                        .path = file.displayPath(),
-                        .hash = hash,
-                        .group = file.group,
-                        .kind = if (file.is_binary) .binary else .file,
-                        .preview = "",
-                    };
-                }
-                return .{
-                    .path = file.displayPath(),
-                    .hash = fingerprintHunk(file.hunks[0].identityHunks()[0]),
-                    .group = file.group,
-                    .kind = .hunk,
-                    .preview = "",
-                };
-            },
-            .section_header, .line => {
-                if (i == 0) return null;
-                i -= 1;
-            },
-        }
-    }
-}
-
-fn fileAt(d: *const diff.Diff, path: []const u8, group: ?diff.Group) ?*const diff.File {
-    for (d.files) |*f| {
-        if (f.group != group) continue;
-        if (std.mem.eql(u8, f.displayPath(), path)) return f;
-    }
-    return null;
-}
-
-/// Rows for `d` with approved add/delete runs removed. A hunk whose changes
-/// are all claimed is dropped, then a file with nothing left. File, hunk, and
-/// line rows come from `view.row.appendFile` (same builder as `flatten`).
-/// `root` is the worktree for hunk-less hashes.
-pub fn hide(
-    alloc: Allocator,
-    d: *const diff.Diff,
-    approved: *const Approved,
-    io: Io,
-    root: Io.Dir,
-) Allocator.Error![]view.row.Row {
-    const placed = try place(alloc, io, root, d, approved);
-    defer alloc.free(placed);
-
-    var rows: std.ArrayList(view.row.Row) = .empty;
-    errdefer rows.deinit(alloc);
-    var prev_group: ?diff.Group = null;
-    var pi: usize = 0;
-
-    for (d.files, 0..) |f, fi| {
-        while (pi < placed.len and placed[pi].file_i < fi) pi += 1;
-        const begin = pi;
-        while (pi < placed.len and placed[pi].file_i == fi) pi += 1;
-        const file_places = placed[begin..pi];
-
-        if (f.hunks.len == 0) {
-            if (file_places.len > 0) continue;
-            try view.row.appendFile(alloc, &rows, f, &prev_group, null, null);
-            continue;
-        }
-
-        const keep = try alloc.alloc(bool, f.hunks.len);
-        defer alloc.free(keep);
-        @memset(keep, true);
-
-        const masks = try alloc.alloc([]bool, f.hunks.len);
-        defer alloc.free(masks);
-        var allocated: usize = 0;
-        defer for (masks[0..allocated]) |m| alloc.free(m);
-        for (f.hunks, 0..) |h, hi| {
-            masks[hi] = try alloc.alloc(bool, h.lines.len);
-            allocated += 1;
-            @memset(masks[hi], false);
-        }
-
-        for (file_places) |p| {
-            const hi = p.hunk_i orelse continue;
-            const span = p.span orelse {
-                keep[hi] = false;
-                continue;
-            };
-            markClaim(masks[hi], f.hunks[hi].lines, span, p.add_span);
-        }
-
-        // Drop a hunk only when every add/delete line is claimed. A context-only
-        // hunk stays unless its own tag-only hash was claimed above.
-        for (f.hunks, 0..) |h, hi| {
-            if (!keep[hi]) continue;
-            var changes: usize = 0;
-            var visible: usize = 0;
-            for (h.lines, 0..) |ln, li| {
-                switch (ln.kind) {
-                    .add, .delete => {
-                        changes += 1;
-                        if (!masks[hi][li]) visible += 1;
-                    },
-                    .context, .meta => {},
-                }
-            }
-            if (changes > 0 and visible == 0) keep[hi] = false;
-        }
-
-        var any = false;
-        for (keep) |k| if (k) {
-            any = true;
-            break;
-        };
-        if (!any) continue;
-
-        const omit = try alloc.alloc([]const bool, f.hunks.len);
-        defer alloc.free(omit);
-        for (masks, 0..) |m, hi| omit[hi] = m;
-        try view.row.appendFile(alloc, &rows, f, &prev_group, keep, omit);
-    }
-    return try rows.toOwnedSlice(alloc);
-}
-
-/// Unapproved flatten plus how many store entries remain after prune.
-pub const Visible = struct {
-    rows: []view.row.Row,
-    approved_n: usize,
-};
-
 /// 0-based hunk in `file` with these `@@` starts, or `null` if none.
 pub fn hunkAt(file: diff.File, old_start: u32, new_start: u32) ?usize {
     for (file.hunks, 0..) |h, i| {
         if (h.old_start == old_start and h.new_start == new_start) return i;
     }
     return null;
-}
-
-/// Load `.rv/approved.json`, prune against `d`, persist if the set shrank,
-/// flatten without approved hunks. `approved_n` is remaining live matches.
-pub fn loadVisible(alloc: Allocator, io: Io, root: Io.Dir, d: *const diff.Diff) LoadError!Visible {
-    var approved = try load(alloc, io, root);
-    defer approved.deinit();
-    const before = approved.entries.items.len;
-    try approved.prune(alloc, io, root, d);
-    if (approved.entries.items.len != before) {
-        save(&approved, alloc, io, root) catch |err| switch (err) {
-            error.OutOfMemory => return error.OutOfMemory,
-            else => {},
-        };
-    }
-    const rows = try hide(alloc, d, &approved, io, root);
-    return .{ .rows = rows, .approved_n = approved.entries.items.len };
 }
 
 const testing = std.testing;
@@ -1120,9 +913,20 @@ test "approving a merged expand hunk takes the original hunks after reload" {
     try approved.prune(alloc, io, .cwd(), &d);
     try testing.expectEqual(2, approved.entries.items.len);
 
-    const hidden = try hide(alloc, &d, &approved, io, .cwd());
-    defer alloc.free(hidden);
-    try testing.expectEqual(0, hidden.len);
+    const placed = try place(alloc, io, .cwd(), &d, &approved);
+    defer alloc.free(placed);
+    try testing.expectEqual(2, placed.len);
+    const lines = d.files[0].hunks[0].lines;
+    const bits = try alloc.alloc(bool, lines.len);
+    defer alloc.free(bits);
+    @memset(bits, false);
+    for (placed) |p| p.mark(bits, lines);
+    for (lines, bits) |ln, bit| {
+        switch (ln.kind) {
+            .add, .delete => try testing.expect(bit),
+            .context, .meta => {},
+        }
+    }
 
     var reload = try diff.parse(alloc, split);
     defer reload.deinit();
@@ -1396,51 +1200,6 @@ fn threeGroupDiff(alloc: Allocator) !diff.Diff {
     });
 }
 
-test "hide with empty store matches flatten" {
-    const io = testing.io;
-    var d = try twoHunkDiff(testing.allocator);
-    defer d.deinit();
-    var approved = initEmpty(testing.allocator);
-    defer approved.deinit();
-    const hidden = try hide(testing.allocator, &d, &approved, io, .cwd());
-    defer testing.allocator.free(hidden);
-    const full = try view.row.flatten(testing.allocator, &d);
-    defer testing.allocator.free(full);
-    try testing.expectEqual(full.len, hidden.len);
-    for (full, hidden) |a, b| {
-        try testing.expectEqual(std.meta.activeTag(a), std.meta.activeTag(b));
-    }
-}
-
-test "hide one hunk keeps the file and the other hunk" {
-    const io = testing.io;
-    var d = try twoHunkDiff(testing.allocator);
-    defer d.deinit();
-    var approved = initEmpty(testing.allocator);
-    defer approved.deinit();
-    try approved.append(d.files[0].displayPath(), fingerprintHunk(d.files[0].hunks[0]));
-    const hidden = try hide(testing.allocator, &d, &approved, io, .cwd());
-    defer testing.allocator.free(hidden);
-    try testing.expectEqual(4, hidden.len);
-    try testing.expect(hidden[0] == .file_header);
-    try testing.expect(hidden[1] == .hunk_header);
-    try testing.expectEqual(d.files[0].hunks[1].old_start, hidden[1].hunk_header.old_start);
-    try testing.expect(hidden[2] == .line);
-    try testing.expectEqualStrings("old2", hidden[2].line.text);
-    try testing.expect(hidden[3] == .line);
-    try testing.expectEqualStrings("new2", hidden[3].line.text);
-}
-
-fn hiddenHas(rows: []const view.row.Row, text: []const u8) bool {
-    for (rows) |row| {
-        switch (row) {
-            .line => |ln| if (std.mem.eql(u8, ln.text, text)) return true,
-            else => {},
-        }
-    }
-    return false;
-}
-
 fn mergedNeighborDiff() []const u8 {
     return
         \\diff --git a/f.txt b/f.txt
@@ -1478,7 +1237,7 @@ fn mergedHunkDiff() []const u8 {
     ;
 }
 
-test "hide omits an approved run and keeps the other changes in the hunk" {
+test "collectApproved preview is the claimed run inside a merged hunk" {
     const io = testing.io;
     const alloc = testing.allocator;
     var piece = try parseOneHunk(mergedPieceDiff());
@@ -1492,18 +1251,6 @@ test "hide omits an approved run and keeps the other changes in the hunk" {
     defer approved.deinit();
     try approved.append(path, hash);
 
-    const hidden = try hide(alloc, &merged, &approved, io, .cwd());
-    defer alloc.free(hidden);
-    try testing.expectEqual(6, hidden.len);
-    try testing.expect(hidden[0] == .file_header);
-    try testing.expect(hidden[1] == .hunk_header);
-    try testing.expectEqualStrings("l4", hidden[2].line.text);
-    try testing.expectEqualStrings("l5", hidden[3].line.text);
-    try testing.expectEqualStrings("STAGED", hidden[4].line.text);
-    try testing.expectEqualStrings("l7", hidden[5].line.text);
-    try testing.expect(!hiddenHas(hidden, "UNSTAGED"));
-    try testing.expect(!hiddenHas(hidden, "l6"));
-
     try approved.prune(alloc, io, .cwd(), &merged);
     try testing.expectEqual(1, approved.entries.items.len);
     try testing.expectEqual(hash, approved.entries.items[0].hash);
@@ -1512,10 +1259,9 @@ test "hide omits an approved run and keeps the other changes in the hunk" {
     defer alloc.free(items);
     try testing.expectEqual(1, items.len);
     try testing.expectEqualStrings("l6", items[0].preview);
-    try testing.expectEqual(1, rowForIdentity(hidden, &merged, path, hash, .hunk).?);
 }
 
-test "hide drops a merged hunk when every change run is approved" {
+test "collectApproved lists regrouped runs in file order" {
     const io = testing.io;
     const alloc = testing.allocator;
     var neighbor = try parseOneHunk(mergedNeighborDiff());
@@ -1538,15 +1284,11 @@ test "hide drops a merged hunk when every change run is approved" {
     try testing.expectEqualStrings("l5", items[0].preview);
     try testing.expectEqualStrings("l6", items[1].preview);
 
-    const hidden = try hide(alloc, &merged, &approved, io, .cwd());
-    defer alloc.free(hidden);
-    try testing.expectEqual(0, hidden.len);
-
     try approved.prune(alloc, io, .cwd(), &merged);
     try testing.expectEqual(2, approved.entries.items.len);
 }
 
-test "a replacement that no longer matches is not hidden" {
+test "a replacement that no longer matches is not placed" {
     const io = testing.io;
     const alloc = testing.allocator;
     const was =
@@ -1575,48 +1317,17 @@ test "a replacement that no longer matches is not hidden" {
     defer approved.deinit();
     try approved.append(path, fingerprintHunk(dw.files[0].hunks[0]));
 
-    const hidden = try hide(alloc, &dn, &approved, io, .cwd());
-    defer alloc.free(hidden);
-    try testing.expect(hiddenHas(hidden, "old"));
-    try testing.expect(hiddenHas(hidden, "newer"));
-    try testing.expect(!hiddenHas(hidden, "new"));
+    const placed = try place(alloc, io, .cwd(), &dn, &approved);
+    defer alloc.free(placed);
+    try testing.expectEqual(0, placed.len);
 
     try approved.prune(alloc, io, .cwd(), &dn);
     try testing.expectEqual(0, approved.entries.items.len);
 }
 
-test "hide all hunks of a file drops the file header" {
+test "one store entry places the first matching file only" {
     const io = testing.io;
-    var d = try twoHunkDiff(testing.allocator);
-    defer d.deinit();
-    var approved = initEmpty(testing.allocator);
-    defer approved.deinit();
-    try approved.append(d.files[0].displayPath(), fingerprintHunk(d.files[0].hunks[0]));
-    try approved.append(d.files[0].displayPath(), fingerprintHunk(d.files[0].hunks[1]));
-    const hidden = try hide(testing.allocator, &d, &approved, io, .cwd());
-    defer testing.allocator.free(hidden);
-    try testing.expectEqual(0, hidden.len);
-}
-
-test "hide drops an empty section and keeps a mixed file" {
-    const io = testing.io;
-    var d = try threeGroupDiff(testing.allocator);
-    defer d.deinit();
-    var approved = initEmpty(testing.allocator);
-    defer approved.deinit();
-    try approved.append("a", fingerprintHunk(d.files[0].hunks[0]));
-    try approved.append("u", fingerprintHunk(d.files[1].hunks[0]));
-    const hidden = try hide(testing.allocator, &d, &approved, io, .cwd());
-    defer testing.allocator.free(hidden);
-    try testing.expect(hidden[0] == .section_header);
-    try testing.expectEqual(diff.Group.staged, hidden[0].section_header);
-    try testing.expect(hidden[1] == .file_header);
-    try testing.expectEqualStrings("a", hidden[1].file_header.path);
-    try testing.expect(hidden[2] == .hunk_header);
-}
-
-test "one store entry hides the first matching live hunk only" {
-    const io = testing.io;
+    const alloc = testing.allocator;
     const txt =
         \\diff --git a/f.txt b/f.txt
         \\--- a/f.txt
@@ -1625,22 +1336,21 @@ test "one store entry hides the first matching live hunk only" {
         \\-old
         \\+new
     ;
-    var d = try diff.parsePieces(testing.allocator, &.{
+    var d = try diff.parsePieces(alloc, &.{
         .{ .text = txt, .group = .unstaged },
         .{ .text = txt, .group = .staged },
     });
     defer d.deinit();
-    var approved = initEmpty(testing.allocator);
+    var approved = initEmpty(alloc);
     defer approved.deinit();
     try approved.append("f.txt", fingerprintHunk(d.files[0].hunks[0]));
-    const hidden = try hide(testing.allocator, &d, &approved, io, .cwd());
-    defer testing.allocator.free(hidden);
-    try testing.expect(hidden[0] == .section_header);
-    try testing.expectEqual(diff.Group.staged, hidden[0].section_header);
-    try testing.expect(hidden[1] == .file_header);
+    const placed = try place(alloc, io, .cwd(), &d, &approved);
+    defer alloc.free(placed);
+    try testing.expectEqual(1, placed.len);
+    try testing.expectEqual(0, placed[0].file_i);
 }
 
-test "hide hunk-less file when worktree bytes match" {
+test "place claims a hunk-less file when worktree bytes match" {
     if (builtin.os.tag == .wasi) return;
     const io = testing.io;
     const alloc = testing.allocator;
@@ -1656,12 +1366,13 @@ test "hide hunk-less file when worktree bytes match" {
     var approved = initEmpty(alloc);
     defer approved.deinit();
     try approved.append("pic.png", fingerprintFile("abc"));
-    const hidden = try hide(alloc, &d, &approved, io, tmp.dir);
-    defer alloc.free(hidden);
-    try testing.expectEqual(0, hidden.len);
+    const placed = try place(alloc, io, tmp.dir, &d, &approved);
+    defer alloc.free(placed);
+    try testing.expectEqual(1, placed.len);
+    try testing.expect(placed[0].hunk_i == null);
 }
 
-test "loadVisible prunes stale identities and reports approved_n" {
+test "save after prune drops a stale entry" {
     if (builtin.os.tag == .wasi) return;
     const io = testing.io;
     const alloc = testing.allocator;
@@ -1677,11 +1388,10 @@ test "loadVisible prunes stale identities and reports approved_n" {
     try approved.append("gone.txt", fingerprintFile("x"));
     try save(&approved, alloc, io, tmp.dir);
 
-    const vis = try loadVisible(alloc, io, tmp.dir, &d);
-    defer alloc.free(vis.rows);
-    try testing.expectEqual(1, vis.approved_n);
-    try testing.expectEqual(4, vis.rows.len);
-    try testing.expect(vis.rows[0] == .file_header);
+    var loaded = try load(alloc, io, tmp.dir);
+    defer loaded.deinit();
+    try loaded.prune(alloc, io, tmp.dir, &d);
+    try save(&loaded, alloc, io, tmp.dir);
 
     var reloaded = try load(alloc, io, tmp.dir);
     defer reloaded.deinit();
@@ -1708,32 +1418,34 @@ test "appendFile empty store adds every hunk" {
     try testing.expectEqual(2, approved.entries.items.len);
 }
 
-test "appendFile skips stored hunks and hide drops the rest" {
+test "appendFile skips stored hunks" {
     const io = testing.io;
-    var d = try twoHunkDiff(testing.allocator);
+    const alloc = testing.allocator;
+    var d = try twoHunkDiff(alloc);
     defer d.deinit();
-    var approved = initEmpty(testing.allocator);
+    var approved = initEmpty(alloc);
     defer approved.deinit();
     try approved.append(d.files[0].displayPath(), fingerprintHunk(d.files[0].hunks[0]));
-    try approved.appendFile(testing.allocator, io, .cwd(), d.files[0]);
+    try approved.appendFile(alloc, io, .cwd(), d.files[0]);
     try testing.expectEqual(2, approved.entries.items.len);
-    const hidden = try hide(testing.allocator, &d, &approved, io, .cwd());
-    defer testing.allocator.free(hidden);
-    try testing.expectEqual(0, hidden.len);
+    const placed = try place(alloc, io, .cwd(), &d, &approved);
+    defer alloc.free(placed);
+    try testing.expectEqual(2, placed.len);
 }
 
 test "appendGroup approves one group only" {
     const io = testing.io;
-    var d = try threeGroupDiff(testing.allocator);
+    const alloc = testing.allocator;
+    var d = try threeGroupDiff(alloc);
     defer d.deinit();
-    var approved = initEmpty(testing.allocator);
+    var approved = initEmpty(alloc);
     defer approved.deinit();
-    try approved.appendGroup(testing.allocator, io, .cwd(), &d, .unstaged);
+    try approved.appendGroup(alloc, io, .cwd(), &d, .unstaged);
     try testing.expectEqual(1, approved.entries.items.len);
-    const hidden = try hide(testing.allocator, &d, &approved, io, .cwd());
-    defer testing.allocator.free(hidden);
-    try testing.expect(hidden[0] == .section_header);
-    try testing.expectEqual(diff.Group.untracked, hidden[0].section_header);
+    const placed = try place(alloc, io, .cwd(), &d, &approved);
+    defer alloc.free(placed);
+    try testing.expectEqual(1, placed.len);
+    try testing.expectEqual(0, placed[0].file_i);
 }
 
 test "collectApproved empty store is empty" {
@@ -1804,57 +1516,6 @@ test "collectApproved identical hunks are a multiset" {
     try testing.expectEqualStrings("a", items[0].preview);
 }
 
-test "rowForIdentity after unapprove restores one hunk and leaves the other hidden" {
-    const io = testing.io;
-    const alloc = testing.allocator;
-    var d = try twoHunkDiff(alloc);
-    defer d.deinit();
-    const path = d.files[0].displayPath();
-    const h0 = fingerprintHunk(d.files[0].hunks[0]);
-    const h1 = fingerprintHunk(d.files[0].hunks[1]);
-    var approved = initEmpty(alloc);
-    defer approved.deinit();
-    try approved.append(path, h0);
-    try approved.append(path, h1);
-    try approved.unapprove(path, h0);
-    const rows = try hide(alloc, &d, &approved, io, .cwd());
-    defer alloc.free(rows);
-    try testing.expectEqual(4, rows.len);
-    try testing.expectEqual(1, rowForIdentity(rows, &d, path, h0, .hunk).?);
-    try testing.expect(rowForIdentity(rows, &d, path, h1, .hunk) == null);
-}
-
-test "rowForIdentity identical hunks: unapprove restores the unmatched live hunk" {
-    const io = testing.io;
-    const alloc = testing.allocator;
-    const txt =
-        \\diff --git a/f.txt b/f.txt
-        \\--- a/f.txt
-        \\+++ b/f.txt
-        \\@@ -1 +1 @@
-        \\-a
-        \\+b
-        \\@@ -10 +10 @@
-        \\-a
-        \\+b
-    ;
-    var d = try diff.parse(alloc, txt);
-    defer d.deinit();
-    const path = d.files[0].displayPath();
-    const hash = fingerprintHunk(d.files[0].hunks[0]);
-    var approved = initEmpty(alloc);
-    defer approved.deinit();
-    try approved.append(path, hash);
-    try approved.append(path, hash);
-    try approved.unapprove(path, hash);
-    const rows = try hide(alloc, &d, &approved, io, .cwd());
-    defer alloc.free(rows);
-    try testing.expectEqual(4, rows.len);
-    try testing.expectEqual(1, rowForIdentity(rows, &d, path, hash, .hunk).?);
-    // Remaining store entry still consumes the first live match.
-    try testing.expectEqual(d.files[0].hunks[1].old_start, rows[1].hunk_header.old_start);
-}
-
 test "collectApproved hunk-less binary" {
     if (builtin.os.tag == .wasi) return;
     const io = testing.io;
@@ -1877,74 +1538,4 @@ test "collectApproved hunk-less binary" {
     try testing.expectEqualStrings("pic.png", items[0].path);
     try testing.expectEqual(Hidden.Kind.binary, items[0].kind);
     try testing.expectEqualStrings("", items[0].preview);
-}
-
-test "identityAtRow hunk line and file header" {
-    const io = testing.io;
-    const alloc = testing.allocator;
-    var d = try twoHunkDiff(alloc);
-    defer d.deinit();
-    const full = try view.row.flatten(alloc, &d);
-    defer alloc.free(full);
-    const h0 = fingerprintHunk(d.files[0].hunks[0]);
-    const h1 = fingerprintHunk(d.files[0].hunks[1]);
-    // 0 file, 1 hunk0, 2 del, 3 add, 4 hunk1, 5 del, 6 add
-    const at_add = identityAtRow(alloc, &d, io, .cwd(), full, 3).?;
-    try testing.expectEqual(Hidden.Kind.hunk, at_add.kind);
-    try testing.expectEqual(h0, at_add.hash);
-    const at_file = identityAtRow(alloc, &d, io, .cwd(), full, 0).?;
-    try testing.expectEqual(h0, at_file.hash);
-    const at_h1 = identityAtRow(alloc, &d, io, .cwd(), full, 6).?;
-    try testing.expectEqual(h1, at_h1.hash);
-}
-
-test "identityAtRow then unapprove restores a hidden comment line" {
-    const io = testing.io;
-    const alloc = testing.allocator;
-    var d = try twoHunkDiff(alloc);
-    defer d.deinit();
-    const path = d.files[0].displayPath();
-    const loc: view.CommentLoc = .{ .path = path, .side = .new, .line = 1 };
-    const full = try view.row.flatten(alloc, &d);
-    defer alloc.free(full);
-    const full_row = view.rowForComment(full, loc).?;
-
-    var approved = initEmpty(alloc);
-    defer approved.deinit();
-    try approved.append(path, fingerprintHunk(d.files[0].hunks[0]));
-    const hidden = try hide(alloc, &d, &approved, io, .cwd());
-    defer alloc.free(hidden);
-    try testing.expect(view.rowForComment(hidden, loc) == null);
-
-    const item = identityAtRow(alloc, &d, io, .cwd(), full, full_row).?;
-    try approved.unapprove(item.path, item.hash);
-    const restored = try hide(alloc, &d, &approved, io, .cwd());
-    defer alloc.free(restored);
-    try testing.expectEqual(full_row, view.rowForComment(restored, loc).?);
-}
-
-test "search on hidden flatten misses approved hunk text" {
-    const io = testing.io;
-    const alloc = testing.allocator;
-    const txt =
-        \\diff --git a/f.txt b/f.txt
-        \\--- a/f.txt
-        \\+++ b/f.txt
-        \\@@ -1 +1 @@
-        \\-alpha
-        \\+beta
-        \\@@ -10 +10 @@
-        \\-gamma
-        \\+delta
-    ;
-    var d = try diff.parse(alloc, txt);
-    defer d.deinit();
-    var approved = initEmpty(alloc);
-    defer approved.deinit();
-    try approved.append(d.files[0].displayPath(), fingerprintHunk(d.files[0].hunks[0]));
-    const hidden = try hide(alloc, &d, &approved, io, .cwd());
-    defer alloc.free(hidden);
-    try testing.expect(view.search.firstMatch(hidden, "alpha", 0) == null);
-    try testing.expect(view.search.firstMatch(hidden, "beta", 0) == null);
-    try testing.expectEqual(2, view.search.firstMatch(hidden, "gamma", 0).?.index);
 }

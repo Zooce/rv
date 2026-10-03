@@ -110,10 +110,11 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
         .imports = &.{
             .{ .name = "diff", .module = diff_mod },
-            .{ .name = "view", .module = view_mod },
             .{ .name = "isolated_tmp", .module = isolated_tmp_mod },
         },
     });
+    view_mod.addImport("approve", approve_mod);
+    view_mod.addImport("isolated_tmp", isolated_tmp_mod);
 
     // Comment model + `.rv/reviews/` JSON store (MVP-1).
     const store_mod = b.addModule("store", .{

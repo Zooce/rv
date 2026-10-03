@@ -1137,13 +1137,58 @@ fn gitFailText(alloc: std.mem.Allocator, fail: []const u8, err: git.Error) std.m
     return try alloc.dupe(u8, git.errorMessage(err));
 }
 
+/// Unapproved rows plus how many store entries remain after prune.
+const Visible = struct {
+    rows: []view.row.Row,
+    approved_n: usize,
+};
+
+/// Rows for `d` with this store's claims removed.
+fn rowsForApproved(
+    alloc: std.mem.Allocator,
+    io: std.Io,
+    root: std.Io.Dir,
+    d: *const diff.Diff,
+    approved: *const approve.Approved,
+) std.mem.Allocator.Error![]view.row.Row {
+    const placed = try approve.place(alloc, io, root, d, approved);
+    defer alloc.free(placed);
+    return view.row.flattenPlaced(alloc, d, placed);
+}
+
+/// Load `.rv/approved.json`, drop entries that no longer match `d`, write
+/// the file when the set shrank, then build rows with the remaining claims
+/// removed. `approved_n` is how many entries remain.
+fn loadVisibleRows(
+    alloc: std.mem.Allocator,
+    io: std.Io,
+    root: std.Io.Dir,
+    d: *const diff.Diff,
+) approve.LoadError!Visible {
+    var approved = try approve.load(alloc, io, root);
+    defer approved.deinit();
+
+    // Drop entries this diff cannot place, and write when the set shrank.
+    const before = approved.entries.items.len;
+    try approved.prune(alloc, io, root, d);
+    if (approved.entries.items.len != before) {
+        approve.save(&approved, alloc, io, root) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            else => {},
+        };
+    }
+
+    const rows = try rowsForApproved(alloc, io, root, d, &approved);
+    return .{ .rows = rows, .approved_n = approved.entries.items.len };
+}
+
 fn localVisible(
     alloc: std.mem.Allocator,
     io: std.Io,
     root: std.Io.Dir,
     d: *const diff.Diff,
-) std.mem.Allocator.Error!approve.Visible {
-    return approve.loadVisible(alloc, io, root, d) catch |err| switch (err) {
+) std.mem.Allocator.Error!Visible {
+    return loadVisibleRows(alloc, io, root, d) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
         else => .{ .rows = try view.row.flatten(alloc, d), .approved_n = 0 },
     };
@@ -1450,9 +1495,9 @@ fn flattenSource(
     io: std.Io,
     source: cli.Source,
     d: *const diff.Diff,
-) approve.LoadError!approve.Visible {
+) approve.LoadError!Visible {
     return switch (source) {
-        .local => approve.loadVisible(alloc, io, .cwd(), d),
+        .local => loadVisibleRows(alloc, io, .cwd(), d),
         .range, .commit => .{ .rows = try view.row.flatten(alloc, d), .approved_n = 0 },
     };
 }
@@ -1697,7 +1742,7 @@ fn applyApprove(
         },
     };
 
-    const new_rows = try approve.hide(alloc, &diff_view.diff, &approved, io, root);
+    const new_rows = try rowsForApproved(alloc, io, root, &diff_view.diff, &approved);
     const restored: usize = if (hunk_mark) |m|
         restoreNeighbor(new_rows, .{
             .path = mark_path.?,
@@ -1745,7 +1790,7 @@ fn unapproveRebuild(
         },
     };
 
-    const new_rows = try approve.hide(alloc, &diff_view.diff, &approved, io, root);
+    const new_rows = try rowsForApproved(alloc, io, root, &diff_view.diff, &approved);
     diff_view.replaceRows(alloc, new_rows, approved.entries.items.len) catch {
         alloc.free(new_rows);
         note.set("out of memory");
@@ -1767,7 +1812,7 @@ fn applyUnapprove(
     item: approve.Hidden,
 ) std.mem.Allocator.Error!void {
     if (!try unapproveRebuild(alloc, io, source, diff_view, note, root, item)) return;
-    const jump = approve.rowForIdentity(
+    const jump = rowForIdentity(
         diff_view.rows,
         &diff_view.diff,
         item.path,
@@ -1784,6 +1829,111 @@ fn groupedFile(d: *const diff.Diff, path: []const u8, group: diff.Group) ?*const
         if (std.mem.eql(u8, f.displayPath(), path)) return f;
     }
     return null;
+}
+
+fn fileAt(d: *const diff.Diff, path: []const u8, group: ?diff.Group) ?*const diff.File {
+    for (d.files) |*f| {
+        if (f.group != group) continue;
+        if (std.mem.eql(u8, f.displayPath(), path)) return f;
+    }
+    return null;
+}
+
+/// First row of this identity (hunk header, or file header if hunk-less).
+fn rowForIdentity(
+    rows: []const view.row.Row,
+    d: *const diff.Diff,
+    path: []const u8,
+    hash: approve.Hash,
+    kind: approve.Hidden.Kind,
+) ?usize {
+    var cur_path: []const u8 = "";
+    var cur_group: ?diff.Group = null;
+    for (rows, 0..) |item, i| {
+        switch (item) {
+            .file_header => |fh| {
+                cur_path = fh.path;
+                cur_group = fh.group;
+                if (kind == .hunk) continue;
+                if (!std.mem.eql(u8, fh.path, path)) continue;
+                const file = fileAt(d, fh.path, fh.group) orelse continue;
+                if (file.hunks.len == 0) return i;
+            },
+            .hunk_header => |hh| {
+                if (kind != .hunk) continue;
+                if (!std.mem.eql(u8, cur_path, path)) continue;
+                const file = fileAt(d, cur_path, cur_group) orelse continue;
+                const hi = approve.hunkAt(file.*, hh.old_start, hh.new_start) orelse continue;
+                if (approve.hunkContains(file.hunks[hi], hash)) return i;
+            },
+            .section_header, .line => {},
+        }
+    }
+    return null;
+}
+
+/// Hunk (or hunk-less file) that owns `row_i`. A file-header row of a file
+/// with hunks is the first hunk — used when the whole file is hidden.
+fn identityAtRow(
+    alloc: std.mem.Allocator,
+    d: *const diff.Diff,
+    io: std.Io,
+    root: std.Io.Dir,
+    rows: []const view.row.Row,
+    row_i: usize,
+) ?approve.Hidden {
+    if (rows.len == 0) return null;
+    const start = if (row_i >= rows.len) rows.len - 1 else row_i;
+    var i = start;
+    while (true) {
+        switch (rows[i]) {
+            .hunk_header => |hh| {
+                const file = blk: {
+                    var j = i;
+                    while (j > 0) {
+                        j -= 1;
+                        switch (rows[j]) {
+                            .file_header => |fh| break :blk fileAt(d, fh.path, fh.group),
+                            else => {},
+                        }
+                    }
+                    break :blk null;
+                } orelse return null;
+                const hi = approve.hunkAt(file.*, hh.old_start, hh.new_start) orelse return null;
+                return .{
+                    .path = file.displayPath(),
+                    .hash = approve.fingerprintHunk(file.hunks[hi].identityHunks()[0]),
+                    .group = file.group,
+                    .kind = .hunk,
+                    .preview = "",
+                };
+            },
+            .file_header => |fh| {
+                const file = fileAt(d, fh.path, fh.group) orelse return null;
+                if (file.hunks.len == 0) {
+                    const hash = approve.hunklessHash(alloc, io, root, file.*) orelse return null;
+                    return .{
+                        .path = file.displayPath(),
+                        .hash = hash,
+                        .group = file.group,
+                        .kind = if (file.is_binary) .binary else .file,
+                        .preview = "",
+                    };
+                }
+                return .{
+                    .path = file.displayPath(),
+                    .hash = approve.fingerprintHunk(file.hunks[0].identityHunks()[0]),
+                    .group = file.group,
+                    .kind = .hunk,
+                    .preview = "",
+                };
+            },
+            .section_header, .line => {
+                if (i == 0) return null;
+                i -= 1;
+            },
+        }
+    }
 }
 
 /// Stage, unstage, or discard the current file or hunk (local source only).
@@ -3057,7 +3207,7 @@ fn landComment(
         note.set("comment not in this diff");
         return false;
     };
-    const item = approve.identityAtRow(alloc, &diff_view.diff, io, .cwd(), full, full_row) orelse {
+    const item = identityAtRow(alloc, &diff_view.diff, io, .cwd(), full, full_row) orelse {
         note.set("comment not in this diff");
         return false;
     };
@@ -4332,7 +4482,7 @@ test "file list omits a fully approved file and keeps a mixed file" {
     defer approved.deinit();
     try approved.append("mixed.txt", approve.fingerprintHunk(d.files[0].hunks[0]));
     try approved.append("gone.txt", approve.fingerprintHunk(d.files[1].hunks[0]));
-    const hidden = try approve.hide(alloc, &d, &approved, io, .cwd());
+    const hidden = try rowsForApproved(alloc, io, .cwd(), &d, &approved);
     defer alloc.free(hidden);
 
     var list: FileList = .{};
@@ -4392,7 +4542,7 @@ test "comment list Enter on a hidden loc is hidden not missing" {
     var approved = approve.initEmpty(alloc);
     defer approved.deinit();
     try approved.append("f.txt", approve.fingerprintHunk(d.files[0].hunks[0]));
-    const hidden = try approve.hide(alloc, &d, &approved, io, .cwd());
+    const hidden = try rowsForApproved(alloc, io, .cwd(), &d, &approved);
     defer alloc.free(hidden);
 
     var list: CommentList = .{};
@@ -4523,7 +4673,7 @@ test "comment list i on a hidden loc is hidden with edit" {
     var approved = approve.initEmpty(alloc);
     defer approved.deinit();
     try approved.append("f.txt", approve.fingerprintHunk(d.files[0].hunks[0]));
-    const hidden = try approve.hide(alloc, &d, &approved, io, .cwd());
+    const hidden = try rowsForApproved(alloc, io, .cwd(), &d, &approved);
     defer alloc.free(hidden);
 
     var list: CommentList = .{};
@@ -4566,10 +4716,150 @@ test "fullIndexOfHidden maps the remaining hunk onto the full flatten" {
     var approved = approve.initEmpty(alloc);
     defer approved.deinit();
     try approved.append("f.txt", approve.fingerprintHunk(d.files[0].hunks[0]));
-    const hidden = try approve.hide(alloc, &d, &approved, io, .cwd());
+    const hidden = try rowsForApproved(alloc, io, .cwd(), &d, &approved);
     defer alloc.free(hidden);
     try std.testing.expectEqual(0, fullIndexOfHidden(full, hidden, 0));
     try std.testing.expectEqual(4, fullIndexOfHidden(full, hidden, 1));
+}
+
+fn twoHunkDiff(alloc: std.mem.Allocator) !diff.Diff {
+    const txt =
+        \\diff --git a/f.txt b/f.txt
+        \\--- a/f.txt
+        \\+++ b/f.txt
+        \\@@ -1 +1 @@
+        \\-old
+        \\+new
+        \\@@ -10 +10 @@
+        \\-old2
+        \\+new2
+    ;
+    var d = try diff.parse(alloc, txt);
+    errdefer d.deinit();
+    try std.testing.expectEqual(1, d.files.len);
+    try std.testing.expectEqual(2, d.files[0].hunks.len);
+    return d;
+}
+
+test "loadVisibleRows prunes a stale entry and omits the hunk" {
+    if (builtin.os.tag == .wasi) return;
+    const io = std.testing.io;
+    const alloc = std.testing.allocator;
+    var tmp = try IsolatedTmp.init(alloc, io);
+    defer tmp.deinit(alloc, io);
+
+    var d = try twoHunkDiff(alloc);
+    defer d.deinit();
+    const path = d.files[0].displayPath();
+    var approved = approve.initEmpty(alloc);
+    defer approved.deinit();
+    try approved.append(path, approve.fingerprintHunk(d.files[0].hunks[0]));
+    try approved.append("gone.txt", approve.fingerprintFile("x"));
+    try approve.save(&approved, alloc, io, tmp.dir);
+
+    const vis = try loadVisibleRows(alloc, io, tmp.dir, &d);
+    defer alloc.free(vis.rows);
+    try std.testing.expectEqual(1, vis.approved_n);
+    try std.testing.expectEqual(4, vis.rows.len);
+    try std.testing.expect(vis.rows[0] == .file_header);
+
+    var reloaded = try approve.load(alloc, io, tmp.dir);
+    defer reloaded.deinit();
+    try std.testing.expectEqual(1, reloaded.entries.items.len);
+    try std.testing.expectEqualStrings(path, reloaded.entries.items[0].path);
+}
+
+test "rowForIdentity after unapprove restores one hunk and leaves the other hidden" {
+    const io = std.testing.io;
+    const alloc = std.testing.allocator;
+    var d = try twoHunkDiff(alloc);
+    defer d.deinit();
+    const path = d.files[0].displayPath();
+    const h0 = approve.fingerprintHunk(d.files[0].hunks[0]);
+    const h1 = approve.fingerprintHunk(d.files[0].hunks[1]);
+    var approved = approve.initEmpty(alloc);
+    defer approved.deinit();
+    try approved.append(path, h0);
+    try approved.append(path, h1);
+    try approved.unapprove(path, h0);
+    const rows = try rowsForApproved(alloc, io, .cwd(), &d, &approved);
+    defer alloc.free(rows);
+    try std.testing.expectEqual(4, rows.len);
+    try std.testing.expectEqual(1, rowForIdentity(rows, &d, path, h0, .hunk).?);
+    try std.testing.expect(rowForIdentity(rows, &d, path, h1, .hunk) == null);
+}
+
+test "rowForIdentity identical hunks: unapprove restores the unmatched live hunk" {
+    const io = std.testing.io;
+    const alloc = std.testing.allocator;
+    const txt =
+        \\diff --git a/f.txt b/f.txt
+        \\--- a/f.txt
+        \\+++ b/f.txt
+        \\@@ -1 +1 @@
+        \\-a
+        \\+b
+        \\@@ -10 +10 @@
+        \\-a
+        \\+b
+    ;
+    var d = try diff.parse(alloc, txt);
+    defer d.deinit();
+    const path = d.files[0].displayPath();
+    const hash = approve.fingerprintHunk(d.files[0].hunks[0]);
+    var approved = approve.initEmpty(alloc);
+    defer approved.deinit();
+    try approved.append(path, hash);
+    try approved.append(path, hash);
+    try approved.unapprove(path, hash);
+    const rows = try rowsForApproved(alloc, io, .cwd(), &d, &approved);
+    defer alloc.free(rows);
+    try std.testing.expectEqual(4, rows.len);
+    try std.testing.expectEqual(1, rowForIdentity(rows, &d, path, hash, .hunk).?);
+    try std.testing.expectEqual(d.files[0].hunks[1].old_start, rows[1].hunk_header.old_start);
+}
+
+test "identityAtRow hunk line and file header" {
+    const io = std.testing.io;
+    const alloc = std.testing.allocator;
+    var d = try twoHunkDiff(alloc);
+    defer d.deinit();
+    const full = try view.row.flatten(alloc, &d);
+    defer alloc.free(full);
+    const h0 = approve.fingerprintHunk(d.files[0].hunks[0]);
+    const h1 = approve.fingerprintHunk(d.files[0].hunks[1]);
+    const at_add = identityAtRow(alloc, &d, io, .cwd(), full, 3).?;
+    try std.testing.expectEqual(approve.Hidden.Kind.hunk, at_add.kind);
+    try std.testing.expectEqual(h0, at_add.hash);
+    const at_file = identityAtRow(alloc, &d, io, .cwd(), full, 0).?;
+    try std.testing.expectEqual(h0, at_file.hash);
+    const at_h1 = identityAtRow(alloc, &d, io, .cwd(), full, 6).?;
+    try std.testing.expectEqual(h1, at_h1.hash);
+}
+
+test "identityAtRow then unapprove restores a hidden comment line" {
+    const io = std.testing.io;
+    const alloc = std.testing.allocator;
+    var d = try twoHunkDiff(alloc);
+    defer d.deinit();
+    const path = d.files[0].displayPath();
+    const loc: view.CommentLoc = .{ .path = path, .side = .new, .line = 1 };
+    const full = try view.row.flatten(alloc, &d);
+    defer alloc.free(full);
+    const full_row = view.rowForComment(full, loc).?;
+
+    var approved = approve.initEmpty(alloc);
+    defer approved.deinit();
+    try approved.append(path, approve.fingerprintHunk(d.files[0].hunks[0]));
+    const hidden = try rowsForApproved(alloc, io, .cwd(), &d, &approved);
+    defer alloc.free(hidden);
+    try std.testing.expect(view.rowForComment(hidden, loc) == null);
+
+    const item = identityAtRow(alloc, &d, io, .cwd(), full, full_row).?;
+    try approved.unapprove(item.path, item.hash);
+    const restored = try rowsForApproved(alloc, io, .cwd(), &d, &approved);
+    defer alloc.free(restored);
+    try std.testing.expectEqual(full_row, view.rowForComment(restored, loc).?);
 }
 
 const builtin = @import("builtin");
@@ -4608,7 +4898,7 @@ fn initTrackedRepo(io: std.Io, tmp: IsolatedTmp) !void {
 fn loadLocalView(alloc: std.mem.Allocator, io: std.Io, cwd: std.process.Child.Cwd, root: std.Io.Dir) !OpenDiff {
     var parsed = try git.loadDefaultDiffCwd(alloc, io, cwd);
     errdefer parsed.deinit();
-    const vis = try approve.loadVisible(alloc, io, root, &parsed);
+    const vis = try loadVisibleRows(alloc, io, root, &parsed);
     errdefer alloc.free(vis.rows);
     return try OpenDiff.build(alloc, parsed, vis.rows, vis.approved_n);
 }

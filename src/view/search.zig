@@ -3,6 +3,7 @@
 
 const std = @import("std");
 const diff = @import("diff");
+const approve = @import("approve");
 const row_mod = @import("row.zig");
 const Row = row_mod.Row;
 const clampCursor = row_mod.clampCursor;
@@ -185,4 +186,31 @@ test "firstPathMatch is file headers only" {
     try testing.expect(firstPathMatch(rows, "", 0) == null);
     // Body text is not a path hit.
     try testing.expect(firstPathMatch(rows, "oldMain", 0) == null);
+}
+
+test "firstMatch misses text in an approved hunk" {
+    const alloc = testing.allocator;
+    const txt =
+        \\diff --git a/f.txt b/f.txt
+        \\--- a/f.txt
+        \\+++ b/f.txt
+        \\@@ -1 +1 @@
+        \\-alpha
+        \\+beta
+        \\@@ -10 +10 @@
+        \\-gamma
+        \\+delta
+    ;
+    var d = try diff.parse(alloc, txt);
+    defer d.deinit();
+    var approved = approve.initEmpty(alloc);
+    defer approved.deinit();
+    try approved.append(d.files[0].displayPath(), approve.fingerprintHunk(d.files[0].hunks[0]));
+    const placed = try approve.place(alloc, testing.io, .cwd(), &d, &approved);
+    defer alloc.free(placed);
+    const hidden = try row_mod.flattenPlaced(alloc, &d, placed);
+    defer alloc.free(hidden);
+    try testing.expect(firstMatch(hidden, "alpha", 0) == null);
+    try testing.expect(firstMatch(hidden, "beta", 0) == null);
+    try testing.expectEqual(2, firstMatch(hidden, "gamma", 0).?.index);
 }
