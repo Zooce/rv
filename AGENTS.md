@@ -40,7 +40,73 @@ For command details, load the `goal` skill / playbook when available.
   - Prefer a typed local over a cast at the call: `const n: usize = 2;` then use `n`.
   - **Allowed only when** the compiler errors without a cast **and** no typed local / peer-type rewrite / different API is cleaner. If you reach for `@as`, stop and try those first. Needless `@as` is a rule violation. Fix it before asking for review.
 - **Test utilities stay out of the production build.** Helpers, fixtures, and fake fds used only by tests must not live on production types (e.g. not nested in `Tty` / public app APIs) and must not ship real implementation into `zig build` artifacts. Prefer file-scope helpers gated with `if (builtin.is_test)` (or equivalent), or code that exists only inside `test` blocks. Production builds may expose an empty stub type at most — never pipe/PTY open helpers, injectable globals meant only for tests, or other harness code.
-- **Self-check AGENTS.md before review.** Before asking the user to review, re-read the relevant rules in this file and scan your own diff for violations (needless `@as`, trivial wrappers, wrong allocator names, banned terms, and the rest). Fix them first; do not hand the user a change that still breaks project rules.
+- **Self-check AGENTS.md before review.** Before asking the user to review, re-read the relevant rules in this file and scan your own diff for violations (needless `@as`, trivial wrappers, wrong allocator names, banned terms, and the rest). Fix those first. A change a person would see in the TUI is not ready for review until you have driven it (**Exercising the TUI**). Do not hand the user a change that still breaks project rules.
+
+## Exercising the TUI
+
+Before you call a change done, exercise the behavior that change affects, and check it against the regression baseline in **Repository**. When it changes what the screen shows or what a key does, drive `rv` in tmux and check that behavior before you ask for review and before you say the work is verified. `mise run test` does not replace that session. When the change has no screen or key effect, run the checks that do apply (`mise run test`, `mise run build`, the goal's verify steps) and say that there was nothing on screen to drive.
+
+`rv` reads keys and paints on `/dev/tty` (`tui/tty.zig`), in raw mode, on the alternate screen. A pipe on stdin does not deliver keys. The process needs a controlling terminal. tmux supplies one. `tmux capture-pane -p` prints the visible text, including the alternate screen. Do not depend on `pyte`, `expect`, or another terminal emulator.
+
+### Session
+
+1. Build with `mise run build`. Run that binary by its absolute path (`zig-out/bin/rv` in this repo), not a copy installed elsewhere.
+2. Copy the regression baseline to `/tmp` (**Repository**). Leave global git config alone. Do not launch `rv` in this repo or in `~/Documents/scratch/temp`. Approve and stage write to the repository you start in.
+3. Start a detached session and leave a shell in it. Pass `rv` through `send-keys`, not as the session command, so `q` returns to the shell and you can start `rv` again:
+
+```
+tmux new-session -d -s rv-drive -x 100 -y 32 -c /tmp/rv-regress
+tmux send-keys -t rv-drive /absolute/path/to/zig-out/bin/rv Enter
+```
+
+`-x 100 -y 32` is wide enough for side-by-side. Below `min_side_by_side_cols` (49, `src/view/layout.zig`) the screen is unified, and the footer shows `uni~` when the preference is still side-by-side. Use a narrow session only when the change is that fallback.
+
+4. When the check ends, including on failure, run `tmux kill-session -t rv-drive`. If no tmux server is running yet, that prints `error connecting to /tmp/tmux-…/default (No such file or directory)`. Ignore that line. Do not leave the session up.
+
+### What to send and what to read
+
+- Send one key at a time: `tmux send-keys -t rv-drive ]`. tmux key names are `Enter`, `Space`, and `Escape`. A word with no spaces (`noteone`) is typed as letters. A leader and its letter are two sends: `Space`, then `a`.
+- After each send, poll `tmux capture-pane -p -t rv-drive` about every 0.1s until the text matches, and give up after a few seconds. Wait until the screen shows the state you set up before the first key. A fixed sleep is not a check. Staging and a reload need a longer wait than a cursor move. Wait until the pane shows the result before you send the next key. Queuing `Space`, `a`, and `Enter` in one burst can press `Enter` before the list is open.
+- Check the text and files that this change is supposed to affect. A token that appears only in the fixture is easier to see than a word that also appears in a title or the footer. When the key writes the approved store, the comment store, or the index, also read `.rv/approved.json` (`entries[].path`), `.rv/reviews/current.json`, or `git diff --cached`. `capture-pane -p` has no color and no reverse video, so it does not mark the selected row. Judge the cursor by which text is on screen and by what the next key does.
+- While diff rows are still on screen, the word `approved` means the approved list is open (its title bar contains it). The footer prints `HEAD · N approved` only when the row list is empty and the approved count is greater than zero.
+- On a timeout, keep the pane text and say which step failed. Put the driver script in `/tmp` and delete it when the check is done. Do not add it to this repo.
+
+### Repository
+
+`~/Documents/scratch/temp` is the regression baseline. It collects git statuses as new cases show up, so read `git status` on the copy instead of assuming a fixed file list. Copy it and drive the copy:
+
+```
+cp -a ~/Documents/scratch/temp /tmp/rv-regress
+```
+
+`cp -a` keeps the index, the dirty worktree, and `.rv`. `git clone` drops unstaged edits, untracked files, and the approved and comment stores. The copy's local `user.name` and `user.email` are already set. Do not write `~/Documents/scratch/temp`. Approve, stage, and comments belong on the copy.
+
+The copy includes `.rv`, so a local load already omits whatever the approved store claims, and existing comments are already there. Read `.rv/approved.json` and `.rv/reviews/` on the copy before you treat a missing row as a failure. Clear those files on the copy only when the check needs an empty store.
+
+Exercise the change on that copy, then walk the statuses the baseline already has. A staged edit, an unstaged edit, a rename, a deletion, an untracked file, and a file that is both staged and unstaged are different screens. A row or key that used to work on one of those and no longer does is a regression.
+
+When the change needs a status the baseline does not have, add it on the copy. If that case is worth keeping, say so and leave `~/Documents/scratch/temp` for its owner to update. When you add two hunks in one file, keep them apart: git's default context is 3 lines, so a 12-line file edited on line 1 and line 10 stays two hunks. Pick tokens that do not appear in titles, the footer, or help.
+
+### Keys that are easy to mis-drive
+
+Drive the keys the change uses. These notes are for keys that are easy to get wrong. On a local load the cursor starts on the section header (`Unstaged`), not on a hunk.
+
+| Key | Effect |
+|-----|--------|
+| `]` | Next hunk header. The first `]` from the section header is the first hunk. |
+| `}` | Next file header. |
+| `a` | Approve the hunk under the cursor: stage it, then hide it. No effect on a section header. No effect on a file header when that file has hunks. |
+| `A` | Approve the whole file, including from that file's header. |
+| Space, then `a` | Open the approved list. It opens on an approved identity in the file under the cursor, otherwise on the first row. From a section header the list cursor stays on the first row. |
+| Enter | On that list: drop one matching store entry, rebuild, move to that row, and close the list. The change stays staged. |
+| `i`, text, Enter | On a hunk header, open a hunk comment. The title contains `create/edit hunk`. Enter saves. |
+| `a` or `A` when that hunk has a live comment | Confirm dialog, No selected. `y` approves. |
+| `)` | Next comment, wrapping. A comment on a hidden hunk unapproves that hunk and lands on it. |
+| `q` | Quit to the shell. |
+
+After `a` hides the hunk under the cursor, the cursor rests on the next header. After Enter unapproves, the cursor rests on the restored hunk header, so the next `i` comments that hunk.
+
+Report what you drove and what the pane and the files showed.
 
 ## Language (project)
 
@@ -99,7 +165,7 @@ Use `goal help <command>` for full flags (`-q` / `--quiet` prints only an id, us
 2. **Read the goal body** (`goal show` / `status --full`). It is the source of truth for scope, acceptance criteria, and verify steps.
 3. **Stay in scope.** Do not implement a different goal “while you are here” unless the user asks. Out-of-scope discoveries → `goal note` or a new goal via `goal new`.
 4. **Record decisions** with `goal note` (API choices, deferred follow-ups, test harness notes).
-5. **Finish cleanly:** leave the tree buildable; run the goal's verify steps; use `goal note` for leftover work. Run `goal complete` / `goal stop` only when the user asks.
+5. **Finish cleanly:** leave the tree buildable; run the goal's verify steps; exercise a visible TUI change in tmux (**Exercising the TUI**); use `goal note` for leftover work. Run `goal complete` / `goal stop` only when the user asks.
 6. **Order of work:** follow **`goal list` Next** (top first). Prefer re-ordering with `goal next` over inventing a side plan.
 
 ### Placement defaults
