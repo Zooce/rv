@@ -1,9 +1,10 @@
 //! Display row model: flatten a parsed `Diff` into `[]Row`. `flattenPlaced`
 //! drops lines an approved claim covers. A row answers kind, searchable
-//! text, and commentable location. Pure data — no TTY.
+//! text, commentable location, and line width. No drawing.
 
 const std = @import("std");
 const diff = @import("diff");
+const tui = @import("tui");
 const approve = @import("approve");
 const Allocator = std.mem.Allocator;
 
@@ -226,6 +227,46 @@ pub fn clampCursor(cursor: usize, len: usize) usize {
     return cursor;
 }
 
+/// Digit columns for old/new numbers: width of the largest `old_no` / `new_no`
+/// in `rows`. At least 1 so blank fields still line up when nothing is numbered.
+pub fn lineNumberWidth(rows: []const Row) usize {
+    var max: u32 = 0;
+    for (rows) |row| {
+        switch (row) {
+            .line => |ln| {
+                if (ln.old_no) |n| max = @max(max, n);
+                if (ln.new_no) |n| max = @max(max, n);
+            },
+            else => {},
+        }
+    }
+    return decimalDigits(max);
+}
+
+fn decimalDigits(n: u32) usize {
+    var w: usize = 1;
+    var x = n;
+    while (x >= 10) {
+        x /= 10;
+        w += 1;
+    }
+    return w;
+}
+
+/// Widest line text in `[body_start, body_end)`. Gutter excluded. 0 if empty.
+/// Width uses the same column rules as the screen, so pan matches paint.
+pub fn hunkMaxLineWidth(rows: []const Row, body_start: usize, body_end: usize) usize {
+    var max_w: usize = 0;
+    var i = body_start;
+    while (i < body_end) : (i += 1) {
+        switch (rows[i]) {
+            .line => |ln| max_w = @max(max_w, tui.screen.displayWidth(ln.text)),
+            else => {},
+        }
+    }
+    return max_w;
+}
+
 /// Anchor for a line comment at `cursor`, or `null` if the row is not a
 /// normal diff body line (file/hunk header or meta).
 pub fn anchorAt(rows: []const Row, cursor: usize) ?Anchor {
@@ -444,6 +485,38 @@ test "clampCursor" {
     try testing.expectEqual(0, clampCursor(0, 3));
     try testing.expectEqual(2, clampCursor(2, 3));
     try testing.expectEqual(2, clampCursor(99, 3));
+}
+
+test "lineNumberWidth is max digits and at least 1" {
+    try testing.expectEqual(1, lineNumberWidth(&.{}));
+    const headers: []const Row = &.{
+        .{ .file_header = .{ .path = "f", .is_binary = false } },
+    };
+    try testing.expectEqual(1, lineNumberWidth(headers));
+    const mixed: []const Row = &.{
+        .{ .line = .{ .kind = .context, .text = "a", .path = "f", .old_no = 9, .new_no = 9 } },
+        .{ .line = .{ .kind = .add, .text = "b", .path = "f", .new_no = 10 } },
+    };
+    try testing.expectEqual(2, lineNumberWidth(mixed));
+    const wide: []const Row = &.{
+        .{ .line = .{ .kind = .delete, .text = "c", .path = "f", .old_no = 100 } },
+    };
+    try testing.expectEqual(3, lineNumberWidth(wide));
+}
+
+test "hunkMaxLineWidth is text only" {
+    const rows: []const Row = &.{
+        .{ .hunk_header = .{
+            .path = "f",
+            .old_start = 1,
+            .old_count = 1,
+            .new_start = 1,
+            .new_count = 1,
+            .section = "",
+        } },
+        .{ .line = .{ .kind = .context, .text = "hello", .path = "f", .old_no = 1, .new_no = 1 } },
+    };
+    try testing.expectEqual(5, hunkMaxLineWidth(rows, 1, 2));
 }
 
 test "searchText is body lines only" {

@@ -128,10 +128,92 @@ pub fn main(init: std.process.Init) !u8 {
     }
 }
 
+/// Rows reserved under the body. A comment box uses `comment_h`; every other
+/// mode uses one status row. Zero when the terminal is a single row or less.
+fn footerHeight(term_rows: u16, focus: Focus, comment_h: u16) u16 {
+    if (term_rows < 2) return 0;
+    if (focus == .commenting) return comment_h;
+    return 1;
+}
+
+/// Title-bar text. `comment` and `confirm` are the open draft and confirm
+/// dialog; other modes use a fixed label.
+fn frameTitle(focus: Focus, comment: []const u8, confirm: []const u8) []const u8 {
+    return switch (focus) {
+        .commenting => comment,
+        .searching => "rv  search  Enter jump  Esc cancel",
+        .listing => "rv  comments  j/k  Enter jump  i edit  d dismiss  Esc close  q quit",
+        .files => "rv  files  j/k  Enter jump  a/A approve  Esc close  q quit",
+        .approved => "rv  approved  j/k move  Enter unapprove  Esc close  q quit",
+        .helping => "rv  help  j/k  Esc/? close  q quit",
+        .git_error => "rv  git error  Enter/Esc close  q quit",
+        .discard_confirm => confirm,
+        .normal => "rv  j/k  /  i/I  ? help  q quit",
+    };
+}
+
+/// Empty-list footer. A local load that only hid approved hunks is not a
+/// clean worktree. Other loads keep the source label.
+fn emptyFooterLabel(buf: []u8, source: cli.Source, approved_n: usize) []const u8 {
+    if (source == .local and approved_n > 0) {
+        return std.fmt.bufPrint(buf, "HEAD · {d} approved", .{approved_n}) catch "HEAD";
+    }
+    return cli.sourceLabel(source, true);
+}
+
+/// Git, approve, and expand labels for the cursor. Git and approve are local
+/// and normal only. Expand is any normal-focus hunk that can still grow.
+fn rowHints(
+    rows: []const view.row.Row,
+    cur: usize,
+    source: cli.Source,
+    focus: Focus,
+) Frame.RowHints {
+    const hints_ok = source == .local and focus == .normal and rows.len > 0;
+    const section: ?usize = if (hints_ok and rows[cur] == .section_header) cur else null;
+    const file: ?usize = blk: {
+        if (!hints_ok or section != null) break :blk null;
+        const fi = view.nav.currentFileStart(rows, cur) orelse break :blk null;
+        const grouped = switch (rows[fi]) {
+            .file_header => |fh| fh.group != null,
+            else => false,
+        };
+        break :blk if (grouped) fi else null;
+    };
+    const hunk: ?usize = if (file != null)
+        view.nav.currentHunkInFile(rows, cur)
+    else
+        null;
+    const group: ?diff.Group = if (file) |fi|
+        rows[fi].file_header.group
+    else if (section) |si|
+        rows[si].section_header
+    else
+        null;
+    const expand_hunk: ?usize = if (focus == .normal and rows.len > 0)
+        view.nav.currentHunkInFile(rows, cur)
+    else
+        null;
+    const expand_ok = if (expand_hunk) |hi| switch (rows[hi]) {
+        .hunk_header => |hh| hh.can_grow,
+        else => false,
+    } else false;
+    return .{
+        .file = file,
+        .hunk = hunk,
+        .section = section,
+        .group = group,
+        .expand_hunk = expand_hunk,
+        .expand_ok = expand_ok,
+    };
+}
+
 /// Clamp the viewport to the body area, then draw the review frame.
-/// The comment box and confirm dialog supply their own title and height;
-/// the frame does not hold those jobs.
+/// The comment box and confirm dialog supply their own title and height.
+/// Comment marks are one bool per row, filled here so the painter does not
+/// know which comment kind a row is.
 fn presentFrame(
+    alloc: std.mem.Allocator,
     frame: *Frame,
     scr: *tui.Screen,
     size: tui.Size,
@@ -142,21 +224,37 @@ fn presentFrame(
     focus: Focus,
     draft: *const Draft,
     discard: DiscardConfirm,
-) void {
-    const footer_h = Frame.footerRows(size, focus, draft.metrics(size).height);
+    marks: *std.ArrayList(bool),
+) !void {
+    const footer_h = footerHeight(size.rows, focus, draft.metrics(size).height);
     const area = Frame.ContentArea.init(size, footer_h);
     viewport.settle(size.cols, area.rows, diff_view.rows, diff_view.sbs_slots);
-    frame.paint(
-        scr,
-        size,
-        diff_view,
-        viewport,
-        review,
-        source,
-        focus,
-        Frame.title(focus, draft.titleBar(), discard.titleBar()),
-        area,
-    );
+
+    // One mark per row. Resize keeps the buffer across paints.
+    try marks.resize(alloc, diff_view.rows.len);
+    for (diff_view.rows, 0..) |row, i| marks.items[i] = comments.rowMarked(row, review);
+
+    var empty_buf: [64]u8 = undefined;
+    const cur = view.row.clampCursor(viewport.cursor, diff_view.rows.len);
+    frame.paint(scr, size, .{
+        .rows = diff_view.rows,
+        .slots = diff_view.sbs_slots,
+        .cursor = viewport.cursor,
+        .scroll = viewport.scroll,
+        .col_scroll = viewport.col_scroll,
+        .pans = viewport.hunk_pans[0..viewport.hunk_pan_n],
+        .wrap = viewport.wrap,
+        .show_line_numbers = viewport.show_line_numbers,
+        .layout_pref = viewport.layout_pref,
+        .marked = marks.items,
+        .title = frameTitle(focus, draft.titleBar(), discard.titleBar()),
+        .show_footer = focus != .searching and focus != .commenting,
+        .source_label = cli.sourceLabel(source, false),
+        .empty_label = emptyFooterLabel(&empty_buf, source, diff_view.approved_n),
+        .open_n = review.openCount(),
+        .hints = rowHints(diff_view.rows, cur, source, focus),
+        .area = area,
+    });
 }
 
 fn runTui(alloc: std.mem.Allocator, io: std.Io, source: cli.Source) !u8 {
@@ -232,10 +330,12 @@ fn runTui(alloc: std.mem.Allocator, io: std.Io, source: cli.Source) !u8 {
     defer approved_list.items.deinit(alloc);
     var help: Help = .{};
     var frame: Frame = .{};
+    var marks: std.ArrayList(bool) = .empty;
+    defer marks.deinit(alloc);
     var failure: Failure = .{};
     defer failure.buf.deinit(alloc);
 
-    presentFrame(&frame, &scr, size, &diff_view, &viewport, &review, source, focus, &draft, discard_confirm);
+    try presentFrame(alloc, &frame, &scr, size, &diff_view, &viewport, &review, source, focus, &draft, discard_confirm, &marks);
     try scr.present(&term);
 
     while (running) {
@@ -630,7 +730,7 @@ fn runTui(alloc: std.mem.Allocator, io: std.Io, source: cli.Source) !u8 {
             .mouse => |mouse| if (wheelDirection(mouse)) |dir| switch (focus) {
                 .normal => {
                     leader = .none;
-                    const footer_h = Frame.footerRows(size, focus, draft.metrics(size).height);
+                    const footer_h = footerHeight(size.rows, focus, draft.metrics(size).height);
                     const area = Frame.ContentArea.init(size, footer_h);
                     viewport.scrollWheel(dir, .{
                         .y = mouse.y,
@@ -654,7 +754,7 @@ fn runTui(alloc: std.mem.Allocator, io: std.Io, source: cli.Source) !u8 {
             },
         }
         if (running) {
-            presentFrame(&frame, &scr, size, &diff_view, &viewport, &review, source, focus, &draft, discard_confirm);
+            try presentFrame(alloc, &frame, &scr, size, &diff_view, &viewport, &review, source, focus, &draft, discard_confirm, &marks);
             if (focus == .helping) {
                 help.paint(&scr, size);
                 scr.hideCursor();
@@ -2671,10 +2771,7 @@ const StatusNote = Frame.StatusNote;
 pub const Viewport = struct {
     const Result = enum { handled, unhandled };
 
-    const HunkPan = struct {
-        header: usize = 0,
-        col: usize = 0,
-    };
+    const HunkPan = view.viewport.Pan;
     const hunk_pan_cap = 48;
 
     cursor: usize = 0,
@@ -2727,9 +2824,9 @@ pub const Viewport = struct {
             .unified => cols,
             .side_by_side => if (full_body) cols else view.layout.sbsPaneWidths(cols).left_w,
         };
-        const num_w = if (self.show_line_numbers) Frame.lineNumberWidth(rows) else 0;
+        const num_w = if (self.show_line_numbers) view.row.lineNumberWidth(rows) else 0;
         const gw_layout: view.layout.EffectiveLayout = if (full_body) .unified else layout;
-        const gw = Frame.lineGutterCols(num_w, gw_layout);
+        const gw = view.layout.lineGutterCols(num_w, gw_layout);
         const gw_u16: u16 = std.math.cast(u16, gw) orelse std.math.maxInt(u16);
         return full -| gw_u16;
     }
@@ -2818,7 +2915,7 @@ pub const Viewport = struct {
             const span = view.viewport.hunkSpanAt(rows, header);
             const col = view.viewport.clampColScroll(
                 self.hunk_pans[i].col,
-                Frame.hunkMaxLineWidth(rows, span),
+                view.row.hunkMaxLineWidth(rows, span.body_start, span.body_end),
                 self.panViewportCols(cols, rows, header),
             );
             if (col == 0) {
@@ -2830,23 +2927,10 @@ pub const Viewport = struct {
         }
     }
 
-    /// First visible column for a body line. The cursor's hunk uses `col_scroll`.
-    /// Headers and lines outside a hunk stay at 0.
-    pub fn columnAt(self: *const Viewport, rows: []const view.row.Row, row_i: usize) usize {
-        if (row_i >= rows.len) return 0;
-        const span = view.viewport.hunkSpanAt(rows, row_i);
-        const header = span.header orelse return 0;
-        if (!span.containsBody(row_i)) return 0;
-        if (view.viewport.hunkSpanAt(rows, self.cursor).header) |cur| {
-            if (cur == header) return self.col_scroll;
-        }
-        return self.storedPan(header);
-    }
-
     /// Display row under the pointer, using the same heights paint uses.
     fn rowUnderPointer(self: *const Viewport, target: WheelTarget) ?usize {
         const layout = view.layout.effectiveLayout(self.layout_pref, target.cols);
-        const num_w = if (self.show_line_numbers) Frame.lineNumberWidth(target.rows) else 0;
+        const num_w = if (self.show_line_numbers) view.row.lineNumberWidth(target.rows) else 0;
         const panes = view.layout.sbsPaneWidths(target.cols);
         return view.viewport.rowAtY(.{
             .y = target.y,
@@ -2854,9 +2938,9 @@ pub const Viewport = struct {
             .bottom = target.area_bottom,
             .scroll = self.scroll,
             .wrap_on = self.wrap,
-            .full_tw = Frame.bodyTextCols(target.cols, num_w, .unified),
-            .left_tw = Frame.bodyTextCols(panes.left_w, num_w, .side_by_side),
-            .right_tw = Frame.bodyTextCols(panes.right_w, num_w, .side_by_side),
+            .full_tw = view.layout.bodyTextCols(target.cols, num_w, .unified),
+            .left_tw = view.layout.bodyTextCols(panes.left_w, num_w, .side_by_side),
+            .right_tw = view.layout.bodyTextCols(panes.right_w, num_w, .side_by_side),
             .layout = layout,
         }, target.rows, target.slots);
     }
@@ -2919,7 +3003,7 @@ pub const Viewport = struct {
                 '$' => if (!self.wrap) {
                     const span = view.viewport.hunkSpanAt(rows, self.cursor);
                     self.col_scroll = view.viewport.colScrollToEnd(
-                        Frame.hunkMaxLineWidth(rows, span),
+                        view.row.hunkMaxLineWidth(rows, span.body_start, span.body_end),
                         self.panViewportCols(cols, rows, self.cursor),
                     );
                 },
@@ -2992,11 +3076,11 @@ pub const Viewport = struct {
         const pan_span = view.viewport.hunkSpanAt(rows, cur);
         self.col_scroll = view.viewport.clampColScroll(
             self.col_scroll,
-            Frame.hunkMaxLineWidth(rows, pan_span),
+            view.row.hunkMaxLineWidth(rows, pan_span.body_start, pan_span.body_end),
             self.panViewportCols(cols, rows, cur),
         );
         self.clampStoredPans(cols, rows);
-        const num_w = if (self.show_line_numbers) Frame.lineNumberWidth(rows) else 0;
+        const num_w = if (self.show_line_numbers) view.row.lineNumberWidth(rows) else 0;
         if (self.window_moved) {
             self.scroll = switch (layout) {
                 .unified => view.viewport.clampScrollSticky(
@@ -3004,7 +3088,7 @@ pub const Viewport = struct {
                     content_rows,
                     rows,
                     self.wrap,
-                    Frame.bodyTextCols(cols, num_w, .unified),
+                    view.layout.bodyTextCols(cols, num_w, .unified),
                 ),
                 .side_by_side => blk: {
                     const panes = view.layout.sbsPaneWidths(cols);
@@ -3014,9 +3098,9 @@ pub const Viewport = struct {
                         slots,
                         rows,
                         self.wrap,
-                        Frame.bodyTextCols(panes.left_w, num_w, .side_by_side),
-                        Frame.bodyTextCols(panes.right_w, num_w, .side_by_side),
-                        Frame.bodyTextCols(cols, num_w, .unified),
+                        view.layout.bodyTextCols(panes.left_w, num_w, .side_by_side),
+                        view.layout.bodyTextCols(panes.right_w, num_w, .side_by_side),
+                        view.layout.bodyTextCols(cols, num_w, .unified),
                     );
                 },
             };
@@ -3028,7 +3112,7 @@ pub const Viewport = struct {
                     content_rows,
                     rows,
                     self.wrap,
-                    Frame.bodyTextCols(cols, num_w, .unified),
+                    view.layout.bodyTextCols(cols, num_w, .unified),
                 );
                 self.scroll = settled.scroll;
             },
@@ -3041,9 +3125,9 @@ pub const Viewport = struct {
                     slots,
                     rows,
                     self.wrap,
-                    Frame.bodyTextCols(panes.left_w, num_w, .side_by_side),
-                    Frame.bodyTextCols(panes.right_w, num_w, .side_by_side),
-                    Frame.bodyTextCols(cols, num_w, .unified),
+                    view.layout.bodyTextCols(panes.left_w, num_w, .side_by_side),
+                    view.layout.bodyTextCols(panes.right_w, num_w, .side_by_side),
+                    view.layout.bodyTextCols(cols, num_w, .unified),
                 );
                 self.scroll = settled.scroll;
             },
@@ -3924,6 +4008,20 @@ const Failure = struct {
     }
 };
 
+test "empty footer local approved is not a clean worktree" {
+    var buf: [64]u8 = undefined;
+    try std.testing.expectEqualStrings("HEAD · empty", emptyFooterLabel(&buf, .local, 0));
+    try std.testing.expectEqualStrings("HEAD · 2 approved", emptyFooterLabel(&buf, .local, 2));
+    try std.testing.expectEqualStrings(
+        "main...HEAD",
+        emptyFooterLabel(&buf, .{ .range = "main...HEAD" }, 3),
+    );
+    try std.testing.expectEqualStrings(
+        "abc123",
+        emptyFooterLabel(&buf, .{ .commit = "abc123" }, 3),
+    );
+}
+
 test "indexHintForRow section has no git hint" {
     const unstaged = Frame.RowHints{ .section = 0, .group = .unstaged };
     const untracked = Frame.RowHints{ .section = 0, .group = .untracked };
@@ -4170,7 +4268,7 @@ test "pan viewport one-sided side-by-side uses full width" {
     const mixed_uni = uni.panViewportCols(cols, rows2, uni.cursor);
     try std.testing.expect(mixed_sbs < mixed_uni);
     const left: usize = view.layout.sbsPaneWidths(cols).left_w;
-    const gw = Frame.lineGutterCols(Frame.lineNumberWidth(rows2), .side_by_side);
+    const gw = view.layout.lineGutterCols(view.row.lineNumberWidth(rows2), .side_by_side);
     const expected: usize = left - gw;
     const got: usize = mixed_sbs;
     try std.testing.expectEqual(expected, got);
@@ -4333,23 +4431,23 @@ test "sideways wheel pans the hunk under the pointer" {
     vp.scrollWheel(.right, on_cursor);
     try std.testing.expectEqual(2, vp.cursor);
     try std.testing.expectEqual(1, vp.col_scroll);
-    try std.testing.expectEqual(1, vp.columnAt(rows, 2));
+    try std.testing.expectEqual(1, view.viewport.columnAt(rows, 2, vp.cursor, vp.col_scroll, vp.hunk_pans[0..vp.hunk_pan_n]));
 
     var on_other = base;
     on_other.y = 6;
     vp.scrollWheel(.right, on_other);
     try std.testing.expectEqual(1, vp.col_scroll);
-    try std.testing.expectEqual(1, vp.columnAt(rows, 5));
-    try std.testing.expectEqual(0, vp.columnAt(rows, 4));
+    try std.testing.expectEqual(1, view.viewport.columnAt(rows, 5, vp.cursor, vp.col_scroll, vp.hunk_pans[0..vp.hunk_pan_n]));
+    try std.testing.expectEqual(0, view.viewport.columnAt(rows, 4, vp.cursor, vp.col_scroll, vp.hunk_pans[0..vp.hunk_pan_n]));
     vp.settle(80, 20, rows, slots);
-    try std.testing.expectEqual(1, vp.columnAt(rows, 5));
+    try std.testing.expectEqual(1, view.viewport.columnAt(rows, 5, vp.cursor, vp.col_scroll, vp.hunk_pans[0..vp.hunk_pan_n]));
     try std.testing.expectEqual(1, vp.col_scroll);
 
     var on_file = base;
     on_file.y = 1;
     vp.scrollWheel(.right, on_file);
     try std.testing.expectEqual(1, vp.col_scroll);
-    try std.testing.expectEqual(1, vp.columnAt(rows, 5));
+    try std.testing.expectEqual(1, view.viewport.columnAt(rows, 5, vp.cursor, vp.col_scroll, vp.hunk_pans[0..vp.hunk_pan_n]));
 
     var on_title = base;
     on_title.y = 0;
@@ -4359,22 +4457,22 @@ test "sideways wheel pans the hunk under the pointer" {
     var on_header = base;
     on_header.y = 5;
     vp.scrollWheel(.right, on_header);
-    try std.testing.expectEqual(2, vp.columnAt(rows, 5));
+    try std.testing.expectEqual(2, view.viewport.columnAt(rows, 5, vp.cursor, vp.col_scroll, vp.hunk_pans[0..vp.hunk_pan_n]));
     try std.testing.expectEqual(1, vp.col_scroll);
 
     vp.wrap = true;
     vp.scrollWheel(.right, on_other);
-    try std.testing.expectEqual(2, vp.columnAt(rows, 5));
+    try std.testing.expectEqual(2, view.viewport.columnAt(rows, 5, vp.cursor, vp.col_scroll, vp.hunk_pans[0..vp.hunk_pan_n]));
     vp.wrap = false;
 
     vp.cursor = 5;
     vp.settle(80, 20, rows, slots);
     try std.testing.expectEqual(2, vp.col_scroll);
-    try std.testing.expectEqual(1, vp.columnAt(rows, 2));
+    try std.testing.expectEqual(1, view.viewport.columnAt(rows, 2, vp.cursor, vp.col_scroll, vp.hunk_pans[0..vp.hunk_pan_n]));
     vp.cursor = 2;
     vp.settle(80, 20, rows, slots);
     try std.testing.expectEqual(1, vp.col_scroll);
-    try std.testing.expectEqual(2, vp.columnAt(rows, 5));
+    try std.testing.expectEqual(2, view.viewport.columnAt(rows, 5, vp.cursor, vp.col_scroll, vp.hunk_pans[0..vp.hunk_pan_n]));
 
     var sbs: Viewport = .{ .cursor = 2 };
     sbs.settle(80, 20, rows, slots);
@@ -4383,7 +4481,7 @@ test "sideways wheel pans the hunk under the pointer" {
     sbs.scrollWheel(.right, on_sbs);
     try std.testing.expectEqual(0, sbs.col_scroll);
     try std.testing.expectEqual(2, sbs.cursor);
-    try std.testing.expectEqual(1, sbs.columnAt(rows, 5));
+    try std.testing.expectEqual(1, view.viewport.columnAt(rows, 5, sbs.cursor, sbs.col_scroll, sbs.hunk_pans[0..sbs.hunk_pan_n]));
 
     var d2 = try diff.parse(std.testing.allocator, fixture);
     defer d2.deinit();
@@ -4393,8 +4491,8 @@ test "sideways wheel pans the hunk under the pointer" {
     defer std.testing.allocator.free(slots2);
     vp.settle(80, 20, rows2, slots2);
     try std.testing.expectEqual(0, vp.col_scroll);
-    try std.testing.expectEqual(0, vp.columnAt(rows2, 2));
-    try std.testing.expectEqual(0, vp.columnAt(rows2, 5));
+    try std.testing.expectEqual(0, view.viewport.columnAt(rows2, 2, vp.cursor, vp.col_scroll, vp.hunk_pans[0..vp.hunk_pan_n]));
+    try std.testing.expectEqual(0, view.viewport.columnAt(rows2, 5, vp.cursor, vp.col_scroll, vp.hunk_pans[0..vp.hunk_pan_n]));
 }
 
 test "shift wheel and sideways wheel pan" {

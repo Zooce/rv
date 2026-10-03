@@ -391,7 +391,80 @@ pub fn atSide(
     };
 }
 
+/// True when `row` has a live comment of the matching kind. A file header
+/// matches a path-only comment, a hunk header matches both starts, and a
+/// body line matches a line comment. Section headers and meta lines do not.
+pub fn rowMarked(row: view.row.Row, review: *const store.Review) bool {
+    return switch (row) {
+        .line => |ln| switch (ln.kind) {
+            .meta => false,
+            else => review.firstAt(ln.path, ln.old_no, ln.new_no, .line) != null,
+        },
+        .file_header => |fh| review.firstAt(fh.path, null, null, .file) != null,
+        .hunk_header => |hh| review.firstAt(hh.path, hh.old_start, hh.new_start, .hunk) != null,
+        .section_header => false,
+    };
+}
+
 const testing = std.testing;
+
+test "rowMarked file header is not a line" {
+    var review = try store.initEmpty(testing.allocator, "t");
+    defer review.deinit();
+    _ = try review.addOpen("f", null, null, null, "file", .local);
+    _ = try review.addOpen("f", null, 1, .new, "line", .local);
+
+    const fh: view.row.Row = .{ .file_header = .{ .path = "f", .is_binary = false } };
+    const other: view.row.Row = .{ .file_header = .{ .path = "g", .is_binary = false } };
+    const line: view.row.Row = .{ .line = .{ .kind = .add, .text = "x", .path = "f", .new_no = 1 } };
+    try testing.expect(rowMarked(fh, &review));
+    try testing.expect(rowMarked(line, &review));
+    try testing.expect(!rowMarked(other, &review));
+    try testing.expect(!rowMarked(.{ .section_header = .unstaged }, &review));
+
+    var lines_only = try store.initEmpty(testing.allocator, "t");
+    defer lines_only.deinit();
+    _ = try lines_only.addOpen("f", null, 1, .new, "line", .local);
+    try testing.expect(!rowMarked(fh, &lines_only));
+    try testing.expect(rowMarked(line, &lines_only));
+}
+
+test "rowMarked hunk is not a line" {
+    var review = try store.initEmpty(testing.allocator, "t");
+    defer review.deinit();
+    _ = try review.addOpen("f", 1, 1, null, "hunk", .local);
+    _ = try review.addOpen("f", null, 1, .new, "line", .local);
+
+    const hunk: view.row.Row = .{ .hunk_header = .{
+        .path = "f",
+        .old_start = 1,
+        .old_count = 1,
+        .new_start = 1,
+        .new_count = 1,
+        .section = "",
+    } };
+    const other_hunk: view.row.Row = .{ .hunk_header = .{
+        .path = "f",
+        .old_start = 10,
+        .old_count = 1,
+        .new_start = 10,
+        .new_count = 1,
+        .section = "",
+    } };
+    const fh: view.row.Row = .{ .file_header = .{ .path = "f", .is_binary = false } };
+    const line: view.row.Row = .{ .line = .{ .kind = .add, .text = "x", .path = "f", .new_no = 1 } };
+    try testing.expect(rowMarked(hunk, &review));
+    try testing.expect(!rowMarked(other_hunk, &review));
+    try testing.expect(!rowMarked(fh, &review));
+    try testing.expect(rowMarked(line, &review));
+
+    var hunk_only = try store.initEmpty(testing.allocator, "t");
+    defer hunk_only.deinit();
+    _ = try hunk_only.addOpen("f", 1, 1, null, "hunk", .local);
+    try testing.expect(rowMarked(hunk, &hunk_only));
+    try testing.expect(!rowMarked(line, &hunk_only));
+    try testing.expect(!rowMarked(fh, &hunk_only));
+}
 
 test "loc open sides context missing resolved" {
     const old_loc = loc(.{

@@ -5,13 +5,7 @@ const Frame = @This();
 const std = @import("std");
 const tui = @import("tui");
 const view = @import("view");
-const store = @import("store");
-const cli = @import("cli");
 const diff = @import("diff");
-const root = @import("root");
-const OpenDiff = root.OpenDiff;
-const Viewport = root.Viewport;
-const Focus = root.Focus;
 
 /// One-shot footer message owned by `Frame`. Bytes always live in `buf`;
 /// `len == 0` means none. Avoids optional slices that sometimes point at
@@ -269,44 +263,36 @@ pub const ContentArea = struct {
     }
 };
 
-/// Rows reserved for the footer. A comment box uses `comment_h`; every other
-/// mode uses one status row. Zero when the terminal is a single row or less.
-pub fn footerRows(size: tui.Size, focus: Focus, comment_h: u16) u16 {
-    if (size.rows < 2) return 0;
-    if (focus == .commenting) return comment_h;
-    return 1;
-}
-
-/// Title-bar text. `comment` and `confirm` are the open draft and confirm
-/// dialog; other modes use a fixed label.
-pub fn title(focus: Focus, comment: []const u8, confirm: []const u8) []const u8 {
-    return switch (focus) {
-        .commenting => comment,
-        .searching => "rv  search  Enter jump  Esc cancel",
-        .listing => "rv  comments  j/k  Enter jump  i edit  d dismiss  Esc close  q quit",
-        .files => "rv  files  j/k  Enter jump  a/A approve  Esc close  q quit",
-        .approved => "rv  approved  j/k move  Enter unapprove  Esc close  q quit",
-        .helping => "rv  help  j/k  Esc/? close  q quit",
-        .git_error => "rv  git error  Enter/Esc close  q quit",
-        .discard_confirm => confirm,
-        .normal => "rv  j/k  /  i/I  ? help  q quit",
-    };
-}
-
-pub fn paint(
-    self: *const Frame,
-    scr: *tui.Screen,
-    size: tui.Size,
-    diff_view: *const OpenDiff,
-    viewport: *const Viewport,
-    review: *const store.Review,
-    source: cli.Source,
-    focus: Focus,
-    title_text: []const u8,
+/// What one frame paints. The loop fills this from the session. The painter
+/// reads these fields and does not know which overlay or load produced them.
+pub const Shown = struct {
+    rows: []const view.row.Row,
+    slots: []const view.layout.SbsSlot,
+    cursor: usize,
+    scroll: usize,
+    col_scroll: usize,
+    pans: []const view.viewport.Pan,
+    wrap: bool,
+    show_line_numbers: bool,
+    layout_pref: view.layout.LayoutPref,
+    /// Parallel to `rows`. True where a comment mark is drawn.
+    marked: []const bool,
+    title: []const u8,
+    /// False when the search prompt or the comment box owns the footer row.
+    show_footer: bool,
+    /// Status label when the list has rows (`HEAD`, a range, a commit).
+    source_label: []const u8,
+    /// Status text when the list is empty, already including an approved count.
+    empty_label: []const u8,
+    open_n: usize,
+    hints: RowHints,
     area: ContentArea,
-) void {
-    const rows = diff_view.rows;
-    const sbs_slots = diff_view.sbs_slots;
+};
+
+pub fn paint(self: *const Frame, scr: *tui.Screen, size: tui.Size, shown: Shown) void {
+    const rows = shown.rows;
+    const sbs_slots = shown.slots;
+    const area = shown.area;
     const status_note = self.note.slice();
     const pal = palette;
 
@@ -314,19 +300,19 @@ pub fn paint(
 
     if (size.rows > 0) {
         fillRow(scr, 0, pal.title);
-        scr.putStr(1, 0, title_text, pal.title, 0, null);
+        scr.putStr(1, 0, shown.title, pal.title, 0, null);
     }
 
-    const cur = view.row.clampCursor(viewport.cursor, rows.len);
-    const layout = view.layout.effectiveLayout(viewport.layout_pref, size.cols);
-    const num_w = if (viewport.show_line_numbers) lineNumberWidth(rows) else 0;
+    const cur = view.row.clampCursor(shown.cursor, rows.len);
+    const layout = view.layout.effectiveLayout(shown.layout_pref, size.cols);
+    const num_w = if (shown.show_line_numbers) view.row.lineNumberWidth(rows) else 0;
 
     var line_buf: [512]u8 = undefined;
     const sticky = switch (layout) {
-        .unified => view.viewport.stickyHeaders(rows, viewport.scroll, area.rows),
-        .side_by_side => view.viewport.stickyHeadersSbs(sbs_slots, rows, viewport.scroll, area.rows),
+        .unified => view.viewport.stickyHeaders(rows, shown.scroll, area.rows),
+        .side_by_side => view.viewport.stickyHeadersSbs(sbs_slots, rows, shown.scroll, area.rows),
     };
-    const hints = rowHints(rows, cur, source, focus);
+    const hints = shown.hints;
     var hint_buf: [160]u8 = undefined;
     // Each body line pans by its own hunk. Headers stay put.
     var full_pane = BodyPane{
@@ -345,7 +331,7 @@ pub fn paint(
             // Sticky file path under the title bar (hunk headers scroll with body).
             if (sticky.file_idx) |fi| {
                 if (screen_y < area.bottom) {
-                    const text = formatRow(&line_buf, rows[fi], rowMarked(rows[fi], review));
+                    const text = formatRow(&line_buf, rows[fi], shown.marked[fi]);
                     const st = if (fi == cur) pal.file_cur else pal.file;
                     fillRow(scr, screen_y, st);
                     putRowHint(scr, screen_y, text, hints.text(&hint_buf, fi), st);
@@ -353,20 +339,20 @@ pub fn paint(
                 }
             }
 
-            var i: usize = viewport.scroll;
+            var i: usize = shown.scroll;
             while (i < rows.len and screen_y < area.bottom) : (i += 1) {
                 const is_cur = i == cur;
-                const marked = rowMarked(rows[i], review);
+                const marked = shown.marked[i];
                 const st = pal.rowStyle(rows[i], is_cur);
                 switch (rows[i]) {
                     .line => {
-                        full_pane.col_scroll = viewport.columnAt(rows, i);
+                        full_pane.col_scroll = view.viewport.columnAt(rows, i, shown.cursor, shown.col_scroll, shown.pans);
                         screen_y = full_pane.putRow(
                             screen_y,
                             area.bottom,
                             rows[i],
                             marked,
-                            viewport.wrap,
+                            shown.wrap,
                             true,
                             st,
                             is_cur,
@@ -410,7 +396,7 @@ pub fn paint(
 
             if (sticky.file_idx) |fi| {
                 if (screen_y < area.bottom) {
-                    const text = formatRow(&line_buf, rows[fi], rowMarked(rows[fi], review));
+                    const text = formatRow(&line_buf, rows[fi], shown.marked[fi]);
                     const st = if (fi == cur) pal.file_cur else pal.file;
                     fillRow(scr, screen_y, st);
                     putRowHint(scr, screen_y, text, hints.text(&hint_buf, fi), st);
@@ -418,12 +404,12 @@ pub fn paint(
                 }
             }
 
-            var si: usize = viewport.scroll;
+            var si: usize = shown.scroll;
             while (si < sbs_slots.len and screen_y < area.bottom) : (si += 1) {
                 switch (sbs_slots[si]) {
                     .header => |ri| {
                         const is_cur = ri == cur;
-                        const text = formatRow(&line_buf, rows[ri], rowMarked(rows[ri], review));
+                        const text = formatRow(&line_buf, rows[ri], shown.marked[ri]);
                         const st = pal.rowStyle(rows[ri], is_cur);
                         if (rows[ri] == .section_header) {
                             scr.fillRect(.{ .x = 0, .y = screen_y, .w = scr.cols, .h = 1 }, '─', st);
@@ -434,15 +420,15 @@ pub fn paint(
                         screen_y += 1;
                     },
                     .body => |ri| {
-                        const marked = rowMarked(rows[ri], review);
+                        const marked = shown.marked[ri];
                         const st = pal.rowStyle(rows[ri], ri == cur);
-                        full_pane.col_scroll = viewport.columnAt(rows, ri);
+                        full_pane.col_scroll = view.viewport.columnAt(rows, ri, shown.cursor, shown.col_scroll, shown.pans);
                         screen_y = full_pane.putRow(
                             screen_y,
                             area.bottom,
                             rows[ri],
                             marked,
-                            viewport.wrap,
+                            shown.wrap,
                             true,
                             st,
                             ri == cur,
@@ -461,10 +447,10 @@ pub fn paint(
                         const n = view.viewport.slotScreenHeight(
                             sbs_slots[si],
                             rows,
-                            bodyTextCols(panes.left_w, num_w, .side_by_side),
-                            bodyTextCols(panes.right_w, num_w, .side_by_side),
-                            bodyTextCols(size.cols, num_w, .unified),
-                            viewport.wrap,
+                            view.layout.bodyTextCols(panes.left_w, num_w, .side_by_side),
+                            view.layout.bodyTextCols(panes.right_w, num_w, .side_by_side),
+                            view.layout.bodyTextCols(size.cols, num_w, .unified),
+                            shown.wrap,
                         );
                         var vis: usize = 0;
                         while (vis < n and screen_y < area.bottom) : (vis += 1) {
@@ -472,18 +458,18 @@ pub fn paint(
                             putSbsCenter(scr, panes, screen_y, size.cols, pal.gutter);
                             fillSpan(scr, right_x, size.cols, screen_y, right_st);
                             if (p.left) |ri| {
-                                const marked = rowMarked(rows[ri], review);
-                                left_pane.col_scroll = viewport.columnAt(rows, ri);
-                                if (viewport.wrap) {
+                                const marked = shown.marked[ri];
+                                left_pane.col_scroll = view.viewport.columnAt(rows, ri, shown.cursor, shown.col_scroll, shown.pans);
+                                if (shown.wrap) {
                                     left_pane.putSegment(screen_y, rows[ri], marked, vis, left_st, slot_cur);
                                 } else {
                                     left_pane.putPanned(screen_y, rows[ri], marked, true, left_st, slot_cur);
                                 }
                             }
                             if (p.right) |ri| {
-                                const marked = rowMarked(rows[ri], review);
-                                right_pane.col_scroll = viewport.columnAt(rows, ri);
-                                if (viewport.wrap) {
+                                const marked = shown.marked[ri];
+                                right_pane.col_scroll = view.viewport.columnAt(rows, ri, shown.cursor, shown.col_scroll, shown.pans);
+                                if (shown.wrap) {
                                     right_pane.putSegment(screen_y, rows[ri], marked, vis, right_st, slot_cur);
                                 } else {
                                     right_pane.putPanned(screen_y, rows[ri], marked, true, right_st, slot_cur);
@@ -498,7 +484,7 @@ pub fn paint(
     }
 
     if (size.rows >= 2) {
-        if (focus != .searching and focus != .commenting) {
+        if (shown.show_footer) {
             const footer_y = area.bottom;
             fillRow(scr, footer_y, pal.footer);
             if (status_note.len > 0) {
@@ -508,12 +494,12 @@ pub fn paint(
                 const footer_text = formatFooter(
                     &line_buf,
                     st,
-                    review.openCount(),
-                    viewport.layout_pref,
+                    shown.open_n,
+                    shown.layout_pref,
                     size.cols,
-                    source,
-                    diff_view.approved_n,
-                    viewport.wrap,
+                    shown.source_label,
+                    shown.empty_label,
+                    shown.wrap,
                 );
                 scr.putStr(1, footer_y, footer_text, pal.footer, 0, null);
             }
@@ -524,63 +510,13 @@ pub fn paint(
     }
 }
 
-/// Widest **line text** in the hunk body (gutter excluded). 0 if empty.
-pub fn hunkMaxLineWidth(rows: []const view.row.Row, span: view.viewport.HunkSpan) usize {
-    var max_w: usize = 0;
-    var i = span.body_start;
-    while (i < span.body_end) : (i += 1) {
-        switch (rows[i]) {
-            .line => |ln| max_w = @max(max_w, tui.screen.displayWidth(ln.text)),
-            else => {},
-        }
-    }
-    return max_w;
-}
-
-/// Digit columns for old/new numbers: width of the largest `old_no` / `new_no`
-/// in `rows`. At least 1 so blank fields still line up when nothing is numbered.
-pub fn lineNumberWidth(rows: []const view.row.Row) usize {
-    var max: u32 = 0;
-    for (rows) |row| {
-        switch (row) {
-            .line => |ln| {
-                if (ln.old_no) |n| max = @max(max, n);
-                if (ln.new_no) |n| max = @max(max, n);
-            },
-            else => {},
-        }
-    }
-    return decimalDigits(max);
-}
-
 const LineNumbers = enum { unified, old, new };
-
-/// Display columns for the sticky body gutter (mark, kind, numbers, trailing space).
-/// `num_w == 0` is numbers off: the original 2-char mark/kind gutter.
-pub fn lineGutterCols(num_w: usize, layout: view.layout.EffectiveLayout) usize {
-    if (num_w == 0) return 2;
-    const numbers: LineNumbers = switch (layout) {
-        .unified => .unified,
-        .side_by_side => .old,
-    };
-    return 2 + numberFieldCols(num_w, numbers) + 1;
-}
 
 fn numberFieldCols(num_w: usize, numbers: LineNumbers) usize {
     return switch (numbers) {
         .unified => num_w + 1 + num_w,
         .old, .new => num_w,
     };
-}
-
-fn decimalDigits(n: u32) usize {
-    var w: usize = 1;
-    var x = n;
-    while (x >= 10) {
-        x /= 10;
-        w += 1;
-    }
-    return w;
 }
 
 fn writePadded(dest: []u8, n: ?u32) void {
@@ -607,7 +543,11 @@ fn formatBodyGutter(
         .line => |l| l,
         else => return buf[0..0],
     };
-    const total: usize = if (num_w == 0) 2 else 2 + numberFieldCols(num_w, numbers) + 1;
+    const gutter_layout: view.layout.EffectiveLayout = switch (numbers) {
+        .unified => .unified,
+        .old, .new => .side_by_side,
+    };
+    const total = view.layout.lineGutterCols(num_w, gutter_layout);
     if (buf.len < total) return buf[0..0];
     @memset(buf[0..total], ' ');
     buf[0] = if (marked) '*' else ' ';
@@ -629,13 +569,6 @@ fn formatBodyGutter(
         .new => writePadded(buf[pos .. pos + num_w], ln.new_no),
     }
     return buf[0..total];
-}
-
-/// Columns of `pane_w` left for body text after the sticky gutter.
-pub fn bodyTextCols(pane_w: u16, num_w: usize, layout: view.layout.EffectiveLayout) usize {
-    const gw = lineGutterCols(num_w, layout);
-    const gw_u16: u16 = std.math.cast(u16, gw) orelse pane_w;
-    return pane_w -| gw_u16;
 }
 
 /// Where one body pane draws: origin, width, which line numbers, and the
@@ -727,7 +660,7 @@ const BodyPane = struct {
             .line => |l| l,
             else => return,
         };
-        const width = bodyTextCols(self.pane_w, self.num_w, self.textLayout());
+        const width = view.layout.bodyTextCols(self.pane_w, self.num_w, self.textLayout());
         const seg = view.wrap.segmentAt(ln.text, width, vis) orelse return;
         var buf: [16]diff.Span = undefined;
         const spans = shiftSpans(ln.spans orelse &.{}, seg.start, seg.end, &buf);
@@ -767,7 +700,7 @@ const BodyPane = struct {
             .line => |l| l,
             else => return y,
         };
-        const width = bodyTextCols(self.pane_w, self.num_w, self.textLayout());
+        const width = view.layout.bodyTextCols(self.pane_w, self.num_w, self.textLayout());
         const n = view.wrap.lineCount(ln.text, width);
         var vis: usize = 0;
         var yy = y;
@@ -794,18 +727,6 @@ fn shiftSpans(spans: []const diff.Span, lo: usize, hi: usize, buf: []diff.Span) 
     return buf[0..n];
 }
 
-fn rowMarked(row: view.row.Row, review: *const store.Review) bool {
-    return switch (row) {
-        .line => |ln| switch (ln.kind) {
-            .meta => false,
-            else => review.firstAt(ln.path, ln.old_no, ln.new_no, .line) != null,
-        },
-        .file_header => |fh| review.firstAt(fh.path, null, null, .file) != null,
-        .hunk_header => |hh| review.firstAt(hh.path, hh.old_start, hh.new_start, .hunk) != null,
-        .section_header => false,
-    };
-}
-
 /// Short layout label for the status footer.
 fn layoutFooterLabel(pref: view.layout.LayoutPref, cols: u16) []const u8 {
     return switch (view.layout.effectiveLayout(pref, cols)) {
@@ -824,22 +745,16 @@ fn formatFooter(
     open_n: usize,
     layout_pref: view.layout.LayoutPref,
     cols: u16,
-    source: cli.Source,
-    approved_n: usize,
+    source_label: []const u8,
+    empty_label: []const u8,
     wrap: bool,
 ) []const u8 {
-    if (st.row_n == 0) {
-        if (source == .local and approved_n > 0) {
-            return bufPrintTrunc(buf, "HEAD · {d} approved", .{approved_n});
-        }
-        return cli.sourceLabel(source, true);
-    }
-    const src = cli.sourceLabel(source, false);
+    if (st.row_n == 0) return empty_label;
     const mode = layoutFooterLabel(layout_pref, cols);
     const wrap_tag: []const u8 = if (wrap) "  wrap" else "";
     if (st.hunk_n == 0) {
         return bufPrintTrunc(buf, "{s}  {s}  {d}/{d}  {d} open  {s}{s}", .{
-            src,
+            source_label,
             if (st.path.len > 0) st.path else "?",
             st.row_i,
             st.row_n,
@@ -849,7 +764,7 @@ fn formatFooter(
         });
     }
     return bufPrintTrunc(buf, "{s}  {s}  hunk {d}/{d}  {d}/{d}  {d} open  {s}{s}", .{
-        src,
+        source_label,
         if (st.path.len > 0) st.path else "?",
         st.hunk_i,
         st.hunk_n,
@@ -1008,51 +923,6 @@ pub const RowHints = struct {
     }
 };
 
-fn rowHints(
-    rows: []const view.row.Row,
-    cur: usize,
-    source: cli.Source,
-    focus: Focus,
-) RowHints {
-    const hints_ok = source == .local and focus == .normal and rows.len > 0;
-    const section: ?usize = if (hints_ok and rows[cur] == .section_header) cur else null;
-    const file: ?usize = blk: {
-        if (!hints_ok or section != null) break :blk null;
-        const fi = view.nav.currentFileStart(rows, cur) orelse break :blk null;
-        const grouped = switch (rows[fi]) {
-            .file_header => |fh| fh.group != null,
-            else => false,
-        };
-        break :blk if (grouped) fi else null;
-    };
-    const hunk: ?usize = if (file != null)
-        view.nav.currentHunkInFile(rows, cur)
-    else
-        null;
-    const group: ?diff.Group = if (file) |fi|
-        rows[fi].file_header.group
-    else if (section) |si|
-        rows[si].section_header
-    else
-        null;
-    const expand_hunk: ?usize = if (focus == .normal and rows.len > 0)
-        view.nav.currentHunkInFile(rows, cur)
-    else
-        null;
-    const expand_ok = if (expand_hunk) |hi| switch (rows[hi]) {
-        .hunk_header => |hh| hh.can_grow,
-        else => false,
-    } else false;
-    return .{
-        .file = file,
-        .hunk = hunk,
-        .section = section,
-        .group = group,
-        .expand_hunk = expand_hunk,
-        .expand_ok = expand_ok,
-    };
-}
-
 /// Path/header on the left; `hint` right-aligned with a one-column gap.
 /// Skips the hint when it would not leave that gap. Hint is dim on `style`.
 fn putRowHint(scr: *tui.Screen, y: u16, text: []const u8, hint: []const u8, style: tui.Style) void {
@@ -1154,88 +1024,6 @@ test "formatRow file header rename" {
     try testing.expectEqualStrings("  gone.txt", formatRow(&buf, deleted, false));
 }
 
-test "rowMarked file header is not a line" {
-    var review = try store.initEmpty(testing.allocator, "t");
-    defer review.deinit();
-    _ = try review.addOpen("f", null, null, null, "file", .local);
-    _ = try review.addOpen("f", null, 1, .new, "line", .local);
-
-    const fh: view.row.Row = .{ .file_header = .{ .path = "f", .is_binary = false } };
-    const other: view.row.Row = .{ .file_header = .{ .path = "g", .is_binary = false } };
-    const line: view.row.Row = .{ .line = .{ .kind = .add, .text = "x", .path = "f", .new_no = 1 } };
-    try testing.expect(rowMarked(fh, &review));
-    try testing.expect(rowMarked(line, &review));
-    try testing.expect(!rowMarked(other, &review));
-    try testing.expect(!rowMarked(.{ .section_header = .unstaged }, &review));
-
-    var lines_only = try store.initEmpty(testing.allocator, "t");
-    defer lines_only.deinit();
-    _ = try lines_only.addOpen("f", null, 1, .new, "line", .local);
-    try testing.expect(!rowMarked(fh, &lines_only));
-    try testing.expect(rowMarked(line, &lines_only));
-}
-
-test "rowMarked hunk is not a line" {
-    var review = try store.initEmpty(testing.allocator, "t");
-    defer review.deinit();
-    _ = try review.addOpen("f", 1, 1, null, "hunk", .local);
-    _ = try review.addOpen("f", null, 1, .new, "line", .local);
-
-    const hunk: view.row.Row = .{ .hunk_header = .{
-        .path = "f",
-        .old_start = 1,
-        .old_count = 1,
-        .new_start = 1,
-        .new_count = 1,
-        .section = "",
-    } };
-    const other_hunk: view.row.Row = .{ .hunk_header = .{
-        .path = "f",
-        .old_start = 10,
-        .old_count = 1,
-        .new_start = 10,
-        .new_count = 1,
-        .section = "",
-    } };
-    const fh: view.row.Row = .{ .file_header = .{ .path = "f", .is_binary = false } };
-    const line: view.row.Row = .{ .line = .{ .kind = .add, .text = "x", .path = "f", .new_no = 1 } };
-    try testing.expect(rowMarked(hunk, &review));
-    try testing.expect(!rowMarked(other_hunk, &review));
-    try testing.expect(!rowMarked(fh, &review));
-    try testing.expect(rowMarked(line, &review));
-
-    var hunk_only = try store.initEmpty(testing.allocator, "t");
-    defer hunk_only.deinit();
-    _ = try hunk_only.addOpen("f", 1, 1, null, "hunk", .local);
-    try testing.expect(rowMarked(hunk, &hunk_only));
-    try testing.expect(!rowMarked(line, &hunk_only));
-    try testing.expect(!rowMarked(fh, &hunk_only));
-}
-
-test "lineNumberWidth is max digits and at least 1" {
-    try testing.expectEqual(1, lineNumberWidth(&.{}));
-    const headers: []const view.row.Row = &.{
-        .{ .file_header = .{ .path = "f", .is_binary = false } },
-    };
-    try testing.expectEqual(1, lineNumberWidth(headers));
-    const mixed: []const view.row.Row = &.{
-        .{ .line = .{ .kind = .context, .text = "a", .path = "f", .old_no = 9, .new_no = 9 } },
-        .{ .line = .{ .kind = .add, .text = "b", .path = "f", .new_no = 10 } },
-    };
-    try testing.expectEqual(2, lineNumberWidth(mixed));
-    const wide: []const view.row.Row = &.{
-        .{ .line = .{ .kind = .delete, .text = "c", .path = "f", .old_no = 100 } },
-    };
-    try testing.expectEqual(3, lineNumberWidth(wide));
-}
-
-test "lineGutterCols numbers on and off" {
-    try testing.expectEqual(8, lineGutterCols(2, .unified));
-    try testing.expectEqual(5, lineGutterCols(2, .side_by_side));
-    try testing.expectEqual(2, lineGutterCols(0, .unified));
-    try testing.expectEqual(2, lineGutterCols(0, .side_by_side));
-}
-
 test "formatBodyGutter unified sbs meta and off" {
     var buf: [32]u8 = undefined;
     const ctx: view.row.Row = .{ .line = .{
@@ -1288,22 +1076,6 @@ test "formatBodyGutter unified sbs meta and off" {
     try testing.expectEqualStrings("  hello", formatRow(&buf, ctx, false));
     try testing.expectEqualStrings("  @@ -1,1 +1,1 @@", formatRow(&buf, hunk, false));
     try testing.expectEqualStrings("* @@ -1,1 +1,1 @@", formatRow(&buf, hunk, true));
-}
-
-test "hunkMaxLineWidth is text only" {
-    const rows: []const view.row.Row = &.{
-        .{ .hunk_header = .{
-            .path = "f",
-            .old_start = 1,
-            .old_count = 1,
-            .new_start = 1,
-            .new_count = 1,
-            .section = "",
-        } },
-        .{ .line = .{ .kind = .context, .text = "hello", .path = "f", .old_no = 1, .new_no = 1 } },
-    };
-    const span = view.viewport.HunkSpan{ .header = 0, .body_start = 1, .body_end = 2 };
-    try testing.expectEqual(5, hunkMaxLineWidth(rows, span));
 }
 
 test "putPannedBody pans text and leaves gutter" {
@@ -1847,19 +1619,19 @@ test "formatFooter approved-only is not a clean worktree" {
     };
     try testing.expectEqualStrings(
         "HEAD · empty",
-        formatFooter(&buf, empty, 0, .side_by_side, 80, .local, 0, false),
+        formatFooter(&buf, empty, 0, .side_by_side, 80, "HEAD", "HEAD · empty", false),
     );
     try testing.expectEqualStrings(
         "HEAD · 2 approved",
-        formatFooter(&buf, empty, 0, .side_by_side, 80, .local, 2, false),
+        formatFooter(&buf, empty, 0, .side_by_side, 80, "HEAD", "HEAD · 2 approved", false),
     );
     try testing.expectEqualStrings(
         "main...HEAD",
-        formatFooter(&buf, empty, 0, .side_by_side, 80, .{ .range = "main...HEAD" }, 3, false),
+        formatFooter(&buf, empty, 0, .side_by_side, 80, "main...HEAD", "main...HEAD", false),
     );
     try testing.expectEqualStrings(
         "abc123",
-        formatFooter(&buf, empty, 0, .side_by_side, 80, .{ .commit = "abc123" }, 3, false),
+        formatFooter(&buf, empty, 0, .side_by_side, 80, "abc123", "abc123", false),
     );
 }
 
@@ -1872,9 +1644,9 @@ test "formatFooter shows wrap when on" {
         .row_i = 1,
         .row_n = 2,
     };
-    const off = formatFooter(&buf, st, 0, .unified, 80, .local, 0, false);
+    const off = formatFooter(&buf, st, 0, .unified, 80, "HEAD", "HEAD · empty", false);
     try testing.expect(std.mem.indexOf(u8, off, "wrap") == null);
     var buf2: [96]u8 = undefined;
-    const on = formatFooter(&buf2, st, 0, .unified, 80, .local, 0, true);
+    const on = formatFooter(&buf2, st, 0, .unified, 80, "HEAD", "HEAD · empty", true);
     try testing.expect(std.mem.indexOf(u8, on, "wrap") != null);
 }

@@ -66,6 +66,25 @@ pub const SbsPanes = struct {
     gutter_x: u16,
 };
 
+/// Display columns for the body gutter (mark, kind, numbers, trailing space).
+/// `num_w == 0` is numbers off: the original 2-char mark/kind gutter.
+/// Side-by-side shows one number column; unified shows old, a space, and new.
+pub fn lineGutterCols(num_w: usize, layout: EffectiveLayout) usize {
+    if (num_w == 0) return 2;
+    const numbers: usize = switch (layout) {
+        .unified => num_w + 1 + num_w,
+        .side_by_side => num_w,
+    };
+    return 2 + numbers + 1;
+}
+
+/// Columns of `pane_w` left for body text after the gutter.
+pub fn bodyTextCols(pane_w: u16, num_w: usize, layout: EffectiveLayout) usize {
+    const gw = lineGutterCols(num_w, layout);
+    const gw_u16: u16 = std.math.cast(u16, gw) orelse pane_w;
+    return pane_w -| gw_u16;
+}
+
 /// Split `cols` into left | gutter | right. When `cols <= 1`, left takes all
 /// columns and right/gutter are zero (not a usable side-by-side layout).
 pub fn sbsPaneWidths(cols: u16) SbsPanes {
@@ -280,6 +299,20 @@ pub fn pairSideBySide(alloc: Allocator, rows: []const Row) Allocator.Error![]Sbs
 }
 
 const testing = std.testing;
+
+test "lineGutterCols numbers on and off" {
+    try testing.expectEqual(8, lineGutterCols(2, .unified));
+    try testing.expectEqual(5, lineGutterCols(2, .side_by_side));
+    try testing.expectEqual(2, lineGutterCols(0, .unified));
+    try testing.expectEqual(2, lineGutterCols(0, .side_by_side));
+}
+
+test "bodyTextCols subtracts the gutter" {
+    try testing.expectEqual(72, bodyTextCols(80, 2, .unified));
+    try testing.expectEqual(35, bodyTextCols(40, 2, .side_by_side));
+    try testing.expectEqual(78, bodyTextCols(80, 0, .unified));
+    try testing.expectEqual(0, bodyTextCols(2, 4, .unified));
+}
 
 test "min_side_by_side_cols formula" {
     try testing.expectEqual(min_pane_cols * 2 + sbs_gutter_cols, min_side_by_side_cols);

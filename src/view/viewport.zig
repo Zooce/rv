@@ -180,6 +180,35 @@ pub fn hunkSpanAt(rows: []const Row, cursor: usize) HunkSpan {
     };
 }
 
+/// One hunk's stored column. A column of 0 is not stored.
+pub const Pan = struct {
+    header: usize = 0,
+    col: usize = 0,
+};
+
+/// First visible column for body row `row_i`. The cursor's hunk uses
+/// `col_scroll`. Other hunks use `pans`. Headers and lines outside a hunk
+/// stay at 0.
+pub fn columnAt(
+    rows: []const Row,
+    row_i: usize,
+    cursor: usize,
+    col_scroll: usize,
+    pans: []const Pan,
+) usize {
+    if (row_i >= rows.len) return 0;
+    const span = hunkSpanAt(rows, row_i);
+    const header = span.header orelse return 0;
+    if (!span.containsBody(row_i)) return 0;
+    if (hunkSpanAt(rows, cursor).header) |cur| {
+        if (cur == header) return col_scroll;
+    }
+    for (pans) |pan| {
+        if (pan.header == header) return pan.col;
+    }
+    return 0;
+}
+
 /// Pointer and window used to find the display row under the pointer.
 /// Matches the paint walk: sticky file header, then items from `scroll`,
 /// each as tall as `rowScreenHeight` / `slotScreenHeight`.
