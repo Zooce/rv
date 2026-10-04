@@ -23,15 +23,13 @@ pub fn build(b: *std.Build) void {
             },
         }),
     });
-    demo.root_module.strip = optimize != .Debug;
+    demo.root_module.strip = optimize != .debug;
     b.installArtifact(demo);
 
     const run_demo = b.addRunArtifact(demo);
     run_demo.step.dependOn(b.getInstallStep());
     // Forward args: zig build run-demo -- ...
-    if (b.args) |args| {
-        run_demo.addArgs(args);
-    }
+    run_demo.addPassthruArgs();
 
     const run_demo_step = b.step("run-demo", "Run the minimal TUI demo (interactive)");
     run_demo_step.dependOn(&run_demo.step);
@@ -177,14 +175,12 @@ pub fn build(b: *std.Build) void {
             },
         }),
     });
-    rv.root_module.strip = optimize != .Debug;
+    rv.root_module.strip = optimize != .debug;
     b.installArtifact(rv);
 
     const run_rv = b.addRunArtifact(rv);
     run_rv.step.dependOn(b.getInstallStep());
-    if (b.args) |args| {
-        run_rv.addArgs(args);
-    }
+    run_rv.addPassthruArgs();
     const run_step = b.step("run", "Run rv (full-screen diff review TUI)");
     run_step.dependOn(&run_rv.step);
 

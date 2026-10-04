@@ -38,7 +38,7 @@ zig build run-demo     # interactive demo
 mise run demo          # same via mise
 ```
 
-Requires Zig **0.16+** (0.14/0.15 APIs may need small adjustments).
+Requires Zig **0.17+**.
 
 ## What works now
 

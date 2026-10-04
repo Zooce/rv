@@ -32,7 +32,7 @@ npx skills add Zooce/rv -g
 
 ### From source
 
-Zig 0.16.0.
+Zig 0.17.0.
 
 ```sh
 zig build -Doptimize=ReleaseSafe --prefix ~/.local

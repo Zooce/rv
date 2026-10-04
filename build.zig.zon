@@ -5,7 +5,7 @@
     // The annotated tag message is the GitHub release notes. The release name is the tag.
     .version = "2.2.0",
     .fingerprint = 0xe5b6dd825d0e580a,
-    .minimum_zig_version = "0.16.0",
+    .minimum_zig_version = "0.17.0",
     .dependencies = .{},
     .paths = .{
         "build.zig",

@@ -1,5 +1,5 @@
 [tools]
-zig = "0.16.0"
+zig = "0.17.0"
 
 [tasks.build]
 description = "Build all artifacts (rv + tui_demo)"

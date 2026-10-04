@@ -8,7 +8,7 @@ case "$os" in
 Linux) os=linux ;;
 Darwin) os=macos ;;
 *)
-    printf '%s\n' "rv: no prebuilt binary for $(uname -s); build from source (Zig 0.16)" >&2
+    printf '%s\n' "rv: no prebuilt binary for $(uname -s); build from source (Zig 0.17)" >&2
     exit 1
     ;;
 esac
@@ -16,7 +16,7 @@ case "$arch" in
 x86_64 | amd64) arch=x86_64 ;;
 aarch64 | arm64) arch=aarch64 ;;
 *)
-    printf '%s\n' "rv: no prebuilt binary for $os/$arch; build from source (Zig 0.16)" >&2
+    printf '%s\n' "rv: no prebuilt binary for $os/$arch; build from source (Zig 0.17)" >&2
     exit 1
     ;;
 esac

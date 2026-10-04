@@ -15,10 +15,10 @@ const std = @import("std");
 const tui = @import("tui"); // our module (see tui/root.zig)
 
 pub fn main() !void {
-    // DebugAllocator tracks leaks in Debug builds (Zig 0.16 name for the old GPA).
-    var gpa_state: std.heap.DebugAllocator(.{}) = .init;
-    defer _ = gpa_state.deinit(); // returns .leak if something was not freed
-    const alloc = gpa_state.allocator(); // the Allocator interface we pass to Screen
+    // SafeAllocator tracks leaks in debug builds.
+    var gpa_state: std.heap.SafeAllocator = .init(std.heap.page_allocator, .{});
+    defer _ = gpa_state.deinit();
+    const alloc = gpa_state.allocator();
 
     // open(): /dev/tty + raw termios + alt screen + signal handlers.
     // defer deinit(): always restore the shell, even if we return via error.

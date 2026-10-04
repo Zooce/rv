@@ -2801,7 +2801,7 @@ pub const Viewport = struct {
     pan_settled: bool = false,
     /// Column pans for hunks other than the cursor's, keyed by header index.
     /// Valid only for the row slice settle last saw. A column of 0 is omitted.
-    hunk_pans: [hunk_pan_cap]HunkPan = [_]HunkPan{.{}} ** hunk_pan_cap,
+    hunk_pans: [hunk_pan_cap]HunkPan = @splat(.{}),
     hunk_pan_n: usize = 0,
     rows_ptr: usize = 0,
     rows_len: usize = 0,
