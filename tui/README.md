@@ -17,6 +17,7 @@ Small, opinionated terminal UI core. Not a widget library.
 | `tty.zig` | Open `/dev/tty`, raw mode, alt screen, buffered write, signal restore |
 | `event.zig` | Key + resize events (basic parsing) |
 | `screen.zig` | Cell grid, double buffer, SGR + CUP diff renderer, overlay helpers |
+| `panel.zig` | Centered overlay panel: fill, box, title, optional scrollbar |
 
 ## Acronyms (quick)
 
@@ -44,7 +45,7 @@ Requires Zig **0.17+**.
 
 1. **Terminal ownership** — opens `/dev/tty` (works with redirected stdio), saves termios, raw mode (`ECHO`/`ICANON`/`ISIG`/`IXON`/`IEXTEN`/`ICRNL` cleared, `VMIN=1`/`VTIME=0`), alt screen + hidden cursor. Restore on normal exit, `SIGINT`/`SIGTERM` (immediate exit after restore), and `SIGHUP`/`SIGQUIT`/`SIGABRT` (restore + re-raise). `SIGWINCH` sets a flag for the event loop.
 2. **Events** — printable ASCII, Enter, Esc, Tab, Backspace, arrows; SGR mouse clicks and wheel (buttons 64–67, including shift); resize events from `SIGWINCH`. Hangup/EOF on the input fd (`poll`-ready + `read` 0, e.g. PTY torn down without a delivered SIGHUP) is `error.EndOfStream` from `Tty.readTimeout` and surfaces as `.quit` from `event.poll` / `event.next` so wait loops exit instead of busy-spinning.
-3. **Screen** — 2D cells (`codepoint` + style + width), front/back buffers, diff present (only changed cells emit CUP + SGR + glyph). No full clear each frame. Overlay helpers (`Rect`, `fillRect`, `drawBox`; `putStr` clips to an optional rect) paint an opaque panel on the same buffer; still not a widget library.
+3. **Screen** — 2D cells (`codepoint` + style + width), front/back buffers, diff present (only changed cells emit CUP + SGR + glyph). No full clear each frame. Overlay helpers (`Rect`, `fillRect`, `drawBox`; `putStr` clips to an optional rect) paint an opaque panel on the same buffer; still not a widget library. `Panel` is the shared overlay box (centered rect, fill, title, optional scrollbar).
 4. **Demo** — counter / status line, two floating panels (`o` toggles), resize-safe, quit on `q`.
 
 ## Known limitations (intentional for v1)

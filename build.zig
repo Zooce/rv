@@ -97,7 +97,6 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
         .imports = &.{
             .{ .name = "tui", .module = tui_mod },
-            .{ .name = "comment_input", .module = comment_input_mod },
         },
     });
 

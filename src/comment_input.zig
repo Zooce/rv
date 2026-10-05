@@ -293,22 +293,6 @@ pub fn ensureVisible(scroll: usize, caret_line: usize, height: u16, line_count: 
     return clampScroll(s, line_count, height);
 }
 
-/// Vertical scrollbar thumb in a track of `track` rows.
-/// Returns half-open `[start, start+len)` of track rows for the thumb.
-pub fn scrollbarThumb(total: usize, visible: usize, scroll: usize, track: usize) struct { start: usize, len: usize } {
-    if (track == 0 or total <= visible) return .{ .start = 0, .len = 0 };
-
-    var thumb_len = (visible * track) / total;
-    if (thumb_len == 0) thumb_len = 1;
-    if (thumb_len > track) thumb_len = track;
-
-    const max_s = total - visible;
-    const s = @min(scroll, max_s);
-    const travel = track - thumb_len;
-    const start = if (max_s == 0) 0 else (s * travel) / max_s;
-    return .{ .start = start, .len = thumb_len };
-}
-
 // --- tests -----------------------------------------------------------------
 
 test "textWidth reserves gutter prefix and right pad" {
@@ -461,14 +445,4 @@ test "ensureVisible keeps caret line in window" {
     try testing.expectEqual(6, ensureVisible(0, 9, 4, 10)); // last page
 }
 
-test "scrollbarThumb extremes" {
-    const top = scrollbarThumb(10, 4, 0, 4);
-    try testing.expectEqual(0, top.start);
-    try testing.expect(top.len >= 1);
 
-    const bot = scrollbarThumb(10, 4, 6, 4);
-    try testing.expectEqual(4, bot.start + bot.len);
-
-    const none = scrollbarThumb(3, 4, 0, 4);
-    try testing.expectEqual(0, none.len);
-}

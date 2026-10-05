@@ -4,7 +4,6 @@ const Help = @This();
 
 const std = @import("std");
 const tui = @import("tui");
-const comment_input = @import("comment_input");
 
 pub const Result = enum { open, closed, quit };
 
@@ -98,42 +97,16 @@ pub fn handleKey(self: *Help, key: tui.Key) Result {
 }
 
 pub fn paint(self: *Help, scr: *tui.Screen, size: tui.Size) void {
-    const bg = tui.Color{ .rgb = .{ .r = 0x12, .g = 0x12, .b = 0x14 } };
-    const fg = tui.Color{ .rgb = .{ .r = 0xd0, .g = 0xd0, .b = 0xd0 } };
-    const panel_bg = tui.Style{ .fg = fg, .bg = bg };
-    const panel_frame = tui.Style{
-        .fg = .{ .rgb = .{ .r = 0x5d, .g = 0x81, .b = 0xb7 } },
-        .bg = bg,
-        .bold = true,
-    };
-    const group_style = tui.Style{ .fg = fg, .bg = bg, .bold = true };
-    const bar_track = tui.Style{
-        .fg = .{ .rgb = .{ .r = 0x6a, .g = 0x7a, .b = 0x9a } },
-        .bg = bg,
-        .dim = true,
-    };
-    const bar_thumb = tui.Style{
-        .fg = .{ .rgb = .{ .r = 0xee, .g = 0xee, .b = 0xee } },
-        .bg = .{ .rgb = .{ .r = 0x4a, .g = 0x6a, .b = 0x9a } },
-        .bold = true,
-    };
+    const group_style = tui.Style{ .fg = tui.Panel.body.fg, .bg = tui.Panel.body.bg, .bold = true };
 
-    const panel = overlayRect(size.cols, size.rows, rows.len);
-    scr.fillRect(panel, ' ', panel_bg);
-    scr.drawBox(panel, panel_frame);
-    if (panel.h > 0 and panel.w > 2) {
-        scr.putStr(panel.x + 2, panel.y, " help ", panel_frame, 0, panel);
-    }
-    const inner = panel.inset(1);
+    const panel = tui.Panel.overlay(size.cols, size.rows, rows.len);
+    panel.paint(scr, " help ");
+    const inner = panel.inner;
     if (inner.h == 0 or inner.w == 0) return;
     const view_h: usize = inner.h;
     const max_scroll = if (rows.len > view_h) rows.len - view_h else 0;
     if (self.scroll > max_scroll) self.scroll = max_scroll;
-    const show_bar = rows.len > inner.h;
-    const text_area = if (show_bar)
-        tui.Rect{ .x = inner.x, .y = inner.y, .w = inner.w -| 2, .h = inner.h }
-    else
-        inner;
+    const text_area = panel.text(rows.len);
     const start = self.scroll;
     var row: u16 = 0;
     while (row < inner.h) : (row += 1) {
@@ -144,40 +117,13 @@ pub fn paint(self: *Help, scr: *tui.Screen, size: tui.Size) void {
             .blank => {},
             .group => |name| scr.putStr(inner.x, y, name, group_style, 0, text_area),
             .item => |it| {
-                scr.putStr(inner.x + 2, y, it.key, panel_bg, 0, text_area);
+                scr.putStr(inner.x + 2, y, it.key, tui.Panel.body, 0, text_area);
                 const label_x = inner.x +| 2 +| key_w +| 2;
-                scr.putStr(label_x, y, it.label, panel_bg, 0, text_area);
+                scr.putStr(label_x, y, it.label, tui.Panel.body, 0, text_area);
             },
         }
     }
-    if (show_bar) {
-        const bar_x: u16 = inner.x + inner.w - 1;
-        const thumb = comment_input.scrollbarThumb(rows.len, inner.h, start, inner.h);
-        var br: u16 = 0;
-        while (br < inner.h) : (br += 1) {
-            const in_thumb = br >= thumb.start and br < thumb.start + thumb.len;
-            const st = if (in_thumb) bar_thumb else bar_track;
-            const ch: u21 = if (in_thumb) '█' else '│';
-            scr.setCell(bar_x, inner.y + br, .{ .char = ch, .width = 1, .style = st });
-        }
-    }
-}
-
-/// Centered overlay. Width up to 120; height grows with rows, clamped to
-/// 25–70% of the terminal. Always leaves at least 2 cells on every side.
-fn overlayRect(cols: u16, rows_n: u16, n: usize) tui.Rect {
-    const n16: u16 = std.math.cast(u16, n) orelse std.math.maxInt(u16);
-    const max_w: u16 = 120;
-    const avail_h: u16 = rows_n -| 4;
-    const rows_u32: u32 = rows_n;
-    const min_pct: u16 = @intCast(rows_u32 / 4);
-    const max_pct: u16 = @intCast(rows_u32 * 7 / 10);
-    const min_h: u16 = @min(avail_h, @max(3, min_pct));
-    const max_h: u16 = @min(avail_h, @max(min_h, max_pct));
-    const want_w: u16 = @min(cols -| 4, max_w);
-    const content_h: u16 = @max(3, n16 +| 2);
-    const want_h: u16 = @min(max_h, @max(min_h, content_h));
-    return tui.Rect.centered(cols, rows_n, want_w, want_h);
+    panel.paintBar(scr, rows.len, start);
 }
 
 test "help catalog includes normal bindings" {

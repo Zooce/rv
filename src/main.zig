@@ -389,7 +389,7 @@ fn runTui(alloc: std.mem.Allocator, io: std.Io, source: cli.Source) !u8 {
                             focus = .normal;
                             viewport.cursor = j.row;
                             if (j.edit) {
-                                try draft.beginComment(alloc, comment_list.items.items[comment_list.cursor]);
+                                try draft.beginComment(alloc, comment_list.items.items[comment_list.win.cursor]);
                                 focus = .commenting;
                             }
                         },
@@ -404,7 +404,7 @@ fn runTui(alloc: std.mem.Allocator, io: std.Io, source: cli.Source) !u8 {
                                 &frame.note,
                                 h.loc,
                             ) and h.edit) {
-                                try draft.beginComment(alloc, comment_list.items.items[comment_list.cursor]);
+                                try draft.beginComment(alloc, comment_list.items.items[comment_list.win.cursor]);
                                 focus = .commenting;
                             }
                         },
@@ -523,7 +523,7 @@ fn runTui(alloc: std.mem.Allocator, io: std.Io, source: cli.Source) !u8 {
                             );
                             if (focus != .git_error) {
                                 if (discard_confirm.return_to_files) {
-                                    try file_list.reload(alloc, diff_view.rows, file_list.cursor);
+                                    try file_list.reload(alloc, diff_view.rows, file_list.win.cursor);
                                     focus = .files;
                                 } else {
                                     focus = .normal;
@@ -746,9 +746,9 @@ fn runTui(alloc: std.mem.Allocator, io: std.Io, source: cli.Source) !u8 {
                     .down => help.scroll +|= 1,
                     .left, .right => {},
                 },
-                .files => scrollList(&file_list.scroll, &file_list.window_moved, dir),
-                .listing => scrollList(&comment_list.scroll, &comment_list.window_moved, dir),
-                .approved => scrollList(&approved_list.scroll, &approved_list.window_moved, dir),
+                .files => file_list.win.wheel(dir),
+                .listing => comment_list.win.wheel(dir),
+                .approved => approved_list.win.wheel(dir),
                 .commenting => draft.scrollWheel(dir, size),
                 .searching, .git_error, .discard_confirm => {},
             },
@@ -2267,20 +2267,6 @@ pub const DiscardConfirm = struct {
         rows: []const view.row.Row,
         cursor: usize,
     ) void {
-        const bg = tui.Color{ .rgb = .{ .r = 0x12, .g = 0x12, .b = 0x14 } };
-        const fg = tui.Color{ .rgb = .{ .r = 0xd0, .g = 0xd0, .b = 0xd0 } };
-        const panel_bg = tui.Style{ .fg = fg, .bg = bg };
-        const panel_frame = tui.Style{
-            .fg = .{ .rgb = .{ .r = 0x5d, .g = 0x81, .b = 0xb7 } },
-            .bg = bg,
-            .bold = true,
-        };
-        const choice_cur = tui.Style{
-            .fg = fg,
-            .bg = .{ .rgb = .{ .r = 0x2a, .g = 0x2a, .b = 0x30 } },
-            .bold = true,
-        };
-
         var hunk_buf: [512]u8 = undefined;
         const group = self.kind == .group;
         const question_only = self.kind == .group or self.kind == .approve or self.comments;
@@ -2303,21 +2289,17 @@ pub const DiscardConfirm = struct {
         else
             3;
         const want_w: u16 = @min(size.cols -| 4, 60);
-        const panel = tui.Rect.centered(size.cols, size.rows, want_w, content_n + 2);
-        scr.fillRect(panel, ' ', panel_bg);
-        scr.drawBox(panel, panel_frame);
-        if (panel.h > 0 and panel.w > 2) {
-            const title: []const u8 = switch (self.kind) {
-                .group => switch (self.group) {
-                    .unstaged, .untracked => " stage ",
-                    .staged => " unstage ",
-                },
-                .discard => if (self.comments) " comments " else " discard ",
-                .approve => " approve ",
-            };
-            scr.putStr(panel.x + 2, panel.y, title, panel_frame, 0, panel);
-        }
-        const inner = panel.inset(1);
+        const title: []const u8 = switch (self.kind) {
+            .group => switch (self.group) {
+                .unstaged, .untracked => " stage ",
+                .staged => " unstage ",
+            },
+            .discard => if (self.comments) " comments " else " discard ",
+            .approve => " approve ",
+        };
+        const panel = tui.Panel.fromRect(tui.Rect.centered(size.cols, size.rows, want_w, content_n + 2));
+        panel.paint(scr, title);
+        const inner = panel.inner;
         if (inner.h == 0 or inner.w == 0) return;
         var row: u16 = 0;
         if (group) {
@@ -2327,7 +2309,7 @@ pub const DiscardConfirm = struct {
                 .staged => "Unstage all staged?",
             };
             if (row < inner.h) {
-                scr.putStr(inner.x, inner.y + row, question, panel_bg, 0, inner);
+                scr.putStr(inner.x, inner.y + row, question, tui.Panel.body, 0, inner);
                 row += 1;
             }
         } else if (self.kind == .approve) {
@@ -2336,28 +2318,28 @@ pub const DiscardConfirm = struct {
             else
                 "This hunk has unresolved comments. Approve anyway?";
             if (row < inner.h) {
-                scr.putStr(inner.x, inner.y + row, question, panel_bg, 0, inner);
+                scr.putStr(inner.x, inner.y + row, question, tui.Panel.body, 0, inner);
                 row += 1;
             }
         } else if (self.comments) {
             if (row < inner.h) {
-                scr.putStr(inner.x, inner.y + row, "delete comments with this change?", panel_bg, 0, inner);
+                scr.putStr(inner.x, inner.y + row, "delete comments with this change?", tui.Panel.body, 0, inner);
                 row += 1;
             }
         } else {
             if (path.len > 0 and row < inner.h) {
-                scr.putStr(inner.x, inner.y + row, path, panel_bg, 0, inner);
+                scr.putStr(inner.x, inner.y + row, path, tui.Panel.body, 0, inner);
                 row += 1;
             }
             if (hunk_text.len > 0 and row < inner.h) {
                 const start: usize = if (hunk_text[0] == ' ') 1 else 0;
-                scr.putStr(inner.x, inner.y + row, hunk_text[start..], panel_bg, 0, inner);
+                scr.putStr(inner.x, inner.y + row, hunk_text[start..], tui.Panel.body, 0, inner);
                 row += 1;
             }
         }
         if (row < inner.h) row += 1;
         if (row >= inner.h) return;
-        paintYesNoChoices(scr, inner, inner.y + row, self.yes, self.comments, panel_bg, choice_cur);
+        paintYesNoChoices(scr, inner, inner.y + row, self.yes, self.comments, tui.Panel.body, tui.Panel.row_cur);
     }
 
     pub fn titleBar(self: DiscardConfirm) []const u8 {
@@ -2633,7 +2615,7 @@ pub const Draft = struct {
         // it stays empty so wrap does not reflow when the bar appears.
         if (m.show_scrollbar and size.cols > 0) {
             const bar_x: u16 = size.cols - 1;
-            const thumb = comment_input.scrollbarThumb(
+            const thumb = tui.scrollbarThumb(
                 m.line_count,
                 m.height,
                 ds,
@@ -3162,44 +3144,58 @@ fn wheelDirection(mouse: tui.Mouse) ?Wheel {
     };
 }
 
-/// Wheel on a list moves the window and leaves the selected row.
-fn scrollList(scroll: *usize, window_moved: *bool, wheel: Wheel) void {
-    switch (wheel) {
-        .up => scroll.* -|= 1,
-        .down => scroll.* +|= 1,
-        .left, .right => return,
-    }
-    window_moved.* = true;
-}
+/// Cursor and window for an overlay list. `j`/`k` and the wheel share this.
+const ListWin = struct {
+    cursor: usize = 0,
+    scroll: usize = 0,
+    window_moved: bool = false,
 
-/// Keep `cursor` inside the overlay window of height `view_h`.
-fn ensureListCursorVisible(scroll: *usize, cursor: usize, view_h: usize, n: usize) void {
-    if (n == 0 or view_h == 0) {
-        scroll.* = 0;
-        return;
+    fn key(self: *ListWin, n: usize, k: tui.Key) void {
+        self.window_moved = false;
+        switch (k) {
+            .char => |c| {
+                if (c == 'j') {
+                    if (self.cursor + 1 < n) self.cursor += 1;
+                } else if (c == 'k') {
+                    if (self.cursor > 0) self.cursor -= 1;
+                }
+            },
+            .down => {
+                if (self.cursor + 1 < n) self.cursor += 1;
+            },
+            .up => {
+                if (self.cursor > 0) self.cursor -= 1;
+            },
+            else => {},
+        }
     }
-    if (cursor < scroll.*) {
-        scroll.* = cursor;
-    } else if (cursor >= scroll.* + view_h) {
-        scroll.* = cursor - view_h + 1;
-    }
-    const max_scroll = if (n > view_h) n - view_h else 0;
-    if (scroll.* > max_scroll) scroll.* = max_scroll;
-}
 
-/// A wheel scroll clamps the window. Any other paint pulls the selected row into view.
-fn placeListScroll(scroll: *usize, cursor: usize, window_moved: bool, view_h: usize, n: usize) void {
-    if (!window_moved) {
-        ensureListCursorVisible(scroll, cursor, view_h, n);
-        return;
+    fn wheel(self: *ListWin, dir: Wheel) void {
+        switch (dir) {
+            .up => self.scroll -|= 1,
+            .down => self.scroll +|= 1,
+            .left, .right => return,
+        }
+        self.window_moved = true;
     }
-    if (n == 0 or view_h == 0) {
-        scroll.* = 0;
-        return;
+
+    /// A wheel scroll clamps the window. Any other paint pulls the selected row into view.
+    fn place(self: *ListWin, view_h: usize, n: usize) void {
+        if (n == 0 or view_h == 0) {
+            self.scroll = 0;
+            return;
+        }
+        if (!self.window_moved) {
+            if (self.cursor < self.scroll) {
+                self.scroll = self.cursor;
+            } else if (self.cursor >= self.scroll + view_h) {
+                self.scroll = self.cursor - view_h + 1;
+            }
+        }
+        const max_scroll = if (n > view_h) n - view_h else 0;
+        if (self.scroll > max_scroll) self.scroll = max_scroll;
     }
-    const max_scroll = if (n > view_h) n - view_h else 0;
-    if (scroll.* > max_scroll) scroll.* = max_scroll;
-}
+};
 
 /// Comment side implied by which line numbers the anchor has.
 /// Path-only (file) and both-starts (hunk) anchors have no side.
@@ -3413,12 +3409,12 @@ fn applyListDismiss(
     list: *CommentList,
     note: *StatusNote,
 ) std.mem.Allocator.Error!void {
-    const idx = list.cursor;
+    const idx = list.win.cursor;
     if (idx >= list.items.items.len) return;
     if (!dismissById(review, alloc, io, list.items.items[idx].id, note)) return;
     try list.load(alloc, review.comments.items);
     if (list.items.items.len > 0) {
-        list.cursor = @min(idx, list.items.items.len - 1);
+        list.win.cursor = @min(idx, list.items.items.len - 1);
     }
 }
 
@@ -3440,7 +3436,7 @@ fn applyListApprove(
     list: *FileList,
 ) std.mem.Allocator.Error!void {
     if (source != .local) return;
-    const idx = list.cursor;
+    const idx = list.win.cursor;
     if (idx >= list.items.items.len) return;
     cursor.* = list.items.items[idx];
     try dispatchApprove(alloc, io, source, diff_view, cursor, note, focus, failure, review, confirm, true);
@@ -3450,23 +3446,6 @@ fn applyListApprove(
     }
     if (focus.* == .git_error) return;
     try list.reload(alloc, diff_view.rows, idx);
-}
-
-/// Centered overlay. Width up to 120; height grows with rows, clamped to
-/// 25–70% of the terminal. Always leaves at least 2 cells on every side.
-fn listOverlayRect(cols: u16, rows: u16, n: usize) tui.Rect {
-    const n16: u16 = std.math.cast(u16, n) orelse std.math.maxInt(u16);
-    const max_w: u16 = 120;
-    const avail_h: u16 = rows -| 4;
-    const rows_n: u32 = rows;
-    const min_pct: u16 = @intCast(rows_n / 4);
-    const max_pct: u16 = @intCast(rows_n * 7 / 10);
-    const min_h: u16 = @min(avail_h, @max(3, min_pct));
-    const max_h: u16 = @min(avail_h, @max(min_h, max_pct));
-    const want_w: u16 = @min(cols -| 4, max_w);
-    const content_h: u16 = @max(3, n16 +| 2);
-    const want_h: u16 = @min(max_h, @max(min_h, content_h));
-    return tui.Rect.centered(cols, rows, want_w, want_h);
 }
 
 /// Comment-list overlay (`Space` `c`): snapshot of live comments, cursor, keys, and paint.
@@ -3483,9 +3462,7 @@ const CommentList = struct {
     };
 
     items: std.ArrayList(store.Comment) = .empty,
-    cursor: usize = 0,
-    scroll: usize = 0,
-    window_moved: bool = false,
+    win: ListWin = .{},
 
     fn load(
         self: *CommentList,
@@ -3494,20 +3471,18 @@ const CommentList = struct {
     ) std.mem.Allocator.Error!void {
         self.items.clearRetainingCapacity();
         try self.items.appendSlice(alloc, live);
-        self.cursor = 0;
-        self.scroll = 0;
-        self.window_moved = false;
+        self.win = .{};
     }
 
     fn jumpResult(self: *const CommentList, rows: []const view.row.Row, edit: bool) Result {
-        if (self.cursor >= self.items.items.len) return .open;
-        const loc = comments.loc(self.items.items[self.cursor]) orelse return .missing;
+        if (self.win.cursor >= self.items.items.len) return .open;
+        const loc = comments.loc(self.items.items[self.win.cursor]) orelse return .missing;
         if (view.rowForComment(rows, loc)) |idx| return .{ .jump = .{ .row = idx, .edit = edit } };
         return .{ .hidden = .{ .loc = loc, .edit = edit } };
     }
 
     fn handleKey(self: *CommentList, key: tui.Key, rows: []const view.row.Row) Result {
-        self.window_moved = false;
+        self.win.key(self.items.items.len, key);
         switch (key) {
             .esc => return .closed,
             .enter => return self.jumpResult(rows, false),
@@ -3516,20 +3491,9 @@ const CommentList = struct {
                 if (c == '?') return .help;
                 if (c == 'i' or c == 'I' or c == 'c' or c == 'C') return self.jumpResult(rows, true);
                 if (c == 'd' or c == 'D') {
-                    if (self.cursor >= self.items.items.len) return .open;
+                    if (self.win.cursor >= self.items.items.len) return .open;
                     return .dismiss;
                 }
-                if (c == 'j') {
-                    if (self.cursor + 1 < self.items.items.len) self.cursor += 1;
-                } else if (c == 'k') {
-                    if (self.cursor > 0) self.cursor -= 1;
-                }
-            },
-            .down => {
-                if (self.cursor + 1 < self.items.items.len) self.cursor += 1;
-            },
-            .up => {
-                if (self.cursor > 0) self.cursor -= 1;
             },
             .ctrl_c => return .quit,
             else => {},
@@ -3580,72 +3544,30 @@ const CommentList = struct {
     }
 
     fn paint(self: *CommentList, scr: *tui.Screen, size: tui.Size) void {
-        const bg = tui.Color{ .rgb = .{ .r = 0x12, .g = 0x12, .b = 0x14 } };
-        const fg = tui.Color{ .rgb = .{ .r = 0xd0, .g = 0xd0, .b = 0xd0 } };
-        const panel_bg = tui.Style{ .fg = fg, .bg = bg };
-        const panel_frame = tui.Style{
-            .fg = .{ .rgb = .{ .r = 0x5d, .g = 0x81, .b = 0xb7 } },
-            .bg = bg,
-            .bold = true,
-        };
-        const row_cur = tui.Style{
-            .fg = fg,
-            .bg = .{ .rgb = .{ .r = 0x2a, .g = 0x2a, .b = 0x30 } },
-            .bold = true,
-        };
-        const bar_track = tui.Style{
-            .fg = .{ .rgb = .{ .r = 0x6a, .g = 0x7a, .b = 0x9a } },
-            .bg = bg,
-            .dim = true,
-        };
-        const bar_thumb = tui.Style{
-            .fg = .{ .rgb = .{ .r = 0xee, .g = 0xee, .b = 0xee } },
-            .bg = .{ .rgb = .{ .r = 0x4a, .g = 0x6a, .b = 0x9a } },
-            .bold = true,
-        };
-
         const items = self.items.items;
-        const panel = listOverlayRect(size.cols, size.rows, items.len);
-        scr.fillRect(panel, ' ', panel_bg);
-        scr.drawBox(panel, panel_frame);
-        const inner = panel.inset(1);
-        if (panel.h > 0 and panel.w > 2) {
-            scr.putStr(panel.x + 2, panel.y, " comments ", panel_frame, 0, panel);
-        }
-        placeListScroll(&self.scroll, self.cursor, self.window_moved, inner.h, items.len);
+        const panel = tui.Panel.overlay(size.cols, size.rows, items.len);
+        panel.paint(scr, " comments ");
+        const inner = panel.inner;
+        self.win.place(inner.h, items.len);
         if (inner.h == 0 or inner.w == 0) return;
         if (items.len == 0) {
-            scr.putStr(inner.x, inner.y, "no comments", panel_bg, 0, inner);
+            scr.putStr(inner.x, inner.y, "no comments", tui.Panel.body, 0, inner);
             return;
         }
-        const show_bar = items.len > inner.h;
-        const text_area = if (show_bar)
-            tui.Rect{ .x = inner.x, .y = inner.y, .w = inner.w -| 2, .h = inner.h }
-        else
-            inner;
-        const start = self.scroll;
+        const text_area = panel.text(items.len);
+        const start = self.win.scroll;
         var line_buf: [512]u8 = undefined;
         var row: u16 = 0;
         while (row < inner.h) : (row += 1) {
             const idx = start + row;
             if (idx >= items.len) break;
             const y = inner.y + row;
-            const st = if (idx == self.cursor) row_cur else panel_bg;
+            const st = if (idx == self.win.cursor) tui.Panel.row_cur else tui.Panel.body;
             scr.fillRect(.{ .x = inner.x, .y = y, .w = inner.w, .h = 1 }, ' ', st);
             const text = formatLine(&line_buf, items[idx]);
             scr.putStr(inner.x, y, text, st, 0, text_area);
         }
-        if (show_bar) {
-            const bar_x: u16 = inner.x + inner.w - 1;
-            const thumb = comment_input.scrollbarThumb(items.len, inner.h, start, inner.h);
-            var br: u16 = 0;
-            while (br < inner.h) : (br += 1) {
-                const in_thumb = br >= thumb.start and br < thumb.start + thumb.len;
-                const st = if (in_thumb) bar_thumb else bar_track;
-                const ch: u21 = if (in_thumb) '█' else '│';
-                scr.setCell(bar_x, inner.y + br, .{ .char = ch, .width = 1, .style = st });
-            }
-        }
+        panel.paintBar(scr, items.len, start);
     }
 };
 
@@ -3661,9 +3583,7 @@ const FileList = struct {
     };
 
     items: std.ArrayList(usize) = .empty,
-    cursor: usize = 0,
-    scroll: usize = 0,
-    window_moved: bool = false,
+    win: ListWin = .{},
 
     fn load(
         self: *FileList,
@@ -3675,13 +3595,11 @@ const FileList = struct {
         for (rows, 0..) |row, i| {
             if (row == .file_header) try self.items.append(alloc, i);
         }
-        self.cursor = 0;
-        self.scroll = 0;
-        self.window_moved = false;
+        self.win = .{};
         if (current_file) |start| {
             for (self.items.items, 0..) |idx, n| {
                 if (idx == start) {
-                    self.cursor = n;
+                    self.win.cursor = n;
                     break;
                 }
             }
@@ -3691,35 +3609,24 @@ const FileList = struct {
     fn reload(self: *FileList, alloc: std.mem.Allocator, rows: []const view.row.Row, keep: usize) std.mem.Allocator.Error!void {
         try self.load(alloc, rows, null);
         if (self.items.items.len > 0) {
-            self.cursor = @min(keep, self.items.items.len - 1);
+            self.win.cursor = @min(keep, self.items.items.len - 1);
         }
     }
 
     fn handleKey(self: *FileList, key: tui.Key) Result {
-        self.window_moved = false;
+        self.win.key(self.items.items.len, key);
         switch (key) {
             .esc => return .closed,
             .enter => {
-                if (self.cursor < self.items.items.len) return .{ .jump = self.items.items[self.cursor] };
+                if (self.win.cursor < self.items.items.len) return .{ .jump = self.items.items[self.win.cursor] };
             },
             .char => |c| {
                 if (c == 'q' or c == 'Q') return .quit;
                 if (c == '?') return .help;
                 if (c == 'a' or c == 'A') {
-                    if (self.cursor >= self.items.items.len) return .open;
+                    if (self.win.cursor >= self.items.items.len) return .open;
                     return .approve;
                 }
-                if (c == 'j') {
-                    if (self.cursor + 1 < self.items.items.len) self.cursor += 1;
-                } else if (c == 'k') {
-                    if (self.cursor > 0) self.cursor -= 1;
-                }
-            },
-            .down => {
-                if (self.cursor + 1 < self.items.items.len) self.cursor += 1;
-            },
-            .up => {
-                if (self.cursor > 0) self.cursor -= 1;
             },
             .ctrl_c => return .quit,
             else => {},
@@ -3728,72 +3635,30 @@ const FileList = struct {
     }
 
     fn paint(self: *FileList, scr: *tui.Screen, size: tui.Size, rows: []const view.row.Row) void {
-        const bg = tui.Color{ .rgb = .{ .r = 0x12, .g = 0x12, .b = 0x14 } };
-        const fg = tui.Color{ .rgb = .{ .r = 0xd0, .g = 0xd0, .b = 0xd0 } };
-        const panel_bg = tui.Style{ .fg = fg, .bg = bg };
-        const panel_frame = tui.Style{
-            .fg = .{ .rgb = .{ .r = 0x5d, .g = 0x81, .b = 0xb7 } },
-            .bg = bg,
-            .bold = true,
-        };
-        const row_cur = tui.Style{
-            .fg = fg,
-            .bg = .{ .rgb = .{ .r = 0x2a, .g = 0x2a, .b = 0x30 } },
-            .bold = true,
-        };
-        const bar_track = tui.Style{
-            .fg = .{ .rgb = .{ .r = 0x6a, .g = 0x7a, .b = 0x9a } },
-            .bg = bg,
-            .dim = true,
-        };
-        const bar_thumb = tui.Style{
-            .fg = .{ .rgb = .{ .r = 0xee, .g = 0xee, .b = 0xee } },
-            .bg = .{ .rgb = .{ .r = 0x4a, .g = 0x6a, .b = 0x9a } },
-            .bold = true,
-        };
-
         const items = self.items.items;
-        const panel = listOverlayRect(size.cols, size.rows, items.len);
-        scr.fillRect(panel, ' ', panel_bg);
-        scr.drawBox(panel, panel_frame);
-        const inner = panel.inset(1);
-        if (panel.h > 0 and panel.w > 2) {
-            scr.putStr(panel.x + 2, panel.y, " files ", panel_frame, 0, panel);
-        }
-        placeListScroll(&self.scroll, self.cursor, self.window_moved, inner.h, items.len);
+        const panel = tui.Panel.overlay(size.cols, size.rows, items.len);
+        panel.paint(scr, " files ");
+        const inner = panel.inner;
+        self.win.place(inner.h, items.len);
         if (inner.h == 0 or inner.w == 0) return;
         if (items.len == 0) {
-            scr.putStr(inner.x, inner.y, "no files", panel_bg, 0, inner);
+            scr.putStr(inner.x, inner.y, "no files", tui.Panel.body, 0, inner);
             return;
         }
-        const show_bar = items.len > inner.h;
-        const text_area = if (show_bar)
-            tui.Rect{ .x = inner.x, .y = inner.y, .w = inner.w -| 2, .h = inner.h }
-        else
-            inner;
-        const start = self.scroll;
+        const text_area = panel.text(items.len);
+        const start = self.win.scroll;
         var path_buf: [512]u8 = undefined;
         var row: u16 = 0;
         while (row < inner.h) : (row += 1) {
             const idx = start + row;
             if (idx >= items.len) break;
             const y = inner.y + row;
-            const st = if (idx == self.cursor) row_cur else panel_bg;
+            const st = if (idx == self.win.cursor) tui.Panel.row_cur else tui.Panel.body;
             scr.fillRect(.{ .x = inner.x, .y = y, .w = inner.w, .h = 1 }, ' ', st);
             const path = view.row.fileHeaderPathLabel(rows[items[idx]].file_header, &path_buf);
             scr.putStr(inner.x, y, path, st, 0, text_area);
         }
-        if (show_bar) {
-            const bar_x: u16 = inner.x + inner.w - 1;
-            const thumb = comment_input.scrollbarThumb(items.len, inner.h, start, inner.h);
-            var br: u16 = 0;
-            while (br < inner.h) : (br += 1) {
-                const in_thumb = br >= thumb.start and br < thumb.start + thumb.len;
-                const st = if (in_thumb) bar_thumb else bar_track;
-                const ch: u21 = if (in_thumb) '█' else '│';
-                scr.setCell(bar_x, inner.y + br, .{ .char = ch, .width = 1, .style = st });
-            }
-        }
+        panel.paintBar(scr, items.len, start);
     }
 };
 
@@ -3809,9 +3674,7 @@ const ApprovedList = struct {
     };
 
     items: std.ArrayList(approve.Hidden) = .empty,
-    cursor: usize = 0,
-    scroll: usize = 0,
-    window_moved: bool = false,
+    win: ListWin = .{},
 
     fn load(
         self: *ApprovedList,
@@ -3827,9 +3690,7 @@ const ApprovedList = struct {
         const hidden = try approve.collectApproved(alloc, io, .cwd(), d, &approved);
         defer alloc.free(hidden);
         try self.items.appendSlice(alloc, hidden);
-        self.cursor = 0;
-        self.scroll = 0;
-        self.window_moved = false;
+        self.win = .{};
         if (rows.len == 0) return;
         const cur = view.row.clampCursor(cursor, rows.len);
         if (rows[cur] == .section_header) return;
@@ -3838,32 +3699,21 @@ const ApprovedList = struct {
         for (self.items.items, 0..) |item, n| {
             if (!std.mem.eql(u8, item.path, fh.path)) continue;
             if (item.group != fh.group) continue;
-            self.cursor = n;
+            self.win.cursor = n;
             break;
         }
     }
 
     fn handleKey(self: *ApprovedList, key: tui.Key) Result {
-        self.window_moved = false;
+        self.win.key(self.items.items.len, key);
         switch (key) {
             .esc => return .closed,
             .enter => {
-                if (self.cursor < self.items.items.len) return .{ .unapprove = self.cursor };
+                if (self.win.cursor < self.items.items.len) return .{ .unapprove = self.win.cursor };
             },
             .char => |c| {
                 if (c == 'q' or c == 'Q') return .quit;
                 if (c == '?') return .help;
-                if (c == 'j') {
-                    if (self.cursor + 1 < self.items.items.len) self.cursor += 1;
-                } else if (c == 'k') {
-                    if (self.cursor > 0) self.cursor -= 1;
-                }
-            },
-            .down => {
-                if (self.cursor + 1 < self.items.items.len) self.cursor += 1;
-            },
-            .up => {
-                if (self.cursor > 0) self.cursor -= 1;
             },
             .ctrl_c => return .quit,
             else => {},
@@ -3885,72 +3735,30 @@ const ApprovedList = struct {
     }
 
     fn paint(self: *ApprovedList, scr: *tui.Screen, size: tui.Size) void {
-        const bg = tui.Color{ .rgb = .{ .r = 0x12, .g = 0x12, .b = 0x14 } };
-        const fg = tui.Color{ .rgb = .{ .r = 0xd0, .g = 0xd0, .b = 0xd0 } };
-        const panel_bg = tui.Style{ .fg = fg, .bg = bg };
-        const panel_frame = tui.Style{
-            .fg = .{ .rgb = .{ .r = 0x5d, .g = 0x81, .b = 0xb7 } },
-            .bg = bg,
-            .bold = true,
-        };
-        const row_cur = tui.Style{
-            .fg = fg,
-            .bg = .{ .rgb = .{ .r = 0x2a, .g = 0x2a, .b = 0x30 } },
-            .bold = true,
-        };
-        const bar_track = tui.Style{
-            .fg = .{ .rgb = .{ .r = 0x6a, .g = 0x7a, .b = 0x9a } },
-            .bg = bg,
-            .dim = true,
-        };
-        const bar_thumb = tui.Style{
-            .fg = .{ .rgb = .{ .r = 0xee, .g = 0xee, .b = 0xee } },
-            .bg = .{ .rgb = .{ .r = 0x4a, .g = 0x6a, .b = 0x9a } },
-            .bold = true,
-        };
-
         const items = self.items.items;
-        const panel = listOverlayRect(size.cols, size.rows, items.len);
-        scr.fillRect(panel, ' ', panel_bg);
-        scr.drawBox(panel, panel_frame);
-        const inner = panel.inset(1);
-        if (panel.h > 0 and panel.w > 2) {
-            scr.putStr(panel.x + 2, panel.y, " approved ", panel_frame, 0, panel);
-        }
-        placeListScroll(&self.scroll, self.cursor, self.window_moved, inner.h, items.len);
+        const panel = tui.Panel.overlay(size.cols, size.rows, items.len);
+        panel.paint(scr, " approved ");
+        const inner = panel.inner;
+        self.win.place(inner.h, items.len);
         if (inner.h == 0 or inner.w == 0) return;
         if (items.len == 0) {
-            scr.putStr(inner.x, inner.y, "no approved", panel_bg, 0, inner);
+            scr.putStr(inner.x, inner.y, "no approved", tui.Panel.body, 0, inner);
             return;
         }
-        const show_bar = items.len > inner.h;
-        const text_area = if (show_bar)
-            tui.Rect{ .x = inner.x, .y = inner.y, .w = inner.w -| 2, .h = inner.h }
-        else
-            inner;
-        const start = self.scroll;
+        const text_area = panel.text(items.len);
+        const start = self.win.scroll;
         var line_buf: [512]u8 = undefined;
         var row: u16 = 0;
         while (row < inner.h) : (row += 1) {
             const idx = start + row;
             if (idx >= items.len) break;
             const y = inner.y + row;
-            const st = if (idx == self.cursor) row_cur else panel_bg;
+            const st = if (idx == self.win.cursor) tui.Panel.row_cur else tui.Panel.body;
             scr.fillRect(.{ .x = inner.x, .y = y, .w = inner.w, .h = 1 }, ' ', st);
             const text = formatLine(&line_buf, items[idx]);
             scr.putStr(inner.x, y, text, st, 0, text_area);
         }
-        if (show_bar) {
-            const bar_x: u16 = inner.x + inner.w - 1;
-            const thumb = comment_input.scrollbarThumb(items.len, inner.h, start, inner.h);
-            var br: u16 = 0;
-            while (br < inner.h) : (br += 1) {
-                const in_thumb = br >= thumb.start and br < thumb.start + thumb.len;
-                const st = if (in_thumb) bar_thumb else bar_track;
-                const ch: u21 = if (in_thumb) '█' else '│';
-                scr.setCell(bar_x, inner.y + br, .{ .char = ch, .width = 1, .style = st });
-            }
-        }
+        panel.paintBar(scr, items.len, start);
     }
 };
 
@@ -3977,32 +3785,19 @@ const Failure = struct {
 
     fn paint(self: *const Failure, scr: *tui.Screen, size: tui.Size) void {
         const text = self.buf.items;
-        const bg = tui.Color{ .rgb = .{ .r = 0x12, .g = 0x12, .b = 0x14 } };
-        const fg = tui.Color{ .rgb = .{ .r = 0xd0, .g = 0xd0, .b = 0xd0 } };
-        const panel_bg = tui.Style{ .fg = fg, .bg = bg };
-        const panel_frame = tui.Style{
-            .fg = .{ .rgb = .{ .r = 0x5d, .g = 0x81, .b = 0xb7 } },
-            .bg = bg,
-            .bold = true,
-        };
-
         var n: usize = 0;
         var count_it = std.mem.splitScalar(u8, text, '\n');
         while (count_it.next()) |_| n += 1;
 
-        const panel = listOverlayRect(size.cols, size.rows, n);
-        scr.fillRect(panel, ' ', panel_bg);
-        scr.drawBox(panel, panel_frame);
-        const inner = panel.inset(1);
-        if (panel.h > 0 and panel.w > 2) {
-            scr.putStr(panel.x + 2, panel.y, " error ", panel_frame, 0, panel);
-        }
+        const panel = tui.Panel.overlay(size.cols, size.rows, n);
+        panel.paint(scr, " error ");
+        const inner = panel.inner;
         if (inner.h == 0 or inner.w == 0) return;
         var row: u16 = 0;
         var lines = std.mem.splitScalar(u8, text, '\n');
         while (lines.next()) |line| {
             if (row >= inner.h) break;
-            scr.putStr(inner.x, inner.y + row, line, panel_bg, 0, inner);
+            scr.putStr(inner.x, inner.y + row, line, tui.Panel.body, 0, inner);
             row += 1;
         }
     }
@@ -4523,19 +4318,18 @@ test "shift wheel and sideways wheel pan" {
 }
 
 test "list wheel moves the window and a key follows the selected row" {
-    var scroll: usize = 0;
-    var moved = false;
-    scrollList(&scroll, &moved, .down);
-    try std.testing.expectEqual(1, scroll);
-    try std.testing.expect(moved);
-    scrollList(&scroll, &moved, .left);
-    try std.testing.expectEqual(1, scroll);
-    try std.testing.expect(moved);
+    var win: ListWin = .{};
+    win.wheel(.down);
+    try std.testing.expectEqual(1, win.scroll);
+    try std.testing.expect(win.window_moved);
+    win.wheel(.left);
+    try std.testing.expectEqual(1, win.scroll);
+    try std.testing.expect(win.window_moved);
 
-    var list: FileList = .{ .scroll = 4, .window_moved = true };
+    var list: FileList = .{ .win = .{ .scroll = 4, .window_moved = true } };
     _ = list.handleKey(.{ .char = 'j' });
-    try std.testing.expect(!list.window_moved);
-    try std.testing.expectEqual(0, list.cursor);
+    try std.testing.expect(!list.win.window_moved);
+    try std.testing.expectEqual(0, list.win.cursor);
 }
 
 test "comment wheel scrolls the text and leaves the caret" {
