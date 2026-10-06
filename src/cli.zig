@@ -46,23 +46,19 @@ pub const Command = union(enum) {
     @"export": ExportOpts,
 };
 
-/// Where the TUI diff came from (`local` / range / commit). Comments store
-/// the same shape as `store.Source`.
-pub const Source = git.Origin;
-
-/// Status-strip text for `source`. `empty` is a clean worktree (no local
-/// changes), not an approved-only hide. Local is `HEAD`; an explicit range
-/// or commit stays the user-supplied string even if empty.
-pub fn sourceLabel(source: Source, empty: bool) []const u8 {
+/// Status-strip text for a TUI load origin. `empty` is a clean worktree (no
+/// local changes), not an approved-only hide. Local is `HEAD`; an explicit
+/// range or commit stays the user-supplied string even if empty.
+pub fn sourceLabel(source: git.Origin, empty: bool) []const u8 {
     return switch (source) {
         .local => if (empty) "HEAD · empty" else "HEAD",
         .range, .commit => |s| s,
     };
 }
 
-/// How to start the process: TUI (with a recorded source) or a headless command.
+/// How to start the process: TUI (with a recorded origin) or a headless command.
 pub const Launch = union(enum) {
-    tui: Source,
+    tui: git.Origin,
     command: Command,
 };
 
@@ -681,7 +677,7 @@ test "parse usage errors" {
 
 test "classify tui vs command" {
     switch (try classify(&.{})) {
-        .tui => |src| try testing.expectEqual(Source.local, src),
+        .tui => |src| try testing.expectEqual(git.Origin.local, src),
         .command => return error.TestUnexpectedResult,
     }
     switch (try classify(&.{"main...HEAD"})) {

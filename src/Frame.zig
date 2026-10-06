@@ -271,7 +271,7 @@ pub const Shown = struct {
     cursor: usize,
     scroll: usize,
     col_scroll: usize,
-    pans: []const view.viewport.Pan,
+    pans: []const view.window.Pan,
     wrap: bool,
     show_line_numbers: bool,
     layout_pref: view.layout.LayoutPref,
@@ -309,8 +309,8 @@ pub fn paint(self: *const Frame, scr: *tui.Screen, size: tui.Size, shown: Shown)
 
     var line_buf: [512]u8 = undefined;
     const sticky = switch (layout) {
-        .unified => view.viewport.stickyHeaders(rows, shown.scroll, area.rows),
-        .side_by_side => view.viewport.stickyHeadersSbs(sbs_slots, rows, shown.scroll, area.rows),
+        .unified => view.window.stickyHeaders(rows, shown.scroll, area.rows),
+        .side_by_side => view.window.stickyHeadersSbs(sbs_slots, rows, shown.scroll, area.rows),
     };
     const hints = shown.hints;
     var hint_buf: [160]u8 = undefined;
@@ -346,7 +346,7 @@ pub fn paint(self: *const Frame, scr: *tui.Screen, size: tui.Size, shown: Shown)
                 const st = pal.rowStyle(rows[i], is_cur);
                 switch (rows[i]) {
                     .line => {
-                        full_pane.col_scroll = view.viewport.columnAt(rows, i, shown.cursor, shown.col_scroll, shown.pans);
+                        full_pane.col_scroll = view.window.columnAt(rows, i, shown.cursor, shown.col_scroll, shown.pans);
                         screen_y = full_pane.putRow(
                             screen_y,
                             area.bottom,
@@ -422,7 +422,7 @@ pub fn paint(self: *const Frame, scr: *tui.Screen, size: tui.Size, shown: Shown)
                     .body => |ri| {
                         const marked = shown.marked[ri];
                         const st = pal.rowStyle(rows[ri], ri == cur);
-                        full_pane.col_scroll = view.viewport.columnAt(rows, ri, shown.cursor, shown.col_scroll, shown.pans);
+                        full_pane.col_scroll = view.window.columnAt(rows, ri, shown.cursor, shown.col_scroll, shown.pans);
                         screen_y = full_pane.putRow(
                             screen_y,
                             area.bottom,
@@ -444,7 +444,7 @@ pub fn paint(self: *const Frame, scr: *tui.Screen, size: tui.Size, shown: Shown)
                         const right_st = if (p.right) |ri|
                             pal.rowStyle(rows[ri], slot_cur)
                         else if (slot_cur) pal.ctx_cur else pal.body;
-                        const n = view.viewport.slotScreenHeight(
+                        const n = view.window.slotScreenHeight(
                             sbs_slots[si],
                             rows,
                             view.layout.bodyTextCols(panes.left_w, num_w, .side_by_side),
@@ -459,7 +459,7 @@ pub fn paint(self: *const Frame, scr: *tui.Screen, size: tui.Size, shown: Shown)
                             fillSpan(scr, right_x, size.cols, screen_y, right_st);
                             if (p.left) |ri| {
                                 const marked = shown.marked[ri];
-                                left_pane.col_scroll = view.viewport.columnAt(rows, ri, shown.cursor, shown.col_scroll, shown.pans);
+                                left_pane.col_scroll = view.window.columnAt(rows, ri, shown.cursor, shown.col_scroll, shown.pans);
                                 if (shown.wrap) {
                                     left_pane.putSegment(screen_y, rows[ri], marked, vis, left_st, slot_cur);
                                 } else {
@@ -468,7 +468,7 @@ pub fn paint(self: *const Frame, scr: *tui.Screen, size: tui.Size, shown: Shown)
                             }
                             if (p.right) |ri| {
                                 const marked = shown.marked[ri];
-                                right_pane.col_scroll = view.viewport.columnAt(rows, ri, shown.cursor, shown.col_scroll, shown.pans);
+                                right_pane.col_scroll = view.window.columnAt(rows, ri, shown.cursor, shown.col_scroll, shown.pans);
                                 if (shown.wrap) {
                                     right_pane.putSegment(screen_y, rows[ri], marked, vis, right_st, slot_cur);
                                 } else {
@@ -490,10 +490,10 @@ pub fn paint(self: *const Frame, scr: *tui.Screen, size: tui.Size, shown: Shown)
             if (status_note.len > 0) {
                 scr.putStr(1, footer_y, status_note, pal.footer, 0, null);
             } else {
-                const st = view.nav.statusAt(rows, cur);
+                const place = view.nav.placeAt(rows, cur);
                 const footer_text = formatFooter(
                     &line_buf,
-                    st,
+                    place,
                     shown.open_n,
                     shown.layout_pref,
                     size.cols,
@@ -741,7 +741,7 @@ fn layoutFooterLabel(pref: view.layout.LayoutPref, cols: u16) []const u8 {
 
 fn formatFooter(
     buf: []u8,
-    st: view.nav.Status,
+    place: view.nav.Place,
     open_n: usize,
     layout_pref: view.layout.LayoutPref,
     cols: u16,
@@ -749,15 +749,15 @@ fn formatFooter(
     empty_label: []const u8,
     wrap: bool,
 ) []const u8 {
-    if (st.row_n == 0) return empty_label;
+    if (place.row_n == 0) return empty_label;
     const mode = layoutFooterLabel(layout_pref, cols);
     const wrap_tag: []const u8 = if (wrap) "  wrap" else "";
-    if (st.hunk_n == 0) {
+    if (place.hunk_n == 0) {
         return bufPrintTrunc(buf, "{s}  {s}  {d}/{d}  {d} open  {s}{s}", .{
             source_label,
-            if (st.path.len > 0) st.path else "?",
-            st.row_i,
-            st.row_n,
+            if (place.path.len > 0) place.path else "?",
+            place.row_i,
+            place.row_n,
             open_n,
             mode,
             wrap_tag,
@@ -765,11 +765,11 @@ fn formatFooter(
     }
     return bufPrintTrunc(buf, "{s}  {s}  hunk {d}/{d}  {d}/{d}  {d} open  {s}{s}", .{
         source_label,
-        if (st.path.len > 0) st.path else "?",
-        st.hunk_i,
-        st.hunk_n,
-        st.row_i,
-        st.row_n,
+        if (place.path.len > 0) place.path else "?",
+        place.hunk_i,
+        place.hunk_n,
+        place.row_i,
+        place.row_n,
         open_n,
         mode,
         wrap_tag,
@@ -845,7 +845,7 @@ pub const RowHints = struct {
     /// Git label for row `ri`. File row says File, including the sticky file
     /// header while the cursor is in a hunk. Hunk row says Hunk. Verb follows
     /// the file's group. Empty on other rows, section rows, and range loads.
-    pub fn indexAt(self: RowHints, ri: usize) []const u8 {
+    pub fn stageAt(self: RowHints, ri: usize) []const u8 {
         const g = self.group orelse return "";
         const stage = switch (g) {
             .unstaged, .untracked => true,
@@ -897,13 +897,13 @@ pub const RowHints = struct {
     }
 
     fn text(self: RowHints, buf: []u8, ri: usize) []const u8 {
-        const git = self.indexAt(ri);
+        const stage = self.stageAt(ri);
         const approve = self.approveAt(ri);
         const expand = self.expandAt(ri);
         var n: usize = 0;
         var parts: [3][]const u8 = undefined;
-        if (git.len > 0) {
-            parts[n] = git;
+        if (stage.len > 0) {
+            parts[n] = stage;
             n += 1;
         }
         if (approve.len > 0) {
@@ -1576,24 +1576,24 @@ test "headerHint expand on hunk that can grow" {
     try testing.expectEqualStrings("", held.expandAt(2));
 }
 
-test "indexHintForRow file hunk and sticky file" {
+test "stageHintForRow file hunk and sticky file" {
     const unstaged_file = RowHints{ .file = 1, .group = .unstaged };
     try testing.expectEqualStrings(
         "Stage File (gS)  Discard File (gD)",
-        unstaged_file.indexAt(1),
+        unstaged_file.stageAt(1),
     );
     const unstaged_both = RowHints{ .file = 1, .hunk = 2, .group = .unstaged };
     try testing.expectEqualStrings(
         "Stage File (gS)  Discard File (gD)",
-        unstaged_both.indexAt(1),
+        unstaged_both.stageAt(1),
     );
     const staged_both = RowHints{ .file = 1, .hunk = 2, .group = .staged };
-    try testing.expectEqualStrings("Unstage File (gU)", staged_both.indexAt(1));
+    try testing.expectEqualStrings("Unstage File (gU)", staged_both.stageAt(1));
     try testing.expectEqualStrings(
         "Stage Hunk (gs)  Discard Hunk (gd)",
-        unstaged_both.indexAt(2),
+        unstaged_both.stageAt(2),
     );
-    try testing.expectEqualStrings("Unstage Hunk (gu)", staged_both.indexAt(2));
+    try testing.expectEqualStrings("Unstage Hunk (gu)", staged_both.stageAt(2));
 }
 
 test "approveHintForRow file hunk section and sticky file" {
@@ -1610,7 +1610,7 @@ test "approveHintForRow file hunk section and sticky file" {
 
 test "formatFooter approved-only is not a clean worktree" {
     var buf: [64]u8 = undefined;
-    const empty = view.nav.Status{
+    const empty = view.nav.Place{
         .path = "",
         .hunk_i = 0,
         .hunk_n = 0,
@@ -1637,16 +1637,16 @@ test "formatFooter approved-only is not a clean worktree" {
 
 test "formatFooter shows wrap when on" {
     var buf: [96]u8 = undefined;
-    const st = view.nav.Status{
+    const place = view.nav.Place{
         .path = "f",
         .hunk_i = 1,
         .hunk_n = 1,
         .row_i = 1,
         .row_n = 2,
     };
-    const off = formatFooter(&buf, st, 0, .unified, 80, "HEAD", "HEAD · empty", false);
+    const off = formatFooter(&buf, place, 0, .unified, 80, "HEAD", "HEAD · empty", false);
     try testing.expect(std.mem.indexOf(u8, off, "wrap") == null);
     var buf2: [96]u8 = undefined;
-    const on = formatFooter(&buf2, st, 0, .unified, 80, "HEAD", "HEAD · empty", true);
+    const on = formatFooter(&buf2, place, 0, .unified, 80, "HEAD", "HEAD · empty", true);
     try testing.expect(std.mem.indexOf(u8, on, "wrap") != null);
 }

@@ -1,5 +1,5 @@
 //! Display/review-list topic: comment helpers on rows.
-//! Row model is `row.zig`; viewport is `viewport.zig`; side-by-side layout
+//! Row model is `row.zig`; window math is `window.zig`; side-by-side layout
 //! is `layout.zig`; structural nav is `nav.zig`; search is `search.zig`;
 //! body wrap is `wrap.zig` (a tab uses the screen's 4-column stops). No terminal drawing.
 
@@ -8,7 +8,7 @@ const diff = @import("diff");
 const Allocator = std.mem.Allocator;
 
 pub const row = @import("row.zig");
-pub const viewport = @import("viewport.zig");
+pub const window = @import("window.zig");
 pub const layout = @import("layout.zig");
 pub const nav = @import("nav.zig");
 pub const search = @import("search.zig");
@@ -132,7 +132,7 @@ const testing = std.testing;
 
 test {
     _ = row;
-    _ = viewport;
+    _ = window;
     _ = layout;
     _ = nav;
     _ = search;
@@ -210,8 +210,8 @@ test "flatten inserts section headers at group boundaries" {
     try testing.expectEqual(1, nav.prevFileHeader(rows, 6));
     try testing.expectEqual(1, nav.prevFileHeader(rows, 5));
 
-    try testing.expectEqualStrings("", nav.statusAt(rows, 0).path);
-    try testing.expectEqualStrings("a", nav.statusAt(rows, 5).path);
+    try testing.expectEqualStrings("", nav.placeAt(rows, 0).path);
+    try testing.expectEqualStrings("a", nav.placeAt(rows, 5).path);
     try testing.expect(nav.currentHunkInFile(rows, 0) == null);
     try testing.expect(nav.currentHunkInFile(rows, 5) == null);
     try testing.expect(row.anchorAt(rows, 0) == null);

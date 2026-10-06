@@ -67,7 +67,7 @@
 //! hide only. Unapprove does not unstage. Live comments on that hunk (`a`)
 //! or on the file / any of its hunks (`A`) open a confirm (No selected;
 //! `yes` proceeds). Range and commit loads ignore `a`/`A`.
-//! Git failure opens a centered overlay with git’s error; Enter or Esc
+//! A git error opens a centered overlay with git’s stderr; Enter or Esc
 //! dismisses. The list is unchanged. Local load paints git and approve
 //! chords on the current file and hunk rows (no git/approve hints on a range
 //! load). `e` expands the current hunk’s context (local and range); a hunk
@@ -142,19 +142,19 @@ fn frameTitle(focus: Focus, comment: []const u8, confirm: []const u8) []const u8
     return switch (focus) {
         .commenting => comment,
         .searching => "rv  search  Enter jump  Esc cancel",
-        .listing => "rv  comments  j/k  Enter jump  i edit  d dismiss  Esc close  q quit",
+        .comments => "rv  comments  j/k  Enter jump  i edit  d dismiss  Esc close  q quit",
         .files => "rv  files  j/k  Enter jump  a/A approve  Esc close  q quit",
         .approved => "rv  approved  j/k move  Enter unapprove  Esc close  q quit",
         .helping => "rv  help  j/k  Esc/? close  q quit",
         .git_error => "rv  git error  Enter/Esc close  q quit",
-        .discard_confirm => confirm,
+        .confirm => confirm,
         .normal => "rv  j/k  /  i/I  ? help  q quit",
     };
 }
 
 /// Empty-list footer. A local load that only hid approved hunks is not a
 /// clean worktree. Other loads keep the source label.
-fn emptyFooterLabel(buf: []u8, source: cli.Source, approved_n: usize) []const u8 {
+fn emptyFooterLabel(buf: []u8, source: git.Origin, approved_n: usize) []const u8 {
     if (source == .local and approved_n > 0) {
         return std.fmt.bufPrint(buf, "HEAD · {d} approved", .{approved_n}) catch "HEAD";
     }
@@ -166,7 +166,7 @@ fn emptyFooterLabel(buf: []u8, source: cli.Source, approved_n: usize) []const u8
 fn rowHints(
     rows: []const view.row.Row,
     cur: usize,
-    source: cli.Source,
+    source: git.Origin,
     focus: Focus,
 ) Frame.RowHints {
     const hints_ok = source == .local and focus == .normal and rows.len > 0;
@@ -220,10 +220,10 @@ fn presentFrame(
     diff_view: *const OpenDiff,
     viewport: *Viewport,
     review: *const store.Review,
-    source: cli.Source,
+    source: git.Origin,
     focus: Focus,
     draft: *const Draft,
-    discard: DiscardConfirm,
+    confirm: Confirm,
     marks: *std.ArrayList(bool),
 ) !void {
     const footer_h = footerHeight(size.rows, focus, draft.metrics(size).height);
@@ -247,7 +247,7 @@ fn presentFrame(
         .show_line_numbers = viewport.show_line_numbers,
         .layout_pref = viewport.layout_pref,
         .marked = marks.items,
-        .title = frameTitle(focus, draft.titleBar(), discard.titleBar()),
+        .title = frameTitle(focus, draft.titleBar(), confirm.titleBar()),
         .show_footer = focus != .searching and focus != .commenting,
         .source_label = cli.sourceLabel(source, false),
         .empty_label = emptyFooterLabel(&empty_buf, source, diff_view.approved_n),
@@ -257,7 +257,7 @@ fn presentFrame(
     });
 }
 
-fn runTui(alloc: std.mem.Allocator, io: std.Io, source: cli.Source) !u8 {
+fn runTui(alloc: std.mem.Allocator, io: std.Io, source: git.Origin) !u8 {
     // Load before any TTY setup so error paths never touch the terminal.
     var diff_view: OpenDiff = switch (loadOpenDiff(alloc, io, source)) {
         .open => |loaded| loaded,
@@ -316,7 +316,7 @@ fn runTui(alloc: std.mem.Allocator, io: std.Io, source: cli.Source) !u8 {
     // next key. Unmatched is dropped; the second key is handled as usual.
     const Leader = enum { none, lists, git };
     var leader: Leader = .none;
-    var discard_confirm: DiscardConfirm = .{};
+    var confirm: Confirm = .{};
     var draft: Draft = .{};
     defer draft.buf.deinit(alloc);
     var search: Search = .{};
@@ -332,10 +332,10 @@ fn runTui(alloc: std.mem.Allocator, io: std.Io, source: cli.Source) !u8 {
     var frame: Frame = .{};
     var marks: std.ArrayList(bool) = .empty;
     defer marks.deinit(alloc);
-    var failure: Failure = .{};
-    defer failure.buf.deinit(alloc);
+    var git_error: GitError = .{};
+    defer git_error.buf.deinit(alloc);
 
-    try presentFrame(alloc, &frame, &scr, size, &diff_view, &viewport, &review, source, focus, &draft, discard_confirm, &marks);
+    try presentFrame(alloc, &frame, &scr, size, &diff_view, &viewport, &review, source, focus, &draft, confirm, &marks);
     try scr.present(&term);
 
     while (running) {
@@ -378,7 +378,7 @@ fn runTui(alloc: std.mem.Allocator, io: std.Io, source: cli.Source) !u8 {
                         },
                         .open => {},
                     },
-                    .listing => switch (comment_list.handleKey(key, diff_view.rows)) {
+                    .comments => switch (comment_list.handleKey(key, diff_view.rows)) {
                         .closed => focus = .normal,
                         .quit => running = false,
                         .help => {
@@ -431,9 +431,9 @@ fn runTui(alloc: std.mem.Allocator, io: std.Io, source: cli.Source) !u8 {
                             &viewport.cursor,
                             &frame.note,
                             &focus,
-                            &failure,
+                            &git_error,
                             &review,
-                            &discard_confirm,
+                            &confirm,
                             &file_list,
                         ),
                         .open => {},
@@ -460,19 +460,19 @@ fn runTui(alloc: std.mem.Allocator, io: std.Io, source: cli.Source) !u8 {
                         },
                         .open => {},
                     },
-                    .git_error => switch (failure.handleKey(key)) {
+                    .git_error => switch (git_error.handleKey(key)) {
                         .closed => focus = .normal,
                         .quit => running = false,
                         .open => {},
                     },
-                    .discard_confirm => switch (discard_confirm.handleKey(
+                    .confirm => switch (confirm.handleKey(
                         key,
                         &review,
                         &diff_view.diff,
                         diff_view.rows,
                         viewport.cursor,
                     )) {
-                        .closed => focus = if (discard_confirm.return_to_files) .files else .normal,
+                        .closed => focus = if (confirm.return_to_files) .files else .normal,
                         .quit => running = false,
                         .open => {},
                         .group => {
@@ -485,7 +485,7 @@ fn runTui(alloc: std.mem.Allocator, io: std.Io, source: cli.Source) !u8 {
                                 &viewport.cursor,
                                 &frame.note,
                                 &focus,
-                                &failure,
+                                &git_error,
                                 &review,
                             );
                         },
@@ -499,9 +499,9 @@ fn runTui(alloc: std.mem.Allocator, io: std.Io, source: cli.Source) !u8 {
                                 &viewport.cursor,
                                 &frame.note,
                                 &focus,
-                                &failure,
+                                &git_error,
                                 &review,
-                                discard_confirm.whole_file,
+                                confirm.whole_file,
                                 .discard,
                                 delete_them,
                             );
@@ -515,14 +515,14 @@ fn runTui(alloc: std.mem.Allocator, io: std.Io, source: cli.Source) !u8 {
                                 &viewport.cursor,
                                 &frame.note,
                                 &focus,
-                                &failure,
+                                &git_error,
                                 &review,
                                 .inherit,
                                 .cwd(),
-                                discard_confirm.whole_file,
+                                confirm.whole_file,
                             );
                             if (focus != .git_error) {
-                                if (discard_confirm.return_to_files) {
+                                if (confirm.return_to_files) {
                                     try file_list.reload(alloc, diff_view.rows, file_list.win.cursor);
                                     focus = .files;
                                 } else {
@@ -547,7 +547,7 @@ fn runTui(alloc: std.mem.Allocator, io: std.Io, source: cli.Source) !u8 {
                                     focus = .files;
                                 } else if (pending == .lists and c == 'c') {
                                     try comment_list.load(alloc, review.comments.items);
-                                    focus = .listing;
+                                    focus = .comments;
                                 } else if (pending == .lists and c == 'a') {
                                     if (source == .local) {
                                         if (approved_list.load(
@@ -572,7 +572,7 @@ fn runTui(alloc: std.mem.Allocator, io: std.Io, source: cli.Source) !u8 {
                                         &viewport.cursor,
                                         &frame.note,
                                         &focus,
-                                        &failure,
+                                        &git_error,
                                         &review,
                                         false,
                                         true,
@@ -586,13 +586,13 @@ fn runTui(alloc: std.mem.Allocator, io: std.Io, source: cli.Source) !u8 {
                                         &viewport.cursor,
                                         &frame.note,
                                         &focus,
-                                        &failure,
+                                        &git_error,
                                         &review,
                                         false,
                                         false,
                                     );
                                 } else if (pending == .git and c == 'd') {
-                                    beginGitDiscard(source, diff_view.rows, viewport.cursor, &discard_confirm, &focus, false);
+                                    beginGitDiscard(source, diff_view.rows, viewport.cursor, &confirm, &focus, false);
                                 } else if (pending == .git and c == 'S') {
                                     try dispatchStage(
                                         alloc,
@@ -602,7 +602,7 @@ fn runTui(alloc: std.mem.Allocator, io: std.Io, source: cli.Source) !u8 {
                                         &viewport.cursor,
                                         &frame.note,
                                         &focus,
-                                        &failure,
+                                        &git_error,
                                         &review,
                                         true,
                                         true,
@@ -616,13 +616,13 @@ fn runTui(alloc: std.mem.Allocator, io: std.Io, source: cli.Source) !u8 {
                                         &viewport.cursor,
                                         &frame.note,
                                         &focus,
-                                        &failure,
+                                        &git_error,
                                         &review,
                                         true,
                                         false,
                                     );
                                 } else if (pending == .git and c == 'D') {
-                                    beginGitDiscard(source, diff_view.rows, viewport.cursor, &discard_confirm, &focus, true);
+                                    beginGitDiscard(source, diff_view.rows, viewport.cursor, &confirm, &focus, true);
                                 } else if (viewport.handleKey(.{ .char = c }, size.cols, diff_view.rows, diff_view.sbs_slots) == .handled) {
                                     // j/k/h/l/0/$/J/K/[/]/{/}/t/#/w
                                 } else if (c == 'q' or c == 'Q') {
@@ -688,9 +688,9 @@ fn runTui(alloc: std.mem.Allocator, io: std.Io, source: cli.Source) !u8 {
                                         &viewport.cursor,
                                         &frame.note,
                                         &focus,
-                                        &failure,
+                                        &git_error,
                                         &review,
-                                        &discard_confirm,
+                                        &confirm,
                                         false,
                                     );
                                 } else if (c == 'A') {
@@ -702,9 +702,9 @@ fn runTui(alloc: std.mem.Allocator, io: std.Io, source: cli.Source) !u8 {
                                         &viewport.cursor,
                                         &frame.note,
                                         &focus,
-                                        &failure,
+                                        &git_error,
                                         &review,
-                                        &discard_confirm,
+                                        &confirm,
                                         true,
                                     );
                                 } else if (c == 'd') {
@@ -747,31 +747,31 @@ fn runTui(alloc: std.mem.Allocator, io: std.Io, source: cli.Source) !u8 {
                     .left, .right => {},
                 },
                 .files => file_list.win.wheel(dir),
-                .listing => comment_list.win.wheel(dir),
+                .comments => comment_list.win.wheel(dir),
                 .approved => approved_list.win.wheel(dir),
                 .commenting => draft.scrollWheel(dir, size),
-                .searching, .git_error, .discard_confirm => {},
+                .searching, .git_error, .confirm => {},
             },
         }
         if (running) {
-            try presentFrame(alloc, &frame, &scr, size, &diff_view, &viewport, &review, source, focus, &draft, discard_confirm, &marks);
+            try presentFrame(alloc, &frame, &scr, size, &diff_view, &viewport, &review, source, focus, &draft, confirm, &marks);
             if (focus == .helping) {
                 help.paint(&scr, size);
                 scr.hideCursor();
             } else if (focus == .git_error) {
-                failure.paint(&scr, size);
+                git_error.paint(&scr, size);
                 scr.hideCursor();
             } else if (focus == .files) {
                 file_list.paint(&scr, size, diff_view.rows);
                 scr.hideCursor();
-            } else if (focus == .listing) {
+            } else if (focus == .comments) {
                 comment_list.paint(&scr, size);
                 scr.hideCursor();
             } else if (focus == .approved) {
                 approved_list.paint(&scr, size);
                 scr.hideCursor();
-            } else if (focus == .discard_confirm) {
-                discard_confirm.paint(&scr, size, diff_view.rows, viewport.cursor);
+            } else if (focus == .confirm) {
+                confirm.paint(&scr, size, diff_view.rows, viewport.cursor);
                 scr.hideCursor();
             } else if (focus == .searching) {
                 search.paintFooter(&scr, size);
@@ -797,7 +797,7 @@ pub const OpenDiff = struct {
     fn maybeInit(
         alloc: std.mem.Allocator,
         io: std.Io,
-        source: cli.Source,
+        source: git.Origin,
         note: *StatusNote,
     ) ?OpenDiff {
         switch (loadOpenDiff(alloc, io, source)) {
@@ -1313,7 +1313,7 @@ fn finishApply(
     cursor: *usize,
     note: *StatusNote,
     focus: *Focus,
-    failure: *Failure,
+    git_error: *GitError,
     result: Apply,
 ) std.mem.Allocator.Error!void {
     if (result.open) |loaded| {
@@ -1326,8 +1326,8 @@ fn finishApply(
     if (result.save_failed) note.set("failed to save .rv comment store");
     if (result.fail_message) |msg| {
         defer alloc.free(msg);
-        failure.buf.clearRetainingCapacity();
-        try failure.buf.appendSlice(alloc, msg);
+        git_error.buf.clearRetainingCapacity();
+        try git_error.buf.appendSlice(alloc, msg);
         focus.* = .git_error;
     }
 }
@@ -1570,7 +1570,7 @@ const DiffLoad = union(enum) {
 fn loadOpenDiff(
     alloc: std.mem.Allocator,
     io: std.Io,
-    source: cli.Source,
+    source: git.Origin,
 ) DiffLoad {
     var parsed = switch (source) {
         .local => git.loadDefaultDiff(alloc, io),
@@ -1593,7 +1593,7 @@ fn loadOpenDiff(
 fn flattenSource(
     alloc: std.mem.Allocator,
     io: std.Io,
-    source: cli.Source,
+    source: git.Origin,
     d: *const diff.Diff,
 ) approve.LoadError!Visible {
     return switch (source) {
@@ -1644,7 +1644,7 @@ fn reloadReview(
 fn reloadDiff(
     alloc: std.mem.Allocator,
     io: std.Io,
-    source: cli.Source,
+    source: git.Origin,
     diff_view: *OpenDiff,
     cursor: *usize,
     note: *StatusNote,
@@ -1666,7 +1666,7 @@ fn reloadDiff(
 fn expandCurrentHunk(
     alloc: std.mem.Allocator,
     io: std.Io,
-    source: cli.Source,
+    source: git.Origin,
     diff_view: *OpenDiff,
     cursor: *usize,
     note: *StatusNote,
@@ -1754,12 +1754,12 @@ fn restoreExpandCursor(
 fn applyApprove(
     alloc: std.mem.Allocator,
     io: std.Io,
-    source: cli.Source,
+    source: git.Origin,
     diff_view: *OpenDiff,
     cursor: *usize,
     note: *StatusNote,
     focus: *Focus,
-    failure: *Failure,
+    git_error: *GitError,
     review: *store.Review,
     cwd: std.process.Child.Cwd,
     root: std.Io.Dir,
@@ -1809,7 +1809,7 @@ fn applyApprove(
             .noop => return,
             .result => |r| {
                 const stage_ok = r.open != null;
-                try finishApply(alloc, diff_view, cursor, note, focus, failure, r);
+                try finishApply(alloc, diff_view, cursor, note, focus, git_error, r);
                 if (!stage_ok) return;
             },
         }
@@ -1864,7 +1864,7 @@ fn applyApprove(
 fn unapproveRebuild(
     alloc: std.mem.Allocator,
     io: std.Io,
-    source: cli.Source,
+    source: git.Origin,
     diff_view: *OpenDiff,
     note: *StatusNote,
     root: std.Io.Dir,
@@ -1904,7 +1904,7 @@ fn unapproveRebuild(
 fn applyUnapprove(
     alloc: std.mem.Allocator,
     io: std.Io,
-    source: cli.Source,
+    source: git.Origin,
     diff_view: *OpenDiff,
     cursor: *usize,
     note: *StatusNote,
@@ -2042,12 +2042,12 @@ fn identityAtRow(
 fn applyIndex(
     alloc: std.mem.Allocator,
     io: std.Io,
-    source: cli.Source,
+    source: git.Origin,
     diff_view: *OpenDiff,
     cursor: *usize,
     note: *StatusNote,
     focus: *Focus,
-    failure: *Failure,
+    git_error: *GitError,
     review: *store.Review,
     whole_file: bool,
     kind: MutationKind,
@@ -2068,7 +2068,7 @@ fn applyIndex(
         delete_comments,
     )) {
         .noop => {},
-        .result => |r| try finishApply(alloc, diff_view, cursor, note, focus, failure, r),
+        .result => |r| try finishApply(alloc, diff_view, cursor, note, focus, git_error, r),
     }
 }
 
@@ -2076,12 +2076,12 @@ fn applyIndex(
 fn applyGroupIndex(
     alloc: std.mem.Allocator,
     io: std.Io,
-    source: cli.Source,
+    source: git.Origin,
     diff_view: *OpenDiff,
     cursor: *usize,
     note: *StatusNote,
     focus: *Focus,
-    failure: *Failure,
+    git_error: *GitError,
     review: *store.Review,
 ) std.mem.Allocator.Error!void {
     if (source != .local) return;
@@ -2096,7 +2096,7 @@ fn applyGroupIndex(
         review,
     )) {
         .noop => {},
-        .result => |r| try finishApply(alloc, diff_view, cursor, note, focus, failure, r),
+        .result => |r| try finishApply(alloc, diff_view, cursor, note, focus, git_error, r),
     }
 }
 
@@ -2106,12 +2106,12 @@ fn applyGroupIndex(
 fn dispatchStage(
     alloc: std.mem.Allocator,
     io: std.Io,
-    source: cli.Source,
+    source: git.Origin,
     diff_view: *OpenDiff,
     cursor: *usize,
     note: *StatusNote,
     focus: *Focus,
-    failure: *Failure,
+    git_error: *GitError,
     review: *store.Review,
     whole_file: bool,
     stage: bool,
@@ -2129,7 +2129,7 @@ fn dispatchStage(
         cursor,
         note,
         focus,
-        failure,
+        git_error,
         review,
         whole_file,
         .stage_unstage,
@@ -2143,53 +2143,53 @@ fn dispatchStage(
 fn dispatchApprove(
     alloc: std.mem.Allocator,
     io: std.Io,
-    source: cli.Source,
+    source: git.Origin,
     diff_view: *OpenDiff,
     cursor: *usize,
     note: *StatusNote,
     focus: *Focus,
-    failure: *Failure,
+    git_error: *GitError,
     review: *store.Review,
-    confirm: *DiscardConfirm,
+    confirm: *Confirm,
     whole_file: bool,
 ) std.mem.Allocator.Error!void {
     if (source != .local) return;
     if (approveHasComments(review, &diff_view.diff, diff_view.rows, cursor.*, whole_file)) {
         confirm.* = .{ .kind = .approve, .whole_file = whole_file, .yes = false, .comments = false };
-        focus.* = .discard_confirm;
+        focus.* = .confirm;
         return;
     }
-    try applyApprove(alloc, io, source, diff_view, cursor, note, focus, failure, review, .inherit, .cwd(), whole_file);
+    try applyApprove(alloc, io, source, diff_view, cursor, note, focus, git_error, review, .inherit, .cwd(), whole_file);
 }
 
 /// Open the discard confirm for the hunk or file at the cursor. Hunk
 /// discard requires a hunk. Staged and range loads are no-ops.
 fn beginGitDiscard(
-    source: cli.Source,
+    source: git.Origin,
     rows: []const view.row.Row,
     cursor: usize,
-    discard: *DiscardConfirm,
+    confirm: *Confirm,
     focus: *Focus,
     whole_file: bool,
 ) void {
     if (source != .local) return;
     const target = discardTargetAt(rows, cursor, whole_file) orelse return;
     if (!whole_file and target.hunk_i == null) return;
-    discard.* = .{ .whole_file = whole_file, .yes = false, .comments = false };
-    focus.* = .discard_confirm;
+    confirm.* = .{ .whole_file = whole_file, .yes = false, .comments = false };
+    focus.* = .confirm;
 }
 
 /// Key ownership: normal nav, comment draft, `/` search prompt, comment list,
 /// file list, approved list, help, git error overlay, or confirm overlay
 /// (discard, group, or approve).
-pub const Focus = enum { normal, commenting, searching, listing, files, approved, helping, git_error, discard_confirm };
+pub const Focus = enum { normal, commenting, searching, comments, files, approved, helping, git_error, confirm };
 
 /// Confirm overlay for discard (`gd` / `gD`), group stage/unstage, and
 /// approve (`a` / `A` when the target has live comments). `yes` is the
 /// selected choice. Opens with **No** selected (Enter does not apply).
 /// Discard: if the target has live comments, `comments` is the second
 /// overlay and defaults to **Yes** (delete).
-pub const DiscardConfirm = struct {
+pub const Confirm = struct {
     const Result = union(enum) {
         open,
         closed,
@@ -2209,7 +2209,7 @@ pub const DiscardConfirm = struct {
     return_to_files: bool = false,
 
     fn handleKey(
-        self: *DiscardConfirm,
+        self: *Confirm,
         key: tui.Key,
         review: *const store.Review,
         d: *const diff.Diff,
@@ -2261,7 +2261,7 @@ pub const DiscardConfirm = struct {
     }
 
     fn paint(
-        self: DiscardConfirm,
+        self: Confirm,
         scr: *tui.Screen,
         size: tui.Size,
         rows: []const view.row.Row,
@@ -2342,7 +2342,7 @@ pub const DiscardConfirm = struct {
         paintYesNoChoices(scr, inner, inner.y + row, self.yes, self.comments, tui.Panel.body, tui.Panel.row_cur);
     }
 
-    pub fn titleBar(self: DiscardConfirm) []const u8 {
+    pub fn titleBar(self: Confirm) []const u8 {
         return switch (self.kind) {
             .group => switch (self.group) {
                 .unstaged, .untracked => "rv  stage all  No/yes  Enter  Esc cancel  q quit",
@@ -2478,7 +2478,7 @@ pub const Draft = struct {
         alloc: std.mem.Allocator,
         io: std.Io,
         review: *store.Review,
-        source: cli.Source,
+        source: git.Origin,
         key: tui.Key,
         size: tui.Size,
     ) std.mem.Allocator.Error!Result {
@@ -2753,7 +2753,7 @@ const StatusNote = Frame.StatusNote;
 pub const Viewport = struct {
     const Result = enum { handled, unhandled };
 
-    const HunkPan = view.viewport.Pan;
+    const HunkPan = view.window.Pan;
     const hunk_pan_cap = 48;
 
     cursor: usize = 0,
@@ -2894,8 +2894,8 @@ pub const Viewport = struct {
                 self.removePan(i);
                 continue;
             }
-            const span = view.viewport.hunkSpanAt(rows, header);
-            const col = view.viewport.clampColScroll(
+            const span = view.window.hunkSpanAt(rows, header);
+            const col = view.window.clampColScroll(
                 self.hunk_pans[i].col,
                 view.row.hunkMaxLineWidth(rows, span.body_start, span.body_end),
                 self.panViewportCols(cols, rows, header),
@@ -2914,7 +2914,7 @@ pub const Viewport = struct {
         const layout = view.layout.effectiveLayout(self.layout_pref, target.cols);
         const num_w = if (self.show_line_numbers) view.row.lineNumberWidth(target.rows) else 0;
         const panes = view.layout.sbsPaneWidths(target.cols);
-        return view.viewport.rowAtY(.{
+        return view.window.rowAtY(.{
             .y = target.y,
             .top = target.area_top,
             .bottom = target.area_bottom,
@@ -2953,8 +2953,8 @@ pub const Viewport = struct {
             return;
         };
         const row_i = self.rowUnderPointer(hit) orelse return;
-        const header = view.viewport.hunkSpanAt(hit.rows, row_i).header orelse return;
-        const cursor_hunk = view.viewport.hunkSpanAt(hit.rows, self.cursor).header;
+        const header = view.window.hunkSpanAt(hit.rows, row_i).header orelse return;
+        const cursor_hunk = view.window.hunkSpanAt(hit.rows, self.cursor).header;
         if (cursor_hunk != null and cursor_hunk.? == header) {
             if (left) self.col_scroll -|= 1 else self.col_scroll +|= 1;
             return;
@@ -2983,8 +2983,8 @@ pub const Viewport = struct {
                     self.col_scroll = 0;
                 },
                 '$' => if (!self.wrap) {
-                    const span = view.viewport.hunkSpanAt(rows, self.cursor);
-                    self.col_scroll = view.viewport.colScrollToEnd(
+                    const span = view.window.hunkSpanAt(rows, self.cursor);
+                    self.col_scroll = view.window.colScrollToEnd(
                         view.row.hunkMaxLineWidth(rows, span.body_start, span.body_end),
                         self.panViewportCols(cols, rows, self.cursor),
                     );
@@ -3041,7 +3041,7 @@ pub const Viewport = struct {
 
         // Moving into another hunk keeps each hunk's column. `col_scroll` is
         // always the cursor hunk's column, so keyboard pan stays on that field.
-        const new_hunk = view.viewport.hunkSpanAt(rows, cur).header;
+        const new_hunk = view.window.hunkSpanAt(rows, cur).header;
         if (self.pan_settled) {
             const same = if (self.settled_hunk) |old|
                 if (new_hunk) |h| old == h else false
@@ -3055,8 +3055,8 @@ pub const Viewport = struct {
         self.settled_hunk = new_hunk;
         self.pan_settled = true;
 
-        const pan_span = view.viewport.hunkSpanAt(rows, cur);
-        self.col_scroll = view.viewport.clampColScroll(
+        const pan_span = view.window.hunkSpanAt(rows, cur);
+        self.col_scroll = view.window.clampColScroll(
             self.col_scroll,
             view.row.hunkMaxLineWidth(rows, pan_span.body_start, pan_span.body_end),
             self.panViewportCols(cols, rows, cur),
@@ -3065,7 +3065,7 @@ pub const Viewport = struct {
         const num_w = if (self.show_line_numbers) view.row.lineNumberWidth(rows) else 0;
         if (self.window_moved) {
             self.scroll = switch (layout) {
-                .unified => view.viewport.clampScrollSticky(
+                .unified => view.window.clampScrollSticky(
                     self.scroll,
                     content_rows,
                     rows,
@@ -3074,7 +3074,7 @@ pub const Viewport = struct {
                 ),
                 .side_by_side => blk: {
                     const panes = view.layout.sbsPaneWidths(cols);
-                    break :blk view.viewport.clampScrollStickySbs(
+                    break :blk view.window.clampScrollStickySbs(
                         self.scroll,
                         content_rows,
                         slots,
@@ -3088,7 +3088,7 @@ pub const Viewport = struct {
             };
         } else switch (layout) {
             .unified => {
-                const settled = view.viewport.ensureVisibleSticky(
+                const settled = view.window.ensureVisibleSticky(
                     self.scroll,
                     cur,
                     content_rows,
@@ -3100,7 +3100,7 @@ pub const Viewport = struct {
             },
             .side_by_side => {
                 const panes = view.layout.sbsPaneWidths(cols);
-                const settled = view.viewport.ensureVisibleStickySbs(
+                const settled = view.window.ensureVisibleStickySbs(
                     self.scroll,
                     cur,
                     content_rows,
@@ -3264,7 +3264,7 @@ fn fullIndexOfHidden(full: []const view.row.Row, hidden: []const view.row.Row, h
 fn landComment(
     alloc: std.mem.Allocator,
     io: std.Io,
-    source: cli.Source,
+    source: git.Origin,
     diff_view: *OpenDiff,
     cursor: *usize,
     note: *StatusNote,
@@ -3305,7 +3305,7 @@ fn jumpLiveComment(
     diff_view: *OpenDiff,
     alloc: std.mem.Allocator,
     io: std.Io,
-    source: cli.Source,
+    source: git.Origin,
     cursor: *usize,
     note: *StatusNote,
     comptime toward: enum { next, prev },
@@ -3425,22 +3425,22 @@ fn applyListDismiss(
 fn applyListApprove(
     alloc: std.mem.Allocator,
     io: std.Io,
-    source: cli.Source,
+    source: git.Origin,
     diff_view: *OpenDiff,
     cursor: *usize,
     note: *StatusNote,
     focus: *Focus,
-    failure: *Failure,
+    git_error: *GitError,
     review: *store.Review,
-    confirm: *DiscardConfirm,
+    confirm: *Confirm,
     list: *FileList,
 ) std.mem.Allocator.Error!void {
     if (source != .local) return;
     const idx = list.win.cursor;
     if (idx >= list.items.items.len) return;
     cursor.* = list.items.items[idx];
-    try dispatchApprove(alloc, io, source, diff_view, cursor, note, focus, failure, review, confirm, true);
-    if (focus.* == .discard_confirm) {
+    try dispatchApprove(alloc, io, source, diff_view, cursor, note, focus, git_error, review, confirm, true);
+    if (focus.* == .confirm) {
         confirm.return_to_files = true;
         return;
     }
@@ -3762,13 +3762,13 @@ const ApprovedList = struct {
     }
 };
 
-/// Dismissible error overlay: message text, keys, and paint.
-const Failure = struct {
+/// Dismissible git-error overlay: stderr text, keys, and paint.
+const GitError = struct {
     const Result = enum { open, closed, quit };
 
     buf: std.ArrayList(u8) = .empty,
 
-    fn handleKey(self: *Failure, key: tui.Key) Result {
+    fn handleKey(self: *GitError, key: tui.Key) Result {
         switch (key) {
             .esc, .enter => {
                 self.buf.clearRetainingCapacity();
@@ -3783,7 +3783,7 @@ const Failure = struct {
         return .open;
     }
 
-    fn paint(self: *const Failure, scr: *tui.Screen, size: tui.Size) void {
+    fn paint(self: *const GitError, scr: *tui.Screen, size: tui.Size) void {
         const text = self.buf.items;
         var n: usize = 0;
         var count_it = std.mem.splitScalar(u8, text, '\n');
@@ -3817,20 +3817,20 @@ test "empty footer local approved is not a clean worktree" {
     );
 }
 
-test "indexHintForRow section has no git hint" {
+test "stageHintForRow section has no git hint" {
     const unstaged = Frame.RowHints{ .section = 0, .group = .unstaged };
     const untracked = Frame.RowHints{ .section = 0, .group = .untracked };
     const staged = Frame.RowHints{ .section = 0, .group = .staged };
-    try std.testing.expectEqualStrings("", unstaged.indexAt(0));
-    try std.testing.expectEqualStrings("", untracked.indexAt(0));
-    try std.testing.expectEqualStrings("", staged.indexAt(0));
-    try std.testing.expectEqualStrings("", unstaged.indexAt(1));
+    try std.testing.expectEqualStrings("", unstaged.stageAt(0));
+    try std.testing.expectEqualStrings("", untracked.stageAt(0));
+    try std.testing.expectEqualStrings("", staged.stageAt(0));
+    try std.testing.expectEqualStrings("", unstaged.stageAt(1));
     const no_section = Frame.RowHints{ .group = .unstaged };
-    try std.testing.expectEqualStrings("", no_section.indexAt(0));
+    try std.testing.expectEqualStrings("", no_section.stageAt(0));
 }
 
 test "approve confirm titleBar" {
-    const c: DiscardConfirm = .{ .kind = .approve };
+    const c: Confirm = .{ .kind = .approve };
     try std.testing.expectEqualStrings(
         "rv  approve  No/yes  Enter  Esc cancel  q quit",
         c.titleBar(),
@@ -4226,23 +4226,23 @@ test "sideways wheel pans the hunk under the pointer" {
     vp.scrollWheel(.right, on_cursor);
     try std.testing.expectEqual(2, vp.cursor);
     try std.testing.expectEqual(1, vp.col_scroll);
-    try std.testing.expectEqual(1, view.viewport.columnAt(rows, 2, vp.cursor, vp.col_scroll, vp.hunk_pans[0..vp.hunk_pan_n]));
+    try std.testing.expectEqual(1, view.window.columnAt(rows, 2, vp.cursor, vp.col_scroll, vp.hunk_pans[0..vp.hunk_pan_n]));
 
     var on_other = base;
     on_other.y = 6;
     vp.scrollWheel(.right, on_other);
     try std.testing.expectEqual(1, vp.col_scroll);
-    try std.testing.expectEqual(1, view.viewport.columnAt(rows, 5, vp.cursor, vp.col_scroll, vp.hunk_pans[0..vp.hunk_pan_n]));
-    try std.testing.expectEqual(0, view.viewport.columnAt(rows, 4, vp.cursor, vp.col_scroll, vp.hunk_pans[0..vp.hunk_pan_n]));
+    try std.testing.expectEqual(1, view.window.columnAt(rows, 5, vp.cursor, vp.col_scroll, vp.hunk_pans[0..vp.hunk_pan_n]));
+    try std.testing.expectEqual(0, view.window.columnAt(rows, 4, vp.cursor, vp.col_scroll, vp.hunk_pans[0..vp.hunk_pan_n]));
     vp.settle(80, 20, rows, slots);
-    try std.testing.expectEqual(1, view.viewport.columnAt(rows, 5, vp.cursor, vp.col_scroll, vp.hunk_pans[0..vp.hunk_pan_n]));
+    try std.testing.expectEqual(1, view.window.columnAt(rows, 5, vp.cursor, vp.col_scroll, vp.hunk_pans[0..vp.hunk_pan_n]));
     try std.testing.expectEqual(1, vp.col_scroll);
 
     var on_file = base;
     on_file.y = 1;
     vp.scrollWheel(.right, on_file);
     try std.testing.expectEqual(1, vp.col_scroll);
-    try std.testing.expectEqual(1, view.viewport.columnAt(rows, 5, vp.cursor, vp.col_scroll, vp.hunk_pans[0..vp.hunk_pan_n]));
+    try std.testing.expectEqual(1, view.window.columnAt(rows, 5, vp.cursor, vp.col_scroll, vp.hunk_pans[0..vp.hunk_pan_n]));
 
     var on_title = base;
     on_title.y = 0;
@@ -4252,22 +4252,22 @@ test "sideways wheel pans the hunk under the pointer" {
     var on_header = base;
     on_header.y = 5;
     vp.scrollWheel(.right, on_header);
-    try std.testing.expectEqual(2, view.viewport.columnAt(rows, 5, vp.cursor, vp.col_scroll, vp.hunk_pans[0..vp.hunk_pan_n]));
+    try std.testing.expectEqual(2, view.window.columnAt(rows, 5, vp.cursor, vp.col_scroll, vp.hunk_pans[0..vp.hunk_pan_n]));
     try std.testing.expectEqual(1, vp.col_scroll);
 
     vp.wrap = true;
     vp.scrollWheel(.right, on_other);
-    try std.testing.expectEqual(2, view.viewport.columnAt(rows, 5, vp.cursor, vp.col_scroll, vp.hunk_pans[0..vp.hunk_pan_n]));
+    try std.testing.expectEqual(2, view.window.columnAt(rows, 5, vp.cursor, vp.col_scroll, vp.hunk_pans[0..vp.hunk_pan_n]));
     vp.wrap = false;
 
     vp.cursor = 5;
     vp.settle(80, 20, rows, slots);
     try std.testing.expectEqual(2, vp.col_scroll);
-    try std.testing.expectEqual(1, view.viewport.columnAt(rows, 2, vp.cursor, vp.col_scroll, vp.hunk_pans[0..vp.hunk_pan_n]));
+    try std.testing.expectEqual(1, view.window.columnAt(rows, 2, vp.cursor, vp.col_scroll, vp.hunk_pans[0..vp.hunk_pan_n]));
     vp.cursor = 2;
     vp.settle(80, 20, rows, slots);
     try std.testing.expectEqual(1, vp.col_scroll);
-    try std.testing.expectEqual(2, view.viewport.columnAt(rows, 5, vp.cursor, vp.col_scroll, vp.hunk_pans[0..vp.hunk_pan_n]));
+    try std.testing.expectEqual(2, view.window.columnAt(rows, 5, vp.cursor, vp.col_scroll, vp.hunk_pans[0..vp.hunk_pan_n]));
 
     var sbs: Viewport = .{ .cursor = 2 };
     sbs.settle(80, 20, rows, slots);
@@ -4276,7 +4276,7 @@ test "sideways wheel pans the hunk under the pointer" {
     sbs.scrollWheel(.right, on_sbs);
     try std.testing.expectEqual(0, sbs.col_scroll);
     try std.testing.expectEqual(2, sbs.cursor);
-    try std.testing.expectEqual(1, view.viewport.columnAt(rows, 5, sbs.cursor, sbs.col_scroll, sbs.hunk_pans[0..sbs.hunk_pan_n]));
+    try std.testing.expectEqual(1, view.window.columnAt(rows, 5, sbs.cursor, sbs.col_scroll, sbs.hunk_pans[0..sbs.hunk_pan_n]));
 
     var d2 = try diff.parse(std.testing.allocator, fixture);
     defer d2.deinit();
@@ -4286,8 +4286,8 @@ test "sideways wheel pans the hunk under the pointer" {
     defer std.testing.allocator.free(slots2);
     vp.settle(80, 20, rows2, slots2);
     try std.testing.expectEqual(0, vp.col_scroll);
-    try std.testing.expectEqual(0, view.viewport.columnAt(rows2, 2, vp.cursor, vp.col_scroll, vp.hunk_pans[0..vp.hunk_pan_n]));
-    try std.testing.expectEqual(0, view.viewport.columnAt(rows2, 5, vp.cursor, vp.col_scroll, vp.hunk_pans[0..vp.hunk_pan_n]));
+    try std.testing.expectEqual(0, view.window.columnAt(rows2, 2, vp.cursor, vp.col_scroll, vp.hunk_pans[0..vp.hunk_pan_n]));
+    try std.testing.expectEqual(0, view.window.columnAt(rows2, 5, vp.cursor, vp.col_scroll, vp.hunk_pans[0..vp.hunk_pan_n]));
 }
 
 test "shift wheel and sideways wheel pan" {
@@ -4889,11 +4889,11 @@ test "applyApprove stages an unstaged hunk and hides it; nearby edit is unstaged
     var cursor: usize = firstHunkRow(diff_view.rows) orelse return error.TestUnexpectedResult;
     var note: StatusNote = .{};
     var focus: Focus = .normal;
-    var failure: Failure = .{};
-    defer failure.buf.deinit(alloc);
+    var git_error: GitError = .{};
+    defer git_error.buf.deinit(alloc);
     var review = try store.initEmpty(alloc, store.default_review_id);
     defer review.deinit();
-    try applyApprove(alloc, io, .local, &diff_view, &cursor, &note, &focus, &failure, &review, tmp.cwd(), tmp.dir, false);
+    try applyApprove(alloc, io, .local, &diff_view, &cursor, &note, &focus, &git_error, &review, tmp.cwd(), tmp.dir, false);
     try std.testing.expect(focus != .git_error);
     try std.testing.expect(!hasRowFile(diff_view.rows, "f.txt", .unstaged));
     try std.testing.expect(!hasRowFile(diff_view.rows, "f.txt", .staged));
@@ -4951,11 +4951,11 @@ test "applyApprove hides approved lines when git merges them with a staged neigh
     var cursor: usize = firstHunkRow(diff_view.rows) orelse return error.TestUnexpectedResult;
     var note: StatusNote = .{};
     var focus: Focus = .normal;
-    var failure: Failure = .{};
-    defer failure.buf.deinit(alloc);
+    var git_error: GitError = .{};
+    defer git_error.buf.deinit(alloc);
     var review = try store.initEmpty(alloc, store.default_review_id);
     defer review.deinit();
-    try applyApprove(alloc, io, .local, &diff_view, &cursor, &note, &focus, &failure, &review, cwd, tmp.dir, false);
+    try applyApprove(alloc, io, .local, &diff_view, &cursor, &note, &focus, &git_error, &review, cwd, tmp.dir, false);
     try std.testing.expect(focus != .git_error);
     try std.testing.expect(rowsHaveLine(diff_view.rows, "STAGED"));
     try std.testing.expect(!rowsHaveLine(diff_view.rows, "UNSTAGED"));
@@ -4996,11 +4996,11 @@ test "applyApprove on already-staged only hides" {
     var cursor: usize = firstHunkRow(diff_view.rows) orelse return error.TestUnexpectedResult;
     var note: StatusNote = .{};
     var focus: Focus = .normal;
-    var failure: Failure = .{};
-    defer failure.buf.deinit(alloc);
+    var git_error: GitError = .{};
+    defer git_error.buf.deinit(alloc);
     var review = try store.initEmpty(alloc, store.default_review_id);
     defer review.deinit();
-    try applyApprove(alloc, io, .local, &diff_view, &cursor, &note, &focus, &failure, &review, tmp.cwd(), tmp.dir, false);
+    try applyApprove(alloc, io, .local, &diff_view, &cursor, &note, &focus, &git_error, &review, tmp.cwd(), tmp.dir, false);
     try std.testing.expect(focus != .git_error);
     try std.testing.expect(!hasRowFile(diff_view.rows, "f.txt", .staged));
     {
@@ -5027,16 +5027,16 @@ test "applyApprove GitFailed does not write the store" {
     var cursor: usize = firstHunkRow(diff_view.rows) orelse return error.TestUnexpectedResult;
     var note: StatusNote = .{};
     var focus: Focus = .normal;
-    var failure: Failure = .{};
-    defer failure.buf.deinit(alloc);
+    var git_error: GitError = .{};
+    defer git_error.buf.deinit(alloc);
     var review = try store.initEmpty(alloc, store.default_review_id);
     defer review.deinit();
     // Index no longer matches the loaded hunk's old side, so apply --cached fails.
     try tmp.write(io, "f.txt", "this no longer matches the loaded hunk\n");
     try expectGitOk(io, tmp.cwd(), &.{ "git", "add", "f.txt" });
-    try applyApprove(alloc, io, .local, &diff_view, &cursor, &note, &focus, &failure, &review, tmp.cwd(), tmp.dir, false);
+    try applyApprove(alloc, io, .local, &diff_view, &cursor, &note, &focus, &git_error, &review, tmp.cwd(), tmp.dir, false);
     try std.testing.expectEqual(Focus.git_error, focus);
-    try std.testing.expect(failure.buf.items.len > 0);
+    try std.testing.expect(git_error.buf.items.len > 0);
     try std.testing.expectEqual(before_len, diff_view.rows.len);
     try std.testing.expect(hasRowFile(diff_view.rows, "f.txt", .unstaged));
     {
@@ -5061,11 +5061,11 @@ test "applyUnapprove restores the row under Staged and leaves the index" {
     var cursor: usize = firstHunkRow(diff_view.rows) orelse return error.TestUnexpectedResult;
     var note: StatusNote = .{};
     var focus: Focus = .normal;
-    var failure: Failure = .{};
-    defer failure.buf.deinit(alloc);
+    var git_error: GitError = .{};
+    defer git_error.buf.deinit(alloc);
     var review = try store.initEmpty(alloc, store.default_review_id);
     defer review.deinit();
-    try applyApprove(alloc, io, .local, &diff_view, &cursor, &note, &focus, &failure, &review, tmp.cwd(), tmp.dir, false);
+    try applyApprove(alloc, io, .local, &diff_view, &cursor, &note, &focus, &git_error, &review, tmp.cwd(), tmp.dir, false);
     try std.testing.expect(focus != .git_error);
 
     var stored = try approve.load(alloc, io, tmp.dir);

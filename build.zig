@@ -72,7 +72,7 @@ pub fn build(b: *std.Build) void {
         },
     });
 
-    // Display rows, viewport, layout, nav, search (MVP-0.3+).
+    // Display rows, window math, layout, nav, search (MVP-0.3+).
     const view_mod = b.addModule("view", .{
         .root_source_file = b.path("src/view/root.zig"),
         .target = target,

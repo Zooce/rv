@@ -67,7 +67,7 @@ fn slotHeightAt(ctx: SlotHeights, i: usize) usize {
     return slotScreenHeight(ctx.slots[i], ctx.rows, ctx.left_tw, ctx.right_tw, ctx.full_tw, ctx.wrap_on);
 }
 
-/// Move `scroll` so `cursor` is visible in a viewport of `height` rows.
+/// Move `scroll` so `cursor` is visible in a window of `height` rows.
 /// Also clamps scroll so the last page is not overscrolled when possible.
 pub fn ensureVisible(scroll: usize, cursor: usize, height: usize, row_count: usize) usize {
     const Unit = struct {
@@ -129,21 +129,21 @@ fn maxStart(
 }
 
 /// Largest first-visible display column for content of `content_w` columns
-/// in a viewport of `viewport_w` columns. Zero when everything fits.
-pub fn maxColScroll(content_w: usize, viewport_w: usize) usize {
-    if (viewport_w == 0 or content_w <= viewport_w) return 0;
-    return content_w - viewport_w;
+/// in a window of `window_w` columns. Zero when everything fits.
+pub fn maxColScroll(content_w: usize, window_w: usize) usize {
+    if (window_w == 0 or content_w <= window_w) return 0;
+    return content_w - window_w;
 }
 
-/// Clamp `col_scroll` into a valid range for the given content and viewport.
-pub fn clampColScroll(col_scroll: usize, content_w: usize, viewport_w: usize) usize {
-    return @min(col_scroll, maxColScroll(content_w, viewport_w));
+/// Clamp `col_scroll` into a valid range for the given content and window.
+pub fn clampColScroll(col_scroll: usize, content_w: usize, window_w: usize) usize {
+    return @min(col_scroll, maxColScroll(content_w, window_w));
 }
 
 /// First-visible column so the end of a `content_w`-wide row is on screen
 /// (or 0 when the row fits). Same as `maxColScroll`.
-pub fn colScrollToEnd(content_w: usize, viewport_w: usize) usize {
-    return maxColScroll(content_w, viewport_w);
+pub fn colScrollToEnd(content_w: usize, window_w: usize) usize {
+    return maxColScroll(content_w, window_w);
 }
 
 /// Body of the hunk that owns `cursor` (half-open `[body_start, body_end)`).

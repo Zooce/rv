@@ -1,4 +1,4 @@
-//! Structural navigation: next/prev hunk, file, and change; status; cursor
+//! Structural navigation: next/prev hunk, file, and change; place; cursor
 //! mark/restore after reload. Pure data — no TTY.
 
 const std = @import("std");
@@ -37,8 +37,8 @@ pub fn currentHunkInFile(rows: []const Row, cursor: usize) ?usize {
     }
 }
 
-/// Location context for the status footer. Slices borrow from `rows`.
-pub const Status = struct {
+/// Cursor place for the status footer. Slices borrow from `rows`.
+pub const Place = struct {
     /// Display path of the file containing the cursor (`""` if none).
     path: []const u8,
     /// 1-based index of the current hunk among all hunks; `0` when not in a hunk.
@@ -283,8 +283,8 @@ pub fn restoreCursor(rows: []const Row, mark: CursorMark) usize {
     return 0;
 }
 
-/// Status footer fields for `cursor` within `rows`.
-pub fn statusAt(rows: []const Row, cursor: usize) Status {
+/// Footer place for `cursor` within `rows`.
+pub fn placeAt(rows: []const Row, cursor: usize) Place {
     if (rows.len == 0) {
         return .{ .path = "", .hunk_i = 0, .hunk_n = 0, .row_i = 0, .row_n = 0 };
     }
@@ -446,29 +446,29 @@ test "nextHunkHeader and prevHunkHeader land on @@ rows" {
     try testing.expectEqual(0, prevHunkHeader(&.{}, 0));
 }
 
-test "statusAt path and hunk index" {
+test "placeAt path and hunk index" {
     var fix = try twoHunkFixture(testing.allocator);
     defer fix.d.deinit();
     defer testing.allocator.free(fix.rows);
     const rows = fix.rows;
 
-    const s0 = statusAt(rows, 0);
+    const s0 = placeAt(rows, 0);
     try testing.expectEqualStrings("f", s0.path);
     try testing.expectEqual(0, s0.hunk_i);
     try testing.expectEqual(2, s0.hunk_n);
     try testing.expectEqual(1, s0.row_i);
     try testing.expectEqual(7, s0.row_n);
 
-    const s2 = statusAt(rows, 2);
+    const s2 = placeAt(rows, 2);
     try testing.expectEqualStrings("f", s2.path);
     try testing.expectEqual(1, s2.hunk_i);
     try testing.expectEqual(2, s2.hunk_n);
 
-    const s5 = statusAt(rows, 5);
+    const s5 = placeAt(rows, 5);
     try testing.expectEqual(2, s5.hunk_i);
     try testing.expectEqual(2, s5.hunk_n);
 
-    const empty = statusAt(&.{}, 0);
+    const empty = placeAt(&.{}, 0);
     try testing.expectEqual(0, empty.hunk_n);
     try testing.expectEqual(0, empty.row_i);
 }

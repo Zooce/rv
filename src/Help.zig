@@ -7,13 +7,13 @@ const tui = @import("tui");
 
 pub const Result = enum { open, closed, quit };
 
-const Row = union(enum) {
+const Entry = union(enum) {
     group: []const u8,
     item: struct { key: []const u8, label: []const u8 },
     blank,
 };
 
-const rows = [_]Row{
+const entries = [_]Entry{
     .{ .group = "Motion" },
     .{ .item = .{ .key = "j/k", .label = "line (also arrows)" } },
     .{ .item = .{ .key = "h/l", .label = "pan current hunk" } },
@@ -62,8 +62,8 @@ const rows = [_]Row{
 
 const key_w: u16 = blk: {
     var w: u16 = 0;
-    for (rows) |row| {
-        switch (row) {
+    for (entries) |entry| {
+        switch (entry) {
             .item => |it| {
                 const n: u16 = @intCast(it.key.len);
                 if (n > w) w = n;
@@ -99,21 +99,21 @@ pub fn handleKey(self: *Help, key: tui.Key) Result {
 pub fn paint(self: *Help, scr: *tui.Screen, size: tui.Size) void {
     const group_style = tui.Style{ .fg = tui.Panel.body.fg, .bg = tui.Panel.body.bg, .bold = true };
 
-    const panel = tui.Panel.overlay(size.cols, size.rows, rows.len);
+    const panel = tui.Panel.overlay(size.cols, size.rows, entries.len);
     panel.paint(scr, " help ");
     const inner = panel.inner;
     if (inner.h == 0 or inner.w == 0) return;
     const view_h: usize = inner.h;
-    const max_scroll = if (rows.len > view_h) rows.len - view_h else 0;
+    const max_scroll = if (entries.len > view_h) entries.len - view_h else 0;
     if (self.scroll > max_scroll) self.scroll = max_scroll;
-    const text_area = panel.text(rows.len);
+    const text_area = panel.text(entries.len);
     const start = self.scroll;
     var row: u16 = 0;
     while (row < inner.h) : (row += 1) {
         const idx = start + row;
-        if (idx >= rows.len) break;
+        if (idx >= entries.len) break;
         const y = inner.y + row;
-        switch (rows[idx]) {
+        switch (entries[idx]) {
             .blank => {},
             .group => |name| scr.putStr(inner.x, y, name, group_style, 0, text_area),
             .item => |it| {
@@ -123,7 +123,7 @@ pub fn paint(self: *Help, scr: *tui.Screen, size: tui.Size) void {
             },
         }
     }
-    panel.paintBar(scr, rows.len, start);
+    panel.paintBar(scr, entries.len, start);
 }
 
 test "help catalog includes normal bindings" {
@@ -134,8 +134,8 @@ test "help catalog includes normal bindings" {
     };
     for (required) |token| {
         var found = false;
-        for (rows) |row| {
-            const key = switch (row) {
+        for (entries) |entry| {
+            const key = switch (entry) {
                 .item => |it| it.key,
                 else => continue,
             };
