@@ -1,5 +1,5 @@
-//! Structural navigation: next/prev hunk, file, and change; place; cursor
-//! mark/restore after reload. Pure data — no TTY.
+//! Structural navigation: next/prev hunk, file, and change; footer cursor
+//! loc; restore after reload. Pure data — no TTY.
 
 const std = @import("std");
 const diff = @import("diff");
@@ -7,7 +7,6 @@ const Allocator = std.mem.Allocator;
 const row_mod = @import("row.zig");
 const Row = row_mod.Row;
 const clampCursor = row_mod.clampCursor;
-const CommentSide = row_mod.CommentSide;
 
 /// Row index of the last `.file_header` at or before `cursor`, or `null`.
 pub fn currentFileStart(rows: []const Row, cursor: usize) ?usize {
@@ -37,8 +36,8 @@ pub fn currentHunkInFile(rows: []const Row, cursor: usize) ?usize {
     }
 }
 
-/// Cursor place for the status footer. Slices borrow from `rows`.
-pub const Place = struct {
+/// Footer cursor location. Slices borrow from `rows`.
+pub const CursorLoc = struct {
     /// Display path of the file containing the cursor (`""` if none).
     path: []const u8,
     /// 1-based index of the current hunk among all hunks; `0` when not in a hunk.
@@ -223,68 +222,41 @@ pub fn prevChange(rows: []const Row, cursor: usize) usize {
     return cur;
 }
 
-/// Enough of a cursor to restore after a reload. `path` (and line numbers)
-/// borrow from the `rows` passed to `cursorMarkAt`.
-pub const CursorMark = struct {
-    path: []const u8,
-    side: ?CommentSide = null,
-    line: ?u32 = null,
-};
-
 /// Snapshot of `cursor` for `restoreCursor`. `null` when `rows` is empty.
-pub fn cursorMarkAt(rows: []const Row, cursor: usize) ?CursorMark {
+/// Hunk headers collapse to the file (hunk starts move on reload). A body
+/// line with no numbers is the file. Section headers have none.
+pub fn cursorMarkAt(rows: []const Row, cursor: usize) ?row_mod.DiffLoc {
     if (rows.len == 0) return null;
     const i = clampCursor(cursor, rows.len);
-    switch (rows[i]) {
-        .file_header => |fh| return .{ .path = fh.path },
-        .section_header => return null,
-        .hunk_header => {
-            const fi = currentFileStart(rows, i) orelse return null;
-            return switch (rows[fi]) {
-                .file_header => |fh| .{ .path = fh.path },
-                else => null,
-            };
-        },
-        .line => |ln| {
-            if (ln.new_no) |n| return .{ .path = ln.path, .side = .new, .line = n };
-            if (ln.old_no) |n| return .{ .path = ln.path, .side = .old, .line = n };
-            return .{ .path = ln.path };
-        },
+    if (row_mod.locAt(rows[i])) |loc| {
+        return switch (loc) {
+            .hunk => |h| .{ .file = h.path },
+            else => loc,
+        };
     }
+    return switch (rows[i]) {
+        .line => |ln| .{ .file = ln.path },
+        else => null,
+    };
 }
 
-/// Best-effort cursor after reload: same path + side + line, else that file's
-/// header, else row 0.
-pub fn restoreCursor(rows: []const Row, mark: CursorMark) usize {
+/// Best-effort cursor after reload: same loc, else that file's header, else
+/// row 0.
+pub fn restoreCursor(rows: []const Row, loc: row_mod.DiffLoc) usize {
     if (rows.len == 0) return 0;
-    if (mark.side) |side| {
-        if (mark.line) |line| {
-            for (rows, 0..) |item, i| {
-                switch (item) {
-                    .line => |ln| {
-                        if (!std.mem.eql(u8, ln.path, mark.path)) continue;
-                        const no = switch (side) {
-                            .old => ln.old_no,
-                            .new => ln.new_no,
-                        };
-                        if (no == line) return i;
-                    },
-                    .file_header, .hunk_header, .section_header => {},
-                }
-            }
-        }
-    }
+    if (row_mod.rowForComment(rows, loc)) |i| return i;
+    const path = loc.path();
     for (rows, 0..) |item, i| {
         switch (item) {
-            .file_header => |fh| if (std.mem.eql(u8, fh.path, mark.path)) return i,
+            .file_header => |fh| if (std.mem.eql(u8, fh.path, path)) return i,
             else => {},
         }
     }
     return 0;
 }
 
-/// Footer place for `cursor` within `rows`.
-pub fn placeAt(rows: []const Row, cursor: usize) Place {
+/// Footer cursor location for `cursor` within `rows`.
+pub fn cursorLocAt(rows: []const Row, cursor: usize) CursorLoc {
     if (rows.len == 0) {
         return .{ .path = "", .hunk_i = 0, .hunk_n = 0, .row_i = 0, .row_n = 0 };
     }
@@ -446,29 +418,29 @@ test "nextHunkHeader and prevHunkHeader land on @@ rows" {
     try testing.expectEqual(0, prevHunkHeader(&.{}, 0));
 }
 
-test "placeAt path and hunk index" {
+test "cursorLocAt path and hunk index" {
     var fix = try twoHunkFixture(testing.allocator);
     defer fix.d.deinit();
     defer testing.allocator.free(fix.rows);
     const rows = fix.rows;
 
-    const s0 = placeAt(rows, 0);
+    const s0 = cursorLocAt(rows, 0);
     try testing.expectEqualStrings("f", s0.path);
     try testing.expectEqual(0, s0.hunk_i);
     try testing.expectEqual(2, s0.hunk_n);
     try testing.expectEqual(1, s0.row_i);
     try testing.expectEqual(7, s0.row_n);
 
-    const s2 = placeAt(rows, 2);
+    const s2 = cursorLocAt(rows, 2);
     try testing.expectEqualStrings("f", s2.path);
     try testing.expectEqual(1, s2.hunk_i);
     try testing.expectEqual(2, s2.hunk_n);
 
-    const s5 = placeAt(rows, 5);
+    const s5 = cursorLocAt(rows, 5);
     try testing.expectEqual(2, s5.hunk_i);
     try testing.expectEqual(2, s5.hunk_n);
 
-    const empty = placeAt(&.{}, 0);
+    const empty = cursorLocAt(&.{}, 0);
     try testing.expectEqual(0, empty.hunk_n);
     try testing.expectEqual(0, empty.row_i);
 }
@@ -613,31 +585,27 @@ test "cursorMarkAt empty file hunk line" {
     // 0 file, 1 hunk, 2 keep, 3 del, 4 add, 5 tail
 
     const file = cursorMarkAt(rows, 0).?;
-    try testing.expectEqualStrings("f", file.path);
-    try testing.expect(file.side == null);
-    try testing.expect(file.line == null);
+    try testing.expectEqualStrings("f", file.file);
 
     const hunk = cursorMarkAt(rows, 1).?;
-    try testing.expectEqualStrings("f", hunk.path);
-    try testing.expect(hunk.side == null);
-    try testing.expect(hunk.line == null);
+    try testing.expectEqualStrings("f", hunk.file);
 
     const ctx = cursorMarkAt(rows, 2).?;
-    try testing.expectEqualStrings("f", ctx.path);
-    try testing.expectEqual(.new, ctx.side.?);
-    try testing.expectEqual(1, ctx.line.?);
+    try testing.expectEqualStrings("f", ctx.line.path);
+    try testing.expectEqual(.new, ctx.line.side);
+    try testing.expectEqual(1, ctx.line.line);
 
     const del = cursorMarkAt(rows, 3).?;
-    try testing.expectEqual(.old, del.side.?);
-    try testing.expectEqual(2, del.line.?);
+    try testing.expectEqual(.old, del.line.side);
+    try testing.expectEqual(2, del.line.line);
 
     const add = cursorMarkAt(rows, 4).?;
-    try testing.expectEqual(.new, add.side.?);
-    try testing.expectEqual(2, add.line.?);
+    try testing.expectEqual(.new, add.line.side);
+    try testing.expectEqual(2, add.line.line);
 }
 
 test "restoreCursor exact file fallback gone" {
-    try testing.expectEqual(0, restoreCursor(&.{}, .{ .path = "f" }));
+    try testing.expectEqual(0, restoreCursor(&.{}, .{ .file = "f" }));
 
     const before =
         \\diff --git a/f b/f
@@ -689,5 +657,5 @@ test "restoreCursor exact file fallback gone" {
     try testing.expectEqual(4, restoreCursor(new_rows, cursorMarkAt(old_rows, 0).?));
     try testing.expectEqual(4, restoreCursor(new_rows, cursorMarkAt(old_rows, 1).?));
     try testing.expectEqual(0, restoreCursor(new_rows, cursorMarkAt(old_rows, 6).?));
-    try testing.expectEqual(0, restoreCursor(new_rows, .{ .path = "gone" }));
+    try testing.expectEqual(0, restoreCursor(new_rows, .{ .file = "gone" }));
 }

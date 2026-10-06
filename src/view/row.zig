@@ -62,6 +62,28 @@ pub const Anchor = struct {
 /// Old vs new side of a diff line.
 pub const CommentSide = enum { old, new };
 
+/// Identity of a file, hunk, or line in the display rows.
+pub const DiffLoc = union(enum) {
+    file: []const u8,
+    hunk: struct { path: []const u8, old_start: u32, new_start: u32 },
+    line: struct { path: []const u8, side: CommentSide, line: u32 },
+
+    pub fn path(self: DiffLoc) []const u8 {
+        return switch (self) {
+            .file => |p| p,
+            .hunk => |h| h.path,
+            .line => |l| l.path,
+        };
+    }
+};
+
+/// Landing in the row list after a walk. `wrapped` is true when the walk
+/// crossed the end or start of the list.
+pub const Hit = struct {
+    row: usize,
+    wrapped: bool,
+};
+
 /// Append one file: a group divider when `f.group` changes, the file header,
 /// then each kept hunk and its lines. `keep_hunks == null` keeps every hunk.
 /// Otherwise it is one flag per hunk in `f.hunks`; false omits that hunk.
@@ -283,6 +305,69 @@ pub fn anchorAt(rows: []const Row, cursor: usize) ?Anchor {
         },
         .file_header, .hunk_header, .section_header => null,
     };
+}
+
+/// Display loc for `row`. Section headers have none. A body line with no
+/// numbers has none. Hunk headers keep both starts.
+pub fn locAt(row: Row) ?DiffLoc {
+    return switch (row) {
+        .file_header => |fh| .{ .file = fh.path },
+        .hunk_header => |hh| .{
+            .hunk = .{ .path = hh.path, .old_start = hh.old_start, .new_start = hh.new_start },
+        },
+        .line => |ln| blk: {
+            if (ln.new_no) |n| break :blk .{ .line = .{ .path = ln.path, .side = .new, .line = n } };
+            if (ln.old_no) |n| break :blk .{ .line = .{ .path = ln.path, .side = .old, .line = n } };
+            break :blk null;
+        },
+        .section_header => null,
+    };
+}
+
+/// Unified row that holds `loc`, or null if that path/side/line is not in `rows`.
+/// File loc lands on the file header. Hunk loc lands on the hunk header.
+pub fn rowForComment(rows: []const Row, loc: DiffLoc) ?usize {
+    switch (loc) {
+        .hunk => |hunk| {
+            for (rows, 0..) |item, i| {
+                switch (item) {
+                    .hunk_header => |hh| {
+                        if (!std.mem.eql(u8, hh.path, hunk.path)) continue;
+                        if (hh.old_start == hunk.old_start and hh.new_start == hunk.new_start) return i;
+                    },
+                    else => {},
+                }
+            }
+            return null;
+        },
+        .file => |path| {
+            for (rows, 0..) |item, i| {
+                switch (item) {
+                    .file_header => |fh| {
+                        if (std.mem.eql(u8, fh.path, path)) return i;
+                    },
+                    else => {},
+                }
+            }
+            return null;
+        },
+        .line => |line| {
+            for (rows, 0..) |item, i| {
+                switch (item) {
+                    .line => |ln| {
+                        if (!std.mem.eql(u8, ln.path, line.path)) continue;
+                        const no = switch (line.side) {
+                            .old => ln.old_no,
+                            .new => ln.new_no,
+                        };
+                        if (no == line.line) return i;
+                    },
+                    .file_header, .hunk_header, .section_header => {},
+                }
+            }
+            return null;
+        },
+    }
 }
 
 /// Searchable text for one display row, or `null` if `/` does not search it.

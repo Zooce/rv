@@ -490,10 +490,10 @@ pub fn paint(self: *const Frame, scr: *tui.Screen, size: tui.Size, shown: Shown)
             if (status_note.len > 0) {
                 scr.putStr(1, footer_y, status_note, pal.footer, 0, null);
             } else {
-                const place = view.nav.placeAt(rows, cur);
+                const loc = view.nav.cursorLocAt(rows, cur);
                 const footer_text = formatFooter(
                     &line_buf,
-                    place,
+                    loc,
                     shown.open_n,
                     shown.layout_pref,
                     size.cols,
@@ -741,7 +741,7 @@ fn layoutFooterLabel(pref: view.layout.LayoutPref, cols: u16) []const u8 {
 
 fn formatFooter(
     buf: []u8,
-    place: view.nav.Place,
+    place: view.nav.CursorLoc,
     open_n: usize,
     layout_pref: view.layout.LayoutPref,
     cols: u16,
@@ -1610,7 +1610,7 @@ test "approveHintForRow file hunk section and sticky file" {
 
 test "formatFooter approved-only is not a clean worktree" {
     var buf: [64]u8 = undefined;
-    const empty = view.nav.Place{
+    const empty = view.nav.CursorLoc{
         .path = "",
         .hunk_i = 0,
         .hunk_n = 0,
@@ -1637,7 +1637,7 @@ test "formatFooter approved-only is not a clean worktree" {
 
 test "formatFooter shows wrap when on" {
     var buf: [96]u8 = undefined;
-    const place = view.nav.Place{
+    const place = view.nav.CursorLoc{
         .path = "f",
         .hunk_i = 1,
         .hunk_n = 1,

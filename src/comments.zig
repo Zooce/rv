@@ -9,44 +9,36 @@ const store = @import("store");
 const view = @import("view");
 const diff = @import("diff");
 
-/// Display target for a live comment. File: path only. Hunk: both starts, no
-/// side. Line: side + line. Null when resolved, or when the store row has no
-/// usable loc.
-pub fn loc(c: store.Comment) ?view.CommentLoc {
+/// Display loc for a live comment. File: path only. Hunk: both starts. Line:
+/// side + line. Null when resolved, or when the store row has no usable loc.
+pub fn loc(c: store.Comment) ?view.row.DiffLoc {
     if (c.state != .open) return null;
     if (c.old_line == null and c.new_line == null) {
         if (c.side != null) return null;
-        return .{ .path = c.path };
+        return .{ .file = c.path };
     }
     if (c.side == null) {
         if (c.old_line) |o| {
             if (c.new_line) |n| return .{
-                .path = c.path,
-                .hunk = .{ .old_start = o, .new_start = n },
+                .hunk = .{ .path = c.path, .old_start = o, .new_start = n },
             };
         }
     }
     if (c.side) |s| {
         switch (s) {
-            .old => if (c.old_line) |n| return .{ .path = c.path, .side = .old, .line = n },
-            .new => if (c.new_line) |n| return .{ .path = c.path, .side = .new, .line = n },
+            .old => if (c.old_line) |n| return .{ .line = .{ .path = c.path, .side = .old, .line = n } },
+            .new => if (c.new_line) |n| return .{ .line = .{ .path = c.path, .side = .new, .line = n } },
             .context => {
-                if (c.new_line) |n| return .{ .path = c.path, .side = .new, .line = n };
-                if (c.old_line) |n| return .{ .path = c.path, .side = .old, .line = n };
+                if (c.new_line) |n| return .{ .line = .{ .path = c.path, .side = .new, .line = n } };
+                if (c.old_line) |n| return .{ .line = .{ .path = c.path, .side = .old, .line = n } };
             },
         }
         return null;
     }
-    if (c.new_line) |n| return .{ .path = c.path, .side = .new, .line = n };
-    if (c.old_line) |n| return .{ .path = c.path, .side = .old, .line = n };
+    if (c.new_line) |n| return .{ .line = .{ .path = c.path, .side = .new, .line = n } };
+    if (c.old_line) |n| return .{ .line = .{ .path = c.path, .side = .old, .line = n } };
     return null;
 }
-
-/// Next/prev live-comment landing: display row, and whether the walk wrapped.
-pub const Walk = struct {
-    row: usize,
-    wrapped: bool,
-};
 
 /// Display order: row, then old before new, then store order.
 const Rank = struct {
@@ -64,10 +56,13 @@ const Rank = struct {
 fn rankOf(c: store.Comment, i: usize, rows: []const view.row.Row) ?Rank {
     const found = loc(c) orelse return null;
     const row = view.rowForComment(rows, found) orelse return null;
-    const side: u1 = if (found.side) |s| switch (s) {
-        .old => 0,
-        .new => 1,
-    } else 0;
+    const side: u1 = switch (found) {
+        .line => |l| switch (l.side) {
+            .old => 0,
+            .new => 1,
+        },
+        else => 0,
+    };
     return .{
         .row = row,
         .side = side,
@@ -77,7 +72,7 @@ fn rankOf(c: store.Comment, i: usize, rows: []const view.row.Row) ?Rank {
 
 /// Next live comment strictly after `cursor` in display order. Wraps to the
 /// first comment when none follow. Null when no live comment resolves to a row.
-pub fn next(review: *const store.Review, rows: []const view.row.Row, cursor: usize) ?Walk {
+pub fn next(review: *const store.Review, rows: []const view.row.Row, cursor: usize) ?view.row.Hit {
     if (rows.len == 0 or review.comments.items.len == 0) return null;
     const cur = view.row.clampCursor(cursor, rows.len);
     var best_after: ?Rank = null;
@@ -97,7 +92,7 @@ pub fn next(review: *const store.Review, rows: []const view.row.Row, cursor: usi
 
 /// Previous live comment strictly before `cursor` in display order. Wraps to
 /// the last comment when none precede. Null when no live comment resolves to a row.
-pub fn prev(review: *const store.Review, rows: []const view.row.Row, cursor: usize) ?Walk {
+pub fn prev(review: *const store.Review, rows: []const view.row.Row, cursor: usize) ?view.row.Hit {
     if (rows.len == 0 or review.comments.items.len == 0) return null;
     const cur = view.row.clampCursor(cursor, rows.len);
     var best_before: ?Rank = null;
@@ -366,7 +361,7 @@ pub fn collectMatching(
 /// Cursor-side open target, plus the first live comment there when one exists.
 /// Null when that side is missing on the current row.
 pub const AtSide = struct {
-    anchor: view.row.Anchor,
+    loc: view.row.DiffLoc,
     idx: ?usize,
 };
 
@@ -378,17 +373,16 @@ pub fn atSide(
     cursor: usize,
     want: view.row.CommentSide,
 ) ?AtSide {
-    const a = view.commentAnchor(rows, slots, layout, cursor, want) orelse return null;
-    const kind: store.CommentKind = if (a.old_line == null and a.new_line == null)
-        .file
-    else if (a.old_line != null and a.new_line != null)
-        .hunk
-    else
-        .line;
-    return .{
-        .anchor = a,
-        .idx = review.firstAt(a.path, a.old_line, a.new_line, kind),
+    const found = view.commentAnchor(rows, slots, layout, cursor, want) orelse return null;
+    const idx = switch (found) {
+        .file => |path| review.firstAt(path, null, null, .file),
+        .hunk => |h| review.firstAt(h.path, h.old_start, h.new_start, .hunk),
+        .line => |l| switch (l.side) {
+            .old => review.firstAt(l.path, l.line, null, .line),
+            .new => review.firstAt(l.path, null, l.line, .line),
+        },
     };
+    return .{ .loc = found, .idx = idx };
 }
 
 /// True when `row` has a live comment of the matching kind. A file header
@@ -474,9 +468,9 @@ test "loc open sides context missing resolved" {
         .side = .old,
         .body = "x",
     }).?;
-    try testing.expectEqualStrings("f", old_loc.path);
-    try testing.expectEqual(.old, old_loc.side.?);
-    try testing.expectEqual(2, old_loc.line.?);
+    try testing.expectEqualStrings("f", old_loc.line.path);
+    try testing.expectEqual(.old, old_loc.line.side);
+    try testing.expectEqual(2, old_loc.line.line);
 
     const new_loc = loc(.{
         .id = "1",
@@ -485,8 +479,8 @@ test "loc open sides context missing resolved" {
         .side = .new,
         .body = "x",
     }).?;
-    try testing.expectEqual(.new, new_loc.side.?);
-    try testing.expectEqual(3, new_loc.line.?);
+    try testing.expectEqual(.new, new_loc.line.side);
+    try testing.expectEqual(3, new_loc.line.line);
 
     const ctx = loc(.{
         .id = "1",
@@ -496,8 +490,8 @@ test "loc open sides context missing resolved" {
         .side = .context,
         .body = "x",
     }).?;
-    try testing.expectEqual(.new, ctx.side.?);
-    try testing.expectEqual(4, ctx.line.?);
+    try testing.expectEqual(.new, ctx.line.side);
+    try testing.expectEqual(4, ctx.line.line);
 
     const ctx_old = loc(.{
         .id = "1",
@@ -506,8 +500,8 @@ test "loc open sides context missing resolved" {
         .side = .context,
         .body = "x",
     }).?;
-    try testing.expectEqual(.old, ctx_old.side.?);
-    try testing.expectEqual(5, ctx_old.line.?);
+    try testing.expectEqual(.old, ctx_old.line.side);
+    try testing.expectEqual(5, ctx_old.line.line);
 
     try testing.expect(loc(.{
         .id = "1",
@@ -531,11 +525,9 @@ test "loc open sides context missing resolved" {
         .new_line = 2,
         .body = "x",
     }).?;
-    try testing.expectEqualStrings("f", hunk_loc.path);
-    try testing.expect(hunk_loc.side == null);
-    try testing.expect(hunk_loc.line == null);
-    try testing.expectEqual(1, hunk_loc.hunk.?.old_start);
-    try testing.expectEqual(2, hunk_loc.hunk.?.new_start);
+    try testing.expectEqualStrings("f", hunk_loc.hunk.path);
+    try testing.expectEqual(1, hunk_loc.hunk.old_start);
+    try testing.expectEqual(2, hunk_loc.hunk.new_start);
 
     const implied_old = loc(.{
         .id = "1",
@@ -543,17 +535,15 @@ test "loc open sides context missing resolved" {
         .old_line = 8,
         .body = "x",
     }).?;
-    try testing.expectEqual(.old, implied_old.side.?);
-    try testing.expectEqual(8, implied_old.line.?);
+    try testing.expectEqual(.old, implied_old.line.side);
+    try testing.expectEqual(8, implied_old.line.line);
 
     const file_loc = loc(.{
         .id = "1",
         .path = "f",
         .body = "x",
     }).?;
-    try testing.expectEqualStrings("f", file_loc.path);
-    try testing.expect(file_loc.side == null);
-    try testing.expect(file_loc.line == null);
+    try testing.expectEqualStrings("f", file_loc.file);
 
     try testing.expect(loc(.{
         .id = "1",
@@ -641,8 +631,8 @@ test "next on truncated rows skips a comment on an omitted hunk" {
     _ = try review.addOpen("f", null, 1, .new, "on first hunk", .local);
     _ = try review.addOpen("f", null, 10, .new, "on second hunk", .local);
 
-    try testing.expectEqual(view.rowForComment(hidden, .{ .path = "f", .side = .new, .line = 10 }).?, next(&review, hidden, 0).?.row);
-    try testing.expectEqual(view.rowForComment(full, .{ .path = "f", .side = .new, .line = 1 }).?, next(&review, full, 0).?.row);
+    try testing.expectEqual(view.rowForComment(hidden, .{ .line = .{ .path = "f", .side = .new, .line = 10 } }).?, next(&review, hidden, 0).?.row);
+    try testing.expectEqual(view.rowForComment(full, .{ .line = .{ .path = "f", .side = .new, .line = 1 } }).?, next(&review, full, 0).?.row);
 }
 
 test "next same row is one stop then later row" {
@@ -1013,28 +1003,26 @@ test "atSide file line and hunk" {
     _ = try review.addOpen("f", 1, 1, null, "hunk", .local);
 
     const found = atSide(&review, rows, empty, .unified, 0, .new).?;
-    try testing.expectEqualStrings("f", found.anchor.path);
-    try testing.expect(found.anchor.old_line == null);
-    try testing.expect(found.anchor.new_line == null);
+    try testing.expectEqualStrings("f", found.loc.file);
     try testing.expectEqual(0, found.idx.?);
 
     const old_side = atSide(&review, rows, empty, .unified, 0, .old).?;
-    try testing.expect(old_side.anchor.old_line == null);
-    try testing.expect(old_side.anchor.new_line == null);
+    try testing.expectEqualStrings("f", old_side.loc.file);
     try testing.expectEqual(0, old_side.idx.?);
 
     const line = atSide(&review, rows, empty, .unified, 3, .new).?;
-    try testing.expectEqual(1, line.anchor.new_line.?);
+    try testing.expectEqual(1, line.loc.line.line);
+    try testing.expectEqual(.new, line.loc.line.side);
     try testing.expectEqual(1, line.idx.?);
 
     const hunk_new = atSide(&review, rows, empty, .unified, 1, .new).?;
-    try testing.expectEqualStrings("f", hunk_new.anchor.path);
-    try testing.expectEqual(1, hunk_new.anchor.old_line.?);
-    try testing.expectEqual(1, hunk_new.anchor.new_line.?);
+    try testing.expectEqualStrings("f", hunk_new.loc.hunk.path);
+    try testing.expectEqual(1, hunk_new.loc.hunk.old_start);
+    try testing.expectEqual(1, hunk_new.loc.hunk.new_start);
     try testing.expectEqual(2, hunk_new.idx.?);
     const hunk_old = atSide(&review, rows, empty, .unified, 1, .old).?;
-    try testing.expectEqual(1, hunk_old.anchor.old_line.?);
-    try testing.expectEqual(1, hunk_old.anchor.new_line.?);
+    try testing.expectEqual(1, hunk_old.loc.hunk.old_start);
+    try testing.expectEqual(1, hunk_old.loc.hunk.new_start);
     try testing.expectEqual(2, hunk_old.idx.?);
 }
 

@@ -239,8 +239,8 @@ pub const VisualPos = struct {
     }
 };
 
-/// Footer screen position for the hardware caret.
-pub const CursorPos = struct {
+/// Footer screen cell for the hardware caret.
+pub const CaretCell = struct {
     x: u16,
     y_off: u16,
 };
@@ -263,7 +263,7 @@ pub fn cursorAt(
     scroll: usize,
     height: u16,
     caret: usize,
-) CursorPos {
+) CaretCell {
     const pos = VisualPos.init(draft, text_w, caret);
     const y_off_usize: usize = if (pos.line < scroll) 0 else pos.line - scroll;
     const h: usize = height;
@@ -279,7 +279,7 @@ pub fn cursorAtEnd(
     text_w: u16,
     scroll: usize,
     height: u16,
-) CursorPos {
+) CaretCell {
     return cursorAt(draft, text_w, scroll, height, draft.len);
 }
 

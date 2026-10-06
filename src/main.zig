@@ -369,7 +369,7 @@ fn runTui(alloc: std.mem.Allocator, io: std.Io, source: git.Origin) !u8 {
                         .quit => running = false,
                         .jump => |hit| {
                             focus = .normal;
-                            viewport.cursor = hit.index;
+                            viewport.cursor = hit.row;
                             if (hit.wrapped) frame.note.set("search wrapped");
                         },
                         .missing => {
@@ -642,7 +642,7 @@ fn runTui(alloc: std.mem.Allocator, io: std.Io, source: git.Origin) !u8 {
                                         .none => {},
                                         .missing => frame.note.set("Pattern not found"),
                                         .hit => |hit| {
-                                            viewport.cursor = hit.index;
+                                            viewport.cursor = hit.row;
                                             if (hit.wrapped) frame.note.set("search wrapped");
                                         },
                                     }
@@ -651,7 +651,7 @@ fn runTui(alloc: std.mem.Allocator, io: std.Io, source: git.Origin) !u8 {
                                         .none => {},
                                         .missing => frame.note.set("Pattern not found"),
                                         .hit => |hit| {
-                                            viewport.cursor = hit.index;
+                                            viewport.cursor = hit.row;
                                             if (hit.wrapped) frame.note.set("search wrapped");
                                         },
                                     }
@@ -1712,14 +1712,14 @@ fn expandCurrentHunk(
 
 fn restoreExpandCursor(
     rows: []const view.row.Row,
-    mark: ?view.nav.CursorMark,
+    mark: ?view.row.DiffLoc,
     path: []const u8,
     group: ?diff.Group,
     old_start: u32,
     new_start: u32,
 ) usize {
     if (mark) |m| {
-        if (m.line != null) return view.nav.restoreCursor(rows, m);
+        if (m == .line) return view.nav.restoreCursor(rows, m);
     }
     var found: ?usize = null;
     for (rows, 0..) |row, i| {
@@ -2392,7 +2392,7 @@ pub const Draft = struct {
     /// Wheel moved the comment window. Paint then leaves the caret where it is.
     window_moved: bool = false,
     caret: usize = 0,
-    anchor: view.row.Anchor = .{ .path = "", .old_line = null, .new_line = null },
+    loc: view.row.DiffLoc = .{ .file = "" },
     edit_id: ?[]const u8 = null,
 
     fn clear(self: *Draft) void {
@@ -2447,7 +2447,7 @@ pub const Draft = struct {
             return true;
         }
         self.clear();
-        self.anchor = found.anchor;
+        self.loc = found.loc;
         return true;
     }
 
@@ -2455,21 +2455,20 @@ pub const Draft = struct {
     /// when that loc already has a comment).
     fn beginComment(self: *Draft, alloc: std.mem.Allocator, c: store.Comment) std.mem.Allocator.Error!void {
         self.clear();
-        self.anchor = .{ .path = c.path, .old_line = c.old_line, .new_line = c.new_line };
+        self.loc = comments.loc(c) orelse .{ .file = c.path };
         try self.buf.appendSlice(alloc, c.body);
         self.caret = self.buf.items.len;
         self.edit_id = c.id;
     }
 
     pub fn titleBar(self: *const Draft) []const u8 {
-        if (self.anchor.old_line != null and self.anchor.new_line != null)
-            return "rv  create/edit hunk  Enter save  Esc cancel  ↑↓ scroll";
-        const side = sideForAnchor(self.anchor) orelse
-            return "rv  create/edit file  Enter save  Esc cancel  ↑↓ scroll";
-        return switch (side) {
-            .new => "rv  create/edit new  Enter save  Esc cancel  ↑↓ scroll",
-            .old => "rv  create/edit old  Enter save  Esc cancel  ↑↓ scroll",
-            .context => "rv  create/edit  Enter save  Esc cancel  ↑↓ scroll",
+        return switch (self.loc) {
+            .hunk => "rv  create/edit hunk  Enter save  Esc cancel  ↑↓ scroll",
+            .file => "rv  create/edit file  Enter save  Esc cancel  ↑↓ scroll",
+            .line => |l| switch (l.side) {
+                .new => "rv  create/edit new  Enter save  Esc cancel  ↑↓ scroll",
+                .old => "rv  create/edit old  Enter save  Esc cancel  ↑↓ scroll",
+            },
         };
     }
 
@@ -2505,11 +2504,19 @@ pub const Draft = struct {
                             }
                         }
                     } else {
-                        const side = sideForAnchor(self.anchor);
+                        const path = self.loc.path();
+                        const old_line: ?u32, const new_line: ?u32, const side: ?store.Side = switch (self.loc) {
+                            .file => .{ null, null, null },
+                            .hunk => |h| .{ h.old_start, h.new_start, null },
+                            .line => |l| switch (l.side) {
+                                .old => .{ l.line, null, .old },
+                                .new => .{ null, l.line, .new },
+                            },
+                        };
                         _ = try review.addOpen(
-                            self.anchor.path,
-                            self.anchor.old_line,
-                            self.anchor.new_line,
+                            path,
+                            old_line,
+                            new_line,
                             side,
                             self.buf.items,
                             switch (source) {
@@ -2646,14 +2653,14 @@ const Search = struct {
         open,
         closed,
         quit,
-        jump: view.search.SearchHit,
+        jump: view.row.Hit,
         missing,
     };
 
     const Match = union(enum) {
         none,
         missing,
-        hit: view.search.SearchHit,
+        hit: view.row.Hit,
     };
 
     buf: std.ArrayList(u8) = .empty,
@@ -3197,31 +3204,6 @@ const ListWin = struct {
     }
 };
 
-/// Comment side implied by which line numbers the anchor has.
-/// Path-only (file) and both-starts (hunk) anchors have no side.
-fn sideForAnchor(a: view.row.Anchor) ?store.Side {
-    if (a.old_line == null and a.new_line == null) return null;
-    if (a.old_line != null and a.new_line != null) return null;
-    if (a.new_line != null) return .new;
-    return .old;
-}
-
-fn locFromRow(row: view.row.Row) ?view.CommentLoc {
-    return switch (row) {
-        .file_header => |fh| .{ .path = fh.path },
-        .line => |ln| blk: {
-            if (ln.new_no) |n| break :blk .{ .path = ln.path, .side = .new, .line = n };
-            if (ln.old_no) |n| break :blk .{ .path = ln.path, .side = .old, .line = n };
-            break :blk null;
-        },
-        .hunk_header => |hh| .{
-            .path = hh.path,
-            .hunk = .{ .old_start = hh.old_start, .new_start = hh.new_start },
-        },
-        .section_header => null,
-    };
-}
-
 fn rowEql(a: view.row.Row, b: view.row.Row) bool {
     if (std.meta.activeTag(a) != std.meta.activeTag(b)) return false;
     switch (a) {
@@ -3268,7 +3250,7 @@ fn landComment(
     diff_view: *OpenDiff,
     cursor: *usize,
     note: *StatusNote,
-    loc: view.CommentLoc,
+    loc: view.row.DiffLoc,
 ) std.mem.Allocator.Error!bool {
     if (view.rowForComment(diff_view.rows, loc)) |row| {
         cursor.* = row;
@@ -3335,7 +3317,7 @@ fn jumpLiveComment(
         note.set("no comments");
         return;
     };
-    const loc = locFromRow(walk_rows[hit.row]) orelse {
+    const loc = view.row.locAt(walk_rows[hit.row]) orelse {
         note.set("no comments");
         return;
     };
@@ -3362,12 +3344,11 @@ fn dismissAt(
         return;
     };
     const idx = found.idx orelse {
-        if (found.anchor.old_line == null and found.anchor.new_line == null)
-            note.set("no comment on this file")
-        else if (found.anchor.old_line != null and found.anchor.new_line != null)
-            note.set("no comment on this hunk")
-        else
-            note.set("no comment on this side");
+        switch (found.loc) {
+            .file => note.set("no comment on this file"),
+            .hunk => note.set("no comment on this hunk"),
+            .line => note.set("no comment on this side"),
+        }
         return;
     };
     _ = dismissById(review, alloc, io, review.comments.items[idx].id, note);
@@ -3456,7 +3437,7 @@ const CommentList = struct {
         quit,
         help,
         jump: struct { row: usize, edit: bool },
-        hidden: struct { loc: view.CommentLoc, edit: bool },
+        hidden: struct { loc: view.row.DiffLoc, edit: bool },
         missing,
         dismiss,
     };
@@ -3503,14 +3484,13 @@ const CommentList = struct {
 
     fn formatLineCol(buf: []u8, c: store.Comment) []const u8 {
         const found = comments.loc(c) orelse return "-";
-        if (found.hunk) |h| {
-            return Frame.bufPrintTrunc(buf, "-{d},+{d}", .{ h.old_start, h.new_start });
-        }
-        const side = found.side orelse return "-";
-        const line = found.line orelse return "-";
-        return switch (side) {
-            .old => Frame.bufPrintTrunc(buf, "-{d}", .{line}),
-            .new => Frame.bufPrintTrunc(buf, "+{d}", .{line}),
+        return switch (found) {
+            .hunk => |h| Frame.bufPrintTrunc(buf, "-{d},+{d}", .{ h.old_start, h.new_start }),
+            .line => |l| switch (l.side) {
+                .old => Frame.bufPrintTrunc(buf, "-{d}", .{l.line}),
+                .new => Frame.bufPrintTrunc(buf, "+{d}", .{l.line}),
+            },
+            .file => "-",
         };
     }
 
@@ -3839,22 +3819,22 @@ test "approve confirm titleBar" {
 
 test "draft titleBar file vs line" {
     var draft: Draft = .{};
-    draft.anchor = .{ .path = "f", .old_line = null, .new_line = null };
+    draft.loc = .{ .file = "f" };
     try std.testing.expectEqualStrings(
         "rv  create/edit file  Enter save  Esc cancel  ↑↓ scroll",
         draft.titleBar(),
     );
-    draft.anchor = .{ .path = "f", .old_line = 1, .new_line = 1 };
+    draft.loc = .{ .hunk = .{ .path = "f", .old_start = 1, .new_start = 1 } };
     try std.testing.expectEqualStrings(
         "rv  create/edit hunk  Enter save  Esc cancel  ↑↓ scroll",
         draft.titleBar(),
     );
-    draft.anchor = .{ .path = "f", .old_line = null, .new_line = 1 };
+    draft.loc = .{ .line = .{ .path = "f", .side = .new, .line = 1 } };
     try std.testing.expectEqualStrings(
         "rv  create/edit new  Enter save  Esc cancel  ↑↓ scroll",
         draft.titleBar(),
     );
-    draft.anchor = .{ .path = "f", .old_line = 1, .new_line = null };
+    draft.loc = .{ .line = .{ .path = "f", .side = .old, .line = 1 } };
     try std.testing.expectEqualStrings(
         "rv  create/edit old  Enter save  Esc cancel  ↑↓ scroll",
         draft.titleBar(),
@@ -3957,20 +3937,18 @@ test "draft begin on file and hunk header" {
     defer draft.buf.deinit(std.testing.allocator);
 
     try std.testing.expect(try draft.begin(&review, std.testing.allocator, rows, empty, .unified, 0, .new));
-    try std.testing.expectEqualStrings("f", draft.anchor.path);
-    try std.testing.expect(draft.anchor.old_line == null);
-    try std.testing.expect(draft.anchor.new_line == null);
+    try std.testing.expectEqualStrings("f", draft.loc.file);
     try std.testing.expect(draft.edit_id == null);
 
     try std.testing.expect(try draft.begin(&review, std.testing.allocator, rows, empty, .unified, 1, .new));
-    try std.testing.expectEqualStrings("f", draft.anchor.path);
-    try std.testing.expectEqual(1, draft.anchor.old_line.?);
-    try std.testing.expectEqual(1, draft.anchor.new_line.?);
+    try std.testing.expectEqualStrings("f", draft.loc.hunk.path);
+    try std.testing.expectEqual(1, draft.loc.hunk.old_start);
+    try std.testing.expectEqual(1, draft.loc.hunk.new_start);
     try std.testing.expect(draft.edit_id == null);
 
     try std.testing.expect(try draft.begin(&review, std.testing.allocator, rows, empty, .unified, 1, .old));
-    try std.testing.expectEqual(1, draft.anchor.old_line.?);
-    try std.testing.expectEqual(1, draft.anchor.new_line.?);
+    try std.testing.expectEqual(1, draft.loc.hunk.old_start);
+    try std.testing.expectEqual(1, draft.loc.hunk.new_start);
     try std.testing.expect(draft.edit_id == null);
 
     _ = try review.addOpen("f", null, null, null, "hello", .local);
@@ -4448,9 +4426,9 @@ test "comment list Enter on a hidden loc is hidden not missing" {
     }});
     switch (list.handleKey(.enter, hidden)) {
         .hidden => |h| {
-            try std.testing.expectEqualStrings("f.txt", h.loc.path);
-            try std.testing.expectEqual(.new, h.loc.side.?);
-            try std.testing.expectEqual(1, h.loc.line.?);
+            try std.testing.expectEqualStrings("f.txt", h.loc.line.path);
+            try std.testing.expectEqual(.new, h.loc.line.side);
+            try std.testing.expectEqual(1, h.loc.line.line);
             try std.testing.expect(!h.edit);
         },
         else => try std.testing.expect(false),
@@ -4458,9 +4436,7 @@ test "comment list Enter on a hidden loc is hidden not missing" {
     switch (list.handleKey(.enter, full)) {
         .jump => |j| {
             try std.testing.expectEqual(view.rowForComment(full, .{
-                .path = "f.txt",
-                .side = .new,
-                .line = 1,
+                .line = .{ .path = "f.txt", .side = .new, .line = 1 },
             }).?, j.row);
             try std.testing.expect(!j.edit);
         },
@@ -4529,9 +4505,7 @@ test "comment list d dismisses and i edits" {
         .jump => |j| {
             try std.testing.expect(j.edit);
             try std.testing.expectEqual(view.rowForComment(rows, .{
-                .path = "f.txt",
-                .side = .new,
-                .line = 1,
+                .line = .{ .path = "f.txt", .side = .new, .line = 1 },
             }).?, j.row);
         },
         else => try std.testing.expect(false),
@@ -4580,9 +4554,9 @@ test "comment list i on a hidden loc is hidden with edit" {
     switch (list.handleKey(.{ .char = 'i' }, hidden)) {
         .hidden => |h| {
             try std.testing.expect(h.edit);
-            try std.testing.expectEqualStrings("f.txt", h.loc.path);
-            try std.testing.expectEqual(.new, h.loc.side.?);
-            try std.testing.expectEqual(1, h.loc.line.?);
+            try std.testing.expectEqualStrings("f.txt", h.loc.line.path);
+            try std.testing.expectEqual(.new, h.loc.line.side);
+            try std.testing.expectEqual(1, h.loc.line.line);
         },
         else => try std.testing.expect(false),
     }
@@ -4735,7 +4709,7 @@ test "identityAtRow then unapprove restores a hidden comment line" {
     var d = try twoHunkDiff(alloc);
     defer d.deinit();
     const path = d.files[0].displayPath();
-    const loc: view.CommentLoc = .{ .path = path, .side = .new, .line = 1 };
+    const loc: view.row.DiffLoc = .{ .line = .{ .path = path, .side = .new, .line = 1 } };
     const full = try view.row.flatten(alloc, &d);
     defer alloc.free(full);
     const full_row = view.rowForComment(full, loc).?;
