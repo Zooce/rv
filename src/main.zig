@@ -1774,14 +1774,28 @@ fn applyApprove(
     // Identities must outlive stage: applyAtCursor replaces the diff.
     var hashes: std.ArrayList(approve.Hash) = .empty;
     defer hashes.deinit(alloc);
+    var old_start: u32 = 0;
+    var new_start: u32 = 0;
     if (!whole_file) {
         const hh = switch (rows[target.first]) {
             .hunk_header => |h| h,
             else => return,
         };
-        const hi = approve.hunkAt(file.*, hh.old_start, hh.new_start) orelse return;
+        old_start = hh.old_start;
+        new_start = hh.new_start;
+        const hi = approve.hunkAt(file.*, old_start, new_start) orelse return;
         for (file.hunks[hi].identityHunks()) |id| {
             try hashes.append(alloc, approve.fingerprintHunk(id));
+        }
+    } else if (file.hunks.len == 0) {
+        if (approve.hunklessHash(alloc, io, root, file.*)) |hash| {
+            try hashes.append(alloc, hash);
+        }
+    } else {
+        for (file.hunks) |*h| {
+            for (h.identityHunks()) |id| {
+                try hashes.append(alloc, approve.fingerprintHunk(id));
+            }
         }
     }
     const hunk_mark = neighborMark(rows, target);
@@ -1815,7 +1829,9 @@ fn applyApprove(
         }
     }
 
-    const live_file = groupedFile(&diff_view.diff, path, .staged) orelse return;
+    // After a successful stage the file is under Staged. A path-only reload
+    // can miss that file; still write the identities taken before stage.
+    const live_file = groupedFile(&diff_view.diff, path, .staged);
     var approved = approve.load(alloc, io, root) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
         else => {
@@ -1825,15 +1841,54 @@ fn applyApprove(
     };
     defer approved.deinit();
 
+    const store_path = if (live_file) |f| f.displayPath() else path;
     if (whole_file) {
-        try approved.appendFile(alloc, io, root, live_file.*);
+        if (live_file) |f| {
+            try approved.appendFile(alloc, io, root, f.*);
+        } else {
+            for (hashes.items) |hash| {
+                try approved.append(store_path, hash);
+            }
+        }
+    } else if (live_file) |f| {
+        var any_place = false;
+        for (hashes.items) |hash| {
+            for (f.hunks) |h| {
+                if (approve.hunkContains(h, hash)) {
+                    any_place = true;
+                    break;
+                }
+            }
+            if (any_place) break;
+        }
+        if (any_place) {
+            for (hashes.items) |hash| {
+                try approved.append(store_path, hash);
+            }
+        } else {
+            const only: ?usize = if (f.hunks.len == 1) 0 else null;
+            const hi = approve.hunkAt(f.*, old_start, new_start) orelse only;
+            if (hi) |i| {
+                for (f.hunks[i].identityHunks()) |id| {
+                    try approved.append(store_path, approve.fingerprintHunk(id));
+                }
+            } else {
+                for (hashes.items) |hash| {
+                    try approved.append(store_path, hash);
+                }
+            }
+        }
     } else {
         for (hashes.items) |hash| {
-            try approved.append(live_file.displayPath(), hash);
+            try approved.append(store_path, hash);
         }
     }
 
-    try approved.prune(alloc, io, root, &diff_view.diff);
+    // Prune only when the staged file is in this load; otherwise the new
+    // entries cannot be placed yet and must survive until the next reload.
+    if (live_file != null) {
+        try approved.prune(alloc, io, root, &diff_view.diff);
+    }
     approve.save(&approved, alloc, io, root) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
         else => {
@@ -4893,6 +4948,120 @@ test "applyApprove stages an unstaged hunk and hides it; nearby edit is unstaged
     };
     try std.testing.expect(hunkAdds(unstaged, "nearby"));
     try std.testing.expect(!hunkAdds(unstaged, "accepted"));
+}
+
+test "applyApprove hides a further edit of a line that was already staged" {
+    if (builtin.os.tag == .wasi) return error.SkipZigTest;
+
+    const io = std.testing.io;
+    const alloc = std.testing.allocator;
+    var tmp = try IsolatedTmp.init(alloc, io);
+    defer tmp.deinit(alloc, io);
+    const cwd = tmp.cwd();
+    try expectGitOk(io, cwd, &.{ "git", "init", "-b", "main" });
+    try expectGitOk(io, cwd, &.{ "git", "config", "user.email", "rv@test" });
+    try expectGitOk(io, cwd, &.{ "git", "config", "user.name", "rv test" });
+    try tmp.write(io, "f.txt", "alpha\n");
+    try expectGitOk(io, cwd, &.{ "git", "add", "f.txt" });
+    try expectGitOk(io, cwd, &.{ "git", "commit", "-m", "init" });
+    try tmp.write(io, "f.txt", "beta\n");
+    try expectGitOk(io, cwd, &.{ "git", "add", "f.txt" });
+    try tmp.write(io, "f.txt", "gamma\n");
+
+    var diff_view = try loadLocalView(alloc, io, tmp.cwd(), tmp.dir);
+    defer diff_view.deinit(alloc);
+    var cursor: usize = firstHunkRow(diff_view.rows) orelse return error.TestUnexpectedResult;
+    var note: StatusNote = .{};
+    var focus: Focus = .normal;
+    var git_error: GitError = .{};
+    defer git_error.buf.deinit(alloc);
+    var review = try store.initEmpty(alloc, store.default_review_id);
+    defer review.deinit();
+    try applyApprove(alloc, io, .local, &diff_view, &cursor, &note, &focus, &git_error, &review, tmp.cwd(), tmp.dir, false);
+    try std.testing.expect(focus != .git_error);
+    try std.testing.expect(!hasRowFile(diff_view.rows, "f.txt", .unstaged));
+    try std.testing.expect(!hasRowFile(diff_view.rows, "f.txt", .staged));
+    {
+        var raw = try git.loadDefaultDiffCwd(alloc, io, tmp.cwd());
+        defer raw.deinit();
+        try std.testing.expect(!hasDiffFile(raw, "f.txt", .unstaged));
+        try std.testing.expect(hasDiffFile(raw, "f.txt", .staged));
+        const staged = blk: {
+            for (raw.files) |f| {
+                const g = f.group orelse continue;
+                if (g == .staged and std.mem.eql(u8, f.displayPath(), "f.txt")) break :blk f;
+            }
+            return error.TestUnexpectedResult;
+        };
+        try std.testing.expect(hunkAdds(staged, "gamma"));
+        try std.testing.expect(!hunkAdds(staged, "beta"));
+    }
+    var stored = try approve.load(alloc, io, tmp.dir);
+    defer stored.deinit();
+    try std.testing.expectEqual(1, stored.entries.items.len);
+
+    const hidden = try approve.collectApproved(alloc, io, tmp.dir, &diff_view.diff, &stored);
+    defer alloc.free(hidden);
+    try std.testing.expectEqual(1, hidden.len);
+    try applyUnapprove(alloc, io, .local, &diff_view, &cursor, &note, tmp.dir, hidden[0]);
+    try std.testing.expect(hasRowFile(diff_view.rows, "f.txt", .staged));
+    try std.testing.expect(!hasRowFile(diff_view.rows, "f.txt", .unstaged));
+    {
+        var raw = try git.loadDefaultDiffCwd(alloc, io, tmp.cwd());
+        defer raw.deinit();
+        try std.testing.expect(hasDiffFile(raw, "f.txt", .staged));
+        try std.testing.expect(!hasDiffFile(raw, "f.txt", .unstaged));
+    }
+}
+
+test "applyApprove hides one unstaged hunk and leaves the other unstaged" {
+    if (builtin.os.tag == .wasi) return error.SkipZigTest;
+
+    const io = std.testing.io;
+    const alloc = std.testing.allocator;
+    var tmp = try IsolatedTmp.init(alloc, io);
+    defer tmp.deinit(alloc, io);
+    const cwd = tmp.cwd();
+    try expectGitOk(io, cwd, &.{ "git", "init", "-b", "main" });
+    try expectGitOk(io, cwd, &.{ "git", "config", "user.email", "rv@test" });
+    try expectGitOk(io, cwd, &.{ "git", "config", "user.name", "rv test" });
+    const head = "l1\nl2\nl3\nl4\nl5\nl6\nl7\nl8\nl9\nl10\nl11\nl12\n";
+    const both = "tokA\nl2\nl3\nl4\nl5\nl6\nl7\nl8\nl9\ntokB\nl11\nl12\n";
+    try tmp.write(io, "f.txt", head);
+    try expectGitOk(io, cwd, &.{ "git", "add", "f.txt" });
+    try expectGitOk(io, cwd, &.{ "git", "commit", "-m", "init" });
+    try tmp.write(io, "f.txt", both);
+
+    var diff_view = try loadLocalView(alloc, io, cwd, tmp.dir);
+    defer diff_view.deinit(alloc);
+    var cursor: usize = firstHunkRow(diff_view.rows) orelse return error.TestUnexpectedResult;
+    var note: StatusNote = .{};
+    var focus: Focus = .normal;
+    var git_error: GitError = .{};
+    defer git_error.buf.deinit(alloc);
+    var review = try store.initEmpty(alloc, store.default_review_id);
+    defer review.deinit();
+    try applyApprove(alloc, io, .local, &diff_view, &cursor, &note, &focus, &git_error, &review, cwd, tmp.dir, false);
+    try std.testing.expect(focus != .git_error);
+    try std.testing.expect(hasRowFile(diff_view.rows, "f.txt", .unstaged));
+    try std.testing.expect(!hasRowFile(diff_view.rows, "f.txt", .staged));
+    try std.testing.expect(rowsHaveLine(diff_view.rows, "tokB"));
+    try std.testing.expect(!rowsHaveLine(diff_view.rows, "tokA"));
+    {
+        var raw = try git.loadDefaultDiffCwd(alloc, io, cwd);
+        defer raw.deinit();
+        try std.testing.expect(hasDiffFile(raw, "f.txt", .unstaged));
+        try std.testing.expect(hasDiffFile(raw, "f.txt", .staged));
+        const unstaged = blk: {
+            for (raw.files) |f| {
+                const g = f.group orelse continue;
+                if (g == .unstaged and std.mem.eql(u8, f.displayPath(), "f.txt")) break :blk f;
+            }
+            return error.TestUnexpectedResult;
+        };
+        try std.testing.expect(hunkAdds(unstaged, "tokB"));
+        try std.testing.expect(!hunkAdds(unstaged, "tokA"));
+    }
 }
 
 test "applyApprove hides approved lines when git merges them with a staged neighbor" {
