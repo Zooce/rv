@@ -46,7 +46,7 @@ pub const Row = union(enum) {
         new_no: ?u32 = null,
         /// Changed bytes in `text`. Borrowed from the diff line.
         /// `null`: word spans were not computed; an add/delete line keeps the solid fill.
-        /// Empty: word-diff found no changed bytes. The row is dim grey, with no red or green.
+        /// Empty: no changed tokens. The row is dim grey, with no red or green.
         spans: ?[]const diff.Span = null,
     },
 };

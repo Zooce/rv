@@ -25,13 +25,13 @@
 //! and untracked files are omitted. The line oracle compares parsed hunk
 //! lines to the blobs these loaders parse.
 //!
-//! ## Word spans
+//! ## Intra-line spans
 //!
-//! Each loader also runs that same git command with `--word-diff=porcelain`
-//! and stores the changed byte ranges on `Line.spans`. Display rows borrow
-//! those slices. If the porcelain hunks do not line up, spans stay `null` and
-//! the line keeps the whole-line add/delete fill. An empty list means
-//! word-diff found no changed bytes, and that line is dim grey with no red or green.
+//! After parsing the unified diff, `worddiff.attachSpans` writes changed-token
+//! ranges onto add/delete lines (`Line.spans`). Display rows borrow those
+//! slices. One-sided files, one-sided hunks, and blank unpaired lines keep
+//! `null` spans and the solid add/delete fill. An empty list means every token
+//! on that line is also on the paired line: dim grey, no red or green.
 //!
 //! ## Explicit range
 //!
@@ -85,10 +85,9 @@
 //! ## Path reload
 //!
 //! `reloadPaths` loads a fresh local diff of those paths and splices them
-//! into the previous `Diff`. Other files stay as loaded, including word
-//! spans and expanded hunks. The reloaded path keeps word spans when its
-//! add and delete lines still match a loaded hunk; otherwise those lines
-//! use the solid fill until a full reload.
+//! into the previous `Diff`. Other files stay as loaded, including expanded
+//! hunks. Intra-line spans on the reloaded path are computed from the fresh
+//! hunk lines.
 //!
 //! ## Errors
 //!
@@ -134,7 +133,6 @@ pub fn loadDefaultDiff(alloc: Allocator, io: Io) Error!diff.Diff {
 
 /// Unified blobs for the local load, in group order. Empty slices (still
 /// owned by `alloc`) when that group was not run.
-/// `porcelain` adds `--word-diff=porcelain` to those same commands.
 const DefaultTexts = struct {
     unstaged: []u8,
     untracked: []u8,
@@ -153,12 +151,11 @@ fn loadDefaultTexts(
     alloc: Allocator,
     io: Io,
     cwd: std.process.Child.Cwd,
-    porcelain: bool,
     only: ?[]const []const u8,
 ) Error!DefaultTexts {
     if (only == null) try ensureInsideWorkTree(alloc, io, cwd);
 
-    const untracked = if (try untrackedDiff(alloc, io, cwd, porcelain, only)) |text| text else try alloc.alloc(u8, 0);
+    const untracked = if (try untrackedDiff(alloc, io, cwd, only)) |text| text else try alloc.alloc(u8, 0);
     errdefer alloc.free(untracked);
 
     if (!try revExists(alloc, io, cwd, "HEAD")) {
@@ -171,12 +168,12 @@ fn loadDefaultTexts(
         };
     }
 
-    const unstaged = try worktreeDiff(alloc, io, cwd, porcelain, false, only);
+    const unstaged = try worktreeDiff(alloc, io, cwd, false, only);
     errdefer alloc.free(unstaged);
     return .{
         .unstaged = unstaged,
         .untracked = untracked,
-        .staged = try worktreeDiff(alloc, io, cwd, porcelain, true, only),
+        .staged = try worktreeDiff(alloc, io, cwd, true, only),
     };
 }
 
@@ -185,14 +182,12 @@ fn worktreeDiff(
     alloc: Allocator,
     io: Io,
     cwd: std.process.Child.Cwd,
-    porcelain: bool,
     cached: bool,
     only: ?[]const []const u8,
 ) Error![]u8 {
     var argv: std.ArrayList([]const u8) = .empty;
     defer argv.deinit(alloc);
     try argv.appendSlice(alloc, &.{ "git", "diff", "--find-renames" });
-    if (porcelain) try argv.append(alloc, "--word-diff=porcelain");
     if (cached) try argv.append(alloc, "--cached");
     if (only) |paths| {
         try argv.append(alloc, "--");
@@ -203,58 +198,40 @@ fn worktreeDiff(
 
 /// Same as `loadDefaultDiff`, but run git with an explicit child cwd.
 pub fn loadDefaultDiffCwd(alloc: Allocator, io: Io, cwd: std.process.Child.Cwd) Error!diff.Diff {
-    const texts = try loadDefaultTexts(alloc, io, cwd, false, null);
+    const texts = try loadDefaultTexts(alloc, io, cwd, null);
     defer texts.deinit(alloc);
-    const por = try loadDefaultTexts(alloc, io, cwd, true, null);
-    defer por.deinit(alloc);
     var parsed = try diff.parsePieces(alloc, &.{
         .{ .text = texts.unstaged, .group = .unstaged },
         .{ .text = texts.untracked, .group = .untracked },
         .{ .text = texts.staged, .group = .staged },
     });
     errdefer parsed.deinit();
-    try attachWordSpans(alloc, &parsed, por.unstaged, .unstaged);
-    try attachWordSpans(alloc, &parsed, por.untracked, .untracked);
-    try attachWordSpans(alloc, &parsed, por.staged, .staged);
+    try worddiff.attachSpans(alloc, &parsed);
     return parsed;
 }
 
-/// Store porcelain ranges on the diff. A hunk that does not line up keeps a
-/// null span list and the solid fill. The other hunks are still filled.
-fn attachWordSpans(alloc: Allocator, d: *diff.Diff, porcelain: []const u8, group: ?diff.Group) Error!void {
-    worddiff.attachSpans(alloc, d, porcelain, group) catch |err| switch (err) {
-        error.AlignFailed => {},
-        error.OutOfMemory => return error.OutOfMemory,
-    };
-}
-
 /// `git diff --find-renames <range>` stdout. Caller frees.
-/// `porcelain` adds `--word-diff=porcelain`.
-fn rangeDiffText(alloc: Allocator, io: Io, cwd: std.process.Child.Cwd, range: []const u8, porcelain: bool) Error![]u8 {
+fn rangeDiffText(alloc: Allocator, io: Io, cwd: std.process.Child.Cwd, range: []const u8) Error![]u8 {
     try ensureInsideWorkTree(alloc, io, cwd);
-    const argv: []const []const u8 = if (porcelain)
-        &.{ "git", "diff", "--find-renames", "--word-diff=porcelain", range }
-    else
-        &.{ "git", "diff", "--find-renames", range };
-    return try git(alloc, io, cwd, .{ .argv = argv });
+    return try git(alloc, io, cwd, .{
+        .argv = &.{ "git", "diff", "--find-renames", range },
+    });
 }
 
 /// Load `git diff --find-renames <range>`. `range` is passed through as
 /// written (no `...` / `..` rewrite). Pass `.inherit` for the process cwd.
 pub fn loadRangeDiff(alloc: Allocator, io: Io, cwd: std.process.Child.Cwd, range: []const u8) Error!diff.Diff {
-    const out = try rangeDiffText(alloc, io, cwd, range, false);
+    const out = try rangeDiffText(alloc, io, cwd, range);
     defer alloc.free(out);
-    const por = try rangeDiffText(alloc, io, cwd, range, true);
-    defer alloc.free(por);
     var parsed = try diff.parse(alloc, out);
     errdefer parsed.deinit();
-    try attachWordSpans(alloc, &parsed, por, null);
+    try worddiff.attachSpans(alloc, &parsed);
     return parsed;
 }
 
 /// `git diff-tree` patch for `commit` (parent → commit). Caller frees.
-/// The commit-ish must peel to a commit. `porcelain` adds `--word-diff=porcelain`.
-fn commitDiffText(alloc: Allocator, io: Io, cwd: std.process.Child.Cwd, commit: []const u8, porcelain: bool) Error![]u8 {
+/// The commit-ish must peel to a commit.
+fn commitDiffText(alloc: Allocator, io: Io, cwd: std.process.Child.Cwd, commit: []const u8) Error![]u8 {
     try ensureInsideWorkTree(alloc, io, cwd);
     const as_commit = try std.fmt.allocPrint(alloc, "{s}^{{commit}}", .{commit});
     defer alloc.free(as_commit);
@@ -263,20 +240,8 @@ fn commitDiffText(alloc: Allocator, io: Io, cwd: std.process.Child.Cwd, commit: 
     });
     alloc.free(peeled);
 
-    const argv: []const []const u8 = if (porcelain)
-        &.{
-            "git",
-            "diff-tree",
-            "-p",
-            "--root",
-            "--find-renames",
-            "--word-diff=porcelain",
-            "--no-commit-id",
-            "--first-parent",
-            commit,
-        }
-    else
-        &.{
+    return try git(alloc, io, cwd, .{
+        .argv = &.{
             "git",
             "diff-tree",
             "-p",
@@ -285,20 +250,18 @@ fn commitDiffText(alloc: Allocator, io: Io, cwd: std.process.Child.Cwd, commit: 
             "--no-commit-id",
             "--first-parent",
             commit,
-        };
-    return try git(alloc, io, cwd, .{ .argv = argv });
+        },
+    });
 }
 
 /// Load the patch `<commit>` introduced (parent → that commit).
 /// `commit` is a commit-ish as given; it must peel to a commit.
 pub fn loadCommitDiff(alloc: Allocator, io: Io, cwd: std.process.Child.Cwd, commit: []const u8) Error!diff.Diff {
-    const out = try commitDiffText(alloc, io, cwd, commit, false);
+    const out = try commitDiffText(alloc, io, cwd, commit);
     defer alloc.free(out);
-    const por = try commitDiffText(alloc, io, cwd, commit, true);
-    defer alloc.free(por);
     var parsed = try diff.parse(alloc, out);
     errdefer parsed.deinit();
-    try attachWordSpans(alloc, &parsed, por, null);
+    try worddiff.attachSpans(alloc, &parsed);
     return parsed;
 }
 
@@ -508,8 +471,7 @@ pub fn mutate(alloc: Allocator, io: Io, cwd: std.process.Child.Cwd, opts: Mutate
 }
 
 /// Replace `paths` in `old` with a fresh local diff of those paths. Other
-/// files are copied. Word spans on the fresh hunks are copied from `old`
-/// when the add and delete lines still match.
+/// files are copied. Intra-line spans on the fresh hunks come from those lines.
 pub fn reloadPaths(
     alloc: Allocator,
     io: Io,
@@ -517,7 +479,7 @@ pub fn reloadPaths(
     old: *const diff.Diff,
     paths: []const []const u8,
 ) Error!diff.Diff {
-    const texts = try loadDefaultTexts(alloc, io, cwd, false, paths);
+    const texts = try loadDefaultTexts(alloc, io, cwd, paths);
     defer texts.deinit(alloc);
     var fresh = try diff.parsePieces(alloc, &.{
         .{ .text = texts.unstaged, .group = .unstaged },
@@ -525,64 +487,8 @@ pub fn reloadPaths(
         .{ .text = texts.staged, .group = .staged },
     });
     defer fresh.deinit();
-    try copyMatchingSpans(old, &fresh);
+    try worddiff.attachSpans(alloc, &fresh);
     return try old.replacePaths(alloc, paths, &fresh);
-}
-
-/// Same add and delete lines, in order. Context and `@@` numbers are ignored.
-fn sameChanges(a: diff.Hunk, b: diff.Hunk) bool {
-    var ia: usize = 0;
-    var ib: usize = 0;
-    while (true) {
-        while (ia < a.lines.len and a.lines[ia].kind != .add and a.lines[ia].kind != .delete) ia += 1;
-        while (ib < b.lines.len and b.lines[ib].kind != .add and b.lines[ib].kind != .delete) ib += 1;
-        if (ia >= a.lines.len and ib >= b.lines.len) return true;
-        if (ia >= a.lines.len or ib >= b.lines.len) return false;
-        if (a.lines[ia].kind != b.lines[ib].kind) return false;
-        if (!std.mem.eql(u8, a.lines[ia].text, b.lines[ib].text)) return false;
-        ia += 1;
-        ib += 1;
-    }
-}
-
-fn matchingHunk(old: *const diff.Diff, path: []const u8, group: ?diff.Group, want: diff.Hunk) ?diff.Hunk {
-    var fallback: ?diff.Hunk = null;
-    for (old.files) |of| {
-        if (!std.mem.eql(u8, of.displayPath(), path)) continue;
-        for (of.hunks) |oh| {
-            if (!sameChanges(oh, want)) continue;
-            if (of.group == group) return oh;
-            if (fallback == null) fallback = oh;
-        }
-    }
-    return fallback;
-}
-
-fn copyChangeSpans(alloc: Allocator, src: diff.Hunk, dst: *diff.Hunk) Allocator.Error!void {
-    const lines = try alloc.alloc(diff.Line, dst.lines.len);
-    for (dst.lines, lines) |ln, *out| out.* = ln;
-    var si: usize = 0;
-    for (lines) |*ln| {
-        if (ln.kind != .add and ln.kind != .delete) continue;
-        while (si < src.lines.len and src.lines[si].kind != .add and src.lines[si].kind != .delete) si += 1;
-        if (si >= src.lines.len) break;
-        if (src.lines[si].spans) |sp| ln.spans = try alloc.dupe(diff.Span, sp);
-        si += 1;
-    }
-    dst.lines = lines;
-}
-
-/// Copy word spans onto `fresh` hunks whose add and delete lines still match
-/// `old`. Same group wins; another group of that path is the fallback (a
-/// staged copy of a hunk that was unstaged). Anything else stays unspanned.
-fn copyMatchingSpans(old: *const diff.Diff, fresh: *diff.Diff) Allocator.Error!void {
-    const alloc = fresh.arena.allocator();
-    for (fresh.files) |*ff| {
-        for (ff.hunks) |*fh| {
-            const src = matchingHunk(old, ff.displayPath(), ff.group, fh.*) orelse continue;
-            try copyChangeSpans(alloc, src, fh);
-        }
-    }
 }
 
 // --- internals -----------------------------------------------------------
@@ -621,7 +527,6 @@ fn untrackedDiff(
     alloc: Allocator,
     io: Io,
     cwd: std.process.Child.Cwd,
-    porcelain: bool,
     only: ?[]const []const u8,
 ) Error!?[]u8 {
     var list_argv: std.ArrayList([]const u8) = .empty;
@@ -642,12 +547,8 @@ fn untrackedDiff(
     while (it.next()) |path| {
         if (path.len == 0) continue;
         // Exit 1 is normal when files differ (always for a real new file).
-        const argv: []const []const u8 = if (porcelain)
-            &.{ "git", "diff", "--no-index", "--word-diff=porcelain", "--", "/dev/null", path }
-        else
-            &.{ "git", "diff", "--no-index", "--", "/dev/null", path };
         const piece = try git(alloc, io, cwd, .{
-            .argv = argv,
+            .argv = &.{ "git", "diff", "--no-index", "--", "/dev/null", path },
             .allowed_error_code = 1,
         });
         defer alloc.free(piece);
@@ -1419,7 +1320,7 @@ test "line oracle: local diff matches the unified body" {
     var d = try loadDefaultDiffCwd(alloc, io, cwd);
     defer d.deinit();
 
-    const texts = try loadDefaultTexts(alloc, io, cwd, false, null);
+    const texts = try loadDefaultTexts(alloc, io, cwd, null);
     defer texts.deinit(alloc);
     try expectDiffMatchesStream(alloc, &d, &.{ texts.unstaged, texts.untracked, texts.staged });
     try expectLineTokens(
@@ -1455,7 +1356,7 @@ test "line oracle: range diff matches the unified body" {
     var d = try loadRangeDiff(alloc, io, cwd, "main...HEAD");
     defer d.deinit();
 
-    const text = try rangeDiffText(alloc, io, cwd, "main...HEAD", false);
+    const text = try rangeDiffText(alloc, io, cwd, "main...HEAD");
     defer alloc.free(text);
     try expectDiffMatchesStream(alloc, &d, &.{text});
     try expectLineTokens(&d, &.{"feature-token"}, &.{ "dirty-token", "untracked-token" });
@@ -1481,13 +1382,13 @@ test "line oracle: commit diff matches the unified body" {
     var d = try loadCommitDiff(alloc, io, cwd, "HEAD");
     defer d.deinit();
 
-    const text = try commitDiffText(alloc, io, cwd, "HEAD", false);
+    const text = try commitDiffText(alloc, io, cwd, "HEAD");
     defer alloc.free(text);
     try expectDiffMatchesStream(alloc, &d, &.{text});
     try expectLineTokens(&d, &.{"committed-token"}, &.{ "dirty-token", "untracked-token" });
 }
 
-test "local word-diff porcelain matches the loaded hunks" {
+test "local load spans changed words on add and delete lines" {
     if (builtin.os.tag == .wasi) return error.SkipZigTest;
 
     const io = testing.io;
@@ -1539,53 +1440,9 @@ test "local word-diff porcelain matches the loaded hunks" {
     try expectLineSpan(d, "other", 0, 5);
     try expectLineSpan(d, "OTHER", 0, 5);
     try expectLineUnspanned(d, "keep0");
-
-    const por = try loadDefaultTexts(alloc, io, cwd, true, null);
-    defer por.deinit(alloc);
-
     try testing.expectEqual(1, d.files.len);
     try testing.expectEqual(diff.Group.unstaged, d.files[0].group.?);
     try testing.expectEqual(2, d.files[0].hunks.len);
-
-    var report = try worddiff.mismatches(
-        alloc,
-        d.files[0].displayPath(),
-        d.files[0].hunks,
-        por.unstaged,
-        &.{},
-    );
-    defer report.deinit();
-
-    var saw_word = false;
-    var saw_other = false;
-    for (report.items) |m| {
-        try testing.expectEqual(worddiff.Which.git_only, m.kind);
-        try testing.expectEqualStrings("a.txt", m.path);
-        if (std.mem.eql(u8, m.text, "WORD")) {
-            saw_word = true;
-            try testing.expectEqual(worddiff.Side.new, m.side);
-            try testing.expectEqual(0, m.hunk);
-        }
-        if (std.mem.eql(u8, m.text, "OTHER")) {
-            saw_other = true;
-            try testing.expectEqual(worddiff.Side.new, m.side);
-            try testing.expectEqual(1, m.hunk);
-        }
-    }
-    try testing.expect(saw_word);
-    try testing.expect(saw_other);
-}
-
-fn expectGitOnly(report: *const worddiff.MismatchReport, text: []const u8, side: worddiff.Side, hunk: usize) !void {
-    for (report.items) |m| {
-        if (!std.mem.eql(u8, m.text, text)) continue;
-        try testing.expectEqual(worddiff.Which.git_only, m.kind);
-        try testing.expectEqual(side, m.side);
-        try testing.expectEqual(hunk, m.hunk);
-        return;
-    }
-    std.debug.print("missing git_only \"{s}\"\n", .{text});
-    return error.TestExpectedEqual;
 }
 
 fn expectLineSpan(d: diff.Diff, text: []const u8, start: usize, end: usize) !void {
@@ -1619,16 +1476,7 @@ fn expectLineUnspanned(d: diff.Diff, text: []const u8) !void {
     return error.TestExpectedEqual;
 }
 
-fn expectAbsentText(report: *const worddiff.MismatchReport, text: []const u8) !void {
-    for (report.items) |m| {
-        if (std.mem.eql(u8, m.text, text)) {
-            std.debug.print("unexpected mismatch text \"{s}\"\n", .{text});
-            return error.TestExpectedEqual;
-        }
-    }
-}
-
-test "range word-diff porcelain matches the loaded hunks" {
+test "range load spans changed words and omits worktree dirt" {
     if (builtin.os.tag == .wasi) return error.SkipZigTest;
 
     const io = testing.io;
@@ -1645,28 +1493,19 @@ test "range word-diff porcelain matches the loaded hunks" {
     try tmp.write(io, "shared.txt", "keep BETA\n");
     try expectGitOk(alloc, io, cwd, &.{ "git", "add", "shared.txt" });
     try expectGitOk(alloc, io, cwd, &.{ "git", "commit", "-m", "on feature" });
-    // Worktree dirt stays out of a range load.
     try tmp.write(io, "shared.txt", "keep BETA\ndirt-token\n");
     try tmp.write(io, "extra.txt", "untracked-token\n");
 
     var d = try loadRangeDiff(alloc, io, cwd, "main...HEAD");
     defer d.deinit();
-    const por = try rangeDiffText(alloc, io, cwd, "main...HEAD", true);
-    defer alloc.free(por);
-
     try testing.expectEqual(1, d.files.len);
     try testing.expectEqual(1, d.files[0].hunks.len);
-    var report = try worddiff.mismatches(alloc, d.files[0].displayPath(), d.files[0].hunks, por, &.{});
-    defer report.deinit();
-    try expectGitOnly(&report, "BETA", .new, 0);
-    try expectGitOnly(&report, "alpha", .old, 0);
-    try expectAbsentText(&report, "dirt-token");
-    try expectAbsentText(&report, "untracked-token");
     try expectLineSpan(d, "keep alpha", 5, 10);
     try expectLineSpan(d, "keep BETA", 5, 9);
+    try expectLineTokens(&d, &.{ "keep alpha", "keep BETA" }, &.{ "dirt-token", "untracked-token" });
 }
 
-test "commit word-diff porcelain matches the loaded hunks" {
+test "commit load spans changed words and omits worktree dirt" {
     if (builtin.os.tag == .wasi) return error.SkipZigTest;
 
     const io = testing.io;
@@ -1687,19 +1526,11 @@ test "commit word-diff porcelain matches the loaded hunks" {
 
     var d = try loadCommitDiff(alloc, io, cwd, "HEAD");
     defer d.deinit();
-    const por = try commitDiffText(alloc, io, cwd, "HEAD", true);
-    defer alloc.free(por);
-
     try testing.expectEqual(1, d.files.len);
     try testing.expectEqual(1, d.files[0].hunks.len);
-    var report = try worddiff.mismatches(alloc, d.files[0].displayPath(), d.files[0].hunks, por, &.{});
-    defer report.deinit();
-    try expectGitOnly(&report, "BETA", .new, 0);
-    try expectGitOnly(&report, "alpha", .old, 0);
-    try expectAbsentText(&report, "dirt-token");
-    try expectAbsentText(&report, "untracked-token");
     try expectLineSpan(d, "keep alpha", 5, 10);
     try expectLineSpan(d, "keep BETA", 5, 9);
+    try expectLineTokens(&d, &.{ "keep alpha", "keep BETA" }, &.{ "dirt-token", "untracked-token" });
 }
 
 test "mutate file: stage, unstage, discard; refuse discard staged" {
@@ -2026,18 +1857,8 @@ test "survivingFileText unstaged is worktree, staged is index" {
     try testing.expectEqualStrings("staged body\n", idx);
 }
 
-test "copyMatchingSpans keeps word spans when context shifts" {
-    const old_txt =
-        \\diff --git a/f.txt b/f.txt
-        \\--- a/f.txt
-        \\+++ b/f.txt
-        \\@@ -1,3 +1,3 @@
-        \\ ctx
-        \\-old
-        \\+new
-        \\ ctx
-    ;
-    const fresh_txt =
+test "attachSpans on a parsed hunk colors the changed tokens" {
+    const text =
         \\diff --git a/f.txt b/f.txt
         \\--- a/f.txt
         \\+++ b/f.txt
@@ -2054,23 +1875,18 @@ test "copyMatchingSpans keeps word spans when context shifts" {
         \\+else
     ;
     const alloc = testing.allocator;
-    var old = try diff.parsePieces(alloc, &.{.{ .text = old_txt, .group = .unstaged }});
-    defer old.deinit();
-    const spans = try old.arena.allocator().dupe(diff.Span, &.{.{ .start = 1, .end = 3 }});
-    const marked = try old.arena.allocator().alloc(diff.Line, old.files[0].hunks[0].lines.len);
-    for (old.files[0].hunks[0].lines, marked) |ln, *out| out.* = ln;
-    marked[2].spans = spans;
-    old.files[0].hunks[0].lines = marked;
+    var d = try diff.parsePieces(alloc, &.{.{ .text = text, .group = .unstaged }});
+    defer d.deinit();
+    try worddiff.attachSpans(alloc, &d);
 
-    var fresh = try diff.parsePieces(alloc, &.{.{ .text = fresh_txt, .group = .unstaged }});
-    defer fresh.deinit();
-    try copyMatchingSpans(&old, &fresh);
-
-    const kept = fresh.files[0].hunks[0].lines[2].spans.?;
-    try testing.expectEqual(1, kept.len);
-    try testing.expectEqual(1, kept[0].start);
-    try testing.expectEqual(3, kept[0].end);
-    try testing.expect(fresh.files[0].hunks[0].lines[0].spans == null);
-    try testing.expect(fresh.files[1].hunks[0].lines[1].spans == null);
+    const old_sp = d.files[0].hunks[0].lines[1].spans.?;
+    try testing.expectEqual(1, old_sp.len);
+    try testing.expectEqual(0, old_sp[0].start);
+    try testing.expectEqual(3, old_sp[0].end);
+    try testing.expect(d.files[0].hunks[0].lines[0].spans == null);
+    const gone = d.files[1].hunks[0].lines[0].spans.?;
+    try testing.expectEqual(1, gone.len);
+    try testing.expectEqual(0, gone[0].start);
+    try testing.expectEqual(4, gone[0].end);
 }
 

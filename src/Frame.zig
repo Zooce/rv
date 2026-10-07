@@ -94,7 +94,7 @@ const Palette = struct {
 
 fn lineStyle(pal: Palette, kind: diff.LineKind, text: []const u8, spans: ?[]const diff.Span, is_cur: bool) tui.Style {
     // `null` spans were not computed, so the line keeps its solid add/delete fill.
-    // An empty list means word-diff found no changed bytes on this side: the row
+    // An empty list means no changed tokens on this side: the row
     // is the same dim grey as the other side, with no red or green.
     // Grey also when some byte sits outside the spans. A full cover stays solid.
     // A blank added or deleted line has a span on the newline past `text`.

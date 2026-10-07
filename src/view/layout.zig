@@ -177,8 +177,8 @@ fn isAddLine(row: Row) bool {
 
 /// True when the lines from `start` until the next header belong in one column.
 /// Adds and no deletes, or deletes and no adds. Also when both kinds are
-/// present but every line on one side has an empty span list: word-diff found
-/// no changed bytes there. Context and meta do not count. `null` spans are a
+/// present but every line on one side has an empty span list: no changed
+/// tokens there. Context and meta do not count. `null` spans are a
 /// whole-line change. A run with neither kind is false.
 pub fn addOnlyOrDeleteOnly(rows: []const Row, start: usize) bool {
     var add = false;
@@ -221,8 +221,8 @@ pub fn addOnlyOrDeleteOnly(rows: []const Row, start: usize) bool {
 /// A file with no old side (`old_path == null`) or no new side
 /// (`new_path == null`) emits a full-width `body` slot per line instead
 /// of pairing. A mixed file (both sides, including a rename) does the same
-/// for a hunk that only adds or only deletes, and for a hunk whose word-diff
-/// changed bytes are all on one side. Context and meta lines in that hunk
+/// for a hunk that only adds or only deletes, and for a hunk whose changed
+/// tokens are all on one side. Context and meta lines in that hunk
 /// are included. A hunk with changed bytes on both sides pairs as above.
 ///
 /// Caller owns the returned slice (`alloc.free`). Nested indices borrow `rows`.

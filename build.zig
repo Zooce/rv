@@ -49,14 +49,13 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
 
-    // Word-diff porcelain spans. Load copies them onto lines; the frame paints them.
+    // Intra-line spans from hunk lines. Load copies them onto lines; the frame paints them.
     const worddiff_mod = b.addModule("worddiff", .{
         .root_source_file = b.path("src/worddiff.zig"),
         .target = target,
         .optimize = optimize,
         .imports = &.{
             .{ .name = "diff", .module = diff_mod },
-            .{ .name = "isolated_tmp", .module = isolated_tmp_mod },
         },
     });
 

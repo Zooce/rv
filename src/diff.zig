@@ -84,7 +84,7 @@ pub const Line = struct {
     /// Changed bytes in `text`. A span may end one past `text` when the change
     /// is that line's newline (a blank added line).
     /// `null`: word spans were not computed; an add/delete line keeps the solid fill.
-    /// Empty: word-diff found no changed bytes. The row is dim grey, with no red or green.
+    /// Empty: no changed tokens. The row is dim grey, with no red or green.
     spans: ?[]const Span = null,
 };
 
