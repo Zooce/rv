@@ -41,6 +41,8 @@ npx skills add Zooce/rv -g
 
 `rv --version` prints `major.minor` (zon `2.2.0` prints `rv 2.2`).
 
+Load, paint, present, and approve timings: `mise run bench`. Compare a run to `bench/baseline.json` with `--compare`. How timings are taken, and how to attach `samply` or `perf`, is in [bench/README.md](bench/README.md).
+
 ## Screenshots
 
 ### Side-by-side diff

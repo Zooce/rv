@@ -20,3 +20,7 @@ run = "zig build run-demo"
 [tasks."demo-build"]
 description = "Build the TUI demo only"
 run = "zig build"
+
+[tasks.bench]
+description = "Time load, paint, present, and approve on generated fixtures"
+run = "zig build bench -Doptimize=ReleaseSafe --"

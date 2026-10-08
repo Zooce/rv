@@ -1444,7 +1444,7 @@ fn applyAtCursor(
             path_n = 2;
         }
     }
-    const spliced = git.reloadPaths(alloc, io, cwd, d, path_buf[0..path_n]) catch |err| {
+    const spliced = git.reloadPaths(alloc, io, cwd, d, path_buf[0..path_n], null) catch |err| {
         return .{ .result = .{ .reload_err = err, .save_failed = save_failed } };
     };
 

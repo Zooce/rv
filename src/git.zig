@@ -133,32 +133,43 @@ pub fn loadDefaultDiff(alloc: Allocator, io: Io) Error!diff.Diff {
 
 /// Unified blobs for the local load, in group order. Empty slices (still
 /// owned by `alloc`) when that group was not run.
-const DefaultTexts = struct {
+pub const DefaultTexts = struct {
     unstaged: []u8,
     untracked: []u8,
     staged: []u8,
 
-    fn deinit(self: DefaultTexts, alloc: Allocator) void {
+    pub fn deinit(self: DefaultTexts, alloc: Allocator) void {
         alloc.free(self.unstaged);
         alloc.free(self.untracked);
         alloc.free(self.staged);
     }
 };
 
+/// How many `git` processes a load started. Passed through `LoadOpts.stats`.
+pub const LoadStats = struct {
+    spawns: usize = 0,
+};
+
+/// Local unified-diff load. `only` limits every command to those paths;
+/// `null` is the whole work tree and checks that cwd is inside one.
+pub const LoadOpts = struct {
+    cwd: std.process.Child.Cwd,
+    only: ?[]const []const u8 = null,
+    stats: ?*LoadStats = null,
+};
+
 /// `only` limits every command to those paths. `null` is the whole work tree
 /// and checks that cwd is inside one. A one-path reload passes the path.
-fn loadDefaultTexts(
-    alloc: Allocator,
-    io: Io,
-    cwd: std.process.Child.Cwd,
-    only: ?[]const []const u8,
-) Error!DefaultTexts {
-    if (only == null) try ensureInsideWorkTree(alloc, io, cwd);
+pub fn loadDefaultTexts(alloc: Allocator, io: Io, opts: LoadOpts) Error!DefaultTexts {
+    const cwd = opts.cwd;
+    const only = opts.only;
+    const stats = opts.stats;
+    if (only == null) try ensureInsideWorkTree(alloc, io, cwd, stats);
 
-    const untracked = if (try untrackedDiff(alloc, io, cwd, only)) |text| text else try alloc.alloc(u8, 0);
+    const untracked = if (try untrackedDiff(alloc, io, cwd, only, stats)) |text| text else try alloc.alloc(u8, 0);
     errdefer alloc.free(untracked);
 
-    if (!try revExists(alloc, io, cwd, "HEAD")) {
+    if (!try revExists(alloc, io, cwd, "HEAD", stats)) {
         const unstaged = try alloc.alloc(u8, 0);
         errdefer alloc.free(unstaged);
         return .{
@@ -168,12 +179,12 @@ fn loadDefaultTexts(
         };
     }
 
-    const unstaged = try worktreeDiff(alloc, io, cwd, false, only);
+    const unstaged = try worktreeDiff(alloc, io, cwd, false, only, stats);
     errdefer alloc.free(unstaged);
     return .{
         .unstaged = unstaged,
         .untracked = untracked,
-        .staged = try worktreeDiff(alloc, io, cwd, true, only),
+        .staged = try worktreeDiff(alloc, io, cwd, true, only, stats),
     };
 }
 
@@ -184,6 +195,7 @@ fn worktreeDiff(
     cwd: std.process.Child.Cwd,
     cached: bool,
     only: ?[]const []const u8,
+    stats: ?*LoadStats,
 ) Error![]u8 {
     var argv: std.ArrayList([]const u8) = .empty;
     defer argv.deinit(alloc);
@@ -193,12 +205,12 @@ fn worktreeDiff(
         try argv.append(alloc, "--");
         try argv.appendSlice(alloc, paths);
     }
-    return try git(alloc, io, cwd, .{ .argv = argv.items });
+    return try git(alloc, io, cwd, .{ .argv = argv.items, .stats = stats });
 }
 
 /// Same as `loadDefaultDiff`, but run git with an explicit child cwd.
 pub fn loadDefaultDiffCwd(alloc: Allocator, io: Io, cwd: std.process.Child.Cwd) Error!diff.Diff {
-    const texts = try loadDefaultTexts(alloc, io, cwd, null);
+    const texts = try loadDefaultTexts(alloc, io, .{ .cwd = cwd });
     defer texts.deinit(alloc);
     var parsed = try diff.parsePieces(alloc, &.{
         .{ .text = texts.unstaged, .group = .unstaged },
@@ -212,7 +224,7 @@ pub fn loadDefaultDiffCwd(alloc: Allocator, io: Io, cwd: std.process.Child.Cwd) 
 
 /// `git diff --find-renames <range>` stdout. Caller frees.
 fn rangeDiffText(alloc: Allocator, io: Io, cwd: std.process.Child.Cwd, range: []const u8) Error![]u8 {
-    try ensureInsideWorkTree(alloc, io, cwd);
+    try ensureInsideWorkTree(alloc, io, cwd, null);
     return try git(alloc, io, cwd, .{
         .argv = &.{ "git", "diff", "--find-renames", range },
     });
@@ -232,7 +244,7 @@ pub fn loadRangeDiff(alloc: Allocator, io: Io, cwd: std.process.Child.Cwd, range
 /// `git diff-tree` patch for `commit` (parent → commit). Caller frees.
 /// The commit-ish must peel to a commit.
 fn commitDiffText(alloc: Allocator, io: Io, cwd: std.process.Child.Cwd, commit: []const u8) Error![]u8 {
-    try ensureInsideWorkTree(alloc, io, cwd);
+    try ensureInsideWorkTree(alloc, io, cwd, null);
     const as_commit = try std.fmt.allocPrint(alloc, "{s}^{{commit}}", .{commit});
     defer alloc.free(as_commit);
     const peeled = try git(alloc, io, cwd, .{
@@ -412,12 +424,14 @@ pub const MutateOpts = struct {
     /// On `error.GitFailed`, filled with owned git stderr (stdout if stderr
     /// is empty). Caller frees. Unchanged on success and other errors.
     fail_output: ?*[]u8 = null,
+    /// When set, incremented once per spawned `git` process.
+    stats: ?*LoadStats = null,
 };
 
 /// Stage, unstage, or discard one path (or one hunk) in `cwd`. See module
 /// docs for the allowed action/group table. Pass `.inherit` for the process cwd.
 pub fn mutate(alloc: Allocator, io: Io, cwd: std.process.Child.Cwd, opts: MutateOpts) Error!void {
-    try ensureInsideWorkTree(alloc, io, cwd);
+    try ensureInsideWorkTree(alloc, io, cwd, opts.stats);
 
     const allowed = switch (opts.action) {
         .stage => switch (opts.group) {
@@ -449,6 +463,7 @@ pub fn mutate(alloc: Allocator, io: Io, cwd: std.process.Child.Cwd, opts: Mutate
             .argv = argv,
             .stdin = patch,
             .fail_output = opts.fail_output,
+            .stats = opts.stats,
         });
         alloc.free(out);
         return;
@@ -466,6 +481,7 @@ pub fn mutate(alloc: Allocator, io: Io, cwd: std.process.Child.Cwd, opts: Mutate
     const out = try git(alloc, io, cwd, .{
         .argv = argv,
         .fail_output = opts.fail_output,
+        .stats = opts.stats,
     });
     alloc.free(out);
 }
@@ -478,8 +494,9 @@ pub fn reloadPaths(
     cwd: std.process.Child.Cwd,
     old: *const diff.Diff,
     paths: []const []const u8,
+    stats: ?*LoadStats,
 ) Error!diff.Diff {
-    const texts = try loadDefaultTexts(alloc, io, cwd, paths);
+    const texts = try loadDefaultTexts(alloc, io, .{ .cwd = cwd, .only = paths, .stats = stats });
     defer texts.deinit(alloc);
     var fresh = try diff.parsePieces(alloc, &.{
         .{ .text = texts.unstaged, .group = .unstaged },
@@ -493,8 +510,11 @@ pub fn reloadPaths(
 
 // --- internals -----------------------------------------------------------
 
-fn ensureInsideWorkTree(alloc: Allocator, io: Io, cwd: std.process.Child.Cwd) Error!void {
-    const out = git(alloc, io, cwd, .{ .argv = &.{ "git", "rev-parse", "--is-inside-work-tree" } }) catch |err| switch (err) {
+fn ensureInsideWorkTree(alloc: Allocator, io: Io, cwd: std.process.Child.Cwd, stats: ?*LoadStats) Error!void {
+    const out = git(alloc, io, cwd, .{
+        .argv = &.{ "git", "rev-parse", "--is-inside-work-tree" },
+        .stats = stats,
+    }) catch |err| switch (err) {
         error.GitFailed => return error.NotARepository,
         else => return err,
     };
@@ -503,7 +523,7 @@ fn ensureInsideWorkTree(alloc: Allocator, io: Io, cwd: std.process.Child.Cwd) Er
     return error.NotARepository;
 }
 
-fn revExists(alloc: Allocator, io: Io, cwd: std.process.Child.Cwd, rev: []const u8) Error!bool {
+fn revExists(alloc: Allocator, io: Io, cwd: std.process.Child.Cwd, rev: []const u8, stats: ?*LoadStats) Error!bool {
     // `--verify` fails when the rev is missing; `--quiet` suppresses noise.
     // Append `^{commit}` so the rev must resolve to a commit object (git
     // syntax: peel tags/refs down to a commit).
@@ -512,6 +532,7 @@ fn revExists(alloc: Allocator, io: Io, cwd: std.process.Child.Cwd, rev: []const 
 
     const out = git(alloc, io, cwd, .{
         .argv = &.{ "git", "rev-parse", "--verify", "--quiet", as_commit },
+        .stats = stats,
     }) catch |err| switch (err) {
         error.GitFailed => return false,
         else => return err,
@@ -528,6 +549,7 @@ fn untrackedDiff(
     io: Io,
     cwd: std.process.Child.Cwd,
     only: ?[]const []const u8,
+    stats: ?*LoadStats,
 ) Error!?[]u8 {
     var list_argv: std.ArrayList([]const u8) = .empty;
     defer list_argv.deinit(alloc);
@@ -536,7 +558,7 @@ fn untrackedDiff(
         try list_argv.append(alloc, "--");
         try list_argv.appendSlice(alloc, paths);
     }
-    const listing = try git(alloc, io, cwd, .{ .argv = list_argv.items });
+    const listing = try git(alloc, io, cwd, .{ .argv = list_argv.items, .stats = stats });
     defer alloc.free(listing);
     if (listing.len == 0) return null;
 
@@ -550,6 +572,7 @@ fn untrackedDiff(
         const piece = try git(alloc, io, cwd, .{
             .argv = &.{ "git", "diff", "--no-index", "--", "/dev/null", path },
             .allowed_error_code = 1,
+            .stats = stats,
         });
         defer alloc.free(piece);
         try out.appendSlice(alloc, piece);
@@ -646,12 +669,15 @@ const GitOpts = struct {
     /// On `error.GitFailed`, filled with owned stderr (stdout if stderr is
     /// empty). Caller frees. Unchanged on success and other errors.
     fail_output: ?*[]u8 = null,
+    /// When set, incremented once per spawned `git` process.
+    stats: ?*LoadStats = null,
 };
 
 /// Run a `git …` command. On exit 0 (or `allowed_error_code` when set), returns
 /// owned stdout (caller frees). Any other exit / crash → `GitFailed`; missing
 /// binary → `GitNotFound`.
 fn git(alloc: Allocator, io: Io, cwd: std.process.Child.Cwd, opts: GitOpts) Error![]u8 {
+    if (opts.stats) |s| s.spawns += 1;
     var child = std.process.spawn(io, .{
         .argv = opts.argv,
         .cwd = cwd,
@@ -841,6 +867,49 @@ test "dirty worktree: unstaged, untracked, then staged" {
     try expectFileAt(d, 2, "extra.zig", .untracked);
     try expectFileAt(d, 3, "mixed.txt", .staged);
     try expectFileAt(d, 4, "staged.txt", .staged);
+}
+
+test "local load spawn count: HEAD and one untracked" {
+    if (builtin.os.tag == .wasi) return error.SkipZigTest;
+
+    const io = testing.io;
+    const alloc = testing.allocator;
+    var tmp = try IsolatedTmp.init(alloc, io);
+    defer tmp.deinit(alloc, io);
+    const cwd = tmp.cwd();
+
+    try initTestRepo(alloc, io, cwd);
+    try tmp.write(io, "a.txt", "base\n");
+    try expectGitOk(alloc, io, cwd, &.{ "git", "add", "a.txt" });
+    try expectGitOk(alloc, io, cwd, &.{ "git", "commit", "-m", "init" });
+    try tmp.write(io, "extra.txt", "untracked\n");
+
+    var stats: LoadStats = .{};
+    const texts = try loadDefaultTexts(alloc, io, .{ .cwd = cwd, .stats = &stats });
+    defer texts.deinit(alloc);
+    // inside-work-tree, ls-files, one --no-index, HEAD verify, unstaged diff, staged diff
+    try testing.expectEqual(6, stats.spawns);
+}
+
+test "local load spawn count: HEAD and no untracked" {
+    if (builtin.os.tag == .wasi) return error.SkipZigTest;
+
+    const io = testing.io;
+    const alloc = testing.allocator;
+    var tmp = try IsolatedTmp.init(alloc, io);
+    defer tmp.deinit(alloc, io);
+    const cwd = tmp.cwd();
+
+    try initTestRepo(alloc, io, cwd);
+    try tmp.write(io, "a.txt", "base\n");
+    try expectGitOk(alloc, io, cwd, &.{ "git", "add", "a.txt" });
+    try expectGitOk(alloc, io, cwd, &.{ "git", "commit", "-m", "init" });
+
+    var stats: LoadStats = .{};
+    const texts = try loadDefaultTexts(alloc, io, .{ .cwd = cwd, .stats = &stats });
+    defer texts.deinit(alloc);
+    // inside-work-tree, ls-files, HEAD verify, unstaged diff, staged diff
+    try testing.expectEqual(5, stats.spawns);
 }
 
 test "clean feature branch: empty model (no local changes)" {
@@ -1320,7 +1389,7 @@ test "line oracle: local diff matches the unified body" {
     var d = try loadDefaultDiffCwd(alloc, io, cwd);
     defer d.deinit();
 
-    const texts = try loadDefaultTexts(alloc, io, cwd, null);
+    const texts = try loadDefaultTexts(alloc, io, .{ .cwd = cwd });
     defer texts.deinit(alloc);
     try expectDiffMatchesStream(alloc, &d, &.{ texts.unstaged, texts.untracked, texts.staged });
     try expectLineTokens(

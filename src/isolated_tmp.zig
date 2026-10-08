@@ -1,6 +1,6 @@
-//! Temp dir under `/tmp` for tests that must not nest inside the project work
-//! tree (e.g. git fixtures where `rev-parse` would walk up into `.git`).
-//! Test-only; import from `test` blocks, not production paths.
+//! Temp dir under `/tmp` for tests and the bench that must not nest inside
+//! the project work tree (e.g. git fixtures where `rev-parse` would walk up
+//! into `.git`). Not used on the production `rv` path.
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;

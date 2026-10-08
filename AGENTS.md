@@ -6,6 +6,7 @@ Project rules for `rv`.
 
 - Use **mise** as the tool and script manager for this project (tool versions, tasks, and project scripts). Prefer `mise run <task>` / tasks defined in `mise.toml` over ad-hoc scripts when a task exists or should exist.
 - Use **goal** for task tracking. Create, start, update, and complete work with `goal` rather than informal TODO lists or untracked notes.
+- After a change that touches load, paint, present, or approve, run `mise run bench -- --compare`. Spawn counts should match `bench/baseline.json`. If the new times are the intended baseline, `--write-baseline bench/baseline.json` and replace the table in `bench/RESULTS.md`. How timings are taken is in `bench/README.md`.
 
 <!-- goal-agent-rules:start -->
 ## Goal (agent rules)

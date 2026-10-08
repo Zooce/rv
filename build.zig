@@ -182,6 +182,40 @@ pub fn build(b: *std.Build) void {
     const run_step = b.step("run", "Run rv (full-screen diff review TUI)");
     run_step.dependOn(&run_rv.step);
 
+    const frame_mod = b.createModule(.{
+        .root_source_file = b.path("src/Frame.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{
+            .{ .name = "tui", .module = tui_mod },
+            .{ .name = "view", .module = view_mod },
+            .{ .name = "diff", .module = diff_mod },
+        },
+    });
+
+    const bench_exe = b.addExecutable(.{
+        .name = "rv-bench",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("bench/main.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "tui", .module = tui_mod },
+                .{ .name = "diff", .module = diff_mod },
+                .{ .name = "git", .module = git_mod },
+                .{ .name = "view", .module = view_mod },
+                .{ .name = "worddiff", .module = worddiff_mod },
+                .{ .name = "approve", .module = approve_mod },
+                .{ .name = "isolated_tmp", .module = isolated_tmp_mod },
+                .{ .name = "Frame", .module = frame_mod },
+            },
+        }),
+    });
+    const run_bench = b.addRunArtifact(bench_exe);
+    run_bench.addPassthruArgs();
+    const bench_step = b.step("bench", "Time load, paint, present, and approve on generated fixtures");
+    bench_step.dependOn(&run_bench.step);
+
     // Unit tests for the TUI module.
     const tui_tests = b.addTest(.{
         .root_module = b.createModule(.{
