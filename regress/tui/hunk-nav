@@ -1,0 +1,6 @@
+# ] from the Unstaged header lands on the first hunk; } lands on the next file.
+wait Unstaged
+send ]
+wait HEAD  a.txt  hunk 1/
+send }
+wait HEAD  b.txt

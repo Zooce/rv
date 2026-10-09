@@ -1,0 +1,7 @@
+# Small fixture load. 100x32 shows Unstaged and the first files; later
+# groups sit below the fold, so `until` steps j until those tokens appear.
+wait Unstaged
+wait   a.txt
+until this is old j
+until this is new j
+until after.txt j

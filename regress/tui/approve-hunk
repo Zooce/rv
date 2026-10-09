@@ -1,0 +1,11 @@
+# ] then a: hide the first hunk, store the path, leave the change staged.
+# `HEAD  a.txt` is the footer while that file is selected; intra.txt contains
+# the substring a.txt, so do not wait for a.txt alone.
+wait Unstaged
+send ]
+wait HEAD  a.txt  hunk 1/
+send a
+gone HEAD  a.txt
+wait HEAD  b.txt
+approved a.txt
+staged a.txt

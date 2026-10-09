@@ -28,3 +28,7 @@ run = "zig build bench -Doptimize=ReleaseSafe --"
 [tasks.fixture]
 description = "Materialize a TUI regression git fixture under /tmp"
 run = "regress/materialize.sh"
+
+[tasks.tui-regress]
+description = "Build rv and run small TUI regression scripts in tmux"
+run = "regress/tui-regress.sh"

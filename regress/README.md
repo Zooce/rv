@@ -6,9 +6,12 @@ Checked-in git worktrees for driving `rv`. Materialize into `/tmp`; do not copy 
 mise run fixture
 mise run fixture -- small
 mise run fixture -- small /tmp/rv-regress
+mise run tui-regress
 ```
 
 Default name is `small`, default dest is `/tmp/rv-regress`. Dest is replaced if it already exists. Dest must be under `/tmp` and outside this work tree.
+
+`mise run tui-regress` builds `zig-out/bin/rv` and runs the small TUI scripts (`boot`, `hunk-nav`, `approve-hunk`) through `regress/drive.sh`. Each script gets its own tmux session (`rv-tui-<pid>`, 100×32) and fixture dest (`/tmp/rv-regress-<pid>`). The session is killed after the script, pass or fail. This is not part of `mise run test`.
 
 ## Layout
 
@@ -36,6 +39,21 @@ regress/fixtures/<name>/
 Git identity in the materialized repo is `rv regress` / `rv@regress`. Author and committer dates are pinned. User and system gitconfig are ignored while materializing.
 
 `small` also commits a `.gitignore` with `.rv/` so the review store is not untracked, independent of a user’s global ignore.
+
+## TUI scripts
+
+Scripts live in `regress/tui/` and are line-oriented. `#` starts a comment. Blank lines are ignored.
+
+| command | effect |
+|---|---|
+| `wait TOKEN` | poll `capture-pane -p` until TOKEN is a substring |
+| `gone TOKEN` | poll until TOKEN is absent |
+| `send KEY` | one `tmux send-keys` (tmux names: `Enter`, `Space`, `Escape`) |
+| `until TOKEN KEY` | send KEY until TOKEN appears on the pane |
+| `approved PATH` | poll `.rv/approved.json` for that `path` |
+| `staged PATH` | poll `git diff --cached --name-only` for that path |
+
+A wait or seek that times out prints the pane and keeps the dest directory.
 
 ## small
 
