@@ -41,7 +41,7 @@ Each fixture warms git and the page cache once, then times a second pass. `prese
 
 ## Approve
 
-One `a` is split on every fixture: `mutate` (`git apply --cached` plus a work-tree check), `reload_paths`, `approve_save`, `place` (fingerprint matching), `flatten_placed`, `pair_rebuild`, `paint_approve`.
+One `a` is split on every fixture: `mutate` (`git apply --cached` or `git add`), `reload_paths` (unstaged and staged diffs of that path), `approve_save`, `place` (fingerprint matching), `flatten_placed`, `pair_rebuild`, `paint_approve`.
 
 On `large` only:
 

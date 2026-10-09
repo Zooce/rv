@@ -89,6 +89,12 @@
 //! hunks. Intra-line spans on the reloaded path are computed from the fresh
 //! hunk lines.
 //!
+//! A path reload skips the work-tree check and `HEAD` verify (the session
+//! already loaded this repo; stage does not move `HEAD`). It also skips
+//! untracked listing unless a staged new file on those paths could become
+//! untracked again. Unstaged and staged diffs still run: git may regroup
+//! neighbors after `apply --cached`.
+//!
 //! ## Errors
 //!
 //! - `NotARepository` — cwd is not inside a git work tree.
@@ -156,20 +162,30 @@ pub const LoadOpts = struct {
     cwd: std.process.Child.Cwd,
     only: ?[]const []const u8 = null,
     stats: ?*LoadStats = null,
+    /// When false, skip `ls-files` / `--no-index`. Path reload after a
+    /// mutation that cannot leave the path untracked.
+    untracked: bool = true,
 };
 
 /// `only` limits every command to those paths. `null` is the whole work tree
 /// and checks that cwd is inside one. A one-path reload passes the path.
+/// Path-limited loads skip the work-tree check and `HEAD` verify.
 pub fn loadDefaultTexts(alloc: Allocator, io: Io, opts: LoadOpts) Error!DefaultTexts {
     const cwd = opts.cwd;
     const only = opts.only;
     const stats = opts.stats;
     if (only == null) try ensureInsideWorkTree(alloc, io, cwd, stats);
 
-    const untracked = if (try untrackedDiff(alloc, io, cwd, only, stats)) |text| text else try alloc.alloc(u8, 0);
+    const untracked = blk: {
+        if (!opts.untracked) break :blk try alloc.alloc(u8, 0);
+        break :blk (try untrackedDiff(alloc, io, cwd, only, stats)) orelse try alloc.alloc(u8, 0);
+    };
     errdefer alloc.free(untracked);
 
-    if (!try revExists(alloc, io, cwd, "HEAD", stats)) {
+    // Full load: no HEAD means only untracked content. Path reload skips
+    // this verify (HEAD does not move on stage) and runs both diffs; they
+    // succeed with no commits too.
+    if (only == null and !try revExists(alloc, io, cwd, "HEAD", stats)) {
         const unstaged = try alloc.alloc(u8, 0);
         errdefer alloc.free(unstaged);
         return .{
@@ -430,9 +446,9 @@ pub const MutateOpts = struct {
 
 /// Stage, unstage, or discard one path (or one hunk) in `cwd`. See module
 /// docs for the allowed action/group table. Pass `.inherit` for the process cwd.
+/// Does not re-check that cwd is a work tree; the apply/add command fails if
+/// it is not.
 pub fn mutate(alloc: Allocator, io: Io, cwd: std.process.Child.Cwd, opts: MutateOpts) Error!void {
-    try ensureInsideWorkTree(alloc, io, cwd, opts.stats);
-
     const allowed = switch (opts.action) {
         .stage => switch (opts.group) {
             .unstaged, .untracked => true,
@@ -496,7 +512,12 @@ pub fn reloadPaths(
     paths: []const []const u8,
     stats: ?*LoadStats,
 ) Error!diff.Diff {
-    const texts = try loadDefaultTexts(alloc, io, .{ .cwd = cwd, .only = paths, .stats = stats });
+    const texts = try loadDefaultTexts(alloc, io, .{
+        .cwd = cwd,
+        .only = paths,
+        .stats = stats,
+        .untracked = stagedNewOnPaths(old, paths),
+    });
     defer texts.deinit(alloc);
     var fresh = try diff.parsePieces(alloc, &.{
         .{ .text = texts.unstaged, .group = .unstaged },
@@ -506,6 +527,21 @@ pub fn reloadPaths(
     defer fresh.deinit();
     try worddiff.attachSpans(alloc, &fresh);
     return try old.replacePaths(alloc, paths, &fresh);
+}
+
+/// Unstaging a staged new file can leave it untracked. Other mutations on
+/// `paths` cannot.
+fn stagedNewOnPaths(old: *const diff.Diff, paths: []const []const u8) bool {
+    for (old.files) |f| {
+        const g = f.group orelse continue;
+        if (g != .staged) continue;
+        if (f.old_path != null) continue;
+        const p = f.new_path orelse continue;
+        for (paths) |want| {
+            if (std.mem.eql(u8, p, want)) return true;
+        }
+    }
+    return false;
 }
 
 // --- internals -----------------------------------------------------------
@@ -910,6 +946,117 @@ test "local load spawn count: HEAD and no untracked" {
     defer texts.deinit(alloc);
     // inside-work-tree, ls-files, HEAD verify, unstaged diff, staged diff
     try testing.expectEqual(5, stats.spawns);
+}
+
+test "mutate spawn count: one git process" {
+    if (builtin.os.tag == .wasi) return error.SkipZigTest;
+
+    const io = testing.io;
+    const alloc = testing.allocator;
+    var tmp = try IsolatedTmp.init(alloc, io);
+    defer tmp.deinit(alloc, io);
+    const cwd = tmp.cwd();
+
+    try initTestRepo(alloc, io, cwd);
+    try tmp.write(io, "a.txt", "base\n");
+    try expectGitOk(alloc, io, cwd, &.{ "git", "add", "a.txt" });
+    try expectGitOk(alloc, io, cwd, &.{ "git", "commit", "-m", "init" });
+    try tmp.write(io, "a.txt", "base\nedit\n");
+
+    var stats: LoadStats = .{};
+    try mutate(alloc, io, cwd, .{
+        .action = .stage,
+        .path = "a.txt",
+        .group = .unstaged,
+        .stats = &stats,
+    });
+    try testing.expectEqual(1, stats.spawns);
+}
+
+test "reloadPaths spawn count: tracked path skips untracked and HEAD" {
+    if (builtin.os.tag == .wasi) return error.SkipZigTest;
+
+    const io = testing.io;
+    const alloc = testing.allocator;
+    var tmp = try IsolatedTmp.init(alloc, io);
+    defer tmp.deinit(alloc, io);
+    const cwd = tmp.cwd();
+
+    try initTestRepo(alloc, io, cwd);
+    try tmp.write(io, "a.txt", "base\n");
+    try expectGitOk(alloc, io, cwd, &.{ "git", "add", "a.txt" });
+    try expectGitOk(alloc, io, cwd, &.{ "git", "commit", "-m", "init" });
+    try tmp.write(io, "a.txt", "base\nedit\n");
+
+    var d = try loadDefaultDiffCwd(alloc, io, cwd);
+    defer d.deinit();
+    try mutate(alloc, io, cwd, .{ .action = .stage, .path = "a.txt", .group = .unstaged });
+
+    var stats: LoadStats = .{};
+    const paths = [_][]const u8{"a.txt"};
+    var next = try reloadPaths(alloc, io, cwd, &d, &paths, &stats);
+    defer next.deinit();
+    // unstaged diff, staged diff
+    try testing.expectEqual(2, stats.spawns);
+    try testing.expect(hasFile(next, "a.txt", .staged));
+    try testing.expect(!hasFile(next, "a.txt", .unstaged));
+}
+
+test "reloadPaths: unstage new file still lists untracked" {
+    if (builtin.os.tag == .wasi) return error.SkipZigTest;
+
+    const io = testing.io;
+    const alloc = testing.allocator;
+    var tmp = try IsolatedTmp.init(alloc, io);
+    defer tmp.deinit(alloc, io);
+    const cwd = tmp.cwd();
+
+    try initTestRepo(alloc, io, cwd);
+    try tmp.write(io, "only.txt", "x\n");
+    try expectGitOk(alloc, io, cwd, &.{ "git", "add", "only.txt" });
+    try expectGitOk(alloc, io, cwd, &.{ "git", "commit", "-m", "init" });
+    try tmp.write(io, "extra.zig", "const x = 1;\n");
+    try expectGitOk(alloc, io, cwd, &.{ "git", "add", "extra.zig" });
+
+    var d = try loadDefaultDiffCwd(alloc, io, cwd);
+    defer d.deinit();
+    try testing.expect(hasFile(d, "extra.zig", .staged));
+
+    try mutate(alloc, io, cwd, .{ .action = .unstage, .path = "extra.zig", .group = .staged });
+
+    var stats: LoadStats = .{};
+    const paths = [_][]const u8{"extra.zig"};
+    var next = try reloadPaths(alloc, io, cwd, &d, &paths, &stats);
+    defer next.deinit();
+    // ls-files, --no-index, unstaged diff, staged diff
+    try testing.expectEqual(4, stats.spawns);
+    try testing.expect(hasFile(next, "extra.zig", .untracked));
+    try testing.expect(!hasFile(next, "extra.zig", .staged));
+}
+
+test "reloadPaths: stage untracked with no HEAD shows staged" {
+    if (builtin.os.tag == .wasi) return error.SkipZigTest;
+
+    const io = testing.io;
+    const alloc = testing.allocator;
+    var tmp = try IsolatedTmp.init(alloc, io);
+    defer tmp.deinit(alloc, io);
+    const cwd = tmp.cwd();
+
+    try initTestRepo(alloc, io, cwd);
+    try tmp.write(io, "newbie.txt", "no commits yet\n");
+
+    var d = try loadDefaultDiffCwd(alloc, io, cwd);
+    defer d.deinit();
+    try testing.expect(hasFile(d, "newbie.txt", .untracked));
+
+    try mutate(alloc, io, cwd, .{ .action = .stage, .path = "newbie.txt", .group = .untracked });
+
+    const paths = [_][]const u8{"newbie.txt"};
+    var next = try reloadPaths(alloc, io, cwd, &d, &paths, null);
+    defer next.deinit();
+    try testing.expect(hasFile(next, "newbie.txt", .staged));
+    try testing.expect(!hasFile(next, "newbie.txt", .untracked));
 }
 
 test "clean feature branch: empty model (no local changes)" {
@@ -1690,7 +1837,7 @@ test "mutate: not a git repository" {
     var tmp = try IsolatedTmp.init(alloc, io);
     defer tmp.deinit(alloc, io);
 
-    try testing.expectError(error.NotARepository, mutate(alloc, io, tmp.cwd(), .{
+    try testing.expectError(error.GitFailed, mutate(alloc, io, tmp.cwd(), .{
         .action = .stage,
         .path = "x",
         .group = .unstaged,
