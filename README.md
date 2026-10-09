@@ -12,10 +12,10 @@ Linux and macOS. No Windows builds yet.
 curl -fsSL https://raw.githubusercontent.com/Zooce/rv/master/install.sh | sh
 ```
 
-Puts `rv` in `~/.local/bin`. A specific release (published tags such as `v2.2.0`; the next tag is `v2.3`):
+Puts `rv` in `~/.local/bin`. A specific release (`v2.3`, or an older tag such as `v2.2.0`):
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/Zooce/rv/master/install.sh | RV_VERSION=v2.2.0 sh
+curl -fsSL https://raw.githubusercontent.com/Zooce/rv/master/install.sh | RV_VERSION=v2.3 sh
 ```
 
 If `~/.local/bin` is not on `PATH`:
@@ -39,7 +39,7 @@ zig build -Doptimize=ReleaseSafe --prefix ~/.local
 npx skills add Zooce/rv -g
 ```
 
-`rv --version` prints `major.minor` (zon `2.2.0` prints `rv 2.2`).
+`rv --version` prints `major.minor` (zon `2.3.0` prints `rv 2.3`).
 
 Load, paint, present, and approve timings: `mise run bench`. Compare a run to `bench/baseline.json` with `--compare`. How timings are taken, and how to attach `samply` or `perf`, is in [bench/README.md](bench/README.md).
 
