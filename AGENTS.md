@@ -45,14 +45,14 @@ For command details, load the `goal` skill / playbook when available.
 
 ## Exercising the TUI
 
-Before you call a change done, exercise the behavior that change affects, and check it against the regression baseline in **Repository**. When it changes what the screen shows or what a key does, drive `rv` in tmux and check that behavior before you ask for review and before you say the work is verified. `mise run test` does not replace that session. When the change has no screen or key effect, run the checks that do apply (`mise run test`, `mise run build`, the goal's verify steps) and say that there was nothing on screen to drive.
+Before you call a change done, exercise the behavior that change affects, and check it against the fixture in **Repository**. When it changes what the screen shows or what a key does, drive `rv` in tmux and check that behavior before you ask for review and before you say the work is verified. `mise run test` does not replace that session. `mise run tui-regress` is the automated suite for the keys and screens it already covers, and it stays separate from `mise run test`. A visible change still needs a tmux drive of the behavior that changed. When that path should stay covered, add a script under `regress/tui/`. When the change has no screen or key effect, run the checks that do apply (`mise run test`, `mise run build`, the goal's verify steps) and say that there was nothing on screen to drive.
 
 `rv` reads keys and paints on `/dev/tty` (`tui/tty.zig`), in raw mode, on the alternate screen. A pipe on stdin does not deliver keys. The process needs a controlling terminal. tmux supplies one. `tmux capture-pane -p` prints the visible text, including the alternate screen. Do not depend on `pyte`, `expect`, or another terminal emulator.
 
 ### Session
 
 1. Build with `mise run build`. Run that binary by its absolute path (`zig-out/bin/rv` in this repo), not a copy installed elsewhere.
-2. Copy the regression baseline to `/tmp` (**Repository**). Leave global git config alone. Do not launch `rv` in this repo or in `~/Documents/scratch/temp`. Approve and stage write to the repository you start in.
+2. Materialize the fixture into `/tmp` (**Repository**). Leave global git config alone. Do not launch `rv` in this repo. Approve and stage write to the copy you start in.
 3. Start a detached session and leave a shell in it. Pass `rv` through `send-keys`, not as the session command, so `q` returns to the shell and you can start `rv` again:
 
 ```
@@ -70,23 +70,25 @@ tmux send-keys -t rv-drive /absolute/path/to/zig-out/bin/rv Enter
 - After each send, poll `tmux capture-pane -p -t rv-drive` about every 0.1s until the text matches, and give up after a few seconds. Wait until the screen shows the state you set up before the first key. A fixed sleep is not a check. Staging and a reload need a longer wait than a cursor move. Wait until the pane shows the result before you send the next key. Queuing `Space`, `a`, and `Enter` in one burst can press `Enter` before the list is open.
 - Check the text and files that this change is supposed to affect. A token that appears only in the fixture is easier to see than a word that also appears in a title or the footer. When the key writes the approved store, the comment store, or the index, also read `.rv/approved.json` (`entries[].path`), `.rv/reviews/current.json`, or `git diff --cached`. `capture-pane -p` has no color and no reverse video, so it does not mark the selected row. Judge the cursor by which text is on screen and by what the next key does.
 - While diff rows are still on screen, the word `approved` means the approved list is open (its title bar contains it). The footer prints `HEAD · N approved` only when the row list is empty and the approved count is greater than zero.
-- On a timeout, keep the pane text and say which step failed. Put the driver script in `/tmp` and delete it when the check is done. Do not add it to this repo.
+- On a timeout, keep the pane text and say which step failed. Put a one-off driver script in `/tmp` and delete it when the check is done. A path that should stay covered is a script under `regress/tui/`.
 
 ### Repository
 
-`~/Documents/scratch/temp` is the regression baseline. It collects git statuses as new cases show up, so read `git status` on the copy instead of assuming a fixed file list. Copy it and drive the copy:
+Materialize the checked-in fixture and drive that copy. `mise run fixture` builds `small` at `/tmp/rv-regress` and replaces that directory when it already exists:
 
 ```
-cp -a ~/Documents/scratch/temp /tmp/rv-regress
+mise run fixture
 ```
 
-`cp -a` keeps the index, the dirty worktree, and `.rv`. `git clone` drops unstaged edits, untracked files, and the approved and comment stores. The copy's local `user.name` and `user.email` are already set. Do not write `~/Documents/scratch/temp`. Approve, stage, and comments belong on the copy.
+`mise run fixture -- large` builds the generated large tree. The fixture sets the copy's git identity. Approve, stage, and comments belong on the copy under `/tmp`.
+
+Fixture format is in `regress/README.md`.
 
 The copy includes `.rv`, so a local load already omits whatever the approved store claims, and existing comments are already there. Read `.rv/approved.json` and `.rv/reviews/` on the copy before you treat a missing row as a failure. Clear those files on the copy only when the check needs an empty store.
 
-Exercise the change on that copy, then walk the statuses the baseline already has. A staged edit, an unstaged edit, a rename, a deletion, an untracked file, and a file that is both staged and unstaged are different screens. A row or key that used to work on one of those and no longer does is a regression.
+Read `git status` on the copy. `small` includes an unstaged edit, an unstaged deletion, a staged rename, a staged deletion, a staged new file, two hunks in one file, a nested path, a file that is both staged and unstaged, and untracked files. A row or key that used to work on one of those and no longer does is a regression.
 
-When the change needs a status the baseline does not have, add it on the copy. If that case is worth keeping, say so and leave `~/Documents/scratch/temp` for its owner to update. When you add two hunks in one file, keep them apart: git's default context is 3 lines, so a 12-line file edited on line 1 and line 10 stays two hunks. Pick tokens that do not appear in titles, the footer, or help.
+When the change needs a status the fixture does not have, add a patch or file under `regress/fixtures/small/` and update `expected.status`. When a check had to invent a status that is not worth keeping, say so and leave it off the fixture. When you add two hunks in one file, keep them apart: git's default context is 3 lines, so a 12-line file edited on line 1 and line 10 stays two hunks. Pick tokens that do not appear in titles, the footer, or help.
 
 ### Keys that are easy to mis-drive
 
