@@ -31,7 +31,7 @@ Generated under `/tmp` and deleted after the run.
 | Name | What it is |
 |---|---|
 | `small` | Ordinary review: unstaged, staged, mixed, one untracked file |
-| `untracked` | 200 untracked files (spawn-heavy local load) |
+| `untracked` | 200 untracked files (in-process new-file diffs after `ls-files`) |
 | `large` | One 2000-line file with an edit every 12 lines; one `a` then the rest of the hunks |
 | `large_file` | Same file as `large`; `A` stages the whole file in one `git add` |
 
@@ -88,4 +88,4 @@ perf record -g -- ./zig-out/bin/rv
 perf report
 ```
 
-Run those from the repository you want to load. A local load still shells out to git once per untracked path; that is the hang-with-no-output case the `untracked` fixture is meant to show.
+Run those from the repository you want to load. Untracked files are listed with one `ls-files` and turned into new-file diffs in-process. The `untracked` fixture is 200 of those files.

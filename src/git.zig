@@ -6,8 +6,8 @@
 //!
 //! 1. **unstaged** — `git diff --find-renames` (worktree vs index)
 //! 2. **untracked** — `git ls-files --others --exclude-standard`, each path
-//!    turned into a new-file unified diff via
-//!    `git diff --no-index -- /dev/null <path>`
+//!    turned into a new-file unified diff in-process (new-file headers, empty
+//!    files, binary placeholders, no-newline markers)
 //! 3. **staged** — `git diff --find-renames --cached` (index vs HEAD)
 //!
 //! Empty groups are omitted. A path with both staged and unstaged hunks
@@ -162,8 +162,8 @@ pub const LoadOpts = struct {
     cwd: std.process.Child.Cwd,
     only: ?[]const []const u8 = null,
     stats: ?*LoadStats = null,
-    /// When false, skip `ls-files` / `--no-index`. Path reload after a
-    /// mutation that cannot leave the path untracked.
+    /// When false, skip `ls-files` and in-process untracked diffs. Path
+    /// reload after a mutation that cannot leave the path untracked.
     untracked: bool = true,
 };
 
@@ -598,26 +598,99 @@ fn untrackedDiff(
     defer alloc.free(listing);
     if (listing.len == 0) return null;
 
+    var close_dir = false;
+    const dir: Io.Dir = switch (cwd) {
+        .inherit => .cwd(),
+        .path => |p| blk: {
+            close_dir = true;
+            break :blk Io.Dir.openDirAbsolute(io, p, .{}) catch return error.GitFailed;
+        },
+        .dir => |d| d,
+    };
+    defer if (close_dir) dir.close(io);
+
     var out: std.ArrayList(u8) = .empty;
     errdefer out.deinit(alloc);
 
     var it = std.mem.splitScalar(u8, listing, 0);
     while (it.next()) |path| {
         if (path.len == 0) continue;
-        // Exit 1 is normal when files differ (always for a real new file).
-        const piece = try git(alloc, io, cwd, .{
-            .argv = &.{ "git", "diff", "--no-index", "--", "/dev/null", path },
-            .allowed_error_code = 1,
-            .stats = stats,
-        });
-        defer alloc.free(piece);
-        try out.appendSlice(alloc, piece);
+        try appendUntrackedPath(alloc, io, dir, path, &out);
     }
     if (out.items.len == 0) {
         out.deinit(alloc);
         return null;
     }
     return try out.toOwnedSlice(alloc);
+}
+
+/// Read one untracked path and append a new-file unified diff.
+fn appendUntrackedPath(
+    alloc: Allocator,
+    io: Io,
+    dir: Io.Dir,
+    path: []const u8,
+    out: *std.ArrayList(u8),
+) Error!void {
+    const st = dir.statFile(io, path, .{ .follow_symlinks = false }) catch return error.GitFailed;
+    if (st.kind == .sym_link) {
+        var buf: [Io.Dir.max_path_bytes]u8 = undefined;
+        const n = dir.readLink(io, path, &buf) catch return error.GitFailed;
+        try appendUntrackedBytes(alloc, path, buf[0..n], out);
+        return;
+    }
+    const body = dir.readFileAlloc(io, path, alloc, .limited(64 * 1024 * 1024)) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return error.GitFailed,
+    };
+    defer alloc.free(body);
+    try appendUntrackedBytes(alloc, path, body, out);
+}
+
+/// New-file unified diff for `body`. Empty files omit `---` / `+++` (git
+/// does). A NUL in the first 8000 bytes is git's binary placeholder.
+fn appendUntrackedBytes(
+    alloc: Allocator,
+    path: []const u8,
+    body: []const u8,
+    out: *std.ArrayList(u8),
+) Allocator.Error!void {
+    try out.print(alloc, "diff --git a/{s} b/{s}\n", .{ path, path });
+    try out.appendSlice(alloc, "new file mode 100644\n");
+
+    const probe_len = @min(body.len, 8000);
+    if (std.mem.indexOfScalar(u8, body[0..probe_len], 0) != null) {
+        try out.print(alloc, "Binary files /dev/null and b/{s} differ\n", .{path});
+        return;
+    }
+    if (body.len == 0) return;
+
+    try out.appendSlice(alloc, "--- /dev/null\n");
+    try out.print(alloc, "+++ b/{s}\n", .{path});
+
+    var line_count: usize = 1;
+    for (body[0 .. body.len - 1]) |c| {
+        if (c == '\n') line_count += 1;
+    }
+    if (line_count == 1) {
+        try out.appendSlice(alloc, "@@ -0,0 +1 @@\n");
+    } else {
+        try out.print(alloc, "@@ -0,0 +1,{d} @@\n", .{line_count});
+    }
+
+    var start: usize = 0;
+    while (start < body.len) {
+        try out.append(alloc, '+');
+        if (std.mem.indexOfScalarPos(u8, body, start, '\n')) |nl| {
+            try out.appendSlice(alloc, body[start..nl]);
+            try out.append(alloc, '\n');
+            start = nl + 1;
+        } else {
+            try out.appendSlice(alloc, body[start..]);
+            try out.appendSlice(alloc, "\n\\ No newline at end of file\n");
+            break;
+        }
+    }
 }
 
 /// Unified patch for one loaded hunk, including `diff --git` / `---` / `+++`
@@ -696,10 +769,6 @@ fn hunkPatch(
 /// Options for `git`. Field defaults match a strict exit-0 success.
 const GitOpts = struct {
     argv: []const []const u8,
-    /// One additional non-zero exit code treated as success (alongside 0).
-    /// Example: `1` for `git diff --no-index`, which exits 1 when the sides
-    /// differ. `null` = only exit 0. Not a range — only this exact code.
-    allowed_error_code: ?u8 = null,
     /// When set, written to the child's stdin (e.g. a patch for `git apply -`).
     stdin: ?[]const u8 = null,
     /// On `error.GitFailed`, filled with owned stderr (stdout if stderr is
@@ -709,9 +778,8 @@ const GitOpts = struct {
     stats: ?*LoadStats = null,
 };
 
-/// Run a `git …` command. On exit 0 (or `allowed_error_code` when set), returns
-/// owned stdout (caller frees). Any other exit / crash → `GitFailed`; missing
-/// binary → `GitNotFound`.
+/// Run a `git …` command. On exit 0, returns owned stdout (caller frees). Any
+/// other exit / crash → `GitFailed`; missing binary → `GitNotFound`.
 fn git(alloc: Allocator, io: Io, cwd: std.process.Child.Cwd, opts: GitOpts) Error![]u8 {
     if (opts.stats) |s| s.spawns += 1;
     var child = std.process.spawn(io, .{
@@ -764,11 +832,7 @@ fn git(alloc: Allocator, io: Io, cwd: std.process.Child.Cwd, opts: GitOpts) Erro
     const stderr_slice = try multi_reader.toOwnedSlice(1);
 
     const success = switch (term) {
-        .exited => |code| blk: {
-            if (code == 0) break :blk true;
-            const allowed = opts.allowed_error_code orelse break :blk false;
-            break :blk code == allowed;
-        },
+        .exited => |code| code == 0,
         else => false,
     };
     if (success) {
@@ -923,8 +987,31 @@ test "local load spawn count: HEAD and one untracked" {
     var stats: LoadStats = .{};
     const texts = try loadDefaultTexts(alloc, io, .{ .cwd = cwd, .stats = &stats });
     defer texts.deinit(alloc);
-    // inside-work-tree, ls-files, one --no-index, HEAD verify, unstaged diff, staged diff
-    try testing.expectEqual(6, stats.spawns);
+    // inside-work-tree, ls-files, HEAD verify, unstaged diff, staged diff
+    try testing.expectEqual(5, stats.spawns);
+}
+
+test "local load spawn count: several untracked files stay at 5" {
+    if (builtin.os.tag == .wasi) return error.SkipZigTest;
+
+    const io = testing.io;
+    const alloc = testing.allocator;
+    var tmp = try IsolatedTmp.init(alloc, io);
+    defer tmp.deinit(alloc, io);
+    const cwd = tmp.cwd();
+
+    try initTestRepo(alloc, io, cwd);
+    try tmp.write(io, "a.txt", "base\n");
+    try expectGitOk(alloc, io, cwd, &.{ "git", "add", "a.txt" });
+    try expectGitOk(alloc, io, cwd, &.{ "git", "commit", "-m", "init" });
+    try tmp.write(io, "u0.txt", "zero\n");
+    try tmp.write(io, "u1.txt", "one\n");
+    try tmp.write(io, "u2.txt", "two\n");
+
+    var stats: LoadStats = .{};
+    const texts = try loadDefaultTexts(alloc, io, .{ .cwd = cwd, .stats = &stats });
+    defer texts.deinit(alloc);
+    try testing.expectEqual(5, stats.spawns);
 }
 
 test "local load spawn count: HEAD and no untracked" {
@@ -1028,8 +1115,8 @@ test "reloadPaths: unstage new file still lists untracked" {
     const paths = [_][]const u8{"extra.zig"};
     var next = try reloadPaths(alloc, io, cwd, &d, &paths, &stats);
     defer next.deinit();
-    // ls-files, --no-index, unstaged diff, staged diff
-    try testing.expectEqual(4, stats.spawns);
+    // ls-files, unstaged diff, staged diff
+    try testing.expectEqual(3, stats.spawns);
     try testing.expect(hasFile(next, "extra.zig", .untracked));
     try testing.expect(!hasFile(next, "extra.zig", .staged));
 }
@@ -1180,6 +1267,83 @@ test "untracked-only worktree: non-empty local stream" {
     try testing.expectEqual(1, d.files.len);
     try expectFileAt(d, 0, "brand_new.zig", .untracked);
     try testing.expect(d.hunk_count >= 1);
+}
+
+test "empty untracked file is a new-file header with no hunks" {
+    if (builtin.os.tag == .wasi) return error.SkipZigTest;
+
+    const io = testing.io;
+    const alloc = testing.allocator;
+    var tmp = try IsolatedTmp.init(alloc, io);
+    defer tmp.deinit(alloc, io);
+    const cwd = tmp.cwd();
+
+    try initTestRepo(alloc, io, cwd);
+    try tmp.write(io, "only.txt", "x\n");
+    try expectGitOk(alloc, io, cwd, &.{ "git", "add", "only.txt" });
+    try expectGitOk(alloc, io, cwd, &.{ "git", "commit", "-m", "init" });
+    try tmp.write(io, "empty.txt", "");
+
+    var d = try loadDefaultDiffCwd(alloc, io, cwd);
+    defer d.deinit();
+
+    try testing.expectEqual(1, d.files.len);
+    try expectFileAt(d, 0, "empty.txt", .untracked);
+    try testing.expectEqual(0, d.files[0].hunks.len);
+    try testing.expect(!d.files[0].is_binary);
+}
+
+test "binary untracked file is a binary placeholder" {
+    if (builtin.os.tag == .wasi) return error.SkipZigTest;
+
+    const io = testing.io;
+    const alloc = testing.allocator;
+    var tmp = try IsolatedTmp.init(alloc, io);
+    defer tmp.deinit(alloc, io);
+    const cwd = tmp.cwd();
+
+    try initTestRepo(alloc, io, cwd);
+    try tmp.write(io, "only.txt", "x\n");
+    try expectGitOk(alloc, io, cwd, &.{ "git", "add", "only.txt" });
+    try expectGitOk(alloc, io, cwd, &.{ "git", "commit", "-m", "init" });
+    try tmp.write(io, "pic.bin", "a\x00b\n");
+
+    var d = try loadDefaultDiffCwd(alloc, io, cwd);
+    defer d.deinit();
+
+    try testing.expectEqual(1, d.files.len);
+    try expectFileAt(d, 0, "pic.bin", .untracked);
+    try testing.expect(d.files[0].is_binary);
+    try testing.expectEqual(0, d.files[0].hunks.len);
+}
+
+test "untracked file without trailing newline has a meta line" {
+    if (builtin.os.tag == .wasi) return error.SkipZigTest;
+
+    const io = testing.io;
+    const alloc = testing.allocator;
+    var tmp = try IsolatedTmp.init(alloc, io);
+    defer tmp.deinit(alloc, io);
+    const cwd = tmp.cwd();
+
+    try initTestRepo(alloc, io, cwd);
+    try tmp.write(io, "only.txt", "x\n");
+    try expectGitOk(alloc, io, cwd, &.{ "git", "add", "only.txt" });
+    try expectGitOk(alloc, io, cwd, &.{ "git", "commit", "-m", "init" });
+    try tmp.write(io, "nonew.txt", "no nl");
+
+    var d = try loadDefaultDiffCwd(alloc, io, cwd);
+    defer d.deinit();
+
+    try testing.expectEqual(1, d.files.len);
+    try expectFileAt(d, 0, "nonew.txt", .untracked);
+    try testing.expectEqual(1, d.files[0].hunks.len);
+    const lines = d.files[0].hunks[0].lines;
+    try testing.expectEqual(2, lines.len);
+    try testing.expectEqual(diff.LineKind.add, lines[0].kind);
+    try testing.expectEqualStrings("no nl", lines[0].text);
+    try testing.expectEqual(diff.LineKind.meta, lines[1].kind);
+    try testing.expectEqualStrings("No newline at end of file", lines[1].text);
 }
 
 test "no HEAD: untracked-only still loads" {
