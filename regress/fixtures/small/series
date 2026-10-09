@@ -1,6 +1,9 @@
 # Mixed local worktree: HEAD + staged + unstaged + untracked + .rv
 # Modes: commit, cached (apply --index), worktree, untracked, rv
 commit    00-base.patch
+commit    30-commit-doomed.patch
+commit    31-commit-twohunk.patch
+commit    32-commit-nest.patch
 cached    10-staged-rename.patch
 cached    11-staged-fav.patch
 worktree  20-unstaged-a.patch
@@ -9,5 +12,9 @@ worktree  22-unstaged-fav.patch
 worktree  23-unstaged-intra.patch
 worktree  24-unstaged-delete.patch
 worktree  25-unstaged-ws.patch
+cached    40-staged-delete.patch
+cached    41-staged-new.patch
+worktree  50-unstaged-twohunk.patch
+worktree  51-unstaged-nest.patch
 untracked untracked/
 rv        rv/

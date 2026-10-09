@@ -1,0 +1,9 @@
+# i on the first hunk opens a hunk comment. Enter saves the body.
+wait Unstaged
+send ]
+wait HEAD  a.txt  hunk 1/
+send i
+wait create/edit hunk
+send rvnote165
+send Enter
+review rvnote165

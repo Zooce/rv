@@ -13,7 +13,9 @@ rv=$root/zig-out/bin/rv
   exit 1
 }
 
-for name in boot hunk-nav approve-hunk; do
+for name in boot hunk-nav approve-hunk approve-file unapprove comment layout statuses; do
   echo "rv-tui: $name"
   "$script_dir/drive.sh" --rv "$rv" --fixture small "$script_dir/tui/$name"
 done
+echo "rv-tui: layout-narrow"
+"$script_dir/drive.sh" --rv "$rv" --fixture small --cols 48 "$script_dir/tui/layout-narrow"

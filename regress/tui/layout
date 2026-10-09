@@ -1,0 +1,7 @@
+# t switches the session preference to unified. At 100 columns that is `uni`,
+# not the narrow fallback `uni~`.
+wait Unstaged
+wait  open  sbs
+send t
+wait  open  uni
+gone uni~

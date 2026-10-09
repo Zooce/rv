@@ -1,0 +1,7 @@
+diff --git a/doomed.txt b/doomed.txt
+new file mode 100644
+index 0000000..744959d
+--- /dev/null
++++ b/doomed.txt
+@@ -0,0 +1 @@
++doomedtoken

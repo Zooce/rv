@@ -1,0 +1,16 @@
+diff --git a/twohunk.txt b/twohunk.txt
+index 1f58bb9..4507237 100644
+--- a/twohunk.txt
++++ b/twohunk.txt
+@@ -1,4 +1,4 @@
+-alpha base
++alphatoken
+ pad two
+ pad three
+ pad four
+@@ -13,4 +13,4 @@ pad twelve
+ pad thirteen
+ pad fourteen
+ pad fifteen
+-omega base
++omegatoken

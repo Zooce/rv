@@ -1,0 +1,15 @@
+# Approve the first hunk, then Space a and Enter put it back. It stays staged.
+# The seeded fav.txt row is first in the approved list, so j selects a.txt.
+wait Unstaged
+send ]
+wait HEAD  a.txt  hunk 1/
+send a
+gone HEAD  a.txt
+staged a.txt
+send Space
+send a
+wait rv  approved
+send j
+send Enter
+wait HEAD  a.txt
+staged a.txt

@@ -3,7 +3,7 @@
 set -euo pipefail
 
 usage() {
-  echo "usage: regress/drive.sh --rv PATH [--fixture NAME] [--dest DIR] [--timeout SEC] SCRIPT" >&2
+  echo "usage: regress/drive.sh --rv PATH [--fixture NAME] [--dest DIR] [--timeout SEC] [--cols N] [--rows N] SCRIPT" >&2
   exit 2
 }
 
@@ -16,6 +16,8 @@ rv=""
 fixture=small
 dest=""
 timeout=10
+cols=100
+rows=32
 script=""
 
 while [[ $# -gt 0 ]]; do
@@ -38,6 +40,16 @@ while [[ $# -gt 0 ]]; do
     --timeout)
       [[ $# -ge 2 ]] || usage
       timeout=$2
+      shift 2
+      ;;
+    --cols)
+      [[ $# -ge 2 ]] || usage
+      cols=$2
+      shift 2
+      ;;
+    --rows)
+      [[ $# -ge 2 ]] || usage
+      rows=$2
       shift 2
       ;;
     -h | --help)
@@ -67,6 +79,8 @@ fi
 [[ -n $script ]] || usage
 [[ -f $script ]] || die "no script: $script"
 [[ -x $rv ]] || die "rv is not executable: $rv"
+[[ $cols =~ ^[1-9][0-9]*$ ]] || die "cols must be a positive number"
+[[ $rows =~ ^[1-9][0-9]*$ ]] || die "rows must be a positive number"
 command -v tmux >/dev/null || die "tmux not found"
 
 script_dir=$(cd "$(dirname "$0")" && pwd)
@@ -95,7 +109,7 @@ trap cleanup EXIT
 
 "$script_dir/materialize.sh" "$fixture" "$dest" >/dev/null
 
-tmux new-session -d -s "$session" -x 100 -y 32 -c "$dest"
+tmux new-session -d -s "$session" -x "$cols" -y "$rows" -c "$dest"
 started=1
 tmux send-keys -t "$session" -l "$rv"
 tmux send-keys -t "$session" Enter
@@ -176,6 +190,27 @@ wait_approved() {
   return 1
 }
 
+wait_review() {
+  local text=$1
+  local f=$dest/.rv/reviews/current.json
+  local start=$SECONDS
+  while ((SECONDS - start < timeout)); do
+    if [[ -f $f ]] && grep -qF -- "$text" "$f"; then
+      return 0
+    fi
+    sleep 0.1
+  done
+  echo "rv-tui: timeout waiting for review text $(printf %q "$text")" >&2
+  echo "--- reviews/current.json ---" >&2
+  if [[ -f $f ]]; then
+    cat "$f" >&2
+  else
+    echo "(missing)" >&2
+  fi
+  dump_pane
+  return 1
+}
+
 wait_staged() {
   local path=$1
   local start=$SECONDS
@@ -225,6 +260,10 @@ while IFS= read -r line || [[ -n $line ]]; do
     approved)
       [[ -n $rest ]] || die "approved needs a path: $line"
       wait_approved "$rest"
+      ;;
+    review)
+      [[ -n $rest ]] || die "review needs text: $line"
+      wait_review "$rest"
       ;;
     staged)
       [[ -n $rest ]] || die "staged needs a path: $line"

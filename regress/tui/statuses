@@ -1,0 +1,39 @@
+# Each new status's token, in the group rv paints it in.
+# } only moves forward, so visit files in display order.
+
+# Unstaged nested path.
+until HEAD  dir/nest.txt }
+until nesttoken j
+wait Stage File
+wait Unstaged
+
+# Unstaged file with two hunks. The second ] stays on twohunk.txt.
+until HEAD  twohunk.txt }
+send ]
+until alphatoken j
+wait HEAD  twohunk.txt
+send ]
+until omegatoken j
+wait HEAD  twohunk.txt
+
+# Untracked: empty, no trailing newline, binary.
+until HEAD  emptyblob.txt }
+wait Untracked
+wait Stage File
+until HEAD  nonewline.txt }
+until nonewlinetoken j
+until No newline at end of file j
+wait Untracked
+until HEAD  nulblob.dat }
+wait (binary)
+wait Untracked
+
+# Staged delete, then staged new file.
+until HEAD  doomed.txt }
+until doomedtoken j
+wait Unstage File
+wait Staged
+until HEAD  staged-new.txt }
+until stagednewtoken j
+wait Unstage File
+wait Staged

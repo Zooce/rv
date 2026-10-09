@@ -1,0 +1,7 @@
+diff --git a/dir/nest.txt b/dir/nest.txt
+new file mode 100644
+index 0000000..a251f28
+--- /dev/null
++++ b/dir/nest.txt
+@@ -0,0 +1 @@
++nestbase

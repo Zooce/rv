@@ -1,0 +1,5 @@
+# 48 columns is below min_side_by_side_cols, so the side-by-side preference
+# paints unified and the footer shows uni~.
+wait Unstaged
+wait uni~
+gone  open  sbs

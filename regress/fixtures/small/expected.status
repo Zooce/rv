@@ -1,9 +1,16 @@
  M a.txt
 R  before.txt -> after.txt
  M b.txt
+ M dir/nest.txt
+D  doomed.txt
 MM fav.txt
  M intra.txt
  D old.txt
+A  staged-new.txt
+ M twohunk.txt
  M ws.txt
+?? emptyblob.txt
 ?? new.txt
+?? nonewline.txt
+?? nulblob.dat
 ?? tabs.txt

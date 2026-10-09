@@ -11,7 +11,7 @@ mise run tui-regress
 
 Default name is `small`, default dest is `/tmp/rv-regress`. Dest is replaced if it already exists. Dest must be under `/tmp` and outside this work tree.
 
-`mise run tui-regress` builds `zig-out/bin/rv` and runs the small TUI scripts (`boot`, `hunk-nav`, `approve-hunk`) through `regress/drive.sh`. Each script gets its own tmux session (`rv-tui-<pid>`, 100×32) and fixture dest (`/tmp/rv-regress-<pid>`). The session is killed after the script, pass or fail. This is not part of `mise run test`.
+`mise run tui-regress` builds `zig-out/bin/rv` and runs the small TUI scripts through `regress/drive.sh`. Each script gets its own tmux session (`rv-tui-<pid>`, 100×32) and fixture dest (`/tmp/rv-regress-<pid>`). `layout-narrow` uses 48 columns. The session is killed after the script, pass or fail. This is not part of `mise run test`.
 
 ## Layout
 
@@ -51,10 +51,13 @@ Scripts live in `regress/tui/` and are line-oriented. `#` starts a comment. Blan
 | `send KEY` | one `tmux send-keys` (tmux names: `Enter`, `Space`, `Escape`) |
 | `until TOKEN KEY` | send KEY until TOKEN appears on the pane |
 | `approved PATH` | poll `.rv/approved.json` for that `path` |
+| `review TEXT` | poll `.rv/reviews/current.json` for that text |
 | `staged PATH` | poll `git diff --cached --name-only` for that path |
 
-A wait or seek that times out prints the pane and keeps the dest directory.
+`drive.sh --cols N --rows N` sets the tmux size (default 100×32). A wait or seek that times out prints the pane and keeps the dest directory.
 
 ## small
 
-Export of the mixed local statuses used to drive the TUI: unstaged modify/delete, staged rename, staged+unstaged (`MM`) `fav.txt`, untracked `new.txt`/`tabs.txt`, seeded `.rv/approved.json` on `fav.txt`.
+Export of the mixed local statuses used to drive the TUI: unstaged modify/delete, staged rename, staged delete, staged new file, two hunks in one file, a nested path, staged+unstaged (`MM`) `fav.txt`, untracked `new.txt`/`tabs.txt` plus an empty file, a binary file, and a file with no trailing newline, seeded `.rv/approved.json` on `fav.txt`.
+
+Scripts: `boot`, `hunk-nav`, `approve-hunk`, `approve-file`, `unapprove`, `comment`, `layout`, `layout-narrow` (48 columns, footer `uni~`), `statuses`.

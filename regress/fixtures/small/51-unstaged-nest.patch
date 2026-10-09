@@ -1,0 +1,7 @@
+diff --git a/dir/nest.txt b/dir/nest.txt
+index a251f28..061ea55 100644
+--- a/dir/nest.txt
++++ b/dir/nest.txt
+@@ -1 +1 @@
+-nestbase
++nesttoken

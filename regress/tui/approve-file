@@ -1,0 +1,11 @@
+# } from Unstaged lands on a.txt's file header (hunk 0). A hides the file.
+# `HEAD  a.txt` is the footer while that file is selected; intra.txt contains
+# the substring a.txt, so do not wait for a.txt alone.
+wait Unstaged
+send }
+wait HEAD  a.txt  hunk 0/
+send A
+gone HEAD  a.txt
+wait HEAD  b.txt
+approved a.txt
+staged a.txt
