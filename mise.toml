@@ -24,3 +24,7 @@ run = "zig build"
 [tasks.bench]
 description = "Time load, paint, present, and approve on generated fixtures"
 run = "zig build bench -Doptimize=ReleaseSafe --"
+
+[tasks.fixture]
+description = "Materialize a TUI regression git fixture under /tmp"
+run = "regress/materialize.sh"

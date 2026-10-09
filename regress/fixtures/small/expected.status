@@ -1,0 +1,9 @@
+ M a.txt
+R  before.txt -> after.txt
+ M b.txt
+MM fav.txt
+ M intra.txt
+ D old.txt
+ M ws.txt
+?? new.txt
+?? tabs.txt

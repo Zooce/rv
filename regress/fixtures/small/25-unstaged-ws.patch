@@ -1,0 +1,14 @@
+diff --git a/ws.txt b/ws.txt
+index 43deb1b..438d6aa 100644
+--- a/ws.txt
++++ b/ws.txt
+@@ -1,5 +1,6 @@
+ const names = {
+-        "walrus",     "otter",  "lynx",  "mink",
+-        "badger",     "stoat",  "vole",  "shrew", "pika",
+-        "gibbon",     "lemur",  "tarsier",
++        "walrus",  "otter",    "lynx",  "mink",
++        "badger",  "stoat",    "vole",  "shrew",
++        "pika",    "gibbon",   "lemur",
++        "tarsier",
+ };

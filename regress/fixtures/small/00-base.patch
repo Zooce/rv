@@ -1,0 +1,77 @@
+diff --git a/.gitignore b/.gitignore
+new file mode 100644
+index 0000000..37f5351
+--- /dev/null
++++ b/.gitignore
+@@ -0,0 +1 @@
++.rv/
+diff --git a/a.txt b/a.txt
+new file mode 100644
+index 0000000..5626abf
+--- /dev/null
++++ b/a.txt
+@@ -0,0 +1 @@
++one
+diff --git a/b.txt b/b.txt
+new file mode 100644
+index 0000000..f719efd
+--- /dev/null
++++ b/b.txt
+@@ -0,0 +1 @@
++two
+diff --git a/before.txt b/before.txt
+new file mode 100644
+index 0000000..a4ec98f
+--- /dev/null
++++ b/before.txt
+@@ -0,0 +1 @@
++rename
+diff --git a/fav.txt b/fav.txt
+new file mode 100644
+index 0000000..b6bd876
+--- /dev/null
++++ b/fav.txt
+@@ -0,0 +1 @@
++this is my favorite file\nand i think its cool
+diff --git a/intra.txt b/intra.txt
+new file mode 100644
+index 0000000..0e49015
+--- /dev/null
++++ b/intra.txt
+@@ -0,0 +1,18 @@
++let's do something cool
++in this file so we can see
++some changes. let's try different
++kinds of things here. I don't
++know what yet, but I'll figure
++this one out because I'm really
++cool and all that stuff. I
++need this file to show different
++kinds of changes so we need many
++lines here.
++
++we even need some stuff about things
++and I don't know what else to say.
++
++
++maybe there's a way to do cool things
++and then we'll party. what the fuck
++are you even saying right now man?
+diff --git a/old.txt b/old.txt
+new file mode 100644
+index 0000000..41a61a5
+--- /dev/null
++++ b/old.txt
+@@ -0,0 +1 @@
++this is old
+diff --git a/ws.txt b/ws.txt
+new file mode 100644
+index 0000000..43deb1b
+--- /dev/null
++++ b/ws.txt
+@@ -0,0 +1,5 @@
++const names = {
++        "walrus",     "otter",  "lynx",  "mink",
++        "badger",     "stoat",  "vole",  "shrew", "pika",
++        "gibbon",     "lemur",  "tarsier",
++};
