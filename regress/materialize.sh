@@ -93,6 +93,60 @@ copy_tree() {
   cp -a -- "$src"/. "$target"/
 }
 
+# Bench makeLarge: commit `lines` of "base", then rewrite so every `stride`
+# line says "edit". Stride must exceed git's default context (3) on both
+# sides, or neighboring edits collapse into one hunk.
+generate_recipe() {
+  local recipe=$1
+  [[ -f $recipe ]] || die "missing recipe: $recipe"
+  local lines="" stride="" path=""
+  while IFS= read -r line || [[ -n $line ]]; do
+    line=${line%%$'\r'}
+    [[ -z $line || $line == \#* ]] && continue
+    local key="" value=""
+    read -r key value <<<"$line"
+    [[ -n $value ]] || die "recipe line missing value: $line"
+    case "$key" in
+      lines) lines=$value ;;
+      stride) stride=$value ;;
+      path) path=$value ;;
+      *) die "unknown recipe key '$key' in: $line" ;;
+    esac
+  done <"$recipe"
+  [[ $lines =~ ^[1-9][0-9]*$ ]] || die "recipe lines must be a positive integer"
+  [[ $stride =~ ^[1-9][0-9]*$ ]] || die "recipe stride must be a positive integer"
+  ((stride > 6)) || die "recipe stride must be greater than 6 so each edit is its own hunk"
+  case "$path" in
+    /* | *..* | "") die "recipe path must be relative with no ..: ${path:-}" ;;
+  esac
+
+  local file=$dest/$path
+  mkdir -p -- "$(dirname -- "$file")"
+  write_body "$file" "$lines" "$stride" 0
+  git_ok add -- "$path"
+  git_ok commit -m "init"
+
+  write_body "$file" "$lines" "$stride" 1
+  local edits=$(((lines - 1) / stride + 1))
+  local got
+  got=$(git_ok --no-pager diff -U3 -- "$path" | grep -c '^@@')
+  [[ $got -eq $edits ]] || die "unstaged hunks for $path: got $got, expected $edits"
+}
+
+write_body() {
+  local file=$1 lines=$2 stride=$3 edited=$4
+  local i word
+  {
+    for ((i = 0; i < lines; i++)); do
+      word=base
+      if [[ $edited -eq 1 && $((i % stride)) -eq 0 ]]; then
+        word=edit
+      fi
+      printf 'line %04d the quick brown fox %s\n' "$i" "$word"
+    done
+  } >"$file"
+}
+
 while IFS= read -r line || [[ -n $line ]]; do
   line=${line%%$'\r'}
   [[ -z $line || $line == \#* ]] && continue
@@ -124,6 +178,9 @@ while IFS= read -r line || [[ -n $line ]]; do
     rv)
       [[ -d $src ]] || die "missing rv dir: $src"
       copy_tree "$src" "$dest/.rv"
+      ;;
+    generate)
+      generate_recipe "$src"
       ;;
     *) die "unknown series mode '$mode' in: $line" ;;
   esac

@@ -1,0 +1,10 @@
+# Generated large fixture: 2000 lines, stride 12, 167 separate hunks.
+# ] then a hides the first hunk and stages it. The next hunk is now 1/166.
+wait Unstaged
+wait big.txt
+send ]
+wait HEAD  big.txt  hunk 1/167
+send a
+wait HEAD  big.txt  hunk 1/166
+approved big.txt
+staged big.txt

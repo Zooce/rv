@@ -6,12 +6,15 @@ Checked-in git worktrees for driving `rv`. Materialize into `/tmp`; do not copy 
 mise run fixture
 mise run fixture -- small
 mise run fixture -- small /tmp/rv-regress
+mise run fixture -- large
 mise run tui-regress
+mise run tui-regress -- large
+mise run tui-regress -- --all
 ```
 
 Default name is `small`, default dest is `/tmp/rv-regress`. Dest is replaced if it already exists. Dest must be under `/tmp` and outside this work tree.
 
-`mise run tui-regress` builds `zig-out/bin/rv` and runs the small TUI scripts through `regress/drive.sh`. Each script gets its own tmux session (`rv-tui-<pid>`, 100×32) and fixture dest (`/tmp/rv-regress-<pid>`). `layout-narrow` uses 48 columns. The session is killed after the script, pass or fail. This is not part of `mise run test`.
+`mise run tui-regress` builds `zig-out/bin/rv` and runs the small TUI scripts through `regress/drive.sh`. Pass `large` to run the generated-size scripts instead, or `--all` to run small and then large. The default run does not materialize `large`. Each script gets its own tmux session (`rv-tui-<pid>`, 100×32) and fixture dest (`/tmp/rv-regress-<pid>`). `layout-narrow` uses 48 columns. The session is killed after the script, pass or fail. This is not part of `mise run test`.
 
 ## Layout
 
@@ -19,6 +22,7 @@ Default name is `small`, default dest is `/tmp/rv-regress`. Dest is replaced if 
 regress/fixtures/<name>/
   series                 # apply order
   *.patch
+  recipe                 # lines / stride / path for `generate`
   untracked/             # copied into the worktree root
   rv/                    # copied to dest/.rv/
   expected.status        # git status --porcelain=v1 after materialize
@@ -33,6 +37,7 @@ regress/fixtures/<name>/
 | `worktree` | `git apply` (worktree only) |
 | `untracked` | copy directory tree into the worktree root |
 | `rv` | copy directory tree to `.rv/` |
+| `generate` | read a recipe and write the file into dest (not checked in) |
 
 `cached` uses `--index` rather than `--cached` so a staged-only path matches the index in the worktree until a `worktree` patch diverges (needed for `MM` files).
 
@@ -61,3 +66,9 @@ Scripts live in `regress/tui/` and are line-oriented. `#` starts a comment. Blan
 Export of the mixed local statuses used to drive the TUI: unstaged modify/delete, staged rename, staged delete, staged new file, two hunks in one file, a nested path, staged+unstaged (`MM`) `fav.txt`, untracked `new.txt`/`tabs.txt` plus an empty file, a binary file, and a file with no trailing newline, seeded `.rv/approved.json` on `fav.txt`.
 
 Scripts: `boot`, `hunk-nav`, `approve-hunk`, `approve-file`, `unapprove`, `comment`, `layout`, `layout-narrow` (48 columns, footer `uni~`), `statuses`.
+
+## large
+
+Not a checked-in patch. `generate recipe` follows the bench `makeLarge` line text: commit 2000 lines of `big.txt`, then change every 12th line and leave that edit unstaged. Stride 12 is wider than git's default context, so the unstaged diff is 167 hunks. The file body is written only under the dest directory.
+
+Scripts: `approve-one` (`]` then `a` hides one hunk and leaves the rest), `approve-all` (`A` stages the file and clears the unstaged list). Run them with `mise run tui-regress -- large`.

@@ -1,0 +1,10 @@
+# } from Unstaged lands on big.txt. A stages the file and hides every hunk.
+# The list is empty. The footer counts one approval per hunk (167).
+wait Unstaged
+send }
+wait HEAD  big.txt  hunk 0/167
+send A
+gone Unstaged
+wait HEAD · 167 approved
+approved big.txt
+staged big.txt

@@ -1,0 +1,2 @@
+# Same line recipe as bench makeLarge. Bodies are generated into dest.
+generate recipe

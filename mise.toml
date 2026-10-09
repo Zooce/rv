@@ -30,5 +30,5 @@ description = "Materialize a TUI regression git fixture under /tmp"
 run = "regress/materialize.sh"
 
 [tasks.tui-regress]
-description = "Build rv and run small TUI regression scripts in tmux"
+description = "Build rv and run TUI regression scripts in tmux"
 run = "regress/tui-regress.sh"

@@ -1,0 +1,5 @@
+# 2000 lines, edit every 12th. Git context 3 keeps each edit its own hunk
+# (167). regress/tui/approve-one and approve-all wait on that count.
+lines 2000
+stride 12
+path big.txt
