@@ -10,10 +10,12 @@
 //! `i`/`c`/`Enter`
 //! create or edit new, `I`/`C` old, `d` dismiss new, `D` dismiss old,
 //! `e` expand the current hunk's context, `r` reload the diff and comments, `q` quit).
-//! Diff layout defaults to side-by-side when the terminal is wide enough;
-//! falls back to unified when narrow. `t` toggles session preference
-//! (explicit unified stays unified even when wide). `#` toggles line numbers
-//! (on by default). `w` toggles wrap of diff body lines (off by default).
+//! Initial layout, line numbers, and wrap come from the user config file
+//! (`$XDG_CONFIG_HOME/rv/config`, or `~/.config/rv/config`) and
+//! `.rv/config`. The repo file overrides one key at a time. Missing
+//! files keep the compiled defaults: side-by-side, numbers on, wrap off.
+//! Narrow terminals still fall back to unified. `t`, `#`, and `w` change
+//! this session only and do not write either file.
 //! Error paths never enter raw / alt-screen mode. An empty model still
 //! opens the TUI; the footer shows the load source (`HEAD · empty` when
 //! the worktree is clean, `HEAD · N approved` when every local change is
@@ -106,6 +108,7 @@ const view = @import("view");
 const store = @import("store");
 const comments = @import("comments");
 const cli = @import("cli");
+const config = @import("config");
 const comment_input = @import("comment_input");
 const Help = @import("Help");
 const Frame = @import("Frame.zig");
@@ -121,7 +124,7 @@ pub fn main(init: std.process.Init) !u8 {
         return 2;
     };
     switch (launch) {
-        .tui => |source| return try runTui(alloc, io, source),
+        .tui => |source| return try runTui(alloc, io, source, init.environ_map),
         .command => |cmd| {
             return cli.run(alloc, io, cmd, .cwd());
         },
@@ -257,7 +260,33 @@ fn presentFrame(
     });
 }
 
-fn runTui(alloc: std.mem.Allocator, io: std.Io, source: git.Origin) !u8 {
+fn runTui(
+    alloc: std.mem.Allocator,
+    io: std.Io,
+    source: git.Origin,
+    environ: *std.process.Environ.Map,
+) !u8 {
+    // Config before the diff and before any TTY setup. A bad file exits here.
+    const configured = try config.load(
+        alloc,
+        io,
+        .cwd(),
+        environ.get("XDG_CONFIG_HOME"),
+        environ.get("HOME"),
+    );
+    const display = switch (configured) {
+        .config => |cfg| cfg,
+        .failure => |fail| {
+            if (fail.line) |line| {
+                std.debug.print("rv: {s}:{d}: {s}\n", .{ fail.path, line, fail.reason });
+            } else {
+                std.debug.print("rv: {s}: {s}\n", .{ fail.path, fail.reason });
+            }
+            fail.deinit(alloc);
+            return 1;
+        },
+    };
+
     // Load before any TTY setup so error paths never touch the terminal.
     var diff_view: OpenDiff = switch (loadOpenDiff(alloc, io, source)) {
         .open => |loaded| loaded,
@@ -307,7 +336,15 @@ fn runTui(alloc: std.mem.Allocator, io: std.Io, source: git.Origin) !u8 {
     };
     defer scr.deinit();
 
-    var viewport: Viewport = .{};
+    // `config.Layout` and the viewport preference are separate enums.
+    var viewport: Viewport = .{
+        .layout_pref = switch (display.layout) {
+            .side_by_side => .side_by_side,
+            .unified => .unified,
+        },
+        .show_line_numbers = display.line_numbers,
+        .wrap = display.wrap,
+    };
     var running = true;
     // Exactly one focus; cannot help, comment, search, and list at once.
     var focus: Focus = .normal;
@@ -5577,7 +5614,6 @@ test "expandTargetAt hunk not file or section" {
     try std.testing.expectEqual(0, in_hunk.file_i);
     try std.testing.expectEqual(0, in_hunk.hunk_i);
 }
-
 
 fn findDiffFile(d: diff.Diff, path: []const u8, group: diff.Group) !diff.File {
     for (d.files) |f| {

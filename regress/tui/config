@@ -1,0 +1,26 @@
+# User file: unified, numbers on. Repo file overrides numbers off and turns
+# wrap on. `t` flips layout for this session only. The next rv reads the
+# files again. `1 one` is the numbered old line of a.txt; numbers off omit it.
+seed user layout = unified
+seed user line_numbers = true
+seed repo line_numbers = false
+seed repo wrap = true
+wait Unstaged
+wait  open  uni
+gone uni~
+gone  open  sbs
+wait  wrap
+wait one
+gone 1 one
+send t
+wait  open  sbs
+wait  wrap
+send q
+gone Unstaged
+restart
+wait Unstaged
+wait  open  uni
+gone  open  sbs
+wait  wrap
+wait one
+gone 1 one

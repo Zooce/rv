@@ -122,6 +122,16 @@ pub fn build(b: *std.Build) void {
         },
     });
 
+    // Display defaults (goal #136).
+    const config_mod = b.addModule("config", .{
+        .root_source_file = b.path("src/config.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{
+            .{ .name = "isolated_tmp", .module = isolated_tmp_mod },
+        },
+    });
+
     // Live-comment location and next/prev walk (rows are a tool).
     const comments_mod = b.addModule("comments", .{
         .root_source_file = b.path("src/comments.zig"),
@@ -167,6 +177,7 @@ pub fn build(b: *std.Build) void {
                 .{ .name = "store", .module = store_mod },
                 .{ .name = "comments", .module = comments_mod },
                 .{ .name = "cli", .module = cli_mod },
+                .{ .name = "config", .module = config_mod },
                 .{ .name = "comment_input", .module = comment_input_mod },
                 .{ .name = "Help", .module = help_mod },
                 .{ .name = "approve", .module = approve_mod },
@@ -277,6 +288,11 @@ pub fn build(b: *std.Build) void {
     });
     const run_cli_tests = b.addRunArtifact(cli_tests);
 
+    const config_tests = b.addTest(.{
+        .root_module = config_mod,
+    });
+    const run_config_tests = b.addRunArtifact(config_tests);
+
     const main_tests = b.addTest(.{
         .root_module = b.createModule(.{
             .root_source_file = b.path("src/main.zig"),
@@ -290,6 +306,7 @@ pub fn build(b: *std.Build) void {
                 .{ .name = "store", .module = store_mod },
                 .{ .name = "comments", .module = comments_mod },
                 .{ .name = "cli", .module = cli_mod },
+                .{ .name = "config", .module = config_mod },
                 .{ .name = "comment_input", .module = comment_input_mod },
                 .{ .name = "Help", .module = help_mod },
                 .{ .name = "approve", .module = approve_mod },
@@ -299,7 +316,7 @@ pub fn build(b: *std.Build) void {
     });
     const run_main_tests = b.addRunArtifact(main_tests);
 
-    const test_step = b.step("test", "Run unit tests (TUI + diff + worddiff + git + view + comment_input + Help + approve + store + comments + cli + main)");
+    const test_step = b.step("test", "Run unit tests (TUI + diff + worddiff + git + view + comment_input + Help + approve + store + comments + cli + config + main)");
     test_step.dependOn(&run_tui_tests.step);
     test_step.dependOn(&run_diff_tests.step);
     test_step.dependOn(&run_worddiff_tests.step);
@@ -311,6 +328,7 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&run_store_tests.step);
     test_step.dependOn(&run_comments_tests.step);
     test_step.dependOn(&run_cli_tests.step);
+    test_step.dependOn(&run_config_tests.step);
     test_step.dependOn(&run_main_tests.step);
 
     // rv --version prints major.minor. A .0 patch in build.zig.zon is left off.

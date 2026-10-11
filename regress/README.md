@@ -58,6 +58,11 @@ Scripts live in `regress/tui/` and are line-oriented. `#` starts a comment. Blan
 | `approved PATH` | poll `.rv/approved.json` for that `path` |
 | `review TEXT` | poll `.rv/reviews/current.json` for that text |
 | `staged PATH` | poll `git diff --cached --name-only` for that path |
+| `seed user TEXT` | before `rv` starts, append TEXT to the private user `config` |
+| `seed repo TEXT` | before `rv` starts, append TEXT to `dest/.rv/config` |
+| `restart` | start `rv` again in the same session |
+
+`seed` lines run before `rv`, in file order, wherever they sit in the script. `drive.sh` sets `XDG_CONFIG_HOME` to a private empty directory so a developer config file does not change the suite. `restart` uses that same directory.
 
 `drive.sh --cols N --rows N` sets the tmux size (default 100×32). A wait or seek that times out prints the pane and keeps the dest directory.
 
@@ -65,7 +70,7 @@ Scripts live in `regress/tui/` and are line-oriented. `#` starts a comment. Blan
 
 Export of the mixed local statuses used to drive the TUI: unstaged modify/delete, staged rename, staged delete, staged new file, two hunks in one file, a nested path, staged+unstaged (`MM`) `fav.txt`, untracked `new.txt`/`tabs.txt` plus an empty file, a binary file, and a file with no trailing newline, seeded `.rv/approved.json` on `fav.txt`.
 
-Scripts: `boot`, `hunk-nav`, `approve-hunk`, `approve-file`, `unapprove`, `comment`, `layout`, `layout-narrow` (48 columns, footer `uni~`), `statuses`.
+Scripts: `boot`, `hunk-nav`, `approve-hunk`, `approve-file`, `unapprove`, `comment`, `layout`, `layout-narrow` (48 columns, footer `uni~`), `statuses`, `config` (user and repo files, session `t`, restart), `config-bad` (invalid file, no TUI).
 
 ## large
 

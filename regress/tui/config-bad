@@ -1,0 +1,5 @@
+# A present but invalid user file prints the reason and does not open the TUI.
+seed user layout = nope
+wait unknown value
+gone Unstaged
+gone ? help

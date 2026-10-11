@@ -116,6 +116,24 @@ rv unapprove <n>
 
 `rv` keeps your approvals and your comments. Your agent changes the code.
 
+## Config
+
+Display defaults are read once, before the first paint.
+
+The user file is `$XDG_CONFIG_HOME/rv/config`. When `XDG_CONFIG_HOME` is unset or empty, it is `~/.config/rv/config`. The repo file is `.rv/config`, in the same directory as comments and approvals. A key in the repo file overrides that key in the user file. A missing file leaves the compiled default in place: side-by-side, line numbers on, wrap off.
+
+```
+layout = uni
+line_numbers = false
+wrap = true
+```
+
+`layout` is `side-by-side`, `sbs`, `unified`, or `uni`. `line_numbers` and `wrap` are `true` or `false`. An invalid file prints its path and the reason, and `rv` does not start.
+
+`t`, `#`, and `w` change layout, line numbers, and wrap for this session. They do not write either file. The next `rv` reads the files again.
+
+`rv list`, `rv export`, and the other headless commands do not read these files.
+
 ## Releases
 
 Pushing a git tag `v<major>.<minor>` (zon `2.3.0` is tag `v2.3`) publishes a GitHub Release with Linux and macOS tarballs (x86_64 and aarch64) and SHA256 checksums. The Linux binaries are musl builds. The release name is the tag. The tag message is the release notes.

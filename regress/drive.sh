@@ -93,12 +93,15 @@ fi
 
 session=rv-tui-$$
 started=0
+# Private config dir so a developer file does not change the suite.
+xdg=$(mktemp -d /tmp/rv-xdg-XXXXXX)
 
 cleanup() {
   local ec=$?
   if [[ $started -eq 1 ]]; then
     tmux kill-session -t "$session" 2>/dev/null || true
   fi
+  rm -rf -- "$xdg"
   if [[ $ec -eq 0 ]]; then
     rm -rf -- "$dest"
   else
@@ -108,11 +111,36 @@ cleanup() {
 trap cleanup EXIT
 
 "$script_dir/materialize.sh" "$fixture" "$dest" >/dev/null
+mkdir -p -- "$xdg/rv" "$dest/.rv"
+
+# `seed` lines run before rv, in file order, wherever they sit in the script.
+while IFS= read -r line || [[ -n $line ]]; do
+  line=${line%%$'\r'}
+  [[ -z $line || $line == \#* ]] && continue
+  cmd=${line%% *}
+  [[ $cmd == seed ]] || continue
+  rest=${line#* }
+  kind=${rest%% *}
+  text=${rest#* }
+  [[ $kind == user || $kind == repo ]] || die "seed needs user or repo: $line"
+  [[ $text != "$rest" ]] || die "seed needs a line of config: $line"
+  if [[ $kind == user ]]; then
+    printf '%s\n' "$text" >> "$xdg/rv/config"
+  else
+    printf '%s\n' "$text" >> "$dest/.rv/config"
+  fi
+done <"$script"
+
+launch_rv() {
+  # The tmux server does not take the client environment, so the assignment
+  # is part of the shell command.
+  tmux send-keys -t "$session" -l "XDG_CONFIG_HOME=$xdg $rv"
+  tmux send-keys -t "$session" Enter
+}
 
 tmux new-session -d -s "$session" -x "$cols" -y "$rows" -c "$dest"
 started=1
-tmux send-keys -t "$session" -l "$rv"
-tmux send-keys -t "$session" Enter
+launch_rv
 
 dump_pane() {
   echo "--- pane ---" >&2
@@ -268,6 +296,12 @@ while IFS= read -r line || [[ -n $line ]]; do
     staged)
       [[ -n $rest ]] || die "staged needs a path: $line"
       wait_staged "$rest"
+      ;;
+    seed)
+      ;;
+    restart)
+      [[ -z $rest ]] || die "restart takes no arguments: $line"
+      launch_rv
       ;;
     *)
       die "unknown command '$cmd' in $script"
