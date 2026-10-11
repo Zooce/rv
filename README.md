@@ -8,6 +8,20 @@ Open `rv` on your local changes. Approve the changes you like, and comment on th
 
 Linux and macOS. No Windows builds yet.
 
+### mise
+
+```sh
+mise use -g github:Zooce/rv
+```
+
+A specific release. Drop the leading `v` from the tag (`2.3`, or an older tag such as `2.2.0`):
+
+```sh
+mise use -g github:Zooce/rv@2.3
+```
+
+### install.sh
+
 ```sh
 curl -fsSL https://raw.githubusercontent.com/Zooce/rv/master/install.sh | sh
 ```
@@ -24,7 +38,7 @@ If `~/.local/bin` is not on `PATH`:
 export PATH="$HOME/.local/bin:$PATH"
 ```
 
-Then:
+Install the agent skill after either method above:
 
 ```sh
 npx skills add Zooce/rv -g
@@ -105,6 +119,8 @@ rv unapprove <n>
 ## Releases
 
 Pushing a git tag `v<major>.<minor>` (zon `2.3.0` is tag `v2.3`) publishes a GitHub Release with Linux and macOS tarballs (x86_64 and aarch64) and SHA256 checksums. The Linux binaries are musl builds. The release name is the tag. The tag message is the release notes.
+
+`mise use github:Zooce/rv` installs those tarballs: `rv-linux-x86_64.tar.gz`, `rv-linux-aarch64.tar.gz`, `rv-macos-x86_64.tar.gz`, and `rv-macos-aarch64.tar.gz`. Each archive contains `bin/rv`.
 
 1. Bump `.version` in `build.zig.zon` to `major.minor.0` (for example `2.3.0`).
 2. Commit that change.

@@ -72,6 +72,8 @@ jobs:
             cp "$stage/bin/rv" "$packdir/bin/rv"
             tar -C "$packdir" -czf "dist/$asset" bin
           }
+          # mise use github:Zooce/rv matches rv-<linux|macos>-<x86_64|aarch64>.tar.gz.
+          # install.sh uses the same names. Each archive is bin/rv.
           pack x86_64-linux-musl rv-linux-x86_64.tar.gz
           pack aarch64-linux-musl rv-linux-aarch64.tar.gz
           pack x86_64-macos rv-macos-x86_64.tar.gz

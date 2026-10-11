@@ -20,6 +20,7 @@ aarch64 | arm64) arch=aarch64 ;;
     exit 1
     ;;
 esac
+# Same names as the release workflow. mise matches rv-<linux|macos>-<x86_64|aarch64>.tar.gz.
 asset="rv-${os}-${arch}.tar.gz"
 
 prefix="${RV_PREFIX:-$HOME/.local}"
