@@ -43,8 +43,10 @@
 //! footer note.
 //!
 //! File list: `Space` then `f` opens a centered overlay of changed-file
-//! paths (flatten order). `j`/`k` move; Enter jumps to that file header and
-//! closes. `a`/`A` approve the remaining hunks of that file in its group
+//! paths (flatten order). `j`/`k` move. `g` then `g` jumps to the first row
+//! and `g` then `e` to the last; a second press stays. The comment list and
+//! the approved list use that same motion. Enter jumps to that
+//! file header and closes. `a`/`A` approve the remaining hunks of that file in its group
 //! (same as `A` on the file header; stages, then hides; local only; range no-op). The overlay stays
 //! open and refreshes; a fully approved file leaves the list. Live comments
 //! on the file open the same approve confirm; Esc on that confirm returns
@@ -62,8 +64,9 @@
 //! `no` keeps them). Git discard runs first; comments are deleted only on
 //! success. Staged `gd`/`gD` are no-ops (unstage first). Range loads ignore
 //! git and approve keys. Exactly one leader at a time (`Space` lists, `g`
-//! git); an unmatched leader is dropped and the next key is
-//! handled as usual. Local `a` stages the current hunk then hides it; `A`
+//! git or a row end). `g` then `g` moves to the first row and `g` then `e`
+//! to the last; a second press stays. An unmatched leader is dropped and
+//! the next key is handled as usual. Local `a` stages the current hunk then hides it; `A`
 //! stages the remaining hunks of that file in this group then hides them
 //! (from a hunk or the file header; no-op on a section). Already staged:
 //! hide only. Unapprove does not unstage. Live comments on that hunk (`a`)
@@ -145,9 +148,9 @@ fn frameTitle(focus: Focus, comment: []const u8, confirm: []const u8) []const u8
     return switch (focus) {
         .commenting => comment,
         .searching => "rv  search  Enter jump  Esc cancel",
-        .comments => "rv  comments  j/k  Enter jump  i edit  d dismiss  Esc close  q quit",
-        .files => "rv  files  j/k  Enter jump  a/A approve  Esc close  q quit",
-        .approved => "rv  approved  j/k move  Enter unapprove  Esc close  q quit",
+        .comments => "rv  comments  j/k gg/ge  Enter jump  i edit  d dismiss  Esc close  q quit",
+        .files => "rv  files  j/k gg/ge  Enter jump  a/A approve  Esc close  q quit",
+        .approved => "rv  approved  j/k gg/ge  Enter unapprove  Esc close  q quit",
         .helping => "rv  help  j/k  Esc/? close  q quit",
         .git_error => "rv  git error  Enter/Esc close  q quit",
         .confirm => confirm,
@@ -349,8 +352,9 @@ fn runTui(
     // Exactly one focus; cannot help, comment, search, and list at once.
     var focus: Focus = .normal;
     // Exactly one leader: `Space` lists (`f` files, `c` comments, `a`
-    // approved), `g` git (`s`/`u`/`d` hunk, `S`/`U`/`D` file). Cleared on the
-    // next key. Unmatched is dropped; the second key is handled as usual.
+    // approved), `g` git (`s`/`u`/`d` hunk, `S`/`U`/`D` file) or a row end
+    // (`g` first, `e` last). Cleared on the next key. Unmatched is dropped;
+    // the second key is handled as usual.
     const Leader = enum { none, lists, git };
     var leader: Leader = .none;
     var confirm: Confirm = .{};
@@ -660,6 +664,10 @@ fn runTui(
                                     );
                                 } else if (pending == .git and c == 'D') {
                                     beginGitDiscard(source, diff_view.rows, viewport.cursor, &confirm, &focus, true);
+                                } else if (pending == .git and c == 'g') {
+                                    viewport.moveToFirst(size.cols, diff_view.rows, diff_view.sbs_slots);
+                                } else if (pending == .git and c == 'e') {
+                                    viewport.moveToLast(size.cols, diff_view.rows, diff_view.sbs_slots);
                                 } else if (viewport.handleKey(.{ .char = c }, size.cols, diff_view.rows, diff_view.sbs_slots) == .handled) {
                                     // j/k/h/l/0/$/J/K/[/]/{/}/t/#/w
                                 } else if (c == 'q' or c == 'Q') {
@@ -2934,6 +2942,30 @@ pub const Viewport = struct {
         };
     }
 
+    /// First row of the same motion as `j`/`k`. A second call stays there.
+    fn moveToFirst(self: *Viewport, cols: u16, rows: []const view.row.Row, slots: []const view.layout.SbsSlot) void {
+        if (rows.len == 0) {
+            self.cursor = 0;
+            return;
+        }
+        self.cursor = switch (view.layout.effectiveLayout(self.layout_pref, cols)) {
+            .unified => 0,
+            .side_by_side => if (slots.len == 0) 0 else view.layout.sbsPrimaryRow(slots[0]),
+        };
+    }
+
+    /// Last row of the same motion as `j`/`k`. A second call stays there.
+    fn moveToLast(self: *Viewport, cols: u16, rows: []const view.row.Row, slots: []const view.layout.SbsSlot) void {
+        if (rows.len == 0) {
+            self.cursor = 0;
+            return;
+        }
+        self.cursor = switch (view.layout.effectiveLayout(self.layout_pref, cols)) {
+            .unified => rows.len - 1,
+            .side_by_side => if (slots.len == 0) rows.len - 1 else view.layout.sbsPrimaryRow(slots[slots.len - 1]),
+        };
+    }
+
     fn panLeft(self: *Viewport, cols: u16, rows: []const view.row.Row) void {
         const step = panStep(self.panViewportCols(cols, rows, self.cursor));
         self.col_scroll = if (self.col_scroll > step) self.col_scroll - step else 0;
@@ -3243,16 +3275,29 @@ fn wheelDirection(mouse: tui.Mouse) ?Wheel {
     };
 }
 
-/// Cursor and window for an overlay list. `j`/`k` and the wheel share this.
+/// Cursor and window for an overlay list. `j`/`k`, `gg`/`ge`, and the wheel share this.
 const ListWin = struct {
     cursor: usize = 0,
     scroll: usize = 0,
     window_moved: bool = false,
+    /// `g` is waiting for `g` (first row) or `e` (last row).
+    pending_g: bool = false,
 
     fn key(self: *ListWin, n: usize, k: tui.Key) void {
         self.window_moved = false;
+        const pending = self.pending_g;
+        self.pending_g = false;
         switch (k) {
             .char => |c| {
+                // `gg` / `ge`. An unmatched `g` is dropped and this key is handled below.
+                if (pending and (c == 'g' or c == 'e')) {
+                    if (n > 0) self.cursor = if (c == 'g') 0 else n - 1;
+                    return;
+                }
+                if (c == 'g') {
+                    self.pending_g = true;
+                    return;
+                }
                 if (c == 'j') {
                     if (self.cursor + 1 < n) self.cursor += 1;
                 } else if (c == 'k') {
@@ -3270,6 +3315,7 @@ const ListWin = struct {
     }
 
     fn wheel(self: *ListWin, dir: Wheel) void {
+        self.pending_g = false;
         switch (dir) {
             .up => self.scroll -|= 1,
             .down => self.scroll +|= 1,
@@ -4400,6 +4446,15 @@ test "list wheel moves the window and a key follows the selected row" {
     _ = list.handleKey(.{ .char = 'j' });
     try std.testing.expect(!list.win.window_moved);
     try std.testing.expectEqual(0, list.win.cursor);
+
+    // A wheel drops a pending g, so the next g starts the chord again.
+    win.cursor = 2;
+    win.pending_g = true;
+    win.wheel(.up);
+    try std.testing.expect(!win.pending_g);
+    win.key(5, .{ .char = 'g' });
+    try std.testing.expectEqual(2, win.cursor);
+    try std.testing.expect(win.pending_g);
 }
 
 test "comment wheel scrolls the text and leaves the caret" {
@@ -4482,6 +4537,237 @@ test "file list a and A approve" {
     defer empty.items.deinit(alloc);
     try std.testing.expect(empty.handleKey(.{ .char = 'A' }) == .open);
     try std.testing.expect(empty.handleKey(.{ .char = 'a' }) == .open);
+}
+
+test "file list gg and ge move to the ends" {
+    const alloc = std.testing.allocator;
+    var d = try diff.parse(alloc,
+        \\diff --git a/a.txt b/a.txt
+        \\--- a/a.txt
+        \\+++ b/a.txt
+        \\@@ -1 +1 @@
+        \\-a
+        \\+A
+        \\diff --git a/b.txt b/b.txt
+        \\--- a/b.txt
+        \\+++ b/b.txt
+        \\@@ -1 +1 @@
+        \\-b
+        \\+B
+        \\diff --git a/c.txt b/c.txt
+        \\--- a/c.txt
+        \\+++ b/c.txt
+        \\@@ -1 +1 @@
+        \\-c
+        \\+C
+    );
+    defer d.deinit();
+    const rows = try view.row.flatten(alloc, &d);
+    defer alloc.free(rows);
+
+    var list: FileList = .{};
+    defer list.items.deinit(alloc);
+    try list.load(alloc, rows, null);
+    try std.testing.expectEqual(3, list.items.items.len);
+
+    list.win.cursor = 1;
+    try std.testing.expect(list.handleKey(.{ .char = 'g' }) == .open);
+    try std.testing.expectEqual(1, list.win.cursor);
+    try std.testing.expect(list.handleKey(.{ .char = 'g' }) == .open);
+    try std.testing.expectEqual(0, list.win.cursor);
+    try std.testing.expect(list.handleKey(.{ .char = 'g' }) == .open);
+    try std.testing.expect(list.handleKey(.{ .char = 'g' }) == .open);
+    try std.testing.expectEqual(0, list.win.cursor);
+
+    list.win.cursor = 1;
+    try std.testing.expect(list.handleKey(.{ .char = 'g' }) == .open);
+    try std.testing.expect(list.handleKey(.{ .char = 'e' }) == .open);
+    try std.testing.expectEqual(2, list.win.cursor);
+    try std.testing.expect(list.handleKey(.{ .char = 'g' }) == .open);
+    try std.testing.expect(list.handleKey(.{ .char = 'e' }) == .open);
+    try std.testing.expectEqual(2, list.win.cursor);
+
+    // An unmatched g is dropped. j still moves, and a still approves.
+    list.win.cursor = 0;
+    try std.testing.expect(list.handleKey(.{ .char = 'g' }) == .open);
+    try std.testing.expect(list.handleKey(.{ .char = 'j' }) == .open);
+    try std.testing.expectEqual(1, list.win.cursor);
+    try std.testing.expect(list.handleKey(.{ .char = 'g' }) == .open);
+    try std.testing.expect(list.handleKey(.{ .char = 'a' }) == .approve);
+
+    var empty: FileList = .{};
+    defer empty.items.deinit(alloc);
+    try std.testing.expect(empty.handleKey(.{ .char = 'g' }) == .open);
+    try std.testing.expect(empty.handleKey(.{ .char = 'e' }) == .open);
+    try std.testing.expectEqual(0, empty.win.cursor);
+    try std.testing.expect(empty.handleKey(.{ .char = 'g' }) == .open);
+    try std.testing.expect(empty.handleKey(.{ .char = 'g' }) == .open);
+    try std.testing.expectEqual(0, empty.win.cursor);
+}
+
+test "comment list gg and ge move to the ends" {
+    const alloc = std.testing.allocator;
+    const rows: []const view.row.Row = &.{};
+
+    var list: CommentList = .{};
+    defer list.items.deinit(alloc);
+    try list.load(alloc, &.{
+        .{ .id = "1", .path = "a", .body = "a" },
+        .{ .id = "2", .path = "b", .body = "b" },
+        .{ .id = "3", .path = "c", .body = "c" },
+    });
+
+    list.win.cursor = 1;
+    try std.testing.expect(list.handleKey(.{ .char = 'g' }, rows) == .open);
+    try std.testing.expectEqual(1, list.win.cursor);
+    try std.testing.expect(list.handleKey(.{ .char = 'g' }, rows) == .open);
+    try std.testing.expectEqual(0, list.win.cursor);
+    try std.testing.expect(list.handleKey(.{ .char = 'g' }, rows) == .open);
+    try std.testing.expect(list.handleKey(.{ .char = 'g' }, rows) == .open);
+    try std.testing.expectEqual(0, list.win.cursor);
+
+    list.win.cursor = 1;
+    try std.testing.expect(list.handleKey(.{ .char = 'g' }, rows) == .open);
+    try std.testing.expect(list.handleKey(.{ .char = 'e' }, rows) == .open);
+    try std.testing.expectEqual(2, list.win.cursor);
+    try std.testing.expect(list.handleKey(.{ .char = 'g' }, rows) == .open);
+    try std.testing.expect(list.handleKey(.{ .char = 'e' }, rows) == .open);
+    try std.testing.expectEqual(2, list.win.cursor);
+
+    // An unmatched g is dropped. j still moves, and d and i still act.
+    list.win.cursor = 0;
+    try std.testing.expect(list.handleKey(.{ .char = 'g' }, rows) == .open);
+    try std.testing.expect(list.handleKey(.{ .char = 'j' }, rows) == .open);
+    try std.testing.expectEqual(1, list.win.cursor);
+    try std.testing.expect(list.handleKey(.{ .char = 'g' }, rows) == .open);
+    try std.testing.expect(list.handleKey(.{ .char = 'd' }, rows) == .dismiss);
+    try std.testing.expectEqual(1, list.win.cursor);
+    try std.testing.expect(list.handleKey(.{ .char = 'g' }, rows) == .open);
+    switch (list.handleKey(.{ .char = 'i' }, rows)) {
+        .hidden => |h| try std.testing.expect(h.edit),
+        else => try std.testing.expect(false),
+    }
+
+    var empty: CommentList = .{};
+    defer empty.items.deinit(alloc);
+    try std.testing.expect(empty.handleKey(.{ .char = 'g' }, rows) == .open);
+    try std.testing.expect(empty.handleKey(.{ .char = 'e' }, rows) == .open);
+    try std.testing.expectEqual(0, empty.win.cursor);
+}
+
+test "approved list gg and ge move to the ends" {
+    const alloc = std.testing.allocator;
+    const hash: approve.Hash = @splat(0);
+
+    var list: ApprovedList = .{};
+    defer list.items.deinit(alloc);
+    try list.items.appendSlice(alloc, &.{
+        .{ .path = "a", .hash = hash, .group = .unstaged, .kind = .hunk, .preview = "a" },
+        .{ .path = "b", .hash = hash, .group = .unstaged, .kind = .hunk, .preview = "b" },
+        .{ .path = "c", .hash = hash, .group = .staged, .kind = .hunk, .preview = "c" },
+    });
+
+    list.win.cursor = 1;
+    try std.testing.expect(list.handleKey(.{ .char = 'g' }) == .open);
+    try std.testing.expectEqual(1, list.win.cursor);
+    try std.testing.expect(list.handleKey(.{ .char = 'g' }) == .open);
+    try std.testing.expectEqual(0, list.win.cursor);
+    try std.testing.expect(list.handleKey(.{ .char = 'g' }) == .open);
+    try std.testing.expect(list.handleKey(.{ .char = 'g' }) == .open);
+    try std.testing.expectEqual(0, list.win.cursor);
+
+    list.win.cursor = 1;
+    try std.testing.expect(list.handleKey(.{ .char = 'g' }) == .open);
+    try std.testing.expect(list.handleKey(.{ .char = 'e' }) == .open);
+    try std.testing.expectEqual(2, list.win.cursor);
+    switch (list.handleKey(.enter)) {
+        .unapprove => |idx| try std.testing.expectEqual(2, idx),
+        else => try std.testing.expect(false),
+    }
+    try std.testing.expect(list.handleKey(.{ .char = 'g' }) == .open);
+    try std.testing.expect(list.handleKey(.{ .char = 'e' }) == .open);
+    try std.testing.expectEqual(2, list.win.cursor);
+
+    // An unmatched g is dropped. j still moves, and Enter still unapproves that row.
+    list.win.cursor = 0;
+    try std.testing.expect(list.handleKey(.{ .char = 'g' }) == .open);
+    try std.testing.expect(list.handleKey(.{ .char = 'j' }) == .open);
+    try std.testing.expectEqual(1, list.win.cursor);
+    try std.testing.expect(list.handleKey(.{ .char = 'g' }) == .open);
+    switch (list.handleKey(.enter)) {
+        .unapprove => |idx| try std.testing.expectEqual(1, idx),
+        else => try std.testing.expect(false),
+    }
+
+    var empty: ApprovedList = .{};
+    defer empty.items.deinit(alloc);
+    try std.testing.expect(empty.handleKey(.{ .char = 'g' }) == .open);
+    try std.testing.expect(empty.handleKey(.{ .char = 'e' }) == .open);
+    try std.testing.expectEqual(0, empty.win.cursor);
+}
+
+test "gg and ge land on the first and last motion row" {
+    const alloc = std.testing.allocator;
+    var d = try diff.parse(alloc,
+        \\diff --git a/f b/f
+        \\--- a/f
+        \\+++ b/f
+        \\@@ -1 +1 @@
+        \\-old
+        \\+new
+    );
+    defer d.deinit();
+    const rows = try view.row.flatten(alloc, &d);
+    defer alloc.free(rows);
+    const slots = try view.layout.pairSideBySide(alloc, rows);
+    defer alloc.free(slots);
+
+    const first_slot = view.layout.sbsPrimaryRow(slots[0]);
+    const last_slot = view.layout.sbsPrimaryRow(slots[slots.len - 1]);
+    try std.testing.expect(last_slot < rows.len - 1);
+
+    var vp: Viewport = .{ .cursor = 1, .layout_pref = .side_by_side };
+    vp.moveToLast(80, rows, slots);
+    try std.testing.expectEqual(last_slot, vp.cursor);
+    vp.moveToLast(80, rows, slots);
+    try std.testing.expectEqual(last_slot, vp.cursor);
+    vp.moveLineDown(80, rows, slots);
+    try std.testing.expectEqual(last_slot, vp.cursor);
+
+    vp.moveToFirst(80, rows, slots);
+    try std.testing.expectEqual(first_slot, vp.cursor);
+    vp.moveToFirst(80, rows, slots);
+    try std.testing.expectEqual(first_slot, vp.cursor);
+    vp.moveLineUp(80, rows, slots);
+    try std.testing.expectEqual(first_slot, vp.cursor);
+
+    vp.layout_pref = .unified;
+    vp.cursor = 1;
+    vp.moveToLast(80, rows, slots);
+    try std.testing.expectEqual(rows.len - 1, vp.cursor);
+    vp.moveToLast(80, rows, slots);
+    try std.testing.expectEqual(rows.len - 1, vp.cursor);
+    vp.moveLineDown(80, rows, slots);
+    try std.testing.expectEqual(rows.len - 1, vp.cursor);
+    vp.moveToFirst(80, rows, slots);
+    try std.testing.expectEqual(0, vp.cursor);
+    vp.moveToFirst(80, rows, slots);
+    try std.testing.expectEqual(0, vp.cursor);
+
+    // Narrow side-by-side is unified, so the last row is the last unified row.
+    vp.layout_pref = .side_by_side;
+    vp.cursor = 1;
+    vp.moveToLast(40, rows, slots);
+    try std.testing.expectEqual(rows.len - 1, vp.cursor);
+
+    var empty: Viewport = .{ .cursor = 4 };
+    const no_rows: []const view.row.Row = &.{};
+    const no_slots: []const view.layout.SbsSlot = &.{};
+    empty.moveToFirst(80, no_rows, no_slots);
+    try std.testing.expectEqual(0, empty.cursor);
+    empty.cursor = 4;
+    empty.moveToLast(80, no_rows, no_slots);
+    try std.testing.expectEqual(0, empty.cursor);
 }
 
 test "comment list Enter on a hidden loc is hidden not missing" {

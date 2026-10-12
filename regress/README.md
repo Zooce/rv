@@ -70,7 +70,7 @@ Scripts live in `regress/tui/` and are line-oriented. `#` starts a comment. Blan
 
 Export of the mixed local statuses used to drive the TUI: unstaged modify/delete, staged rename, staged delete, staged new file, two hunks in one file, a nested path, staged+unstaged (`MM`) `fav.txt`, untracked `new.txt`/`tabs.txt` plus an empty file, a binary file, and a file with no trailing newline, seeded `.rv/approved.json` on `fav.txt`.
 
-Scripts: `boot`, `hunk-nav`, `approve-hunk`, `approve-file`, `unapprove`, `comment`, `layout`, `layout-narrow` (48 columns, footer `uni~`), `statuses`, `config` (user and repo files, session `t`, restart), `config-bad` (invalid file, no TUI).
+Scripts: `boot`, `hunk-nav`, `ends` (`gg`/`ge` in the diff, the file list, the comment list, and the approved list), `approve-hunk`, `approve-file`, `unapprove`, `comment`, `layout`, `layout-narrow` (48 columns, footer `uni~`), `statuses`, `config` (user and repo files, session `t`, restart), `config-bad` (invalid file, no TUI).
 
 ## large
 

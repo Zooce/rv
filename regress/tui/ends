@@ -1,0 +1,171 @@
+# gg and ge from the middle of the diff, then from each j/k list.
+# The cursor starts on Unstaged. } walks file headers forward.
+wait Unstaged
+until HEAD  staged-new.txt }
+gone Unstaged
+send g
+send g
+wait Unstaged
+gone stagednewtoken
+send g
+send g
+wait Unstaged
+gone stagednewtoken
+
+until HEAD  staged-new.txt }
+gone Unstaged
+send g
+send e
+wait stagednewtoken
+gone Unstaged
+send g
+send e
+wait stagednewtoken
+gone Unstaged
+
+# File list opens on the file under the cursor. From b.txt, gg then Enter
+# lands on a.txt. From there, ge lands on staged-new.txt. A second ge stays.
+until HEAD  b.txt {
+send Space
+send f
+wait files
+send g
+send g
+send Enter
+wait HEAD  a.txt
+
+send Space
+send f
+wait files
+send j
+send g
+send e
+send Enter
+wait HEAD  staged-new.txt
+wait Unstage File
+gone Unstaged
+
+send Space
+send f
+wait files
+send g
+send e
+send Enter
+wait HEAD  staged-new.txt
+wait Unstage File
+gone Unstaged
+
+# Approved list. Seeded fav.txt plus three more, so a middle row is not an end.
+# Approve before any comment, so a does not open a confirm.
+send ]
+wait HEAD  staged-new.txt  hunk
+send a
+approved staged-new.txt
+gone HEAD  staged-new.txt
+
+send g
+send g
+wait Unstaged
+send ]
+wait HEAD  a.txt  hunk 1/
+send a
+approved a.txt
+staged a.txt
+gone HEAD  a.txt
+wait HEAD  b.txt
+
+send ]
+wait HEAD  b.txt  hunk
+send a
+approved b.txt
+staged b.txt
+gone HEAD  b.txt
+
+# From the section header the list opens on the first row (seeded fav.txt).
+# j is the second. gg returns to fav. A second gg stays. Enter unapproves it.
+# The restored hunk header sits on the last screen row, so the body is not visible.
+send g
+send g
+wait Unstaged
+send Space
+send a
+wait rv  approved
+send j
+send g
+send g
+send g
+send g
+send Enter
+gone rv  approved
+wait HEAD  fav.txt
+
+# Three rows remain. Newly staged paths follow the index, so b.txt is last.
+# j is the middle. ge lands on b.txt. A second ge stays.
+send Space
+send a
+wait rv  approved
+send j
+send g
+send e
+send g
+send e
+send Enter
+gone rv  approved
+wait HEAD  b.txt
+
+# Comment list, store order, on files that are still visible.
+send g
+send g
+wait Unstaged
+until HEAD  dir/nest.txt }
+send ]
+wait HEAD  dir/nest.txt  hunk
+send i
+wait create/edit hunk
+send notealpha
+send Enter
+review notealpha
+
+until HEAD  intra.txt }
+send ]
+wait HEAD  intra.txt  hunk
+send i
+wait create/edit hunk
+send notemiddle
+send Enter
+review notemiddle
+
+until HEAD  twohunk.txt }
+send ]
+wait HEAD  twohunk.txt  hunk
+send i
+wait create/edit hunk
+send notelast
+send Enter
+review notelast
+
+# The list opens on the first comment. j is the middle. gg returns to nest.
+send Space
+send c
+wait rv  comments
+send j
+send g
+send g
+send g
+send g
+send Enter
+gone rv  comments
+wait HEAD  dir/nest.txt
+wait nesttoken
+
+send Space
+send c
+wait rv  comments
+send j
+send g
+send e
+send g
+send e
+send Enter
+gone rv  comments
+wait HEAD  twohunk.txt

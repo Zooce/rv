@@ -16,6 +16,7 @@ const Entry = union(enum) {
 const entries = [_]Entry{
     .{ .group = "Motion" },
     .{ .item = .{ .key = "j/k", .label = "line (also arrows)" } },
+    .{ .item = .{ .key = "gg/ge", .label = "first / last row" } },
     .{ .item = .{ .key = "h/l", .label = "pan current hunk" } },
     .{ .item = .{ .key = "wheel", .label = "scroll the window; shift or sideways pans the hunk under the pointer" } },
     .{ .item = .{ .key = "0/$", .label = "pan home / end" } },
@@ -54,8 +55,8 @@ const entries = [_]Entry{
     .{ .group = "In a prompt" },
     .{ .item = .{ .key = "comment", .label = "Enter save · Esc cancel · arrows move" } },
     .{ .item = .{ .key = "search", .label = "Enter jump · Esc cancel" } },
-    .{ .item = .{ .key = "list", .label = "j/k move · Enter jump · Esc close" } },
-    .{ .item = .{ .key = "approved", .label = "Enter unapprove (does not unstage) · jump · Esc close" } },
+    .{ .item = .{ .key = "list", .label = "j/k gg/ge move · Enter jump · Esc close" } },
+    .{ .item = .{ .key = "approved", .label = "j/k gg/ge · Enter unapprove (does not unstage) · Esc close" } },
     .{ .item = .{ .key = "discard", .label = "No/yes · comments no/Yes · Esc cancel" } },
     .{ .item = .{ .key = "approve", .label = "No/yes · Esc cancel" } },
 };
@@ -128,9 +129,9 @@ pub fn paint(self: *Help, scr: *tui.Screen, size: tui.Size) void {
 
 test "help catalog includes normal bindings" {
     const required = [_][]const u8{
-        "j/k",     "h/l",     "0/$", "J/K", "[/]", "{/}", "(/)", "/", "n/N",
+        "j/k", "gg", "ge", "h/l", "0/$", "J/K", "[/]", "{/}", "(/)", "/", "n/N",
         "Space f", "Space c", "Space a", "gs", "gS", "a", "A", "i", "I", "d", "D",
-        "t",       "#",       "w",           "e", "r", "?", "q", "approved", "approve",
+        "t", "#", "w", "e", "r", "?", "q", "approved", "approve",
     };
     for (required) |token| {
         var found = false;
