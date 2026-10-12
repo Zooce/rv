@@ -113,6 +113,12 @@ pub const Approved = struct {
     pub fn prune(self: *Approved, alloc: Allocator, io: Io, root: Io.Dir, d: *const diff.Diff) Allocator.Error!void {
         const placed = try place(alloc, io, root, d, self);
         defer alloc.free(placed);
+        try self.retainPlaced(alloc, placed);
+    }
+
+    /// Drop entries `placed` did not consume. Indexes refer to this store
+    /// before the removal.
+    pub fn retainPlaced(self: *Approved, alloc: Allocator, placed: []const Placement) Allocator.Error!void {
         const used = try alloc.alloc(bool, self.entries.items.len);
         defer alloc.free(used);
         @memset(used, false);
@@ -475,49 +481,166 @@ const Found = struct {
     start: usize,
 };
 
-fn claimOf(lines: []const diff.Line, omit: ?[]const bool, hash: Hash) ?Found {
-    if (firstSpan(lines, omit, hash)) |span| {
-        return .{
-            .entry_i = 0,
-            .span = span,
-            .add_span = null,
-            .start = span[0],
-        };
-    }
-    if (firstRegrouped(lines, omit, hash)) |split| {
-        return .{
-            .entry_i = 0,
-            .span = split.del,
-            .add_span = split.add,
-            .start = split.start,
-        };
-    }
-    return null;
-}
+const EntryList = std.ArrayList(usize);
+const ByHash = std.AutoHashMap(Hash, EntryList);
 
-/// Earliest uncovered run among unused entries for `path`.
-/// The same start keeps the earlier store entry.
-fn earliest(
-    approved: *const Approved,
+/// Unused entries on one path, indexed by hash. `best` is the earliest
+/// uncovered run this round: smaller start, then earlier store index.
+/// Each entry keeps the first run whose hash matches (`seen`), contiguous
+/// runs before a regrouped pair, same as `firstSpan` then `matchBlock`.
+const Candidates = struct {
+    by_hash: *const ByHash,
     used: []const bool,
-    path: []const u8,
-    lines: []const diff.Line,
-    omit: []const bool,
-) ?Found {
-    var best: ?Found = null;
-    for (approved.entries.items, 0..) |e, ei| {
-        if (ei >= used.len or used[ei]) continue;
-        if (!std.mem.eql(u8, e.path, path)) continue;
-        var hit = claimOf(lines, omit, e.hash) orelse continue;
-        hit.entry_i = ei;
-        if (best) |b| {
-            if (hit.start > b.start) continue;
-            if (hit.start == b.start and ei > b.entry_i) continue;
+    seen: []bool,
+    best: ?Found = null,
+
+    fn offer(self: *Candidates, hash: Hash, span: [2]usize, add_span: ?[2]usize, start: usize) void {
+        const list = self.by_hash.getPtr(hash) orelse return;
+        for (list.items) |ei| {
+            if (self.used[ei] or self.seen[ei]) continue;
+            self.seen[ei] = true;
+            if (self.best) |b| {
+                if (start > b.start) continue;
+                if (start == b.start and ei > b.entry_i) continue;
+            }
+            self.best = .{
+                .entry_i = ei,
+                .span = span,
+                .add_span = add_span,
+                .start = start,
+            };
         }
-        best = hit;
     }
-    return best;
-}
+
+    /// Contiguous runs in `firstSpan` order. With nothing omitted, the whole
+    /// hunk hash is offered before any shorter prefix.
+    fn offerSpans(self: *Candidates, lines: []const diff.Line, omit: []const bool) void {
+        const open = !anyOmitted(lines, omit);
+        var first: ?usize = null;
+        var last: usize = 0;
+        for (lines, 0..) |ln, i| {
+            switch (ln.kind) {
+                .add, .delete => {
+                    if (first == null) first = i;
+                    last = i;
+                },
+                .context, .meta => {},
+            }
+        }
+        const start = first orelse return;
+        if (open) {
+            const whole = fingerprintHunk(.{
+                .old_start = 0,
+                .old_count = null,
+                .new_start = 0,
+                .new_count = null,
+                .lines = lines,
+            });
+            self.offer(whole, .{ start, last }, null, start);
+        }
+
+        var i: usize = 0;
+        while (i < lines.len) : (i += 1) {
+            switch (lines[i].kind) {
+                .add, .delete => {},
+                .context, .meta => continue,
+            }
+            if (omit[i]) continue;
+
+            var hasher = Sha256.init(.{});
+            hasher.update(&.{hunk_tag});
+            var j = i;
+            while (j < lines.len) : (j += 1) {
+                switch (lines[j].kind) {
+                    .add, .delete => {},
+                    .context, .meta => continue,
+                }
+                if (omit[j]) break;
+                feedChange(&hasher, lines[j]);
+                self.offer(hasher.peek(), .{ i, j }, null, i);
+            }
+        }
+    }
+
+    /// Regrouped pairs in `matchBlock` order, for entries no contiguous run
+    /// claimed. A one-sided block, and one delete beside one add, are already
+    /// contiguous runs. Wider blocks still enumerate every pair.
+    fn offerRegrouped(self: *Candidates, lines: []const diff.Line, omit: []const bool) void {
+        var b: usize = 0;
+        while (b < lines.len) {
+            switch (lines[b].kind) {
+                .add, .delete => {},
+                .context, .meta => {
+                    b += 1;
+                    continue;
+                },
+            }
+            const from = b;
+            while (b < lines.len) {
+                if (lines[b].kind == .context) break;
+                b += 1;
+            }
+            self.offerBlock(lines[from..b], from, omit);
+        }
+    }
+
+    fn offerBlock(self: *Candidates, block: []const diff.Line, base: usize, omit: []const bool) void {
+        var nd: usize = 0;
+        var na: usize = 0;
+        for (block) |ln| {
+            switch (ln.kind) {
+                .delete => nd += 1,
+                .add => na += 1,
+                else => {},
+            }
+        }
+        if (nd == 0 or na == 0) return;
+        if (nd == 1 and na == 1) return;
+
+        var ds: usize = 0;
+        while (ds < block.len) : (ds += 1) {
+            if (block[ds].kind != .delete) continue;
+            if (lineOmitted(omit, base + ds)) continue;
+
+            var hasher = Sha256.init(.{});
+            hasher.update(&.{hunk_tag});
+            var de = ds;
+            while (de < block.len) : (de += 1) {
+                switch (block[de].kind) {
+                    .delete => {},
+                    .add => break,
+                    .context, .meta => continue,
+                }
+                if (lineOmitted(omit, base + de)) break;
+                feedChange(&hasher, block[de]);
+                const after_del = hasher;
+
+                var as: usize = 0;
+                while (as < block.len) : (as += 1) {
+                    if (block[as].kind != .add) continue;
+                    if (lineOmitted(omit, base + as)) continue;
+                    var add_hasher = after_del;
+                    var ae = as;
+                    while (ae < block.len) : (ae += 1) {
+                        switch (block[ae].kind) {
+                            .add => {},
+                            .delete => break,
+                            .context, .meta => continue,
+                        }
+                        if (lineOmitted(omit, base + ae)) break;
+                        feedChange(&add_hasher, block[ae]);
+                        self.offer(
+                            add_hasher.peek(),
+                            .{ base + ds, base + de },
+                            .{ base + as, base + ae },
+                            base + @min(ds, as),
+                        );
+                    }
+                }
+            }
+        }
+    }
+};
 
 /// True when `hash` is this hunk, a contiguous run inside it, or a regrouped
 /// deletion/addition pair inside it.
@@ -544,17 +667,38 @@ pub fn place(
     d: *const diff.Diff,
     approved: *const Approved,
 ) Allocator.Error![]Placement {
-    const used = try alloc.alloc(bool, approved.entries.items.len);
+    const n = approved.entries.items.len;
+    const used = try alloc.alloc(bool, n);
     defer alloc.free(used);
     @memset(used, false);
+    const seen = try alloc.alloc(bool, n);
+    defer alloc.free(seen);
 
     var list: std.ArrayList(Placement) = .empty;
     errdefer list.deinit(alloc);
 
+    // Hash lists for one path live until `place` returns.
+    var scratch_arena = ArenaAllocator.init(alloc);
+    defer scratch_arena.deinit();
+
     for (d.files, 0..) |f, fi| {
         const path = f.displayPath();
+
+        // Index this path once. Lookups then hash each run one time.
+        var by_hash = ByHash.init(scratch_arena.allocator());
+        var live: usize = 0;
+        for (approved.entries.items, 0..) |e, ei| {
+            if (used[ei]) continue;
+            if (!std.mem.eql(u8, e.path, path)) continue;
+            const gop = try by_hash.getOrPut(e.hash);
+            if (!gop.found_existing) gop.value_ptr.* = .empty;
+            try gop.value_ptr.append(scratch_arena.allocator(), ei);
+            live += 1;
+        }
+
         if (f.hunks.len == 0) {
             // Hunk-less file: one hash of the worktree bytes.
+            if (live == 0) continue;
             const hash = hunklessHash(alloc, io, root, f) orelse continue;
             const ei = approved.take(used, path, hash) orelse continue;
             try list.append(alloc, .{
@@ -576,8 +720,10 @@ pub fn place(
             }
             if (changes == 0) {
                 // Context-only hunk: the tag-only fingerprint.
+                if (live == 0) continue;
                 const hash = fingerprintHunk(h.*);
                 const ei = approved.take(used, path, hash) orelse continue;
+                live -= 1;
                 try list.append(alloc, .{
                     .entry_i = ei,
                     .file_i = fi,
@@ -587,14 +733,25 @@ pub fn place(
                 });
                 continue;
             }
+            if (live == 0) continue;
 
             // Claim non-overlapping runs, earlier lines first.
             const omit = try alloc.alloc(bool, h.lines.len);
             defer alloc.free(omit);
             @memset(omit, false);
-            while (true) {
-                const found = earliest(approved, used, path, h.lines, omit) orelse break;
+            var candidates = Candidates{
+                .by_hash = &by_hash,
+                .used = used,
+                .seen = seen,
+            };
+            while (live > 0) {
+                @memset(seen, false);
+                candidates.best = null;
+                candidates.offerSpans(h.lines, omit);
+                candidates.offerRegrouped(h.lines, omit);
+                const found = candidates.best orelse break;
                 used[found.entry_i] = true;
+                live -= 1;
                 markClaim(omit, h.lines, found.span, found.add_span);
                 try list.append(alloc, .{
                     .entry_i = found.entry_i,
@@ -1202,38 +1359,38 @@ fn threeGroupDiff(alloc: Allocator) !diff.Diff {
 
 fn mergedNeighborDiff() []const u8 {
     return
-        \\diff --git a/f.txt b/f.txt
-        \\--- a/f.txt
-        \\+++ b/f.txt
-        \\@@ -5 +5 @@
-        \\-l5
-        \\+STAGED
+    \\diff --git a/f.txt b/f.txt
+    \\--- a/f.txt
+    \\+++ b/f.txt
+    \\@@ -5 +5 @@
+    \\-l5
+    \\+STAGED
     ;
 }
 
 fn mergedPieceDiff() []const u8 {
     return
-        \\diff --git a/f.txt b/f.txt
-        \\--- a/f.txt
-        \\+++ b/f.txt
-        \\@@ -6 +6 @@
-        \\-l6
-        \\+UNSTAGED
+    \\diff --git a/f.txt b/f.txt
+    \\--- a/f.txt
+    \\+++ b/f.txt
+    \\@@ -6 +6 @@
+    \\-l6
+    \\+UNSTAGED
     ;
 }
 
 fn mergedHunkDiff() []const u8 {
     return
-        \\diff --git a/f.txt b/f.txt
-        \\--- a/f.txt
-        \\+++ b/f.txt
-        \\@@ -4,5 +4,5 @@
-        \\ l4
-        \\-l5
-        \\-l6
-        \\+STAGED
-        \\+UNSTAGED
-        \\ l7
+    \\diff --git a/f.txt b/f.txt
+    \\--- a/f.txt
+    \\+++ b/f.txt
+    \\@@ -4,5 +4,5 @@
+    \\ l4
+    \\-l5
+    \\-l6
+    \\+STAGED
+    \\+UNSTAGED
+    \\ l7
     ;
 }
 

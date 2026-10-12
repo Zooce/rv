@@ -51,7 +51,7 @@ On `large_file`:
 
 - `approve_file` — `A`: one `git add`, reload, fingerprint every hunk, omit, paint.
 
-The TUI currently matches (`place`) more than once per `a` (reload compose, then prune, then omit). The bench times matching once.
+The TUI matches (`place`) twice per `a`: once when the reloaded diff is composed, and once when the new approval is hidden. The bench times matching once.
 
 ## Compare
 

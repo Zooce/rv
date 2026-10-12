@@ -1301,6 +1301,24 @@ fn rowsForApproved(
     return view.row.flattenPlaced(alloc, d, placed);
 }
 
+/// Place once. When `retain` is set, drop store entries that did not place.
+/// Rows omit those claims. `approved_n` is the store length after the drop.
+fn visibleRows(
+    alloc: std.mem.Allocator,
+    io: std.Io,
+    root: std.Io.Dir,
+    d: *const diff.Diff,
+    approved: *approve.Approved,
+    retain: bool,
+) std.mem.Allocator.Error!Visible {
+    const placed = try approve.place(alloc, io, root, d, approved);
+    defer alloc.free(placed);
+    const rows = try view.row.flattenPlaced(alloc, d, placed);
+    errdefer alloc.free(rows);
+    if (retain) try approved.retainPlaced(alloc, placed);
+    return .{ .rows = rows, .approved_n = approved.entries.items.len };
+}
+
 /// Load `.rv/approved.json`, drop entries that no longer match `d`, write
 /// the file when the set shrank, then build rows with the remaining claims
 /// removed. `approved_n` is how many entries remain.
@@ -1315,16 +1333,17 @@ fn loadVisibleRows(
 
     // Drop entries this diff cannot place, and write when the set shrank.
     const before = approved.entries.items.len;
-    try approved.prune(alloc, io, root, d);
+    const vis = try visibleRows(alloc, io, root, d, &approved, true);
     if (approved.entries.items.len != before) {
         approve.save(&approved, alloc, io, root) catch |err| switch (err) {
-            error.OutOfMemory => return error.OutOfMemory,
+            error.OutOfMemory => {
+                alloc.free(vis.rows);
+                return error.OutOfMemory;
+            },
             else => {},
         };
     }
-
-    const rows = try rowsForApproved(alloc, io, root, d, &approved);
-    return .{ .rows = rows, .approved_n = approved.entries.items.len };
+    return vis;
 }
 
 fn localVisible(
@@ -1929,30 +1948,31 @@ fn applyApprove(
         }
     }
 
-    // Prune only when the staged file is in this load; otherwise the new
-    // entries cannot be placed yet and must survive until the next reload.
-    if (live_file != null) {
-        try approved.prune(alloc, io, root, &diff_view.diff);
-    }
+    // Drop unplaceable entries only when the staged file is in this load.
+    // Otherwise the new entries cannot be placed yet and must survive.
+    const vis = try visibleRows(alloc, io, root, &diff_view.diff, &approved, live_file != null);
     approve.save(&approved, alloc, io, root) catch |err| switch (err) {
-        error.OutOfMemory => return error.OutOfMemory,
+        error.OutOfMemory => {
+            alloc.free(vis.rows);
+            return error.OutOfMemory;
+        },
         else => {
+            alloc.free(vis.rows);
             note.set("failed to save .rv approved store");
             return;
         },
     };
 
-    const new_rows = try rowsForApproved(alloc, io, root, &diff_view.diff, &approved);
     const restored: usize = if (hunk_mark) |m|
-        restoreNeighbor(new_rows, .{
+        restoreNeighbor(vis.rows, .{
             .path = mark_path.?,
             .group = m.group,
             .hunk_i = m.hunk_i,
         })
     else
         0;
-    diff_view.replaceRows(alloc, new_rows, approved.entries.items.len) catch {
-        alloc.free(new_rows);
+    diff_view.replaceRows(alloc, vis.rows, vis.approved_n) catch {
+        alloc.free(vis.rows);
         note.set("out of memory");
         return;
     };
@@ -1981,18 +2001,21 @@ fn unapproveRebuild(
     defer approved.deinit();
     approved.unapprove(item.path, item.hash) catch return false;
 
-    try approved.prune(alloc, io, root, &diff_view.diff);
+    const vis = try visibleRows(alloc, io, root, &diff_view.diff, &approved, true);
     approve.save(&approved, alloc, io, root) catch |err| switch (err) {
-        error.OutOfMemory => return error.OutOfMemory,
+        error.OutOfMemory => {
+            alloc.free(vis.rows);
+            return error.OutOfMemory;
+        },
         else => {
+            alloc.free(vis.rows);
             note.set("failed to save .rv approved store");
             return false;
         },
     };
 
-    const new_rows = try rowsForApproved(alloc, io, root, &diff_view.diff, &approved);
-    diff_view.replaceRows(alloc, new_rows, approved.entries.items.len) catch {
-        alloc.free(new_rows);
+    diff_view.replaceRows(alloc, vis.rows, vis.approved_n) catch {
+        alloc.free(vis.rows);
         note.set("out of memory");
         return false;
     };
