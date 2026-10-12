@@ -5,6 +5,7 @@
 //! or `perf` to a real `rv` for that (see README).
 //!
 //! Generates git fixtures under `/tmp`. No controlling terminal.
+//! Each fixture is timed `sample_n` times after a warmup. The table is the mean.
 
 const std = @import("std");
 const git = @import("git");
@@ -25,6 +26,8 @@ const large_stride: usize = 12;
 const term_size: tui.Size = .{ .cols = 100, .rows = 32 };
 
 const default_baseline = "bench/baseline.json";
+/// Warm passes averaged into each reported time and byte count. Spawns must match.
+const sample_n: usize = 3;
 
 const usage_text =
     \\rv-bench — load / paint / present / approve timings
@@ -38,6 +41,7 @@ const usage_text =
     \\
     \\Fixtures: small, untracked, large, large_file.
     \\Each step is a monotonic clock around one API (not a sampling profiler).
+    \\Each fixture is warmed, timed three times, and reported as the mean.
     \\
 ;
 
@@ -172,8 +176,29 @@ pub fn main(init: std.process.Init) !u8 {
 
     var kinds = want.iterator();
     while (kinds.next()) |kind| {
-        const run = try benchFixture(alloc, io, kind);
-        try runs.append(alloc, run);
+        // One warmup plus one timed pass per sample. Sum the times, then divide.
+        var run = try benchFixture(alloc, io, kind);
+        var s: usize = 1;
+        while (s < sample_n) : (s += 1) {
+            const extra = benchFixture(alloc, io, kind) catch |err| {
+                alloc.free(run.steps);
+                return err;
+            };
+            defer alloc.free(extra.steps);
+            addTimes(&run, extra) catch |err| {
+                alloc.free(run.steps);
+                return err;
+            };
+        }
+        const n: u64 = sample_n;
+        for (run.steps) |*st| {
+            st.ns = (st.ns + n / 2) / n;
+            st.bytes = (st.bytes + sample_n / 2) / sample_n;
+        }
+        runs.append(alloc, run) catch |err| {
+            alloc.free(run.steps);
+            return err;
+        };
     }
 
     var out_buf: [4096]u8 = undefined;
@@ -567,6 +592,28 @@ fn mutateOrPrint(alloc: Allocator, io: Io, cwd: std.process.Child.Cwd, opts: git
     };
 }
 
+/// Add one sample into `dst`. Shape and spawns must match. Times and bytes sum.
+fn addTimes(dst: *Run, src: Run) !void {
+    if (dst.files != src.files or dst.hunks != src.hunks or dst.rows != src.rows or dst.steps.len != src.steps.len) {
+        std.debug.print(
+            "rv-bench: {s} shape {d} files {d} hunks {d} rows {d} steps vs {d} {d} {d} {d}\n",
+            .{ dst.name, dst.files, dst.hunks, dst.rows, dst.steps.len, src.files, src.hunks, src.rows, src.steps.len },
+        );
+        return error.SampleMismatch;
+    }
+    for (dst.steps, src.steps) |*d, s| {
+        if (!std.mem.eql(u8, d.name, s.name) or d.spawns != s.spawns) {
+            std.debug.print(
+                "rv-bench: {s} {s} spawns {d} vs {s} spawns {d}\n",
+                .{ dst.name, d.name, d.spawns, s.name, s.spawns },
+            );
+            return error.SampleMismatch;
+        }
+        d.ns += s.ns;
+        d.bytes += s.bytes;
+    }
+}
+
 fn hunkCount(d: *const diff.Diff) usize {
     var n: usize = 0;
     for (d.files) |f| n += f.hunks.len;
@@ -705,6 +752,7 @@ fn fillLinesEdited(alloc: Allocator, n: usize) ![]u8 {
 }
 
 fn writeTable(out: *std.Io.Writer, runs: []const Run) !void {
+    try out.print("mean of {d} runs\n", .{sample_n});
     try out.writeAll("fixture     files  hunks   rows  step                    ms     alloc  spawns\n");
     for (runs) |run| {
         for (run.steps) |s| {
@@ -726,7 +774,7 @@ fn writeTable(out: *std.Io.Writer, runs: []const Run) !void {
 }
 
 fn writeJson(out: *std.Io.Writer, runs: []const Run) !void {
-    try out.writeAll("{\"fixtures\":[");
+    try out.print("{{\"samples\":{d},\"fixtures\":[", .{sample_n});
     for (runs, 0..) |run, ri| {
         if (ri > 0) try out.writeByte(',');
         try out.print(

@@ -37,7 +37,7 @@ Generated under `/tmp` and deleted after the run.
 
 `--fixture` can be passed more than once. Default is all three.
 
-Each fixture warms git and the page cache once, then times a second pass. `present` writes the cell-diff CSI stream to `/dev/null`. `present_noop` is the second paint+present with unchanged cells (goal 32).
+Each fixture is built three times. Each time warms git and the page cache, then times one pass. The table is the mean of those three times and byte counts, rounded to the nearest unit. Spawn counts must match on every pass; if they do not, the run stops. `present` writes the cell-diff CSI stream to `/dev/null`. `present_noop` is the second paint+present with unchanged cells (goal 32).
 
 ## Approve
 
@@ -62,7 +62,7 @@ mise run bench -- --compare
 mise run bench -- --write-baseline bench/baseline.json
 ```
 
-`--compare` prints baseline vs this run for each step (ms and spawns). Time moves around from run to run; spawn counts should not. The process exits `1` when any compared step’s spawn count changed, `2` when the baseline file is missing or invalid.
+`--compare` prints baseline vs this run for each step (ms and spawns). The reported time is a mean of three. The checked-in baseline is one timed pass from 2026-10-08, so its milliseconds are not a mean. Spawn counts should not change. The process exits `1` when any compared step’s spawn count changed, `2` when the baseline file is missing or invalid.
 
 After a load, paint, present, or approve change, re-run, read the compare table, and if the new numbers are the intended baseline:
 

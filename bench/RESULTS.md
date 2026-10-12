@@ -6,7 +6,7 @@ Snapshot from `mise run bench` (`zig build bench -Doptimize=ReleaseSafe`).
 - Host: AMD Ryzen AI 5 340, 12 CPUs, Linux 7.2.5-3-omarchy
 - git 2.55.0, Zig 0.17.0
 
-Re-run with `mise run bench -- --compare` against `baseline.json`. Time moves from run to run; spawn counts should not. After an intended shift, `--write-baseline bench/baseline.json` and replace this table.
+Re-run with `mise run bench -- --compare` against `baseline.json`. This snapshot is one timed pass. Current runs report the mean of three. Spawn counts should not change. After an intended shift, `--write-baseline bench/baseline.json` and replace this table.
 
 ```
 fixture     files  hunks   rows  step                    ms     alloc  spawns
