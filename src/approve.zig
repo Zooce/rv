@@ -30,11 +30,21 @@ const hunk_tag: u8 = 1;
 const file_tag: u8 = 2;
 
 /// SHA-256 of this hunk's add/delete lines (kind + length + text, in order).
+/// Also remembers the XOR of those lines' hashes for `place`.
 pub fn fingerprintHunk(hunk: diff.Hunk) Hash {
     var hasher = Sha256.init(.{});
     hasher.update(&.{hunk_tag});
-    for (hunk.lines) |line| feedChange(&hasher, line);
-    return hasher.finalResult();
+    var seq: u128 = 0;
+    for (hunk.lines) |line| {
+        feedChange(&hasher, line);
+        switch (line.kind) {
+            .add, .delete => seq ^= lineRoll(line),
+            .context, .meta => {},
+        }
+    }
+    const sha = hasher.finalResult();
+    rememberRoll(sha, seq);
+    return sha;
 }
 
 /// Kind byte, length, and text for one add or delete. Context and meta add nothing.
@@ -51,6 +61,57 @@ fn feedChange(hasher: *Sha256, line: diff.Line) void {
     hasher.update(line.text);
 }
 
+/// Odd mixer for one line's feed bytes.
+const roll_p: u128 = 0x9E3779B97F4A7C15F39CC0605CEDC835;
+
+/// Polynomial hash of one line's feed bytes (kind, length, text).
+/// The final mix spreads a last-byte change. Without it, `d0` and `d1`
+/// differ by 1 and the range XORs collide.
+fn lineRoll(line: diff.Line) u128 {
+    const kind: u8 = switch (line.kind) {
+        .add => '+',
+        .delete => '-',
+        .context, .meta => return 0,
+    };
+    var h: u128 = kind;
+    var len_buf: [4]u8 = undefined;
+    std.mem.writeInt(u32, &len_buf, @intCast(line.text.len), .little);
+    for (len_buf) |b| {
+        const byte: u128 = b;
+        h = h *% roll_p +% byte;
+    }
+    for (line.text) |b| {
+        const byte: u128 = b;
+        h = h *% roll_p +% byte;
+    }
+    h ^= h >> 64;
+    h *%= roll_p;
+    h ^= h >> 65;
+    h *%= roll_p;
+    return h;
+}
+
+// SHA-256 does not split across the delete/add join. The XOR of the line
+// hashes does: add = full ^ delete. Remembered here so `place` and
+// `hunkContains` can look up the add range. Filled by `fingerprintHunk` and
+// by loading a store that saved the roll. The entry stores it too, so the
+// next process can refill this cache.
+threadlocal var roll_cache: std.AutoHashMap(Hash, u128) = undefined;
+threadlocal var roll_cache_on = false;
+
+fn rememberRoll(sha: Hash, roll: u128) void {
+    if (!roll_cache_on) {
+        roll_cache = .init(std.heap.page_allocator);
+        roll_cache_on = true;
+    }
+    roll_cache.put(sha, roll) catch return;
+}
+
+fn recallRoll(sha: Hash) ?u128 {
+    if (!roll_cache_on) return null;
+    return roll_cache.get(sha);
+}
+
 /// SHA-256 of file bytes with a type tag that cannot collide with a hunk hash.
 pub fn fingerprintFile(bytes: []const u8) Hash {
     var hasher = Sha256.init(.{});
@@ -65,6 +126,11 @@ pub const rel_path = ".rv/approved.json";
 pub const Entry = struct {
     path: []const u8,
     hash: Hash,
+    /// XOR of each add/delete line hash for `hash`, when `roll_known`.
+    /// SHA-256 does not split; this does, so a wide block can solve for
+    /// the add range instead of hashing every pair.
+    roll: u128 = 0,
+    roll_known: bool = false,
 };
 
 pub const Approved = struct {
@@ -77,11 +143,15 @@ pub const Approved = struct {
     }
 
     /// Path is copied into the arena. Duplicate path+hash pairs are kept (multiset).
+    /// A line-hash XOR remembered for `hash` is kept with the entry.
     pub fn append(self: *Approved, path: []const u8, hash: Hash) Allocator.Error!void {
         const alloc = self.arena.allocator();
+        const roll = recallRoll(hash);
         try self.entries.append(alloc, .{
             .path = try alloc.dupe(u8, path),
             .hash = hash,
+            .roll = roll orelse 0,
+            .roll_known = roll != null,
         });
     }
 
@@ -207,7 +277,10 @@ pub fn save(self: *const Approved, alloc: Allocator, io: Io, root: Io.Dir) SaveE
 const WireEntry = struct {
     path: []const u8,
     hash: []const u8,
+    roll: []const u8 = "",
 };
+
+const roll_hex_len = 32;
 
 const WireFile = struct {
     version: u32 = schema_version,
@@ -231,22 +304,45 @@ fn parseJson(alloc: Allocator, raw: []const u8) LoadError!Approved {
     var approved = initEmpty(alloc);
     errdefer approved.deinit();
     for (parsed.value.entries) |we| {
-        try approved.append(we.path, try parseHash(we.hash));
+        const sha = try parseHash(we.hash);
+        try approved.append(we.path, sha);
+        if (we.roll.len == 0) continue;
+        const roll = try parseRoll(we.roll);
+        const e = &approved.entries.items[approved.entries.items.len - 1];
+        e.roll = roll;
+        e.roll_known = true;
+        rememberRoll(sha, roll);
     }
     return approved;
+}
+
+fn parseRoll(hex: []const u8) error{InvalidHash}!u128 {
+    if (hex.len != roll_hex_len) return error.InvalidHash;
+    var buf: [16]u8 = undefined;
+    _ = std.fmt.hexToBytes(&buf, hex) catch return error.InvalidHash;
+    return std.mem.readInt(u128, &buf, .big);
 }
 
 fn stringify(self: *const Approved, alloc: Allocator) Allocator.Error![]u8 {
     const hex_bufs = try alloc.alloc([hash_hex_len]u8, self.entries.items.len);
     defer alloc.free(hex_bufs);
+    const roll_bufs = try alloc.alloc([roll_hex_len]u8, self.entries.items.len);
+    defer alloc.free(roll_bufs);
     var wire_entries: std.ArrayList(WireEntry) = .empty;
     defer wire_entries.deinit(alloc);
     try wire_entries.ensureTotalCapacity(alloc, self.entries.items.len);
     for (self.entries.items, 0..) |e, i| {
         hex_bufs[i] = std.fmt.bytesToHex(e.hash, .lower);
+        const roll_hex: []const u8 = if (e.roll_known) blk: {
+            var be: [16]u8 = undefined;
+            std.mem.writeInt(u128, &be, e.roll, .big);
+            roll_bufs[i] = std.fmt.bytesToHex(be, .lower);
+            break :blk &roll_bufs[i];
+        } else "";
         wire_entries.appendAssumeCapacity(.{
             .path = e.path,
             .hash = &hex_bufs[i],
+            .roll = roll_hex,
         });
     }
     const wire: WireFile = .{
@@ -330,7 +426,37 @@ fn anyOmitted(lines: []const diff.Line, omit: []const bool) bool {
 /// Earliest contiguous add/delete run whose fingerprint is `hash`.
 /// A run stops at a claimed change line. Context is skipped, same as
 /// `fingerprintHunk`. `omit == null` means nothing is claimed yet.
+/// A remembered line-hash XOR confirms with SHA-256 only on a hit.
 fn firstSpan(lines: []const diff.Line, omit: ?[]const bool, hash: Hash) ?[2]usize {
+    if (recallRoll(hash)) |full| {
+        var roll_arena = ArenaAllocator.init(std.heap.page_allocator);
+        defer roll_arena.deinit();
+        return spanByRoll(roll_arena.allocator(), lines, omit, hash, full) catch
+            return spanScan(lines, omit, hash);
+    }
+    return spanScan(lines, omit, hash);
+}
+
+fn lineRolls(alloc: Allocator, lines: []const diff.Line) Allocator.Error![]u128 {
+    const line_h = try alloc.alloc(u128, lines.len);
+    for (lines, 0..) |ln, i| {
+        line_h[i] = switch (ln.kind) {
+            .add, .delete => lineRoll(ln),
+            else => 0,
+        };
+    }
+    return line_h;
+}
+
+fn digestSpan(lines: []const diff.Line, from: usize, to: usize) Hash {
+    var hasher = Sha256.init(.{});
+    hasher.update(&.{hunk_tag});
+    var i = from;
+    while (i <= to) : (i += 1) feedChange(&hasher, lines[i]);
+    return hasher.finalResult();
+}
+
+fn spanScan(lines: []const diff.Line, omit: ?[]const bool, hash: Hash) ?[2]usize {
     const open = if (omit) |bits| !anyOmitted(lines, bits) else true;
     var first: ?usize = null;
     var last: usize = 0;
@@ -380,6 +506,58 @@ fn firstSpan(lines: []const diff.Line, omit: ?[]const bool, hash: Hash) ?[2]usiz
     return null;
 }
 
+fn spanByRoll(alloc: Allocator, lines: []const diff.Line, omit: ?[]const bool, hash: Hash, full: u128) Allocator.Error!?[2]usize {
+    const line_h = try lineRolls(alloc, lines);
+    const open = if (omit) |bits| !anyOmitted(lines, bits) else true;
+    var first: ?usize = null;
+    var last: usize = 0;
+    var all: u128 = 0;
+    for (lines, 0..) |ln, i| {
+        switch (ln.kind) {
+            .add, .delete => {
+                if (first == null) first = i;
+                last = i;
+                all ^= line_h[i];
+            },
+            .context, .meta => {},
+        }
+    }
+    const start = first orelse return null;
+    if (open and all == full) {
+        const whole = fingerprintHunk(.{
+            .old_start = 0,
+            .old_count = null,
+            .new_start = 0,
+            .new_count = null,
+            .lines = lines,
+        });
+        if (std.mem.eql(u8, &whole, &hash)) return .{ start, last };
+    }
+
+    var i: usize = 0;
+    while (i < lines.len) : (i += 1) {
+        switch (lines[i].kind) {
+            .add, .delete => {},
+            .context, .meta => continue,
+        }
+        if (omit) |bits| if (i < bits.len and bits[i]) continue;
+
+        var seq: u128 = 0;
+        var j = i;
+        while (j < lines.len) : (j += 1) {
+            switch (lines[j].kind) {
+                .add, .delete => {},
+                .context, .meta => continue,
+            }
+            if (omit) |bits| if (j < bits.len and bits[j]) break;
+            seq ^= line_h[j];
+            if (seq != full) continue;
+            if (std.mem.eql(u8, &digestSpan(lines, i, j), &hash)) return .{ i, j };
+        }
+    }
+    return null;
+}
+
 const Split = struct {
     del: [2]usize,
     add: [2]usize,
@@ -416,6 +594,8 @@ fn lineOmitted(omit: ?[]const bool, i: usize) bool {
 
 /// Delete subslices by add subslices inside one change block. Both sides are
 /// non-empty; a one-sided edit stays a contiguous run for `firstSpan`.
+/// A remembered line-hash XOR solves for the add range. SHA-256 confirms
+/// that hit. Without the XOR, every pair is hashed.
 fn matchBlock(block: []const diff.Line, base: usize, omit: ?[]const bool, hash: Hash) ?Split {
     var nd: usize = 0;
     var na: usize = 0;
@@ -427,7 +607,16 @@ fn matchBlock(block: []const diff.Line, base: usize, omit: ?[]const bool, hash: 
         }
     }
     if (nd == 0 or na == 0) return null;
+    if (recallRoll(hash)) |full| {
+        var roll_arena = ArenaAllocator.init(std.heap.page_allocator);
+        defer roll_arena.deinit();
+        return findSplit(roll_arena.allocator(), block, base, omit, full, hash) catch
+            return matchBlockPairs(block, base, omit, hash);
+    }
+    return matchBlockPairs(block, base, omit, hash);
+}
 
+fn matchBlockPairs(block: []const diff.Line, base: usize, omit: ?[]const bool, hash: Hash) ?Split {
     var ds: usize = 0;
     while (ds < block.len) : (ds += 1) {
         if (block[ds].kind != .delete) continue;
@@ -474,6 +663,109 @@ fn matchBlock(block: []const diff.Line, base: usize, omit: ?[]const bool, hash: 
     return null;
 }
 
+const range_none = std.math.maxInt(usize);
+
+const Range = struct {
+    start: usize,
+    end: usize,
+    roll: u128,
+    next: usize = range_none,
+};
+
+const Chain = struct {
+    head: usize,
+    tail: usize,
+};
+
+fn collectHalf(
+    alloc: Allocator,
+    block: []const diff.Line,
+    base: usize,
+    omit: ?[]const bool,
+    line_h: []const u128,
+    kind: diff.LineKind,
+    out: *std.ArrayList(Range),
+) Allocator.Error!void {
+    var s: usize = 0;
+    while (s < block.len) : (s += 1) {
+        if (block[s].kind != kind) continue;
+        if (lineOmitted(omit, base + s)) continue;
+        var seq: u128 = 0;
+        var e = s;
+        while (e < block.len) : (e += 1) {
+            switch (block[e].kind) {
+                .delete => if (kind != .delete) break,
+                .add => if (kind != .add) break,
+                .context, .meta => continue,
+            }
+            if (lineOmitted(omit, base + e)) break;
+            seq ^= line_h[e];
+            try out.append(alloc, .{
+                .start = s,
+                .end = e,
+                .roll = seq,
+            });
+        }
+    }
+}
+
+fn digestPair(block: []const diff.Line, del: Range, add: Range) Hash {
+    var hasher = Sha256.init(.{});
+    hasher.update(&.{hunk_tag});
+    var i = del.start;
+    while (i <= del.end) : (i += 1) feedChange(&hasher, block[i]);
+    i = add.start;
+    while (i <= add.end) : (i += 1) feedChange(&hasher, block[i]);
+    return hasher.finalResult();
+}
+
+/// First delete range, then earliest add range, in `matchBlock` order, whose
+/// line-hash XOR completes `full` and whose SHA-256 is `sha`.
+fn findSplit(
+    alloc: Allocator,
+    block: []const diff.Line,
+    base: usize,
+    omit: ?[]const bool,
+    full: u128,
+    sha: Hash,
+) Allocator.Error!?Split {
+    const line_h = try lineRolls(alloc, block);
+    var deletes: std.ArrayList(Range) = .empty;
+    var adds: std.ArrayList(Range) = .empty;
+    try collectHalf(alloc, block, base, omit, line_h, .delete, &deletes);
+    try collectHalf(alloc, block, base, omit, line_h, .add, &adds);
+    if (deletes.items.len == 0 or adds.items.len == 0) return null;
+
+    var by_add = std.AutoHashMap(u128, Chain).init(alloc);
+    for (adds.items, 0..) |r, i| {
+        const gop = try by_add.getOrPut(r.roll);
+        if (!gop.found_existing) {
+            gop.value_ptr.* = .{ .head = i, .tail = i };
+        } else {
+            adds.items[gop.value_ptr.tail].next = i;
+            gop.value_ptr.tail = i;
+        }
+    }
+
+    for (deletes.items) |del| {
+        const chain = by_add.get(full ^ del.roll) orelse continue;
+        var idx = chain.head;
+        while (idx != range_none) {
+            const add = adds.items[idx];
+            const got = digestPair(block, del, add);
+            if (std.mem.eql(u8, &got, &sha)) {
+                return .{
+                    .del = .{ base + del.start, base + del.end },
+                    .add = .{ base + add.start, base + add.end },
+                    .start = base + @min(del.start, add.start),
+                };
+            }
+            idx = add.next;
+        }
+    }
+    return null;
+}
+
 const Found = struct {
     entry_i: usize,
     span: [2]usize,
@@ -513,8 +805,86 @@ const Candidates = struct {
     }
 
     /// Contiguous runs in `firstSpan` order. With nothing omitted, the whole
-    /// hunk hash is offered before any shorter prefix.
-    fn offerSpans(self: *Candidates, lines: []const diff.Line, omit: []const bool) void {
+    /// hunk hash is offered before any shorter prefix. Known line-hash XORs
+    /// skip SHA-256 until a prefix matches. An unknown roll keeps the scan.
+    fn offerSpans(self: *Candidates, alloc: Allocator, lines: []const diff.Line, omit: []const bool) Allocator.Error!void {
+        if (try self.spansSolved(alloc, lines, omit)) return;
+        self.spansScan(lines, omit);
+    }
+
+    fn spansSolved(self: *Candidates, alloc: Allocator, lines: []const diff.Line, omit: []const bool) Allocator.Error!bool {
+        var rolls: std.ArrayList(u128) = .empty;
+        defer rolls.deinit(alloc);
+        var live = false;
+        var it = self.by_hash.iterator();
+        while (it.next()) |ent| {
+            if (bucketIdle(self, ent.value_ptr.items)) continue;
+            live = true;
+            const roll = recallRoll(ent.key_ptr.*) orelse return false;
+            try rolls.append(alloc, roll);
+        }
+        if (!live) return true;
+
+        const line_h = try lineRolls(alloc, lines);
+        defer alloc.free(line_h);
+        const want = rolls.items;
+        const open = !anyOmitted(lines, omit);
+        var first: ?usize = null;
+        var last: usize = 0;
+        var all: u128 = 0;
+        for (lines, 0..) |ln, i| {
+            switch (ln.kind) {
+                .add, .delete => {
+                    if (first == null) first = i;
+                    last = i;
+                    all ^= line_h[i];
+                },
+                .context, .meta => {},
+            }
+        }
+        const start = first orelse return true;
+        if (open) {
+            for (want) |roll| {
+                if (roll != all) continue;
+                const whole = fingerprintHunk(.{
+                    .old_start = 0,
+                    .old_count = null,
+                    .new_start = 0,
+                    .new_count = null,
+                    .lines = lines,
+                });
+                self.offer(whole, .{ start, last }, null, start);
+                break;
+            }
+        }
+
+        var i: usize = 0;
+        while (i < lines.len) : (i += 1) {
+            switch (lines[i].kind) {
+                .add, .delete => {},
+                .context, .meta => continue,
+            }
+            if (omit[i]) continue;
+            var seq: u128 = 0;
+            var j = i;
+            while (j < lines.len) : (j += 1) {
+                switch (lines[j].kind) {
+                    .add, .delete => {},
+                    .context, .meta => continue,
+                }
+                if (omit[j]) break;
+                seq ^= line_h[j];
+                for (want) |roll| {
+                    if (roll != seq) continue;
+                    self.offer(digestSpan(lines, i, j), .{ i, j }, null, i);
+                    break;
+                }
+            }
+        }
+        return true;
+    }
+
+    fn spansScan(self: *Candidates, lines: []const diff.Line, omit: []const bool) void {
         const open = !anyOmitted(lines, omit);
         var first: ?usize = null;
         var last: usize = 0;
@@ -564,8 +934,8 @@ const Candidates = struct {
 
     /// Regrouped pairs in `matchBlock` order, for entries no contiguous run
     /// claimed. A one-sided block, and one delete beside one add, are already
-    /// contiguous runs. Wider blocks still enumerate every pair.
-    fn offerRegrouped(self: *Candidates, lines: []const diff.Line, omit: []const bool) void {
+    /// contiguous runs. A wider block hashes each side once, then solves.
+    fn offerRegrouped(self: *Candidates, alloc: Allocator, lines: []const diff.Line, omit: []const bool) Allocator.Error!void {
         var b: usize = 0;
         while (b < lines.len) {
             switch (lines[b].kind) {
@@ -580,11 +950,11 @@ const Candidates = struct {
                 if (lines[b].kind == .context) break;
                 b += 1;
             }
-            self.offerBlock(lines[from..b], from, omit);
+            try self.offerBlock(alloc, lines[from..b], from, omit);
         }
     }
 
-    fn offerBlock(self: *Candidates, block: []const diff.Line, base: usize, omit: []const bool) void {
+    fn offerBlock(self: *Candidates, alloc: Allocator, block: []const diff.Line, base: usize, omit: []const bool) Allocator.Error!void {
         var nd: usize = 0;
         var na: usize = 0;
         for (block) |ln| {
@@ -597,6 +967,41 @@ const Candidates = struct {
         if (nd == 0 or na == 0) return;
         if (nd == 1 and na == 1) return;
 
+        var known = false;
+        var blind = false;
+        var it = self.by_hash.iterator();
+        while (it.next()) |ent| {
+            if (bucketIdle(self, ent.value_ptr.items)) continue;
+            if (recallRoll(ent.key_ptr.*) != null) known = true else blind = true;
+        }
+        if (known) {
+            var roll_arena = ArenaAllocator.init(alloc);
+            defer roll_arena.deinit();
+            try self.offerSolved(roll_arena.allocator(), block, base, omit);
+        }
+        if (blind) self.offerPairs(block, base, omit);
+    }
+
+    fn bucketIdle(self: *const Candidates, items: []const usize) bool {
+        for (items) |ei| {
+            if (!self.used[ei] and !self.seen[ei]) return false;
+        }
+        return true;
+    }
+
+    fn offerSolved(self: *Candidates, alloc: Allocator, block: []const diff.Line, base: usize, omit: []const bool) Allocator.Error!void {
+        var it = self.by_hash.iterator();
+        while (it.next()) |ent| {
+            if (bucketIdle(self, ent.value_ptr.items)) continue;
+            const full = recallRoll(ent.key_ptr.*) orelse continue;
+            const hit = try findSplit(alloc, block, base, omit, full, ent.key_ptr.*);
+            if (hit) |split| {
+                self.offer(ent.key_ptr.*, split.del, split.add, split.start);
+            }
+        }
+    }
+
+    fn offerPairs(self: *Candidates, block: []const diff.Line, base: usize, omit: []const bool) void {
         var ds: usize = 0;
         while (ds < block.len) : (ds += 1) {
             if (block[ds].kind != .delete) continue;
@@ -747,8 +1152,8 @@ pub fn place(
             while (live > 0) {
                 @memset(seen, false);
                 candidates.best = null;
-                candidates.offerSpans(h.lines, omit);
-                candidates.offerRegrouped(h.lines, omit);
+                try candidates.offerSpans(alloc, h.lines, omit);
+                try candidates.offerRegrouped(alloc, h.lines, omit);
                 const found = candidates.best orelse break;
                 used[found.entry_i] = true;
                 live -= 1;
@@ -1695,4 +2100,202 @@ test "collectApproved hunk-less binary" {
     try testing.expectEqualStrings("pic.png", items[0].path);
     try testing.expectEqual(Hidden.Kind.binary, items[0].kind);
     try testing.expectEqualStrings("", items[0].preview);
+}
+
+test "regrouped tie-break keeps the earlier start line" {
+    const io = testing.io;
+    const alloc = testing.allocator;
+    const txt =
+        \\diff --git a/f.txt b/f.txt
+        \\--- a/f.txt
+        \\+++ b/f.txt
+        \\@@ -1,2 +1,2 @@
+        \\-firstD
+        \\-secondD
+        \\+firstA
+        \\+secondA
+    ;
+    const later =
+        \\diff --git a/f.txt b/f.txt
+        \\--- a/f.txt
+        \\+++ b/f.txt
+        \\@@ -2 +2 @@
+        \\-secondD
+        \\+secondA
+    ;
+    const earlier =
+        \\diff --git a/f.txt b/f.txt
+        \\--- a/f.txt
+        \\+++ b/f.txt
+        \\@@ -1 +1 @@
+        \\-firstD
+        \\+firstA
+    ;
+    var wide = try parseOneHunk(txt);
+    defer wide.deinit();
+    var late = try parseOneHunk(later);
+    defer late.deinit();
+    var early = try parseOneHunk(earlier);
+    defer early.deinit();
+    const path = wide.files[0].displayPath();
+    var approved = initEmpty(alloc);
+    defer approved.deinit();
+    try approved.append(path, fingerprintHunk(late.files[0].hunks[0]));
+    try approved.append(path, fingerprintHunk(early.files[0].hunks[0]));
+    const placed = try place(alloc, io, .cwd(), &wide, &approved);
+    defer alloc.free(placed);
+    try testing.expectEqual(2, placed.len);
+    try testing.expectEqual(1, placed[0].entry_i);
+    try testing.expectEqualStrings("firstD", placed[0].preview);
+    try testing.expectEqual(0, placed[1].entry_i);
+    try testing.expectEqualStrings("secondD", placed[1].preview);
+}
+
+test "identical regrouped lines keep the earlier pair" {
+    const io = testing.io;
+    const alloc = testing.allocator;
+    // The two `-same`/`+same` pairs share a line-hash XOR. `+otherA` sits
+    // between them so the pair is not also a contiguous run.
+    const txt =
+        \\diff --git a/f.txt b/f.txt
+        \\--- a/f.txt
+        \\+++ b/f.txt
+        \\@@ -1,2 +1,3 @@
+        \\-same
+        \\-same
+        \\+otherA
+        \\+same
+        \\+same
+    ;
+    const piece =
+        \\diff --git a/f.txt b/f.txt
+        \\--- a/f.txt
+        \\+++ b/f.txt
+        \\@@ -1 +1 @@
+        \\-same
+        \\+same
+    ;
+    var wide = try parseOneHunk(txt);
+    defer wide.deinit();
+    var one = try parseOneHunk(piece);
+    defer one.deinit();
+    const lines = wide.files[0].hunks[0].lines;
+    const del = lineAt(lines, "same") orelse return error.MissingLine;
+    var approved = initEmpty(alloc);
+    defer approved.deinit();
+    try approved.append(wide.files[0].displayPath(), fingerprintHunk(one.files[0].hunks[0]));
+    const placed = try place(alloc, io, .cwd(), &wide, &approved);
+    defer alloc.free(placed);
+    try testing.expectEqual(1, placed.len);
+    try testing.expectEqual(del, placed[0].span.?[0]);
+    try testing.expectEqual(del, placed[0].span.?[1]);
+    try testing.expectEqual(del + 3, placed[0].add_span.?[0]);
+    try testing.expectEqual(del + 3, placed[0].add_span.?[1]);
+    try testing.expectEqualStrings("same", lines[del + 3].text);
+    try testing.expect(lines[del + 3].kind == .add);
+    try testing.expectEqualStrings("same", placed[0].preview);
+}
+
+fn lineAt(lines: []const diff.Line, text: []const u8) ?usize {
+    for (lines, 0..) |ln, i| {
+        if (std.mem.eql(u8, ln.text, text)) return i;
+    }
+    return null;
+}
+
+test "wide change block matches and misses in under 100 ms" {
+    if (builtin.os.tag == .wasi) return;
+    const io = testing.io;
+    const alloc = testing.allocator;
+    const n: usize = 160;
+    var text: std.Io.Writer.Allocating = .init(alloc);
+    defer text.deinit();
+    try text.writer.writeAll(
+        \\diff --git a/f.txt b/f.txt
+        \\--- a/f.txt
+        \\+++ b/f.txt
+        \\@@ -1 +1 @@
+        \\ ctx
+        \\
+    );
+    var i: usize = 0;
+    while (i < n) : (i += 1) {
+        if (i == 40) try text.writer.writeAll("-alphaOne\n") else if (i == 41) try text.writer.writeAll("-alphaTwo\n") else try text.writer.print("-d{d}\n", .{i});
+    }
+    i = 0;
+    while (i < n) : (i += 1) {
+        if (i == 70) try text.writer.writeAll("+betaOne\n") else if (i == 71) try text.writer.writeAll("+betaTwo\n") else try text.writer.print("+a{d}\n", .{i});
+    }
+    try text.writer.writeAll(" tail\n");
+    const wide_txt = try text.toOwnedSlice();
+    defer alloc.free(wide_txt);
+
+    const kept =
+        \\diff --git a/f.txt b/f.txt
+        \\--- a/f.txt
+        \\+++ b/f.txt
+        \\@@ -1,2 +1,2 @@
+        \\-alphaOne
+        \\-alphaTwo
+        \\+betaOne
+        \\+betaTwo
+    ;
+    const nope =
+        \\diff --git a/f.txt b/f.txt
+        \\--- a/f.txt
+        \\+++ b/f.txt
+        \\@@ -1 +1 @@
+        \\-nopeDel
+        \\+nopeAdd
+    ;
+    var wide = try parseOneHunk(wide_txt);
+    defer wide.deinit();
+    var piece = try parseOneHunk(kept);
+    defer piece.deinit();
+    var other = try parseOneHunk(nope);
+    defer other.deinit();
+    const lines = wide.files[0].hunks[0].lines;
+    const del0 = lineAt(lines, "alphaOne") orelse return error.MissingLine;
+    const del1 = lineAt(lines, "alphaTwo") orelse return error.MissingLine;
+    const add0 = lineAt(lines, "betaOne") orelse return error.MissingLine;
+    const add1 = lineAt(lines, "betaTwo") orelse return error.MissingLine;
+    const path = wide.files[0].displayPath();
+    const hit = fingerprintHunk(piece.files[0].hunks[0]);
+    const miss = fingerprintHunk(other.files[0].hunks[0]);
+
+    var tmp = try IsolatedTmp.init(alloc, io);
+    defer tmp.deinit(alloc, io);
+    var stored = initEmpty(alloc);
+    defer stored.deinit();
+    try stored.append(path, hit);
+    try save(&stored, alloc, io, tmp.dir);
+    var loaded = try load(alloc, io, tmp.dir);
+    defer loaded.deinit();
+    try testing.expect(loaded.entries.items[0].roll_known);
+
+    const t0 = std.Io.Clock.awake.now(io).nanoseconds;
+    const placed = try place(alloc, io, .cwd(), &wide, &loaded);
+    defer alloc.free(placed);
+    const hit_ok = hunkContains(wide.files[0].hunks[0], hit);
+    const hit_ns = std.Io.Clock.awake.now(io).nanoseconds - t0;
+    try testing.expect(hit_ok);
+    try testing.expectEqual(1, placed.len);
+    try testing.expectEqual(del0, placed[0].span.?[0]);
+    try testing.expectEqual(del1, placed[0].span.?[1]);
+    try testing.expectEqual(add0, placed[0].add_span.?[0]);
+    try testing.expectEqual(add1, placed[0].add_span.?[1]);
+    try testing.expectEqualStrings("alphaOne", placed[0].preview);
+    try testing.expect(hit_ns < 100_000_000);
+
+    var missed = initEmpty(alloc);
+    defer missed.deinit();
+    try missed.append(path, miss);
+    const t1 = std.Io.Clock.awake.now(io).nanoseconds;
+    const none = try place(alloc, io, .cwd(), &wide, &missed);
+    defer alloc.free(none);
+    const miss_ok = !hunkContains(wide.files[0].hunks[0], miss);
+    const miss_ns = std.Io.Clock.awake.now(io).nanoseconds - t1;
+    try testing.expectEqual(0, none.len);
+    try testing.expect(miss_ok);
+    try testing.expect(miss_ns < 100_000_000);
 }
