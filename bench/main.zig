@@ -463,7 +463,7 @@ fn shownFor(
         .title = "rv-bench",
         .show_footer = true,
         .source_label = "HEAD",
-        .empty_label = "HEAD · empty",
+        .empty_label = "HEAD  empty",
         .open_n = 0,
         .hints = .{},
         .area = .init(term_size, 1),

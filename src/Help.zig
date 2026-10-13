@@ -44,7 +44,7 @@ const entries = [_]Entry{
     .{ .item = .{ .key = "a/A", .label = "approve hunk / file (stages, then hides)" } },
     .blank,
     .{ .group = "Session" },
-    .{ .item = .{ .key = "t", .label = "layout" } },
+    .{ .item = .{ .key = "t", .label = "layout (footer sbs, uni, uni~)" } },
     .{ .item = .{ .key = "#", .label = "line numbers" } },
     .{ .item = .{ .key = "w", .label = "wrap" } },
     .{ .item = .{ .key = "e", .label = "expand hunk context" } },

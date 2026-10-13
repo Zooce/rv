@@ -69,7 +69,7 @@ tmux send-keys -t rv-drive /absolute/path/to/zig-out/bin/rv Enter
 - Send one key at a time: `tmux send-keys -t rv-drive ]`. tmux key names are `Enter`, `Space`, and `Escape`. A word with no spaces (`noteone`) is typed as letters. A leader and its letter are two sends: `Space`, then `a`.
 - After each send, poll `tmux capture-pane -p -t rv-drive` about every 0.1s until the text matches, and give up after a few seconds. Wait until the screen shows the state you set up before the first key. A fixed sleep is not a check. Staging and a reload need a longer wait than a cursor move. Wait until the pane shows the result before you send the next key. Queuing `Space`, `a`, and `Enter` in one burst can press `Enter` before the list is open.
 - Check the text and files that this change is supposed to affect. A token that appears only in the fixture is easier to see than a word that also appears in a title or the footer. When the key writes the approved store, the comment store, or the index, also read `.rv/approved.json` (`entries[].path`), `.rv/reviews/current.json`, or `git diff --cached`. `capture-pane -p` has no color and no reverse video, so it does not mark the selected row. Judge the cursor by which text is on screen and by what the next key does.
-- While diff rows are still on screen, the word `approved` means the approved list is open (its title bar contains it). The footer prints `HEAD · N approved` only when the row list is empty and the approved count is greater than zero.
+- While diff rows are still on screen, the word `approved` means the approved list is open (its overlay caption contains it). The footer prints `HEAD  N approved` only when the row list is empty and the approved count is greater than zero.
 - On a timeout, keep the pane text and say which step failed. Put a one-off driver script in `/tmp` and delete it when the check is done. A path that should stay covered is a script under `regress/tui/`.
 
 ### Repository
@@ -102,7 +102,7 @@ Drive the keys the change uses. These notes are for keys that are easy to get wr
 | `A` | Approve the whole file, including from that file's header. |
 | Space, then `a` | Open the approved list. It opens on an approved identity in the file under the cursor, otherwise on the first row. From a section header the list cursor stays on the first row. |
 | Enter | On that list: drop one matching store entry, rebuild, move to that row, and close the list. The change stays staged. |
-| `i`, text, Enter | On a hunk header, open a hunk comment. The title contains `create/edit hunk`. Enter saves. |
+| `i`, text, Enter | On a hunk header, open a hunk comment. The title contains `hunk comment`. Enter saves. |
 | `a` or `A` when that hunk has a live comment | Confirm dialog, No selected. `y` approves. |
 | `)` | Next comment, wrapping. A comment on a hidden hunk unapproves that hunk and lands on it. |
 | `q` | Quit to the shell. |

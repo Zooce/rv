@@ -6,21 +6,21 @@ seed user line_numbers = true
 seed repo line_numbers = false
 seed repo wrap = true
 wait Unstaged
-wait  open  uni
+wait  uni
 gone uni~
-gone  open  sbs
+gone  sbs
 wait  wrap
 wait one
 gone 1 one
 send t
-wait  open  sbs
+wait  sbs
 wait  wrap
 send q
 gone Unstaged
 restart
 wait Unstaged
-wait  open  uni
-gone  open  sbs
+wait  uni
+gone  sbs
 wait  wrap
 wait one
 gone 1 one

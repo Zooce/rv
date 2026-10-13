@@ -739,6 +739,8 @@ fn layoutFooterLabel(pref: view.layout.LayoutPref, cols: u16) []const u8 {
     };
 }
 
+/// Source, path, hunk, line, open comments, layout, wrap. A zero comment
+/// count is left off. Layout stays `sbs`, `uni`, or `uni~`.
 fn formatFooter(
     buf: []u8,
     place: view.nav.CursorLoc,
@@ -752,25 +754,31 @@ fn formatFooter(
     if (place.row_n == 0) return empty_label;
     const mode = layoutFooterLabel(layout_pref, cols);
     const wrap_tag: []const u8 = if (wrap) "  wrap" else "";
+    var comments_buf: [32]u8 = undefined;
+    const comments: []const u8 = if (open_n == 0)
+        ""
+    else
+        std.fmt.bufPrint(&comments_buf, "  {d} comments", .{open_n}) catch "";
+    const path = if (place.path.len > 0) place.path else "?";
     if (place.hunk_n == 0) {
-        return bufPrintTrunc(buf, "{s}  {s}  {d}/{d}  {d} open  {s}{s}", .{
+        return bufPrintTrunc(buf, "{s}  {s}  line {d}/{d}{s}  {s}{s}", .{
             source_label,
-            if (place.path.len > 0) place.path else "?",
+            path,
             place.row_i,
             place.row_n,
-            open_n,
+            comments,
             mode,
             wrap_tag,
         });
     }
-    return bufPrintTrunc(buf, "{s}  {s}  hunk {d}/{d}  {d}/{d}  {d} open  {s}{s}", .{
+    return bufPrintTrunc(buf, "{s}  {s}  hunk {d}/{d}  line {d}/{d}{s}  {s}{s}", .{
         source_label,
-        if (place.path.len > 0) place.path else "?",
+        path,
         place.hunk_i,
         place.hunk_n,
         place.row_i,
         place.row_n,
-        open_n,
+        comments,
         mode,
         wrap_tag,
     });
@@ -1618,12 +1626,12 @@ test "formatFooter approved-only is not a clean worktree" {
         .row_n = 0,
     };
     try testing.expectEqualStrings(
-        "HEAD · empty",
-        formatFooter(&buf, empty, 0, .side_by_side, 80, "HEAD", "HEAD · empty", false),
+        "HEAD  empty",
+        formatFooter(&buf, empty, 0, .side_by_side, 80, "HEAD", "HEAD  empty", false),
     );
     try testing.expectEqualStrings(
-        "HEAD · 2 approved",
-        formatFooter(&buf, empty, 0, .side_by_side, 80, "HEAD", "HEAD · 2 approved", false),
+        "HEAD  2 approved",
+        formatFooter(&buf, empty, 0, .side_by_side, 80, "HEAD", "HEAD  2 approved", false),
     );
     try testing.expectEqualStrings(
         "main...HEAD",
@@ -1644,9 +1652,46 @@ test "formatFooter shows wrap when on" {
         .row_i = 1,
         .row_n = 2,
     };
-    const off = formatFooter(&buf, place, 0, .unified, 80, "HEAD", "HEAD · empty", false);
+    const off = formatFooter(&buf, place, 0, .unified, 80, "HEAD", "HEAD  empty", false);
     try testing.expect(std.mem.indexOf(u8, off, "wrap") == null);
     var buf2: [96]u8 = undefined;
-    const on = formatFooter(&buf2, place, 0, .unified, 80, "HEAD", "HEAD · empty", true);
+    const on = formatFooter(&buf2, place, 0, .unified, 80, "HEAD", "HEAD  empty", true);
     try testing.expect(std.mem.indexOf(u8, on, "wrap") != null);
+}
+
+test "formatFooter names the line and open comments" {
+    var buf: [128]u8 = undefined;
+    const place = view.nav.CursorLoc{
+        .path = "f",
+        .hunk_i = 2,
+        .hunk_n = 4,
+        .row_i = 9,
+        .row_n = 20,
+    };
+    try testing.expectEqualStrings(
+        "HEAD  f  hunk 2/4  line 9/20  sbs",
+        formatFooter(&buf, place, 0, .side_by_side, 80, "HEAD", "HEAD  empty", false),
+    );
+    var buf2: [128]u8 = undefined;
+    try testing.expectEqualStrings(
+        "HEAD  f  hunk 2/4  line 9/20  3 comments  sbs  wrap",
+        formatFooter(&buf2, place, 3, .side_by_side, 80, "HEAD", "HEAD  empty", true),
+    );
+    var buf3: [128]u8 = undefined;
+    const file = view.nav.CursorLoc{
+        .path = "f",
+        .hunk_i = 0,
+        .hunk_n = 0,
+        .row_i = 1,
+        .row_n = 2,
+    };
+    try testing.expectEqualStrings(
+        "HEAD  f  line 1/2  uni",
+        formatFooter(&buf3, file, 0, .unified, 80, "HEAD", "HEAD  empty", false),
+    );
+    var buf4: [128]u8 = undefined;
+    try testing.expectEqualStrings(
+        "HEAD  f  line 1/2  uni~",
+        formatFooter(&buf4, file, 0, .side_by_side, 40, "HEAD", "HEAD  empty", false),
+    );
 }

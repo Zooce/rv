@@ -5,6 +5,6 @@ send }
 wait HEAD  big.txt  hunk 0/167
 send A
 gone Unstaged
-wait HEAD · 167 approved
+wait HEAD  167 approved
 approved big.txt
 staged big.txt

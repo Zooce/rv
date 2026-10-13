@@ -29,6 +29,7 @@ until HEAD  b.txt {
 send Space
 send f
 wait files
+wait Esc close
 send g
 send g
 send Enter
@@ -89,28 +90,28 @@ send g
 wait Unstaged
 send Space
 send a
-wait rv  approved
+wait Enter unapprove
 send j
 send g
 send g
 send g
 send g
 send Enter
-gone rv  approved
+gone Enter unapprove
 wait HEAD  fav.txt
 
 # Three rows remain. Newly staged paths follow the index, so b.txt is last.
 # j is the middle. ge lands on b.txt. A second ge stays.
 send Space
 send a
-wait rv  approved
+wait Enter unapprove
 send j
 send g
 send e
 send g
 send e
 send Enter
-gone rv  approved
+gone Enter unapprove
 wait HEAD  b.txt
 
 # Comment list, store order, on files that are still visible.
@@ -121,7 +122,7 @@ until HEAD  dir/nest.txt }
 send ]
 wait HEAD  dir/nest.txt  hunk
 send i
-wait create/edit hunk
+wait hunk comment
 send notealpha
 send Enter
 review notealpha
@@ -130,7 +131,7 @@ until HEAD  intra.txt }
 send ]
 wait HEAD  intra.txt  hunk
 send i
-wait create/edit hunk
+wait hunk comment
 send notemiddle
 send Enter
 review notemiddle
@@ -139,7 +140,7 @@ until HEAD  twohunk.txt }
 send ]
 wait HEAD  twohunk.txt  hunk
 send i
-wait create/edit hunk
+wait hunk comment
 send notelast
 send Enter
 review notelast
@@ -147,25 +148,25 @@ review notelast
 # The list opens on the first comment. j is the middle. gg returns to nest.
 send Space
 send c
-wait rv  comments
+wait i edit
 send j
 send g
 send g
 send g
 send g
 send Enter
-gone rv  comments
+gone i edit
 wait HEAD  dir/nest.txt
 wait nesttoken
 
 send Space
 send c
-wait rv  comments
+wait i edit
 send j
 send g
 send e
 send g
 send e
 send Enter
-gone rv  comments
+gone i edit
 wait HEAD  twohunk.txt

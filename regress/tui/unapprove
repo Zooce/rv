@@ -8,7 +8,7 @@ gone HEAD  a.txt
 staged a.txt
 send Space
 send a
-wait rv  approved
+wait Enter unapprove
 send j
 send Enter
 wait HEAD  a.txt

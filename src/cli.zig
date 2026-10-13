@@ -51,7 +51,7 @@ pub const Command = union(enum) {
 /// range or commit stays the user-supplied string even if empty.
 pub fn sourceLabel(source: git.Origin, empty: bool) []const u8 {
     return switch (source) {
-        .local => if (empty) "HEAD · empty" else "HEAD",
+        .local => if (empty) "HEAD  empty" else "HEAD",
         .range, .commit => |s| s,
     };
 }
@@ -765,7 +765,7 @@ test "release version drops a zero patch" {
 
 test "sourceLabel local range commit" {
     try testing.expectEqualStrings("HEAD", sourceLabel(.local, false));
-    try testing.expectEqualStrings("HEAD · empty", sourceLabel(.local, true));
+    try testing.expectEqualStrings("HEAD  empty", sourceLabel(.local, true));
     try testing.expectEqualStrings("main...HEAD", sourceLabel(.{ .range = "main...HEAD" }, false));
     try testing.expectEqualStrings("main...HEAD", sourceLabel(.{ .range = "main...HEAD" }, true));
     try testing.expectEqualStrings("abc123", sourceLabel(.{ .commit = "abc123" }, false));

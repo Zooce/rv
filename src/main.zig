@@ -17,8 +17,8 @@
 //! Narrow terminals still fall back to unified. `t`, `#`, and `w` change
 //! this session only and do not write either file.
 //! Error paths never enter raw / alt-screen mode. An empty model still
-//! opens the TUI; the footer shows the load source (`HEAD · empty` when
-//! the worktree is clean, `HEAD · N approved` when every local change is
+//! opens the TUI; the footer shows the load source (`HEAD  empty` when
+//! the worktree is clean, `HEAD  N approved` when every local change is
 //! hidden).
 //!
 //! With a git commit-ish arg: load that commit's patch → same TUI (read-only
@@ -147,14 +147,14 @@ fn footerHeight(term_rows: u16, focus: Focus, comment_h: u16) u16 {
 fn frameTitle(focus: Focus, comment: []const u8, confirm: []const u8) []const u8 {
     return switch (focus) {
         .commenting => comment,
-        .searching => "rv  search  Enter jump  Esc cancel",
-        .comments => "rv  comments  j/k gg/ge  Enter jump  i edit  d dismiss  Esc close  q quit",
-        .files => "rv  files  j/k gg/ge  Enter jump  a/A approve  Esc close  q quit",
-        .approved => "rv  approved  j/k gg/ge  Enter unapprove  Esc close  q quit",
-        .helping => "rv  help  j/k  Esc/? close  q quit",
-        .git_error => "rv  git error  Enter/Esc close  q quit",
+        .searching => "rv  Enter jump  Esc cancel",
+        .comments => "rv  Enter jump  i edit  d dismiss  Esc close",
+        .files => "rv  Enter jump  a/A approve  Esc close",
+        .approved => "rv  Enter unapprove  Esc close",
+        .helping => "rv  Esc close",
+        .git_error => "rv  Enter/Esc close",
         .confirm => confirm,
-        .normal => "rv  j/k  /  i/I  ? help  q quit",
+        .normal => "rv  a/A approve  i/I comment  ? help  q quit",
     };
 }
 
@@ -162,7 +162,7 @@ fn frameTitle(focus: Focus, comment: []const u8, confirm: []const u8) []const u8
 /// clean worktree. Other loads keep the source label.
 fn emptyFooterLabel(buf: []u8, source: git.Origin, approved_n: usize) []const u8 {
     if (source == .local and approved_n > 0) {
-        return std.fmt.bufPrint(buf, "HEAD · {d} approved", .{approved_n}) catch "HEAD";
+        return std.fmt.bufPrint(buf, "HEAD  {d} approved", .{approved_n}) catch "HEAD";
     }
     return cli.sourceLabel(source, true);
 }
@@ -2417,7 +2417,7 @@ pub const Confirm = struct {
                 .unstaged, .untracked => " stage ",
                 .staged => " unstage ",
             },
-            .discard => if (self.comments) " comments " else " discard ",
+            .discard => " discard ",
             .approve => " approve ",
         };
         const panel = tui.Panel.fromRect(tui.Rect.centered(size.cols, size.rows, want_w, content_n + 2));
@@ -2468,14 +2468,11 @@ pub const Confirm = struct {
     pub fn titleBar(self: Confirm) []const u8 {
         return switch (self.kind) {
             .group => switch (self.group) {
-                .unstaged, .untracked => "rv  stage all  No/yes  Enter  Esc cancel  q quit",
-                .staged => "rv  unstage all  No/yes  Enter  Esc cancel  q quit",
+                .unstaged, .untracked => "rv  stage  Enter  Esc cancel",
+                .staged => "rv  unstage  Enter  Esc cancel",
             },
-            .discard => if (self.comments)
-                "rv  discard comments  no/Yes  Enter  Esc cancel  q quit"
-            else
-                "rv  discard  No/yes  Enter  Esc cancel  q quit",
-            .approve => "rv  approve  No/yes  Enter  Esc cancel  q quit",
+            .discard => "rv  discard  Enter  Esc cancel",
+            .approve => "rv  approve  Enter  Esc cancel",
         };
     }
 
@@ -2586,11 +2583,11 @@ pub const Draft = struct {
 
     pub fn titleBar(self: *const Draft) []const u8 {
         return switch (self.loc) {
-            .hunk => "rv  create/edit hunk  Enter save  Esc cancel  ↑↓ scroll",
-            .file => "rv  create/edit file  Enter save  Esc cancel  ↑↓ scroll",
+            .hunk => "rv  hunk comment  Enter save  Esc cancel",
+            .file => "rv  file comment  Enter save  Esc cancel",
             .line => |l| switch (l.side) {
-                .new => "rv  create/edit new  Enter save  Esc cancel  ↑↓ scroll",
-                .old => "rv  create/edit old  Enter save  Esc cancel  ↑↓ scroll",
+                .new => "rv  new comment  Enter save  Esc cancel",
+                .old => "rv  old comment  Enter save  Esc cancel",
             },
         };
     }
@@ -3946,8 +3943,8 @@ const GitError = struct {
 
 test "empty footer local approved is not a clean worktree" {
     var buf: [64]u8 = undefined;
-    try std.testing.expectEqualStrings("HEAD · empty", emptyFooterLabel(&buf, .local, 0));
-    try std.testing.expectEqualStrings("HEAD · 2 approved", emptyFooterLabel(&buf, .local, 2));
+    try std.testing.expectEqualStrings("HEAD  empty", emptyFooterLabel(&buf, .local, 0));
+    try std.testing.expectEqualStrings("HEAD  2 approved", emptyFooterLabel(&buf, .local, 2));
     try std.testing.expectEqualStrings(
         "main...HEAD",
         emptyFooterLabel(&buf, .{ .range = "main...HEAD" }, 3),
@@ -3973,8 +3970,13 @@ test "stageHintForRow section has no git hint" {
 test "approve confirm titleBar" {
     const c: Confirm = .{ .kind = .approve };
     try std.testing.expectEqualStrings(
-        "rv  approve  No/yes  Enter  Esc cancel  q quit",
+        "rv  approve  Enter  Esc cancel",
         c.titleBar(),
+    );
+    const discard: Confirm = .{ .comments = true };
+    try std.testing.expectEqualStrings(
+        "rv  discard  Enter  Esc cancel",
+        discard.titleBar(),
     );
 }
 
@@ -3982,22 +3984,22 @@ test "draft titleBar file vs line" {
     var draft: Draft = .{};
     draft.loc = .{ .file = "f" };
     try std.testing.expectEqualStrings(
-        "rv  create/edit file  Enter save  Esc cancel  ↑↓ scroll",
+        "rv  file comment  Enter save  Esc cancel",
         draft.titleBar(),
     );
     draft.loc = .{ .hunk = .{ .path = "f", .old_start = 1, .new_start = 1 } };
     try std.testing.expectEqualStrings(
-        "rv  create/edit hunk  Enter save  Esc cancel  ↑↓ scroll",
+        "rv  hunk comment  Enter save  Esc cancel",
         draft.titleBar(),
     );
     draft.loc = .{ .line = .{ .path = "f", .side = .new, .line = 1 } };
     try std.testing.expectEqualStrings(
-        "rv  create/edit new  Enter save  Esc cancel  ↑↓ scroll",
+        "rv  new comment  Enter save  Esc cancel",
         draft.titleBar(),
     );
     draft.loc = .{ .line = .{ .path = "f", .side = .old, .line = 1 } };
     try std.testing.expectEqualStrings(
-        "rv  create/edit old  Enter save  Esc cancel  ↑↓ scroll",
+        "rv  old comment  Enter save  Esc cancel",
         draft.titleBar(),
     );
 }

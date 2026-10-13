@@ -2,4 +2,4 @@
 # paints unified and the footer shows uni~.
 wait Unstaged
 wait uni~
-gone  open  sbs
+gone  sbs

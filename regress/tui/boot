@@ -1,7 +1,17 @@
 # Small fixture load. 100x32 shows Unstaged and the first files; later
 # groups sit below the fold, so `until` steps j until those tokens appear.
 wait Unstaged
+wait a/A approve
+wait line 1/
 wait   a.txt
 until this is old j
 until this is new j
 until after.txt j
+
+# ? opens help. The title lists the close key; the panel caption names help.
+send ?
+wait Esc close
+gone a/A approve
+send Escape
+wait a/A approve
+gone Esc close
