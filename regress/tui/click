@@ -1,0 +1,16 @@
+# A left click jumps to that line. 1-based cells: row 1 is the title,
+# row 2 is Unstaged, row 3 is a.txt, row 5 is the one|A pair.
+# Column 2 is the left pane (the old line). Column 60 is the right pane.
+wait Unstaged
+wait line 1/
+click 2 3
+wait HEAD  a.txt  hunk 0/
+click 2 5
+wait line 4/93
+click 60 5
+wait line 5/93
+send t
+wait  uni
+gone uni~
+click 2 5
+wait line 4/93

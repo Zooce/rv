@@ -35,7 +35,7 @@ rv=$root/zig-out/bin/rv
 
 run_small() {
   local name
-  for name in boot hunk-nav ends approve-hunk approve-file unapprove comment layout statuses config config-bad; do
+  for name in boot hunk-nav ends click approve-hunk approve-file unapprove comment layout statuses config config-bad; do
     echo "rv-tui: $name"
     "$script_dir/drive.sh" --rv "$rv" --fixture small "$script_dir/tui/$name"
   done

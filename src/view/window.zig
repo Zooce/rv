@@ -213,8 +213,12 @@ pub fn columnAt(
 /// Matches the paint walk: sticky file header, then items from `scroll`,
 /// each as tall as `rowScreenHeight` / `slotScreenHeight`.
 pub const WindowPointer = struct {
+    /// 0-based terminal column. Picks the pane of a side-by-side pair.
+    x: u16 = 0,
     /// 0-based terminal row.
     y: u16,
+    /// Terminal width, for the side-by-side center gutter.
+    cols: u16 = 0,
     /// First content row (the row under the title).
     top: u16,
     /// First row past the content (the footer).
@@ -228,10 +232,18 @@ pub const WindowPointer = struct {
     layout: layout_mod.EffectiveLayout,
 };
 
+/// Line under the pointer. `slot` is the screen row's line (left of a pair,
+/// else right) so a wheel can pan that hunk. `cell` is the line in the cell:
+/// the same as `slot` for a full-width row, the pane under `x` for a pair,
+/// and null on the center gutter or an empty pane.
+pub const PointerHit = struct {
+    slot: usize,
+    cell: ?usize,
+};
+
 /// Display row under `at`, or null when the pointer is on the title, the
-/// footer, or past the last item. A side-by-side pair returns the left row,
-/// or the right row when the left pane is empty (both belong to one hunk).
-pub fn rowAtY(at: WindowPointer, rows: []const Row, slots: []const SbsSlot) ?usize {
+/// footer, or past the last item.
+pub fn rowAtY(at: WindowPointer, rows: []const Row, slots: []const SbsSlot) ?PointerHit {
     if (at.y < at.top or at.y >= at.bottom) return null;
     const limit: usize = at.bottom;
     const y: usize = at.y;
@@ -244,7 +256,7 @@ pub fn rowAtY(at: WindowPointer, rows: []const Row, slots: []const SbsSlot) ?usi
     var screen_y: usize = at.top;
     if (sticky.file_idx) |fi| {
         if (screen_y >= limit) return null;
-        if (y == screen_y) return fi;
+        if (y == screen_y) return .{ .slot = fi, .cell = fi };
         screen_y += 1;
     }
 
@@ -254,7 +266,7 @@ pub fn rowAtY(at: WindowPointer, rows: []const Row, slots: []const SbsSlot) ?usi
             while (i < rows.len and screen_y < limit) : (i += 1) {
                 const h = rowScreenHeight(rows[i], at.full_tw, at.wrap_on);
                 const end = std.math.add(usize, screen_y, h) catch std.math.maxInt(usize);
-                if (y >= screen_y and y < end) return i;
+                if (y >= screen_y and y < end) return .{ .slot = i, .cell = i };
                 screen_y = end;
             }
         },
@@ -265,9 +277,18 @@ pub fn rowAtY(at: WindowPointer, rows: []const Row, slots: []const SbsSlot) ?usi
                 const end = std.math.add(usize, screen_y, h) catch std.math.maxInt(usize);
                 if (y >= screen_y and y < end) {
                     return switch (slots[si]) {
-                        .header => |ri| ri,
-                        .body => |ri| ri,
-                        .pair => |p| p.left orelse p.right,
+                        .header, .body => |ri| .{ .slot = ri, .cell = ri },
+                        .pair => |p| blk: {
+                            const slot_row = p.left orelse p.right.?;
+                            const gutter = layout_mod.sbsPaneWidths(at.cols).gutter_x;
+                            const cell: ?usize = if (at.x < gutter)
+                                p.left
+                            else if (at.x > gutter)
+                                p.right
+                            else
+                                null;
+                            break :blk .{ .slot = slot_row, .cell = cell };
+                        },
                     };
                 }
                 screen_y = end;
@@ -786,11 +807,11 @@ test "rowAtY follows the paint walk" {
     var at = uni;
     try testing.expect(rowAtY(at, rows, slots) == null);
     at.y = 1;
-    try testing.expectEqual(0, rowAtY(at, rows, slots).?);
+    try testing.expectEqual(0, rowAtY(at, rows, slots).?.slot);
     at.y = 3;
-    try testing.expectEqual(2, rowAtY(at, rows, slots).?);
+    try testing.expectEqual(2, rowAtY(at, rows, slots).?.cell.?);
     at.y = 7;
-    try testing.expectEqual(6, rowAtY(at, rows, slots).?);
+    try testing.expectEqual(6, rowAtY(at, rows, slots).?.slot);
     at.y = 8;
     try testing.expect(rowAtY(at, rows, slots) == null);
     at.y = 10;
@@ -799,17 +820,26 @@ test "rowAtY follows the paint walk" {
     // Scroll past the file header: it pins, and the window starts at row 2.
     at.y = 1;
     at.scroll = 2;
-    try testing.expectEqual(0, rowAtY(at, rows, slots).?);
+    try testing.expectEqual(0, rowAtY(at, rows, slots).?.cell.?);
     at.y = 2;
-    try testing.expectEqual(2, rowAtY(at, rows, slots).?);
+    try testing.expectEqual(2, rowAtY(at, rows, slots).?.slot);
 
+    // cols 80 → gutter at 39. y=3 is del|add (rows 2 and 3). y=5 is the next pair.
     var sbs = uni;
     sbs.layout = .side_by_side;
+    sbs.cols = 80;
     sbs.scroll = 0;
     sbs.y = 3;
-    try testing.expectEqual(2, rowAtY(sbs, rows, slots).?);
+    sbs.x = 1;
+    try testing.expectEqual(2, rowAtY(sbs, rows, slots).?.cell.?);
+    sbs.x = 50;
+    try testing.expectEqual(3, rowAtY(sbs, rows, slots).?.cell.?);
+    try testing.expectEqual(2, rowAtY(sbs, rows, slots).?.slot);
+    sbs.x = 39;
+    try testing.expect(rowAtY(sbs, rows, slots).?.cell == null);
     sbs.y = 5;
-    try testing.expectEqual(5, rowAtY(sbs, rows, slots).?);
+    sbs.x = 1;
+    try testing.expectEqual(5, rowAtY(sbs, rows, slots).?.cell.?);
 
     // A wrapped body line occupies more than one screen row.
     const body_h = rowScreenHeight(rows[2], 2, true);
@@ -819,10 +849,10 @@ test "rowAtY follows the paint walk" {
     wrapped.full_tw = 2;
     wrapped.scroll = 0;
     wrapped.y = 3;
-    try testing.expectEqual(2, rowAtY(wrapped, rows, slots).?);
+    try testing.expectEqual(2, rowAtY(wrapped, rows, slots).?.slot);
     const body_h_u16: u16 = @intCast(body_h);
     wrapped.y = 3 + body_h_u16 - 1;
-    try testing.expectEqual(2, rowAtY(wrapped, rows, slots).?);
+    try testing.expectEqual(2, rowAtY(wrapped, rows, slots).?.cell.?);
     wrapped.y = 3 + body_h_u16;
-    try testing.expectEqual(3, rowAtY(wrapped, rows, slots).?);
+    try testing.expectEqual(3, rowAtY(wrapped, rows, slots).?.slot);
 }

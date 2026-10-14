@@ -772,30 +772,37 @@ fn runTui(
                     },
                 }
             },
-            .mouse => |mouse| if (wheelDirection(mouse)) |dir| switch (focus) {
-                .normal => {
+            .mouse => |mouse| {
+                const footer_h = footerHeight(size.rows, focus, draft.metrics(size).height);
+                const area = Frame.ContentArea.init(size, footer_h);
+                const pointed = WheelTarget{
+                    .x = mouse.x,
+                    .y = mouse.y,
+                    .cols = size.cols,
+                    .rows = diff_view.rows,
+                    .slots = diff_view.sbs_slots,
+                    .area_top = area.top,
+                    .area_bottom = area.bottom,
+                };
+                if (wheelDirection(mouse)) |dir| switch (focus) {
+                    .normal => {
+                        leader = .none;
+                        viewport.scrollWheel(dir, pointed);
+                    },
+                    .helping => switch (dir) {
+                        .up => help.scroll -|= 1,
+                        .down => help.scroll +|= 1,
+                        .left, .right => {},
+                    },
+                    .files => file_list.win.wheel(dir),
+                    .comments => comment_list.win.wheel(dir),
+                    .approved => approved_list.win.wheel(dir),
+                    .commenting => draft.scrollWheel(dir, size),
+                    .searching, .git_error, .confirm => {},
+                } else if (mouse.button == .left and mouse.action == .press and focus == .normal) {
                     leader = .none;
-                    const footer_h = footerHeight(size.rows, focus, draft.metrics(size).height);
-                    const area = Frame.ContentArea.init(size, footer_h);
-                    viewport.scrollWheel(dir, .{
-                        .y = mouse.y,
-                        .cols = size.cols,
-                        .rows = diff_view.rows,
-                        .slots = diff_view.sbs_slots,
-                        .area_top = area.top,
-                        .area_bottom = area.bottom,
-                    });
-                },
-                .helping => switch (dir) {
-                    .up => help.scroll -|= 1,
-                    .down => help.scroll +|= 1,
-                    .left, .right => {},
-                },
-                .files => file_list.win.wheel(dir),
-                .comments => comment_list.win.wheel(dir),
-                .approved => approved_list.win.wheel(dir),
-                .commenting => draft.scrollWheel(dir, size),
-                .searching, .git_error, .confirm => {},
+                    viewport.clickLine(pointed);
+                }
             },
         }
         if (running) {
@@ -3061,12 +3068,14 @@ pub const Viewport = struct {
     }
 
     /// Display row under the pointer, using the same heights paint uses.
-    fn rowUnderPointer(self: *const Viewport, target: WheelTarget) ?usize {
+    fn rowUnderPointer(self: *const Viewport, target: WheelTarget) ?view.window.PointerHit {
         const layout = view.layout.effectiveLayout(self.layout_pref, target.cols);
         const num_w = if (self.show_line_numbers) view.row.lineNumberWidth(target.rows) else 0;
         const panes = view.layout.sbsPaneWidths(target.cols);
         return view.window.rowAtY(.{
+            .x = target.x,
             .y = target.y,
+            .cols = target.cols,
             .top = target.area_top,
             .bottom = target.area_bottom,
             .scroll = self.scroll,
@@ -3076,6 +3085,13 @@ pub const Viewport = struct {
             .right_tw = view.layout.bodyTextCols(panes.right_w, num_w, .side_by_side),
             .layout = layout,
         }, target.rows, target.slots);
+    }
+
+    /// Left click selects the line under the pointer. The title, the footer,
+    /// the center gutter, and an empty pane leave the cursor where it is.
+    fn clickLine(self: *Viewport, target: WheelTarget) void {
+        const under = self.rowUnderPointer(target) orelse return;
+        self.cursor = under.cell orelse return;
     }
 
     /// One wheel event: one row, or one column of the hunk under the pointer.
@@ -3099,13 +3115,13 @@ pub const Viewport = struct {
     /// or when that hunk is the cursor's, the column is `col_scroll`.
     fn panWheel(self: *Viewport, left: bool, target: ?WheelTarget) void {
         if (self.wrap) return;
-        const hit = target orelse {
+        const pointed = target orelse {
             if (left) self.col_scroll -|= 1 else self.col_scroll +|= 1;
             return;
         };
-        const row_i = self.rowUnderPointer(hit) orelse return;
-        const header = view.window.hunkSpanAt(hit.rows, row_i).header orelse return;
-        const cursor_hunk = view.window.hunkSpanAt(hit.rows, self.cursor).header;
+        const row_i = (self.rowUnderPointer(pointed) orelse return).slot;
+        const header = view.window.hunkSpanAt(pointed.rows, row_i).header orelse return;
+        const cursor_hunk = view.window.hunkSpanAt(pointed.rows, self.cursor).header;
         if (cursor_hunk != null and cursor_hunk.? == header) {
             if (left) self.col_scroll -|= 1 else self.col_scroll +|= 1;
             return;
@@ -3276,6 +3292,7 @@ const Wheel = enum { up, down, left, right };
 
 /// Where the pointer is, so a sideways wheel pans that hunk.
 const WheelTarget = struct {
+    x: u16 = 0,
     y: u16,
     cols: u16,
     rows: []const view.row.Row,
@@ -4295,6 +4312,83 @@ test "wheel scrolls the window and leaves the selected line" {
     try std.testing.expectEqual(2, sbs.cursor);
     try std.testing.expect(sbs.window_moved);
     try std.testing.expectEqual(before + 1, sbs.scroll);
+}
+
+test "click moves the cursor to that line" {
+    const fixture =
+        \\diff --git a/f b/f
+        \\--- a/f
+        \\+++ b/f
+        \\@@ -1 +1,2 @@
+        \\-old
+        \\+new1
+        \\+new2
+    ;
+    var d = try diff.parse(std.testing.allocator, fixture);
+    defer d.deinit();
+    const rows = try view.row.flatten(std.testing.allocator, &d);
+    defer std.testing.allocator.free(rows);
+    const slots = try view.layout.pairSideBySide(std.testing.allocator, rows);
+    defer std.testing.allocator.free(slots);
+
+    // 0 file, 1 hunk, 2 del, 3 add, 4 add. Content starts at screen row 1.
+    var vp: Viewport = .{ .layout_pref = .unified, .cursor = 0 };
+    vp.settle(80, 20, rows, slots);
+    const base = WheelTarget{
+        .cols = 80,
+        .rows = rows,
+        .slots = slots,
+        .area_top = 1,
+        .area_bottom = 21,
+        .y = 0,
+    };
+
+    var on_title = base;
+    on_title.y = 0;
+    vp.clickLine(on_title);
+    try std.testing.expectEqual(0, vp.cursor);
+
+    var on_add = base;
+    on_add.y = 4;
+    vp.clickLine(on_add);
+    try std.testing.expectEqual(3, vp.cursor);
+    vp.settle(80, 20, rows, slots);
+    try std.testing.expectEqual(3, vp.cursor);
+    try std.testing.expectEqual(0, vp.scroll);
+
+    var on_footer = base;
+    on_footer.y = 21;
+    vp.clickLine(on_footer);
+    try std.testing.expectEqual(3, vp.cursor);
+
+    // Side-by-side: the pane under the click. The second add has an empty left pane.
+    var sbs: Viewport = .{ .cursor = 0 };
+    sbs.settle(80, 20, rows, slots);
+    var left = base;
+    left.y = 3;
+    left.x = 1;
+    sbs.clickLine(left);
+    try std.testing.expectEqual(2, sbs.cursor);
+    var right = base;
+    right.y = 3;
+    right.x = 50;
+    sbs.clickLine(right);
+    try std.testing.expectEqual(3, sbs.cursor);
+    var gutter = base;
+    gutter.y = 3;
+    gutter.x = 39;
+    sbs.clickLine(gutter);
+    try std.testing.expectEqual(3, sbs.cursor);
+    var empty_left = base;
+    empty_left.y = 4;
+    empty_left.x = 1;
+    sbs.clickLine(empty_left);
+    try std.testing.expectEqual(3, sbs.cursor);
+    var only_right = base;
+    only_right.y = 4;
+    only_right.x = 50;
+    sbs.clickLine(only_right);
+    try std.testing.expectEqual(4, sbs.cursor);
 }
 
 test "sideways wheel pans the hunk and leaves the selected line" {

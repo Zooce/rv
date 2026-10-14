@@ -278,6 +278,14 @@ while IFS= read -r line || [[ -n $line ]]; do
       [[ -n $rest ]] || die "send needs a key: $line"
       tmux send-keys -t "$session" -- "$rest"
       ;;
+    click)
+      [[ -n $rest ]] || die "click needs COL ROW: $line"
+      col=${rest%% *}
+      row=${rest#* }
+      [[ $col != "$rest" && $col =~ ^[1-9][0-9]*$ && $row =~ ^[1-9][0-9]*$ ]] || die "click needs COL ROW: $line"
+      # SGR left press. Coordinates are 1-based cells, same as the terminal.
+      tmux send-keys -t "$session" -l "$(printf '\033[<0;%s;%sM' "$col" "$row")"
+      ;;
     until)
       [[ -n $rest ]] || die "until needs TOKEN KEY: $line"
       key=${rest##* }

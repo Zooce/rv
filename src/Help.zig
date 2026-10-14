@@ -16,6 +16,7 @@ const Entry = union(enum) {
 const entries = [_]Entry{
     .{ .group = "Motion" },
     .{ .item = .{ .key = "j/k", .label = "line (also arrows)" } },
+    .{ .item = .{ .key = "click", .label = "jump to that line" } },
     .{ .item = .{ .key = "gg/ge", .label = "first / last row" } },
     .{ .item = .{ .key = "h/l", .label = "pan current hunk" } },
     .{ .item = .{ .key = "wheel", .label = "scroll the window; shift or sideways pans the hunk under the pointer" } },
@@ -129,7 +130,7 @@ pub fn paint(self: *Help, scr: *tui.Screen, size: tui.Size) void {
 
 test "help catalog includes normal bindings" {
     const required = [_][]const u8{
-        "j/k", "gg", "ge", "h/l", "0/$", "J/K", "[/]", "{/}", "(/)", "/", "n/N",
+        "j/k", "click", "gg", "ge", "h/l", "0/$", "J/K", "[/]", "{/}", "(/)", "/", "n/N",
         "Space f", "Space c", "Space a", "gs", "gS", "a", "A", "i", "I", "d", "D",
         "t", "#", "w", "e", "r", "?", "q", "approved", "approve",
     };
