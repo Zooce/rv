@@ -782,9 +782,22 @@ const GitOpts = struct {
 /// other exit / crash → `GitFailed`; missing binary → `GitNotFound`.
 fn git(alloc: Allocator, io: Io, cwd: std.process.Child.Cwd, opts: GitOpts) Error![]u8 {
     if (opts.stats) |s| s.spawns += 1;
+    // `Io.Dir.cwd()` is AT_FDCWD, not an open directory. Linux `fchdir` ignores
+    // that value, so the child keeps the process cwd. macOS spawn uses
+    // `posix_spawn_file_actions_addfchdir_np`, which rejects AT_FDCWD (EBADF).
+    // A release build then reports `NotARepository`. Inherit is the same cwd.
+    const child_cwd: std.process.Child.Cwd = switch (cwd) {
+        .dir => |dir| blk: {
+            if (comptime @hasDecl(std.posix.AT, "FDCWD")) {
+                if (dir.handle == std.posix.AT.FDCWD) break :blk .inherit;
+            }
+            break :blk cwd;
+        },
+        else => cwd,
+    };
     var child = std.process.spawn(io, .{
         .argv = opts.argv,
-        .cwd = cwd,
+        .cwd = child_cwd,
         .stdin = if (opts.stdin != null) .pipe else .ignore,
         .stdout = .pipe,
         .stderr = .pipe,
@@ -929,6 +942,28 @@ test "not a git repository" {
         error.NotARepository,
         loadDefaultDiffCwd(alloc, io, tmp.cwd()),
     );
+}
+
+test "process cwd dir handle is the same work tree as inherit" {
+    if (builtin.os.tag == .wasi) return error.SkipZigTest;
+
+    const io = testing.io;
+    const alloc = testing.allocator;
+    const argv = &.{ "git", "rev-parse", "--is-inside-work-tree" };
+
+    // `zig build test` keeps the invoker's cwd. Skip when that is not a repo.
+    const inherited = git(alloc, io, .inherit, .{ .argv = argv }) catch |err| switch (err) {
+        error.GitFailed => return,
+        else => return err,
+    };
+    defer alloc.free(inherited);
+    const inherited_text = std.mem.trim(u8, inherited, " \t\r\n");
+    if (!std.mem.eql(u8, inherited_text, "true")) return;
+
+    // `Io.Dir.cwd()` is AT_FDCWD. macOS rejects that fd in posix_spawn.
+    const via_dir = try git(alloc, io, .{ .dir = .cwd() }, .{ .argv = argv });
+    defer alloc.free(via_dir);
+    try testing.expectEqualStrings("true", std.mem.trim(u8, via_dir, " \t\r\n"));
 }
 
 test "dirty worktree: unstaged, untracked, then staged" {
