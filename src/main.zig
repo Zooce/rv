@@ -134,6 +134,28 @@ pub fn main(init: std.process.Init) !u8 {
     }
 }
 
+/// Work tree this TUI session reads and writes. `dir` is an opened directory
+/// (not AT_FDCWD). Git children use `{ .dir = dir }`.
+const Root = struct {
+    path: []u8,
+    dir: std.Io.Dir,
+
+    fn deinit(self: *Root, alloc: std.mem.Allocator, io: std.Io) void {
+        self.dir.close(io);
+        alloc.free(self.path);
+        self.* = undefined;
+    }
+};
+
+fn openProcessRoot(alloc: std.mem.Allocator, io: std.Io) !Root {
+    const dir = try std.Io.Dir.cwd().openDir(io, ".", .{});
+    errdefer dir.close(io);
+    var buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const n = try dir.realPath(io, &buf);
+    const path = try alloc.dupe(u8, buf[0..n]);
+    return .{ .path = path, .dir = dir };
+}
+
 /// Rows reserved under the body. A comment box uses `comment_h`; every other
 /// mode uses one status row. Zero when the terminal is a single row or less.
 fn footerHeight(term_rows: u16, focus: Focus, comment_h: u16) u16 {
@@ -269,11 +291,21 @@ fn runTui(
     source: git.Origin,
     environ: *std.process.Environ.Map,
 ) !u8 {
+    var root = openProcessRoot(alloc, io) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => {
+            std.debug.print("rv: cannot open working directory\n", .{});
+            return 1;
+        },
+    };
+    defer root.deinit(alloc, io);
+    const git_cwd: std.process.Child.Cwd = .{ .dir = root.dir };
+
     // Config before the diff and before any TTY setup. A bad file exits here.
     const configured = try config.load(
         alloc,
         io,
-        .cwd(),
+        root.dir,
         environ.get("XDG_CONFIG_HOME"),
         environ.get("HOME"),
     );
@@ -291,7 +323,7 @@ fn runTui(
     };
 
     // Load before any TTY setup so error paths never touch the terminal.
-    var diff_view: OpenDiff = switch (loadOpenDiff(alloc, io, source)) {
+    var diff_view: OpenDiff = switch (loadOpenDiff(alloc, io, git_cwd, root.dir, source)) {
         .open => |loaded| loaded,
         .git => |err| {
             std.debug.print("rv: {s}\n", .{git.errorMessage(err)});
@@ -305,7 +337,7 @@ fn runTui(
     };
     defer diff_view.deinit(alloc);
 
-    var review = store.load(alloc, io, .cwd(), store.default_review_id) catch |err| {
+    var review = store.load(alloc, io, root.dir, store.default_review_id) catch |err| {
         std.debug.print("rv: {s}\n", .{reviewLoadMessage(err)});
         return 1;
     };
@@ -391,7 +423,7 @@ fn runTui(
                 // Notes are one-shot; any key clears them (including keys that no-op).
                 frame.note.clear();
                 switch (focus) {
-                    .commenting => switch (try draft.handleKey(alloc, io, &review, source, key, size)) {
+                    .commenting => switch (try draft.handleKey(alloc, io, root.dir, &review, source, key, size)) {
                         .closed => focus = .normal,
                         .quit => running = false,
                         .save_failed => {
@@ -439,6 +471,7 @@ fn runTui(
                             if (try landComment(
                                 alloc,
                                 io,
+                                root.dir,
                                 source,
                                 &diff_view,
                                 &viewport.cursor,
@@ -450,7 +483,7 @@ fn runTui(
                             }
                         },
                         .missing => frame.note.set("comment not in this diff"),
-                        .dismiss => try applyListDismiss(alloc, io, &review, &comment_list, &frame.note),
+                        .dismiss => try applyListDismiss(alloc, io, root.dir, &review, &comment_list, &frame.note),
                         .open => {},
                     },
                     .files => switch (file_list.handleKey(key)) {
@@ -467,6 +500,8 @@ fn runTui(
                         .approve => try applyListApprove(
                             alloc,
                             io,
+                            git_cwd,
+                            root.dir,
                             source,
                             &diff_view,
                             &viewport.cursor,
@@ -495,7 +530,7 @@ fn runTui(
                                 &diff_view,
                                 &viewport.cursor,
                                 &frame.note,
-                                .cwd(),
+                                root.dir,
                                 approved_list.items.items[idx],
                             );
                         },
@@ -521,6 +556,8 @@ fn runTui(
                             try applyGroupIndex(
                                 alloc,
                                 io,
+                                git_cwd,
+                                root.dir,
                                 source,
                                 &diff_view,
                                 &viewport.cursor,
@@ -535,6 +572,8 @@ fn runTui(
                             try applyIndex(
                                 alloc,
                                 io,
+                                git_cwd,
+                                root.dir,
                                 source,
                                 &diff_view,
                                 &viewport.cursor,
@@ -558,8 +597,8 @@ fn runTui(
                                 &focus,
                                 &git_error,
                                 &review,
-                                .inherit,
-                                .cwd(),
+                                git_cwd,
+                                root.dir,
                                 confirm.whole_file,
                             );
                             if (focus != .git_error) {
@@ -594,6 +633,7 @@ fn runTui(
                                         if (approved_list.load(
                                             alloc,
                                             io,
+                                            root.dir,
                                             &diff_view.diff,
                                             diff_view.rows,
                                             viewport.cursor,
@@ -608,6 +648,8 @@ fn runTui(
                                     try dispatchStage(
                                         alloc,
                                         io,
+                                        git_cwd,
+                                        root.dir,
                                         source,
                                         &diff_view,
                                         &viewport.cursor,
@@ -622,6 +664,8 @@ fn runTui(
                                     try dispatchStage(
                                         alloc,
                                         io,
+                                        git_cwd,
+                                        root.dir,
                                         source,
                                         &diff_view,
                                         &viewport.cursor,
@@ -638,6 +682,8 @@ fn runTui(
                                     try dispatchStage(
                                         alloc,
                                         io,
+                                        git_cwd,
+                                        root.dir,
                                         source,
                                         &diff_view,
                                         &viewport.cursor,
@@ -652,6 +698,8 @@ fn runTui(
                                     try dispatchStage(
                                         alloc,
                                         io,
+                                        git_cwd,
+                                        root.dir,
                                         source,
                                         &diff_view,
                                         &viewport.cursor,
@@ -701,16 +749,18 @@ fn runTui(
                                         },
                                     }
                                 } else if (c == ')') {
-                                    try jumpLiveComment(&review, &diff_view, alloc, io, source, &viewport.cursor, &frame.note, .next);
+                                    try jumpLiveComment(&review, &diff_view, alloc, io, root.dir, source, &viewport.cursor, &frame.note, .next);
                                 } else if (c == '(') {
-                                    try jumpLiveComment(&review, &diff_view, alloc, io, source, &viewport.cursor, &frame.note, .prev);
+                                    try jumpLiveComment(&review, &diff_view, alloc, io, root.dir, source, &viewport.cursor, &frame.note, .prev);
                                 } else if (c == 'r') {
-                                    reloadReview(alloc, io, .cwd(), &review, &frame.note);
-                                    reloadDiff(alloc, io, source, &diff_view, &viewport.cursor, &frame.note);
+                                    reloadReview(alloc, io, root.dir, &review, &frame.note);
+                                    reloadDiff(alloc, io, git_cwd, root.dir, source, &diff_view, &viewport.cursor, &frame.note);
                                 } else if (c == 'e') {
                                     try expandCurrentHunk(
                                         alloc,
                                         io,
+                                        git_cwd,
+                                        root.dir,
                                         source,
                                         &diff_view,
                                         &viewport.cursor,
@@ -728,6 +778,8 @@ fn runTui(
                                     try dispatchApprove(
                                         alloc,
                                         io,
+                                        git_cwd,
+                                        root.dir,
                                         source,
                                         &diff_view,
                                         &viewport.cursor,
@@ -742,6 +794,8 @@ fn runTui(
                                     try dispatchApprove(
                                         alloc,
                                         io,
+                                        git_cwd,
+                                        root.dir,
                                         source,
                                         &diff_view,
                                         &viewport.cursor,
@@ -753,9 +807,9 @@ fn runTui(
                                         true,
                                     );
                                 } else if (c == 'd') {
-                                    dismissAt(&review, alloc, io, diff_view.rows, diff_view.sbs_slots, layout, viewport.cursor, .new, &frame.note);
+                                    dismissAt(&review, alloc, io, root.dir, diff_view.rows, diff_view.sbs_slots, layout, viewport.cursor, .new, &frame.note);
                                 } else if (c == 'D') {
-                                    dismissAt(&review, alloc, io, diff_view.rows, diff_view.sbs_slots, layout, viewport.cursor, .old, &frame.note);
+                                    dismissAt(&review, alloc, io, root.dir, diff_view.rows, diff_view.sbs_slots, layout, viewport.cursor, .old, &frame.note);
                                 }
                             },
                             .enter => {
@@ -849,10 +903,12 @@ pub const OpenDiff = struct {
     fn maybeInit(
         alloc: std.mem.Allocator,
         io: std.Io,
+        cwd: std.process.Child.Cwd,
+        root: std.Io.Dir,
         source: git.Origin,
         note: *StatusNote,
     ) ?OpenDiff {
-        switch (loadOpenDiff(alloc, io, source)) {
+        switch (loadOpenDiff(alloc, io, cwd, root, source)) {
             .open => |loaded| return loaded,
             .git => |err| note.set(git.errorMessage(err)),
             .approved => |err| note.set(approvedLoadMessage(err)),
@@ -1407,12 +1463,13 @@ fn removeMatchingComments(
     review: *store.Review,
     alloc: std.mem.Allocator,
     io: std.Io,
+    root: std.Io.Dir,
     ids: []const []const u8,
     saved: []const comments.RemoveSnap,
 ) bool {
     if (ids.len == 0) return true;
     review.remove(ids) catch return true;
-    store.save(review, alloc, io, .cwd()) catch {
+    store.save(review, alloc, io, root) catch {
         for (saved) |s| {
             review.comments.insert(review.arena.allocator(), s.idx, s.comment) catch {};
         }
@@ -1425,10 +1482,11 @@ fn saveCommentRemap(
     review: *store.Review,
     alloc: std.mem.Allocator,
     io: std.Io,
+    root: std.Io.Dir,
     priors: []const comments.AnchorSnap,
 ) bool {
     if (priors.len == 0) return true;
-    store.save(review, alloc, io, .cwd()) catch {
+    store.save(review, alloc, io, root) catch {
         for (priors) |p| {
             review.setLines(p.id, p.old_line, p.new_line, p.side) catch {};
         }
@@ -1502,7 +1560,7 @@ fn applyAtCursor(
 
     var save_failed = false;
     if (ids.items.len > 0) {
-        save_failed = !removeMatchingComments(review, alloc, io, ids.items, saved.items);
+        save_failed = !removeMatchingComments(review, alloc, io, root, ids.items, saved.items);
     }
 
     // Reload only the mutated path; other files stay as loaded.
@@ -1535,7 +1593,7 @@ fn applyAtCursor(
             loaded.deinit(alloc);
             return err;
         };
-        if (!saveCommentRemap(review, alloc, io, priors.items)) save_failed = true;
+        if (!saveCommentRemap(review, alloc, io, root, priors.items)) save_failed = true;
     }
 
     const new_cursor: usize = if (neighbor) |m| restoreNeighbor(loaded.rows, m) else 0;
@@ -1607,7 +1665,7 @@ fn applyGroupAtCursor(
                     return err;
                 };
             }
-            group_save_failed = !saveCommentRemap(review, alloc, io, priors.items);
+            group_save_failed = !saveCommentRemap(review, alloc, io, root, priors.items);
             new_cursor = if (neighbor) |m| restoreGroupNeighbor(opened.rows, m) else 0;
             next = opened;
         } else |err| {
@@ -1641,15 +1699,17 @@ const DiffLoad = union(enum) {
 fn loadOpenDiff(
     alloc: std.mem.Allocator,
     io: std.Io,
+    cwd: std.process.Child.Cwd,
+    root: std.Io.Dir,
     source: git.Origin,
 ) DiffLoad {
     var parsed = switch (source) {
-        .local => git.loadDefaultDiff(alloc, io),
-        .range => |r| git.loadRangeDiff(alloc, io, .inherit, r),
-        .commit => |c| git.loadCommitDiff(alloc, io, .inherit, c),
+        .local => git.loadDefaultDiffCwd(alloc, io, cwd),
+        .range => |r| git.loadRangeDiff(alloc, io, cwd, r),
+        .commit => |c| git.loadCommitDiff(alloc, io, cwd, c),
     } catch |err| return .{ .git = err };
 
-    const vis = flattenSource(alloc, io, source, &parsed) catch |err| {
+    const vis = flattenSource(alloc, io, root, source, &parsed) catch |err| {
         parsed.deinit();
         return .{ .approved = err };
     };
@@ -1664,11 +1724,12 @@ fn loadOpenDiff(
 fn flattenSource(
     alloc: std.mem.Allocator,
     io: std.Io,
+    root: std.Io.Dir,
     source: git.Origin,
     d: *const diff.Diff,
 ) approve.LoadError!Visible {
     return switch (source) {
-        .local => loadVisibleRows(alloc, io, .cwd(), d),
+        .local => loadVisibleRows(alloc, io, root, d),
         .range, .commit => .{ .rows = try view.row.flatten(alloc, d), .approved_n = 0 },
     };
 }
@@ -1715,12 +1776,14 @@ fn reloadReview(
 fn reloadDiff(
     alloc: std.mem.Allocator,
     io: std.Io,
+    cwd: std.process.Child.Cwd,
+    root: std.Io.Dir,
     source: git.Origin,
     diff_view: *OpenDiff,
     cursor: *usize,
     note: *StatusNote,
 ) void {
-    const loaded = OpenDiff.maybeInit(alloc, io, source, note) orelse return;
+    const loaded = OpenDiff.maybeInit(alloc, io, cwd, root, source, note) orelse return;
     const new_cursor: usize = blk: {
         const mark = view.nav.cursorMarkAt(diff_view.rows, cursor.*);
         break :blk if (mark) |m| view.nav.restoreCursor(loaded.rows, m) else 0;
@@ -1737,6 +1800,8 @@ fn reloadDiff(
 fn expandCurrentHunk(
     alloc: std.mem.Allocator,
     io: std.Io,
+    cwd: std.process.Child.Cwd,
+    root: std.Io.Dir,
     source: git.Origin,
     diff_view: *OpenDiff,
     cursor: *usize,
@@ -1754,7 +1819,7 @@ fn expandCurrentHunk(
     const hh = rows[hunk_row].hunk_header;
 
     const file = &diff_view.diff.files[target.file_i];
-    const text = git.survivingFileText(alloc, io, .inherit, file, source) catch |err| switch (err) {
+    const text = git.survivingFileText(alloc, io, cwd, file, source) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
         else => {
             note.set(git.errorMessage(err));
@@ -1769,7 +1834,7 @@ fn expandCurrentHunk(
     }
 
     // Rebuild rows from the expanded Diff; do not reload git.
-    const vis = flattenSource(alloc, io, source, &diff_view.diff) catch |err| {
+    const vis = flattenSource(alloc, io, root, source, &diff_view.diff) catch |err| {
         note.set(approvedLoadMessage(err));
         return;
     };
@@ -2172,6 +2237,8 @@ fn identityAtRow(
 fn applyIndex(
     alloc: std.mem.Allocator,
     io: std.Io,
+    cwd: std.process.Child.Cwd,
+    root: std.Io.Dir,
     source: git.Origin,
     diff_view: *OpenDiff,
     cursor: *usize,
@@ -2187,8 +2254,8 @@ fn applyIndex(
     switch (try applyAtCursor(
         alloc,
         io,
-        .inherit,
-        .cwd(),
+        cwd,
+        root,
         &diff_view.diff,
         diff_view.rows,
         cursor.*,
@@ -2206,6 +2273,8 @@ fn applyIndex(
 fn applyGroupIndex(
     alloc: std.mem.Allocator,
     io: std.Io,
+    cwd: std.process.Child.Cwd,
+    root: std.Io.Dir,
     source: git.Origin,
     diff_view: *OpenDiff,
     cursor: *usize,
@@ -2218,8 +2287,8 @@ fn applyGroupIndex(
     switch (try applyGroupAtCursor(
         alloc,
         io,
-        .inherit,
-        .cwd(),
+        cwd,
+        root,
         &diff_view.diff,
         diff_view.rows,
         cursor.*,
@@ -2236,6 +2305,8 @@ fn applyGroupIndex(
 fn dispatchStage(
     alloc: std.mem.Allocator,
     io: std.Io,
+    cwd: std.process.Child.Cwd,
+    root: std.Io.Dir,
     source: git.Origin,
     diff_view: *OpenDiff,
     cursor: *usize,
@@ -2254,6 +2325,8 @@ fn dispatchStage(
     try applyIndex(
         alloc,
         io,
+        cwd,
+        root,
         source,
         diff_view,
         cursor,
@@ -2273,6 +2346,8 @@ fn dispatchStage(
 fn dispatchApprove(
     alloc: std.mem.Allocator,
     io: std.Io,
+    cwd: std.process.Child.Cwd,
+    root: std.Io.Dir,
     source: git.Origin,
     diff_view: *OpenDiff,
     cursor: *usize,
@@ -2289,7 +2364,7 @@ fn dispatchApprove(
         focus.* = .confirm;
         return;
     }
-    try applyApprove(alloc, io, source, diff_view, cursor, note, focus, git_error, review, .inherit, .cwd(), whole_file);
+    try applyApprove(alloc, io, source, diff_view, cursor, note, focus, git_error, review, cwd, root, whole_file);
 }
 
 /// Open the discard confirm for the hunk or file at the cursor. Hunk
@@ -2603,6 +2678,7 @@ pub const Draft = struct {
         self: *Draft,
         alloc: std.mem.Allocator,
         io: std.Io,
+        root: std.Io.Dir,
         review: *store.Review,
         source: git.Origin,
         key: tui.Key,
@@ -2620,7 +2696,7 @@ pub const Draft = struct {
                         if (review.find(id)) |c| {
                             const prior = c.body;
                             if (review.setBody(id, self.buf.items)) |_| {
-                                store.save(review, alloc, io, .cwd()) catch {
+                                store.save(review, alloc, io, root) catch {
                                     review.setBody(id, prior) catch {};
                                     self.clear();
                                     return .save_failed;
@@ -2652,7 +2728,7 @@ pub const Draft = struct {
                                 .commit => |c| .{ .commit = c },
                             },
                         );
-                        store.save(review, alloc, io, .cwd()) catch {
+                        store.save(review, alloc, io, root) catch {
                             // Stay in review; next save can retry. Marker is in-memory.
                         };
                     }
@@ -3421,6 +3497,7 @@ fn fullIndexOfHidden(full: []const view.row.Row, hidden: []const view.row.Row, h
 fn landComment(
     alloc: std.mem.Allocator,
     io: std.Io,
+    root: std.Io.Dir,
     source: git.Origin,
     diff_view: *OpenDiff,
     cursor: *usize,
@@ -3444,11 +3521,11 @@ fn landComment(
         note.set("comment not in this diff");
         return false;
     };
-    const item = identityAtRow(alloc, &diff_view.diff, io, .cwd(), full, full_row) orelse {
+    const item = identityAtRow(alloc, &diff_view.diff, io, root, full, full_row) orelse {
         note.set("comment not in this diff");
         return false;
     };
-    if (!try unapproveRebuild(alloc, io, source, diff_view, note, .cwd(), item)) return false;
+    if (!try unapproveRebuild(alloc, io, source, diff_view, note, root, item)) return false;
     const row = view.rowForComment(diff_view.rows, loc) orelse {
         note.set("comment not in this diff");
         return false;
@@ -3462,6 +3539,7 @@ fn jumpLiveComment(
     diff_view: *OpenDiff,
     alloc: std.mem.Allocator,
     io: std.Io,
+    root: std.Io.Dir,
     source: git.Origin,
     cursor: *usize,
     note: *StatusNote,
@@ -3496,7 +3574,7 @@ fn jumpLiveComment(
         note.set("no comments");
         return;
     };
-    if (try landComment(alloc, io, source, diff_view, cursor, note, loc)) {
+    if (try landComment(alloc, io, root, source, diff_view, cursor, note, loc)) {
         if (hit.wrapped) note.set("comment wrapped");
     }
 }
@@ -3507,6 +3585,7 @@ fn dismissAt(
     review: *store.Review,
     alloc: std.mem.Allocator,
     io: std.Io,
+    root: std.Io.Dir,
     rows: []const view.row.Row,
     slots: []const view.layout.SbsSlot,
     layout: view.layout.EffectiveLayout,
@@ -3526,7 +3605,7 @@ fn dismissAt(
         }
         return;
     };
-    _ = dismissById(review, alloc, io, review.comments.items[idx].id, note);
+    _ = dismissById(review, alloc, io, root, review.comments.items[idx].id, note);
 }
 
 /// Delete `id` and save. True when the store dropped it. Not found: false,
@@ -3535,6 +3614,7 @@ fn dismissById(
     review: *store.Review,
     alloc: std.mem.Allocator,
     io: std.Io,
+    root: std.Io.Dir,
     id: []const u8,
     note: *StatusNote,
 ) bool {
@@ -3546,7 +3626,7 @@ fn dismissById(
     };
     const saved = review.comments.items[idx];
     review.remove(&.{id}) catch return false;
-    store.save(review, alloc, io, .cwd()) catch {
+    store.save(review, alloc, io, root) catch {
         review.comments.insert(review.arena.allocator(), idx, saved) catch {};
         note.set("failed to save .rv comment store");
         return false;
@@ -3561,13 +3641,14 @@ fn dismissById(
 fn applyListDismiss(
     alloc: std.mem.Allocator,
     io: std.Io,
+    root: std.Io.Dir,
     review: *store.Review,
     list: *CommentList,
     note: *StatusNote,
 ) std.mem.Allocator.Error!void {
     const idx = list.win.cursor;
     if (idx >= list.items.items.len) return;
-    if (!dismissById(review, alloc, io, list.items.items[idx].id, note)) return;
+    if (!dismissById(review, alloc, io, root, list.items.items[idx].id, note)) return;
     try list.load(alloc, review.comments.items);
     if (list.items.items.len > 0) {
         list.win.cursor = @min(idx, list.items.items.len - 1);
@@ -3581,6 +3662,8 @@ fn applyListDismiss(
 fn applyListApprove(
     alloc: std.mem.Allocator,
     io: std.Io,
+    cwd: std.process.Child.Cwd,
+    root: std.Io.Dir,
     source: git.Origin,
     diff_view: *OpenDiff,
     cursor: *usize,
@@ -3595,7 +3678,7 @@ fn applyListApprove(
     const idx = list.win.cursor;
     if (idx >= list.items.items.len) return;
     cursor.* = list.items.items[idx];
-    try dispatchApprove(alloc, io, source, diff_view, cursor, note, focus, git_error, review, confirm, true);
+    try dispatchApprove(alloc, io, cwd, root, source, diff_view, cursor, note, focus, git_error, review, confirm, true);
     if (focus.* == .confirm) {
         confirm.return_to_files = true;
         return;
@@ -3835,14 +3918,15 @@ const ApprovedList = struct {
         self: *ApprovedList,
         alloc: std.mem.Allocator,
         io: std.Io,
+        root: std.Io.Dir,
         d: *const diff.Diff,
         rows: []const view.row.Row,
         cursor: usize,
     ) approve.LoadError!void {
         self.items.clearRetainingCapacity();
-        var approved = try approve.load(alloc, io, .cwd());
+        var approved = try approve.load(alloc, io, root);
         defer approved.deinit();
-        const hidden = try approve.collectApproved(alloc, io, .cwd(), d, &approved);
+        const hidden = try approve.collectApproved(alloc, io, root, d, &approved);
         defer alloc.free(hidden);
         try self.items.appendSlice(alloc, hidden);
         self.win = .{};
@@ -5259,11 +5343,108 @@ fn initTrackedRepo(io: std.Io, tmp: IsolatedTmp) !void {
 }
 
 fn loadLocalView(alloc: std.mem.Allocator, io: std.Io, cwd: std.process.Child.Cwd, root: std.Io.Dir) !OpenDiff {
-    var parsed = try git.loadDefaultDiffCwd(alloc, io, cwd);
-    errdefer parsed.deinit();
-    const vis = try loadVisibleRows(alloc, io, root, &parsed);
-    errdefer alloc.free(vis.rows);
-    return try OpenDiff.build(alloc, parsed, vis.rows, vis.approved_n);
+    return switch (loadOpenDiff(alloc, io, cwd, root, .local)) {
+        .open => |loaded| loaded,
+        .git => |err| err,
+        .approved => error.TestUnexpectedResult,
+        .build => |err| err,
+    };
+}
+
+test "openProcessRoot is an opened directory, not AT_FDCWD" {
+    const io = std.testing.io;
+    const alloc = std.testing.allocator;
+    var root = try openProcessRoot(alloc, io);
+    defer root.deinit(alloc, io);
+    try std.testing.expect(std.fs.path.isAbsolute(root.path));
+    if (comptime @hasDecl(std.posix.AT, "FDCWD")) {
+        try std.testing.expect(root.dir.handle != std.posix.AT.FDCWD);
+    }
+}
+
+test "loadOpenDiff reads the given work tree, not process cwd" {
+    if (builtin.os.tag == .wasi) return error.SkipZigTest;
+
+    const io = std.testing.io;
+    const alloc = std.testing.allocator;
+    var tmp = try IsolatedTmp.init(alloc, io);
+    defer tmp.deinit(alloc, io);
+    try initTrackedRepo(io, tmp);
+    try tmp.write(io, "f.txt", "sessroot-unique-7f3a\n");
+
+    switch (loadOpenDiff(alloc, io, tmp.cwd(), tmp.dir, .local)) {
+        .open => |loaded| {
+            defer loaded.deinit(alloc);
+            try std.testing.expect(rowsHaveLine(loaded.rows, "sessroot-unique-7f3a"));
+            try std.testing.expect(hasRowFile(loaded.rows, "f.txt", .unstaged));
+        },
+        else => return error.TestUnexpectedResult,
+    }
+}
+
+test "applyIndex stages in the given work tree, not process cwd" {
+    if (builtin.os.tag == .wasi) return error.SkipZigTest;
+
+    const io = std.testing.io;
+    const alloc = std.testing.allocator;
+    var tmp = try IsolatedTmp.init(alloc, io);
+    defer tmp.deinit(alloc, io);
+    try initTrackedRepo(io, tmp);
+    try tmp.write(io, "f.txt", accepted_body);
+
+    var diff_view = try loadLocalView(alloc, io, tmp.cwd(), tmp.dir);
+    defer diff_view.deinit(alloc);
+    var cursor: usize = firstHunkRow(diff_view.rows) orelse return error.TestUnexpectedResult;
+    var note: StatusNote = .{};
+    var focus: Focus = .normal;
+    var git_error: GitError = .{};
+    defer git_error.buf.deinit(alloc);
+    var review = try store.initEmpty(alloc, store.default_review_id);
+    defer review.deinit();
+    try applyIndex(
+        alloc,
+        io,
+        tmp.cwd(),
+        tmp.dir,
+        .local,
+        &diff_view,
+        &cursor,
+        &note,
+        &focus,
+        &git_error,
+        &review,
+        false,
+        .stage_unstage,
+        false,
+    );
+    try std.testing.expect(focus != .git_error);
+    try std.testing.expect(hasRowFile(diff_view.rows, "f.txt", .staged));
+    try std.testing.expect(!hasRowFile(diff_view.rows, "f.txt", .unstaged));
+    {
+        var raw = try git.loadDefaultDiffCwd(alloc, io, tmp.cwd());
+        defer raw.deinit();
+        try std.testing.expect(hasDiffFile(raw, "f.txt", .staged));
+        try std.testing.expect(!hasDiffFile(raw, "f.txt", .unstaged));
+    }
+}
+
+test "dismissById writes the comment store in the given root" {
+    if (builtin.os.tag == .wasi) return error.SkipZigTest;
+
+    const io = std.testing.io;
+    const alloc = std.testing.allocator;
+    var tmp = try IsolatedTmp.init(alloc, io);
+    defer tmp.deinit(alloc, io);
+
+    var review = try store.initEmpty(alloc, store.default_review_id);
+    defer review.deinit();
+    const id = try review.addOpen("f.txt", null, 1, .new, "sessroot-comment", .local);
+    try store.save(&review, alloc, io, tmp.dir);
+    var note: StatusNote = .{};
+    try std.testing.expect(dismissById(&review, alloc, io, tmp.dir, id, &note));
+    var disk = try store.load(alloc, io, tmp.dir, store.default_review_id);
+    defer disk.deinit();
+    try std.testing.expectEqual(0, disk.openCount());
 }
 
 fn firstHunkRow(rows: []const view.row.Row) ?usize {
