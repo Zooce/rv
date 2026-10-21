@@ -14,10 +14,10 @@ Linux and macOS. No Windows builds yet.
 mise use -g github:Zooce/rv
 ```
 
-A specific release. Drop the leading `v` from the tag (`2.5`, or an older tag such as `2.2.0`):
+A specific release. Drop the leading `v` from the tag (`2.6`, or an older tag such as `2.2.0`):
 
 ```sh
-mise use -g github:Zooce/rv@2.5
+mise use -g github:Zooce/rv@2.6
 ```
 
 ### install.sh
@@ -26,10 +26,10 @@ mise use -g github:Zooce/rv@2.5
 curl -fsSL https://raw.githubusercontent.com/Zooce/rv/master/install.sh | sh
 ```
 
-Puts `rv` in `~/.local/bin`. A specific release (`v2.5`, or an older tag such as `v2.2.0`):
+Puts `rv` in `~/.local/bin`. A specific release (`v2.6`, or an older tag such as `v2.2.0`):
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/Zooce/rv/master/install.sh | RV_VERSION=v2.5 sh
+curl -fsSL https://raw.githubusercontent.com/Zooce/rv/master/install.sh | RV_VERSION=v2.6 sh
 ```
 
 If `~/.local/bin` is not on `PATH`:
@@ -53,7 +53,7 @@ zig build -Doptimize=ReleaseSafe --prefix ~/.local
 npx skills add Zooce/rv -g
 ```
 
-`rv --version` prints `major.minor` (zon `2.5.0` prints `rv 2.5`).
+`rv --version` prints `major.minor` (zon `2.6.0` prints `rv 2.6`).
 
 Load, paint, present, and approve timings: `mise run bench`. Compare a run to `bench/baseline.json` with `--compare`. How timings are taken, and how to attach `samply` or `perf`, is in [bench/README.md](bench/README.md).
 
