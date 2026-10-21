@@ -65,29 +65,47 @@ Changed words are colored on the line. Unchanged words on that line stay grey. A
 
 ![Side-by-side diff. Changed words are colored; whole added and deleted lines stay solid.](docs/screenshots/review.png)
 
-### Writing a comment
-
-`i` opens the comment box under the diff. The box grows as the comment wraps.
-
-![Comment box open with a comment that wraps across several lines.](docs/screenshots/comment.png)
-
 ### Unified diff
 
 `t` shows the same review as a unified diff.
 
 ![Unified diff of the same review.](docs/screenshots/unified.png)
 
+### Writing a comment
+
+`i` opens the comment box under the diff. The box grows as the comment wraps.
+
+![Comment box open with a comment that wraps across two lines.](docs/screenshots/comment.png)
+
 ### Comment list
 
-`Space` then `c` lists open comments.
+`Space` then `c` lists open comments. Enter jumps to that comment.
 
 ![Comment list over the diff.](docs/screenshots/comments.png)
 
 ### Approved list
 
-`Space` then `a` lists approved hunks. Approving stages a hunk and hides it from the diff.
+`Space` then `a` lists approved hunks. Approving stages a hunk and hides it from the diff. Enter puts that hunk back on the diff and leaves it staged.
 
 ![Approved list. Those hunks are staged and hidden from the diff.](docs/screenshots/approved.png)
+
+### Search
+
+`/` searches the diff. Enter jumps to the match.
+
+![Search prompt under the diff.](docs/screenshots/search.png)
+
+### File list
+
+`Space` then `f` lists the files in this review.
+
+![File list over the diff.](docs/screenshots/files.png)
+
+### Project list
+
+`Space` then `p` switches among saved work trees.
+
+![Project list over the diff.](docs/screenshots/projects.png)
 
 ## Use
 
@@ -95,9 +113,15 @@ Changed words are colored on the line. Unchanged words on that line stay grey. A
 rv                 # local changes (staged, unstaged, untracked)
 ```
 
-`j` and `k` move the current line. A click jumps to that line. The scroll wheel moves the window and leaves that line selected. Shift+wheel, or a sideways trackpad scroll, pans the hunk under the pointer. `a` approves the hunk at that line and `A` approves the whole file. Approving stages the change and hides it from the diff. `i` or `Enter` comments on the current line. Press `?` for every key, and `q` to quit.
+`j` and `k` move the current line. `gg` and `ge` jump to the first and last row. A click jumps to that line. The scroll wheel moves the window and leaves that line selected. `h` and `l`, Shift+wheel, or a sideways trackpad scroll, pan the hunk. `e` grows the hunk's context.
 
-`Space` then `p` switches among saved work trees. Bare `rv` starts from any directory and restores that list. `rv path` opens that work tree and adds it to the list. Tab in the add prompt cycles matching directories. Type `/` and Tab again to go into the one on the line.
+`a` approves the hunk at that line and `A` approves the whole file. Approving stages the change and hides it from the diff. `gs`, `gu`, and `gd` stage, unstage, and discard the hunk. `gS`, `gU`, and `gD` do the same for the file.
+
+`i`, `c`, or Enter comments on the new side of the current line. `I` and `C` comment on the old side. `d` and `D` dismiss that comment. `/` searches the diff, and `n` and `N` move through the matches.
+
+`Space` then `f` lists files, `c` lists open comments, `a` lists approved hunks, and `p` switches among saved work trees. Bare `rv` starts from any directory and restores that list. `rv path` opens that work tree and adds it to the list. Tab in the add prompt cycles matching directories. Type `/` and Tab again to go into the one on the line.
+
+Press `?` for every key, and `q` to quit.
 
 Tell your agent to address your rv comments. The skill from the install step reads those comments, edits the code, and resolves each comment it has handled. What you approved stays staged and stays out of the next diff.
 
@@ -110,9 +134,12 @@ rv ~/src/other     # open that work tree and remember it
 ```
 
 ```sh
+rv status          # comment count, approved count, and store paths
 rv list            # open comments
-rv export          # those comments as markdown
-rv resolve <id>    # drop an addressed comment
+rv show <id>       # one comment
+rv export          # those comments as markdown on stdout
+rv export --format json -o review.json
+rv resolve <id> [id…]
 rv approved        # hidden hunks and files
 rv unapprove <n>
 ```

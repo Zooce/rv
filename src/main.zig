@@ -3011,6 +3011,25 @@ pub const Confirm = struct {
     }
 };
 
+/// Open prompt (comment, search, add path). A different bar from the status
+/// footer, so the row that is waiting for text is obvious.
+const input_footer_bg: tui.Color = .{ .rgb = .{ .r = 0xd4, .g = 0x6a, .b = 0x14 } };
+const input_footer_fg: tui.Color = .{ .rgb = .{ .r = 0xff, .g = 0xf6, .b = 0xe8 } };
+const input_footer: tui.Style = .{
+    .fg = input_footer_fg,
+    .bg = input_footer_bg,
+};
+const input_bar_track: tui.Style = .{
+    .fg = .{ .rgb = .{ .r = 0x7a, .g = 0x3c, .b = 0x10 } },
+    .bg = input_footer_bg,
+    .dim = true,
+};
+const input_bar_thumb: tui.Style = .{
+    .fg = input_footer_fg,
+    .bg = .{ .rgb = .{ .r = 0xf0, .g = 0x94, .b = 0x30 } },
+    .bold = true,
+};
+
 /// Comment prompt: buffer, caret, keys, save, and footer paint.
 pub const Draft = struct {
     const Result = enum { open, closed, quit, save_failed };
@@ -3209,20 +3228,9 @@ pub const Draft = struct {
 
     fn paintFooter(self: *Draft, scr: *tui.Screen, size: tui.Size) void {
         if (size.rows < 2) return;
-        const footer_style = tui.Style{
-            .fg = .{ .rgb = .{ .r = 0xee, .g = 0xee, .b = 0xee } },
-            .bg = .{ .rgb = .{ .r = 0x2a, .g = 0x3f, .b = 0x5f } },
-        };
-        const footer_bar_track = tui.Style{
-            .fg = .{ .rgb = .{ .r = 0x6a, .g = 0x7a, .b = 0x9a } },
-            .bg = .{ .rgb = .{ .r = 0x2a, .g = 0x3f, .b = 0x5f } },
-            .dim = true,
-        };
-        const footer_bar_thumb = tui.Style{
-            .fg = .{ .rgb = .{ .r = 0xee, .g = 0xee, .b = 0xee } },
-            .bg = .{ .rgb = .{ .r = 0x4a, .g = 0x6a, .b = 0x9a } },
-            .bold = true,
-        };
+        const footer_style = input_footer;
+        const footer_bar_track = input_bar_track;
+        const footer_bar_thumb = input_bar_thumb;
 
         const m = self.metrics(size);
         const footer_h = m.height;
@@ -3366,10 +3374,7 @@ const Search = struct {
 
     fn paintFooter(self: *const Search, scr: *tui.Screen, size: tui.Size) void {
         if (size.rows < 2) return;
-        const footer_style = tui.Style{
-            .fg = .{ .rgb = .{ .r = 0xee, .g = 0xee, .b = 0xee } },
-            .bg = .{ .rgb = .{ .r = 0x2a, .g = 0x3f, .b = 0x5f } },
-        };
+        const footer_style = input_footer;
         const footer_y = size.rows - 1;
         Frame.fillRow(scr, footer_y, footer_style);
         var line_buf: [512]u8 = undefined;
@@ -4675,10 +4680,7 @@ const PathPrompt = struct {
 
     fn paint(self: *const PathPrompt, scr: *tui.Screen, size: tui.Size) void {
         if (size.rows < 2) return;
-        const footer_style = tui.Style{
-            .fg = .{ .rgb = .{ .r = 0xee, .g = 0xee, .b = 0xee } },
-            .bg = .{ .rgb = .{ .r = 0x2a, .g = 0x3f, .b = 0x5f } },
-        };
+        const footer_style = input_footer;
         const footer_y = size.rows - 1;
         Frame.fillRow(scr, footer_y, footer_style);
         var line_buf: [512]u8 = undefined;
