@@ -141,10 +141,11 @@ const Overlay = union(enum) {
 
 /// Compiled defaults, then the user file, then the repo file. `xdg` is
 /// `$XDG_CONFIG_HOME` and `home` is `$HOME`. Empty strings count as unset.
+/// A null `root` skips the repo file (no live project).
 pub fn load(
     alloc: Allocator,
     io: Io,
-    root: Io.Dir,
+    root: ?Io.Dir,
     xdg: ?[]const u8,
     home: ?[]const u8,
 ) Allocator.Error!LoadResult {
@@ -157,9 +158,11 @@ pub fn load(
             .failure => |fail| return .{ .failure = fail },
         }
     }
-    switch (try overlayFile(alloc, io, root, &config, repo_rel_path)) {
-        .applied, .missing => {},
-        .failure => |fail| return .{ .failure = fail },
+    if (root) |dir| {
+        switch (try overlayFile(alloc, io, dir, &config, repo_rel_path)) {
+            .applied, .missing => {},
+            .failure => |fail| return .{ .failure = fail },
+        }
     }
     return .{ .config = config };
 }

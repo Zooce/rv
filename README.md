@@ -97,6 +97,8 @@ rv                 # local changes (staged, unstaged, untracked)
 
 `j` and `k` move the current line. A click jumps to that line. The scroll wheel moves the window and leaves that line selected. Shift+wheel, or a sideways trackpad scroll, pans the hunk under the pointer. `a` approves the hunk at that line and `A` approves the whole file. Approving stages the change and hides it from the diff. `i` or `Enter` comments on the current line. Press `?` for every key, and `q` to quit.
 
+`Space` then `p` switches among saved work trees. Bare `rv` starts from any directory and restores that list. `rv path` opens that work tree and adds it to the list. Tab in the add prompt cycles matching directories. Type `/` and Tab again to go into the one on the line.
+
 Tell your agent to address your rv comments. The skill from the install step reads those comments, edits the code, and resolves each comment it has handled. What you approved stays staged and stays out of the next diff.
 
 `r` reloads the diff and the comments. Continue until you are happy with the changes.
@@ -104,6 +106,7 @@ Tell your agent to address your rv comments. The skill from the install step rea
 ```sh
 rv HEAD            # one commit
 rv main...HEAD     # a range
+rv ~/src/other     # open that work tree and remember it
 ```
 
 ```sh
@@ -120,7 +123,7 @@ rv unapprove <n>
 
 Display defaults are read once, before the first paint.
 
-The user file is `$XDG_CONFIG_HOME/rv/config`. When `XDG_CONFIG_HOME` is unset or empty, it is `~/.config/rv/config`. The repo file is `.rv/config`, in the same directory as comments and approvals. A key in the repo file overrides that key in the user file. A missing file leaves the compiled default in place: side-by-side, line numbers on, wrap off.
+The user file is `$XDG_CONFIG_HOME/rv/config`. When `XDG_CONFIG_HOME` is unset or empty, it is `~/.config/rv/config`. The same directory holds `projects`: one absolute path per line, in the order projects were added, plus an optional `current` line for the last live project. The repo file is `.rv/config`, in the same directory as comments and approvals. A key in the repo file overrides that key in the user file. A missing file leaves the compiled default in place: side-by-side, line numbers on, wrap off.
 
 ```
 layout = uni

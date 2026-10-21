@@ -1,0 +1,34 @@
+# Tab cycles directories in the add prompt. rv <path> opens that work
+# tree and writes it into the projects file.
+twin
+tabdir
+wait Unstaged
+wait rv  @base  a
+send Space
+send p
+wait Enter switch
+send a
+wait Enter add
+send-path tab
+wait aaat
+send Tab
+wait aaatabother
+gone aaatabtarget
+send Tab
+wait aaatabtarget
+gone aaatabother
+send Tab
+wait aaatabother
+gone aaatabtarget
+send Escape
+wait Enter switch
+send Escape
+wait a/A approve
+send q
+gone Unstaged
+args @other
+restart norepo
+wait othertoken
+wait rv  @otherbase  a
+projects @other
+projects-gone @dest

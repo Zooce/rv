@@ -5,7 +5,8 @@
 //! `h`/`l` pan, `0`/`$` col home/end, `[`/`]` hunk, `{`/`}` file header,
 //! `(`/`)` prev/next comment (unapproves a hidden hunk if needed), `/` text search, `n`/`N` next/prev match,
 //! `Space` `f` file list, `Space` `c` comment list, `Space` `a` approved list
-//! (local; Enter unapproves and jumps, does not unstage), `gs`/`gu`/`gd` hunk git and `gS`/`gU`/`gD`
+//! (local; Enter unapproves and jumps, does not unstage), `Space` `p` project list
+//! (local; Enter switches work tree, `a` adds a path, `d` removes one), `gs`/`gu`/`gd` hunk git and `gS`/`gU`/`gD`
 //! file git (local), `a`/`A` approve hunk/file (local; stages, then hides),
 //! `i`/`c`/`Enter`
 //! create or edit new, `I`/`C` old, `d` dismiss new, `D` dismiss old,
@@ -16,6 +17,11 @@
 //! files keep the compiled defaults: side-by-side, numbers on, wrap off.
 //! Narrow terminals still fall back to unified. `t`, `#`, and `w` change
 //! this session only and do not write either file.
+//! Saved work trees are listed in `projects` beside that user file.
+//! Bare `rv` enters the TUI from any directory and restores the list.
+//! `rv <path>` opens that work tree and adds it to the list. Tab in the
+//! add prompt cycles matching directories.
+//! With no live project the rows are empty and the footer is `no project`.
 //! Error paths never enter raw / alt-screen mode. An empty model still
 //! opens the TUI; the footer shows the load source (`HEAD  empty` when
 //! the worktree is clean, `HEAD  N approved` when every local change is
@@ -98,7 +104,12 @@
 //! Opens on an approved identity in the file under the cursor when there is
 //! one; otherwise the first row. `q` still quits.
 //!
-//! Help: `?` in normal (or from a file, comment, or approved list) opens a centered overlay
+//! Project list: `Space` then `p` opens a centered overlay of saved work
+//! trees (local only). Bare `rv` starts from any directory and restores
+//! that list. Enter switches to the row and closes. The current row only
+//! closes. `a` prompts for a path. `d` drops the row. Esc closes. `q` quits.
+//!
+//! Help: `?` in normal (or from a file, comment, approved, or project list) opens a centered overlay
 //! with the grouped key catalog. `j`/`k` scroll when it does not fit. `?` or
 //! Esc closes; `q` still quits. Other keys are ignored. While commenting or
 //! searching, `?` inserts a question mark. The title bar is a short hint.
@@ -112,6 +123,7 @@ const store = @import("store");
 const comments = @import("comments");
 const cli = @import("cli");
 const config = @import("config");
+const projects = @import("projects");
 const comment_input = @import("comment_input");
 const Help = @import("Help");
 const Frame = @import("Frame.zig");
@@ -122,16 +134,46 @@ pub fn main(init: std.process.Init) !u8 {
     const io = init.io;
 
     const argv = try init.minimal.args.toSlice(init.arena.allocator());
-    const launch = cli.classify(if (argv.len > 1) argv[1..] else &.{}) catch {
+    const args = if (argv.len > 1) argv[1..] else &.{};
+
+    // An existing directory wins over a commit or a range (`../repo`).
+    // A file named HEAD stays a commit. Commands stay commands.
+    if (args.len == 1 and args[0].len > 0 and args[0][0] != '-' and !cli.isCommand(args[0])) {
+        if (try launchDirectory(alloc, io, init.environ_map.get("HOME"), args[0])) |path| {
+            defer alloc.free(path);
+            if (!try projects.isWorkTree(alloc, io, path)) {
+                std.debug.print("rv: {s}\n", .{git.errorMessage(error.NotARepository)});
+                return 1;
+            }
+            return try runTui(alloc, io, .local, init.environ_map, path);
+        }
+    }
+
+    const launch = cli.classify(args) catch {
         std.debug.print("{s}", .{cli.usage_text});
         return 2;
     };
     switch (launch) {
-        .tui => |source| return try runTui(alloc, io, source, init.environ_map),
+        .tui => |source| return try runTui(alloc, io, source, init.environ_map, null),
         .command => |cmd| {
             return cli.run(alloc, io, cmd, .cwd());
         },
     }
+}
+
+/// Real path when `arg` is an existing directory. Null when it is not, or
+/// when the process directory cannot be resolved.
+fn launchDirectory(
+    alloc: std.mem.Allocator,
+    io: std.Io,
+    home: ?[]const u8,
+    arg: []const u8,
+) std.mem.Allocator.Error!?[]u8 {
+    var dir = std.Io.Dir.cwd().openDir(io, ".", .{}) catch return null;
+    defer dir.close(io);
+    var buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const n = dir.realPath(io, &buf) catch return null;
+    return try projects.directoryArg(alloc, io, home, buf[0..n], arg);
 }
 
 /// Work tree this TUI session reads and writes. `dir` is an opened directory
@@ -156,6 +198,211 @@ fn openProcessRoot(alloc: std.mem.Allocator, io: std.Io) !Root {
     return .{ .path = path, .dir = dir };
 }
 
+fn openRoot(alloc: std.mem.Allocator, io: std.Io, path: []const u8) !Root {
+    const dir = try std.Io.Dir.openDirAbsolute(io, path, .{});
+    errdefer dir.close(io);
+    var buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const n = try dir.realPath(io, &buf);
+    const owned = try alloc.dupe(u8, buf[0..n]);
+    return .{ .path = owned, .dir = dir };
+}
+
+/// Normal-mode title with the live project's basename. No name, or a name
+/// that does not fit in `buf`, leaves `title` unchanged.
+fn projectTitle(buf: []u8, project: ?[]const u8, title: []const u8) []const u8 {
+    const name = project orelse return title;
+    if (name.len == 0) return title;
+    const rest = if (std.mem.startsWith(u8, title, "rv  ")) title["rv  ".len..] else title;
+    return std.fmt.bufPrint(buf, "rv  {s}  {s}", .{ name, rest }) catch title;
+}
+
+fn projectBasename(root: *const ?Root) ?[]const u8 {
+    const live = root.* orelse return null;
+    const base = std.fs.path.basename(live.path);
+    return if (base.len == 0) live.path else base;
+}
+
+fn viewportFromConfig(display: config.Config) Viewport {
+    return .{
+        .layout_pref = switch (display.layout) {
+            .side_by_side => .side_by_side,
+            .unified => .unified,
+        },
+        .show_line_numbers = display.line_numbers,
+        .wrap = display.wrap,
+    };
+}
+
+fn loadProjects(alloc: std.mem.Allocator, io: std.Io, path: ?[]const u8) !projects.List {
+    const file = path orelse return .{};
+    return projects.load(alloc, io, file) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return .{},
+    };
+}
+
+fn emptyOpenDiff(alloc: std.mem.Allocator) std.mem.Allocator.Error!OpenDiff {
+    const parsed = diff.parse(alloc, "") catch return error.OutOfMemory;
+    const rows = view.row.flatten(alloc, &parsed) catch |err| {
+        var parsed_mut = parsed;
+        parsed_mut.deinit();
+        return err;
+    };
+    return OpenDiff.build(alloc, parsed, rows, 0) catch |err| {
+        alloc.free(rows);
+        var parsed_mut = parsed;
+        parsed_mut.deinit();
+        return err;
+    };
+}
+
+const SwitchResult = enum { switched, unchanged, failed };
+
+/// Open `path` as the one live review. A failed open leaves the previous
+/// review in place. Session layout, numbers, and wrap come from that
+/// project's config, the same as starting `rv` there.
+fn switchProject(
+    alloc: std.mem.Allocator,
+    io: std.Io,
+    path: []const u8,
+    root: *?Root,
+    diff_view: *OpenDiff,
+    review: *store.Review,
+    viewport: *Viewport,
+    note: *StatusNote,
+    xdg: ?[]const u8,
+    home: ?[]const u8,
+) std.mem.Allocator.Error!SwitchResult {
+    if (root.*) |*live| if (std.mem.eql(u8, live.path, path)) return .unchanged;
+
+    // Open and load the next tree before dropping the one on screen.
+    var opened = openRoot(alloc, io, path) catch {
+        note.set("not a git repository");
+        return .failed;
+    };
+    const repo = projects.isWorkTree(alloc, io, opened.path) catch |err| {
+        opened.deinit(alloc, io);
+        return err;
+    };
+    if (!repo) {
+        opened.deinit(alloc, io);
+        note.set("not a git repository");
+        return .failed;
+    }
+
+    const configured = try config.load(alloc, io, opened.dir, xdg, home);
+    const display = switch (configured) {
+        .config => |cfg| cfg,
+        .failure => |fail| {
+            note.set(fail.reason);
+            fail.deinit(alloc);
+            opened.deinit(alloc, io);
+            return .failed;
+        },
+    };
+
+    const loaded = loadOpenDiff(alloc, io, .{ .dir = opened.dir }, opened.dir, .local);
+    const next_diff = switch (loaded) {
+        .open => |view_diff| view_diff,
+        .git => |err| {
+            note.set(git.errorMessage(err));
+            opened.deinit(alloc, io);
+            return .failed;
+        },
+        .approved => |err| {
+            note.set(approvedLoadMessage(err));
+            opened.deinit(alloc, io);
+            return .failed;
+        },
+        .build => |err| {
+            opened.deinit(alloc, io);
+            return err;
+        },
+    };
+    const next_review = store.load(alloc, io, opened.dir, store.default_review_id) catch |err| {
+        var failed = next_diff;
+        failed.deinit(alloc);
+        opened.deinit(alloc, io);
+        switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            else => {
+                note.set(reviewLoadMessage(err));
+                return .failed;
+            },
+        }
+    };
+
+    diff_view.deinit(alloc);
+    diff_view.* = next_diff;
+    review.deinit();
+    review.* = next_review;
+    if (root.*) |*live| live.deinit(alloc, io);
+    root.* = opened;
+    viewport.* = viewportFromConfig(display);
+    return .switched;
+}
+
+/// Drop the live review. Git, approve, comment save, and reload then no-op.
+fn clearProject(
+    alloc: std.mem.Allocator,
+    io: std.Io,
+    root: *?Root,
+    diff_view: *OpenDiff,
+    review: *store.Review,
+    viewport: *Viewport,
+    xdg: ?[]const u8,
+    home: ?[]const u8,
+) std.mem.Allocator.Error!void {
+    const configured = try config.load(alloc, io, null, xdg, home);
+    const display = switch (configured) {
+        .config => |cfg| cfg,
+        .failure => |fail| blk: {
+            fail.deinit(alloc);
+            break :blk config.Config{};
+        },
+    };
+    var next_diff = try emptyOpenDiff(alloc);
+    var next_review = try store.initEmpty(alloc, store.default_review_id);
+    diff_view.deinit(alloc);
+    diff_view.* = next_diff;
+    next_diff = undefined;
+    review.deinit();
+    review.* = next_review;
+    next_review = undefined;
+    if (root.*) |*live| {
+        live.deinit(alloc, io);
+        root.* = null;
+    }
+    viewport.* = viewportFromConfig(display);
+}
+
+fn saveProjects(alloc: std.mem.Allocator, io: std.Io, path: ?[]const u8, list: *const projects.List) bool {
+    const file = path orelse return true;
+    projects.save(list, alloc, io, file) catch return false;
+    return true;
+}
+
+/// Append `path` when it is new and point `current` at it. Writes the file
+/// when the list changed. A failed write puts the list back. False means
+/// the file was not updated.
+fn storeCurrent(
+    alloc: std.mem.Allocator,
+    io: std.Io,
+    projects_path: ?[]const u8,
+    list: *projects.List,
+    path: []const u8,
+) std.mem.Allocator.Error!bool {
+    const prev = list.current;
+    const added = try list.append(alloc, path);
+    const idx = list.indexOf(path).?;
+    const moved = list.setCurrent(idx);
+    if (!added and !moved) return true;
+    if (saveProjects(alloc, io, projects_path, list)) return true;
+    if (added) list.remove(alloc, idx);
+    list.current = prev;
+    return false;
+}
+
 /// Rows reserved under the body. A comment box uses `comment_h`; every other
 /// mode uses one status row. Zero when the terminal is a single row or less.
 fn footerHeight(term_rows: u16, focus: Focus, comment_h: u16) u16 {
@@ -173,6 +420,8 @@ fn frameTitle(focus: Focus, comment: []const u8, confirm: []const u8) []const u8
         .comments => "rv  Enter jump  i edit  d dismiss  Esc close",
         .files => "rv  Enter jump  a/A approve  Esc close",
         .approved => "rv  Enter unapprove  Esc close",
+        .projects => "rv  Enter switch  a add  d remove  Esc close",
+        .adding => "rv  Tab cycle  Enter add  Esc cancel",
         .helping => "rv  Esc close",
         .git_error => "rv  Enter/Esc close",
         .confirm => confirm,
@@ -249,6 +498,7 @@ fn presentFrame(
     viewport: *Viewport,
     review: *const store.Review,
     source: git.Origin,
+    project: ?[]const u8,
     focus: Focus,
     draft: *const Draft,
     confirm: Confirm,
@@ -262,8 +512,15 @@ fn presentFrame(
     try marks.resize(alloc, diff_view.rows.len);
     for (diff_view.rows, 0..) |row, i| marks.items[i] = comments.rowMarked(row, review);
 
-    var empty_buf: [64]u8 = undefined;
+    var empty_store: [128]u8 = undefined;
+    var title_buf: [512]u8 = undefined;
+    const base_empty = emptyFooterLabel(&empty_store, source, diff_view.approved_n);
+    const prompt_footer = focus == .searching or focus == .commenting or
+        (focus == .adding and frame.note.slice().len == 0);
     const cur = view.row.clampCursor(viewport.cursor, diff_view.rows.len);
+    // The basename sits in the normal title. The footer keeps `HEAD`, the
+    // approved count, and the layout tag where existing checks read them.
+    const live = if (focus == .normal) project else null;
     frame.paint(scr, size, .{
         .rows = diff_view.rows,
         .slots = diff_view.sbs_slots,
@@ -275,10 +532,10 @@ fn presentFrame(
         .show_line_numbers = viewport.show_line_numbers,
         .layout_pref = viewport.layout_pref,
         .marked = marks.items,
-        .title = frameTitle(focus, draft.titleBar(), confirm.titleBar()),
-        .show_footer = focus != .searching and focus != .commenting,
-        .source_label = cli.sourceLabel(source, false),
-        .empty_label = emptyFooterLabel(&empty_buf, source, diff_view.approved_n),
+        .title = projectTitle(&title_buf, live, frameTitle(focus, draft.titleBar(), confirm.titleBar())),
+        .show_footer = !prompt_footer,
+        .source_label = if (project == null) "no project" else cli.sourceLabel(source, false),
+        .empty_label = if (project == null) "no project" else base_empty,
         .open_n = review.openCount(),
         .hints = rowHints(diff_view.rows, cur, source, focus),
         .area = area,
@@ -290,25 +547,99 @@ fn runTui(
     io: std.Io,
     source: git.Origin,
     environ: *std.process.Environ.Map,
+    launch_path: ?[]const u8,
 ) !u8 {
-    var root = openProcessRoot(alloc, io) catch |err| switch (err) {
+    const xdg = environ.get("XDG_CONFIG_HOME");
+    const home = environ.get("HOME");
+
+    var cwd_root = openProcessRoot(alloc, io) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
         else => {
             std.debug.print("rv: cannot open working directory\n", .{});
             return 1;
         },
     };
-    defer root.deinit(alloc, io);
-    const git_cwd: std.process.Child.Cwd = .{ .dir = root.dir };
+    var cwd_owned = true;
+    defer if (cwd_owned) cwd_root.deinit(alloc, io);
+
+    const process_path = try alloc.dupe(u8, cwd_root.path);
+    defer alloc.free(process_path);
+
+    const projects_path = try projects.userPath(alloc, xdg, home);
+    defer if (projects_path) |p| alloc.free(p);
+    var list = try loadProjects(alloc, io, projects_path);
+    defer list.deinit(alloc);
+    // Process cwd when it is a work tree and not yet saved. Shown last.
+    var unsaved: ?[]u8 = null;
+    defer if (unsaved) |p| alloc.free(p);
+
+    var root: ?Root = null;
+    defer if (root) |*live| live.deinit(alloc, io);
+
+    // Local: an explicit directory, else cwd, else the saved current path,
+    // else the first saved work tree. Otherwise the review is empty.
+    // Range and commit still need a git cwd.
+    if (source == .local) {
+        const cwd_repo = git.isWorkTree(alloc, io, .{ .dir = cwd_root.dir }) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            else => false,
+        };
+        if (launch_path) |asked| {
+            // Save the named work tree, then open it. A failed save still opens it.
+            _ = try storeCurrent(alloc, io, projects_path, &list, asked);
+            if (std.mem.eql(u8, asked, process_path)) {
+                if (list.indexOf(process_path) == null) unsaved = try alloc.dupe(u8, process_path);
+                root = cwd_root;
+                cwd_owned = false;
+            } else {
+                if (cwd_repo and list.indexOf(process_path) == null) {
+                    unsaved = try alloc.dupe(u8, process_path);
+                }
+                cwd_root.deinit(alloc, io);
+                cwd_owned = false;
+                root = openRoot(alloc, io, asked) catch |err| switch (err) {
+                    error.OutOfMemory => return error.OutOfMemory,
+                    else => null,
+                };
+            }
+        } else if (cwd_repo) {
+            if (list.indexOf(process_path)) |idx| {
+                if (list.setCurrent(idx)) _ = saveProjects(alloc, io, projects_path, &list);
+            } else {
+                unsaved = try alloc.dupe(u8, process_path);
+            }
+            root = cwd_root;
+            cwd_owned = false;
+        } else {
+            var flags = try alloc.alloc(bool, list.paths.items.len);
+            defer alloc.free(flags);
+            for (list.paths.items, 0..) |p, i| {
+                flags[i] = try projects.isWorkTree(alloc, io, p);
+            }
+            switch (projects.launchChoice(&list, false, process_path, flags)) {
+                .saved => |idx| {
+                    if (list.setCurrent(idx)) _ = saveProjects(alloc, io, projects_path, &list);
+                    const path = list.paths.items[idx];
+                    cwd_root.deinit(alloc, io);
+                    cwd_owned = false;
+                    root = openRoot(alloc, io, path) catch |err| switch (err) {
+                        error.OutOfMemory => return error.OutOfMemory,
+                        else => null,
+                    };
+                },
+                .cwd, .none => {
+                    cwd_root.deinit(alloc, io);
+                    cwd_owned = false;
+                },
+            }
+        }
+    } else {
+        root = cwd_root;
+        cwd_owned = false;
+    }
 
     // Config before the diff and before any TTY setup. A bad file exits here.
-    const configured = try config.load(
-        alloc,
-        io,
-        root.dir,
-        environ.get("XDG_CONFIG_HOME"),
-        environ.get("HOME"),
-    );
+    const configured = try config.load(alloc, io, if (root) |*live| live.dir else null, xdg, home);
     const display = switch (configured) {
         .config => |cfg| cfg,
         .failure => |fail| {
@@ -323,7 +654,8 @@ fn runTui(
     };
 
     // Load before any TTY setup so error paths never touch the terminal.
-    var diff_view: OpenDiff = switch (loadOpenDiff(alloc, io, git_cwd, root.dir, source)) {
+    // No live project: empty rows, footer `no project`.
+    var diff_view: OpenDiff = if (root) |*live| switch (loadOpenDiff(alloc, io, .{ .dir = live.dir }, live.dir, source)) {
         .open => |loaded| loaded,
         .git => |err| {
             std.debug.print("rv: {s}\n", .{git.errorMessage(err)});
@@ -334,13 +666,16 @@ fn runTui(
             return 1;
         },
         .build => |err| return err,
-    };
+    } else try emptyOpenDiff(alloc);
     defer diff_view.deinit(alloc);
 
-    var review = store.load(alloc, io, root.dir, store.default_review_id) catch |err| {
-        std.debug.print("rv: {s}\n", .{reviewLoadMessage(err)});
-        return 1;
-    };
+    var review = if (root) |*live|
+        store.load(alloc, io, live.dir, store.default_review_id) catch |err| {
+            std.debug.print("rv: {s}\n", .{reviewLoadMessage(err)});
+            return 1;
+        }
+    else
+        try store.initEmpty(alloc, store.default_review_id);
     defer review.deinit();
 
     // TTY/screen setup after load: map failures to short messages (same as load
@@ -372,21 +707,14 @@ fn runTui(
     defer scr.deinit();
 
     // `config.Layout` and the viewport preference are separate enums.
-    var viewport: Viewport = .{
-        .layout_pref = switch (display.layout) {
-            .side_by_side => .side_by_side,
-            .unified => .unified,
-        },
-        .show_line_numbers = display.line_numbers,
-        .wrap = display.wrap,
-    };
+    var viewport: Viewport = viewportFromConfig(display);
     var running = true;
     // Exactly one focus; cannot help, comment, search, and list at once.
     var focus: Focus = .normal;
     // Exactly one leader: `Space` lists (`f` files, `c` comments, `a`
-    // approved), `g` git (`s`/`u`/`d` hunk, `S`/`U`/`D` file) or a row end
-    // (`g` first, `e` last). Cleared on the next key. Unmatched is dropped;
-    // the second key is handled as usual.
+    // approved, `p` projects), `g` git (`s`/`u`/`d` hunk, `S`/`U`/`D` file)
+    // or a row end (`g` first, `e` last). Cleared on the next key. Unmatched
+    // is dropped; the second key is handled as usual.
     const Leader = enum { none, lists, git };
     var leader: Leader = .none;
     var confirm: Confirm = .{};
@@ -401,6 +729,9 @@ fn runTui(
     defer file_list.items.deinit(alloc);
     var approved_list: ApprovedList = .{};
     defer approved_list.items.deinit(alloc);
+    var project_list: ProjectList = .{};
+    var path_prompt: PathPrompt = .{};
+    defer path_prompt.deinit(alloc);
     var help: Help = .{};
     var frame: Frame = .{};
     var marks: std.ArrayList(bool) = .empty;
@@ -408,7 +739,7 @@ fn runTui(
     var git_error: GitError = .{};
     defer git_error.buf.deinit(alloc);
 
-    try presentFrame(alloc, &frame, &scr, size, &diff_view, &viewport, &review, source, focus, &draft, confirm, &marks);
+    try presentFrame(alloc, &frame, &scr, size, &diff_view, &viewport, &review, source, projectBasename(&root), focus, &draft, confirm, &marks);
     try scr.present(&term);
 
     while (running) {
@@ -423,7 +754,7 @@ fn runTui(
                 // Notes are one-shot; any key clears them (including keys that no-op).
                 frame.note.clear();
                 switch (focus) {
-                    .commenting => switch (try draft.handleKey(alloc, io, root.dir, &review, source, key, size)) {
+                    .commenting => switch (try draft.handleKey(alloc, io, root.?.dir, &review, source, key, size)) {
                         .closed => focus = .normal,
                         .quit => running = false,
                         .save_failed => {
@@ -466,12 +797,12 @@ fn runTui(
                                 focus = .commenting;
                             }
                         },
-                        .hidden => |h| {
+                        .hidden => |h| if (root != null) {
                             focus = .normal;
                             if (try landComment(
                                 alloc,
                                 io,
-                                root.dir,
+                                root.?.dir,
                                 source,
                                 &diff_view,
                                 &viewport.cursor,
@@ -483,7 +814,9 @@ fn runTui(
                             }
                         },
                         .missing => frame.note.set("comment not in this diff"),
-                        .dismiss => try applyListDismiss(alloc, io, root.dir, &review, &comment_list, &frame.note),
+                        .dismiss => if (root != null) {
+                            try applyListDismiss(alloc, io, root.?.dir, &review, &comment_list, &frame.note);
+                        },
                         .open => {},
                     },
                     .files => switch (file_list.handleKey(key)) {
@@ -497,11 +830,11 @@ fn runTui(
                             viewport.cursor = row;
                             focus = .normal;
                         },
-                        .approve => try applyListApprove(
+                        .approve => if (root != null) try applyListApprove(
                             alloc,
                             io,
-                            git_cwd,
-                            root.dir,
+                            .{ .dir = root.?.dir },
+                            root.?.dir,
                             source,
                             &diff_view,
                             &viewport.cursor,
@@ -521,7 +854,7 @@ fn runTui(
                             help.scroll = 0;
                             focus = .helping;
                         },
-                        .unapprove => |idx| {
+                        .unapprove => |idx| if (root != null) {
                             focus = .normal;
                             try applyUnapprove(
                                 alloc,
@@ -530,7 +863,7 @@ fn runTui(
                                 &diff_view,
                                 &viewport.cursor,
                                 &frame.note,
-                                root.dir,
+                                root.?.dir,
                                 approved_list.items.items[idx],
                             );
                         },
@@ -556,8 +889,8 @@ fn runTui(
                             try applyGroupIndex(
                                 alloc,
                                 io,
-                                git_cwd,
-                                root.dir,
+                                .{ .dir = root.?.dir },
+                                root.?.dir,
                                 source,
                                 &diff_view,
                                 &viewport.cursor,
@@ -572,8 +905,8 @@ fn runTui(
                             try applyIndex(
                                 alloc,
                                 io,
-                                git_cwd,
-                                root.dir,
+                                .{ .dir = root.?.dir },
+                                root.?.dir,
                                 source,
                                 &diff_view,
                                 &viewport.cursor,
@@ -597,8 +930,8 @@ fn runTui(
                                 &focus,
                                 &git_error,
                                 &review,
-                                git_cwd,
-                                root.dir,
+                                .{ .dir = root.?.dir },
+                                root.?.dir,
                                 confirm.whole_file,
                             );
                             if (focus != .git_error) {
@@ -610,6 +943,72 @@ fn runTui(
                                 }
                             }
                         },
+                    },
+                    .projects => switch (project_list.handleKey(key, &list, unsaved, if (root) |*live| live.path else null)) {
+                        .closed => focus = .normal,
+                        .quit => running = false,
+                        .help => {
+                            help.scroll = 0;
+                            focus = .helping;
+                        },
+                        .add => {
+                            path_prompt.begin(alloc);
+                            focus = .adding;
+                        },
+                        .remove => try removeProjectRow(
+                            alloc,
+                            io,
+                            xdg,
+                            home,
+                            projects_path,
+                            &list,
+                            &unsaved,
+                            &root,
+                            &diff_view,
+                            &review,
+                            &viewport,
+                            &project_list,
+                            &frame.note,
+                        ),
+                        .activate => try activateProject(
+                            alloc,
+                            io,
+                            xdg,
+                            home,
+                            projects_path,
+                            &list,
+                            unsaved,
+                            &root,
+                            &diff_view,
+                            &review,
+                            &viewport,
+                            &project_list,
+                            &focus,
+                            &frame.note,
+                        ),
+                        .open => {},
+                    },
+                    .adding => switch (try path_prompt.handleKey(alloc, io, home, process_path, key)) {
+                        .cancel => focus = .projects,
+                        .quit => running = false,
+                        .submit => try acceptAddedPath(
+                            alloc,
+                            io,
+                            xdg,
+                            home,
+                            process_path,
+                            projects_path,
+                            &list,
+                            &unsaved,
+                            &root,
+                            &diff_view,
+                            &review,
+                            &viewport,
+                            &focus,
+                            &frame.note,
+                            path_prompt.buf.items,
+                        ),
+                        .open => {},
                     },
                     .helping => switch (help.handleKey(key)) {
                         .closed => focus = .normal,
@@ -628,12 +1027,18 @@ fn runTui(
                                 } else if (pending == .lists and c == 'c') {
                                     try comment_list.load(alloc, review.comments.items);
                                     focus = .comments;
-                                } else if (pending == .lists and c == 'a') {
+                                } else if (pending == .lists and c == 'p') {
+                                    if (source == .local) {
+                                        const current = if (root) |*live| live.path else null;
+                                        project_list.open(&list, unsaved, current);
+                                        focus = .projects;
+                                    }
+                                } else if (pending == .lists and c == 'a' and root != null) {
                                     if (source == .local) {
                                         if (approved_list.load(
                                             alloc,
                                             io,
-                                            root.dir,
+                                            root.?.dir,
                                             &diff_view.diff,
                                             diff_view.rows,
                                             viewport.cursor,
@@ -644,12 +1049,12 @@ fn runTui(
                                             else => frame.note.set(approvedLoadMessage(err)),
                                         }
                                     }
-                                } else if (pending == .git and c == 's') {
+                                } else if (pending == .git and c == 's' and root != null) {
                                     try dispatchStage(
                                         alloc,
                                         io,
-                                        git_cwd,
-                                        root.dir,
+                                        .{ .dir = root.?.dir },
+                                        root.?.dir,
                                         source,
                                         &diff_view,
                                         &viewport.cursor,
@@ -660,12 +1065,12 @@ fn runTui(
                                         false,
                                         true,
                                     );
-                                } else if (pending == .git and c == 'u') {
+                                } else if (pending == .git and c == 'u' and root != null) {
                                     try dispatchStage(
                                         alloc,
                                         io,
-                                        git_cwd,
-                                        root.dir,
+                                        .{ .dir = root.?.dir },
+                                        root.?.dir,
                                         source,
                                         &diff_view,
                                         &viewport.cursor,
@@ -676,14 +1081,14 @@ fn runTui(
                                         false,
                                         false,
                                     );
-                                } else if (pending == .git and c == 'd') {
+                                } else if (pending == .git and c == 'd' and root != null) {
                                     beginGitDiscard(source, diff_view.rows, viewport.cursor, &confirm, &focus, false);
-                                } else if (pending == .git and c == 'S') {
+                                } else if (pending == .git and c == 'S' and root != null) {
                                     try dispatchStage(
                                         alloc,
                                         io,
-                                        git_cwd,
-                                        root.dir,
+                                        .{ .dir = root.?.dir },
+                                        root.?.dir,
                                         source,
                                         &diff_view,
                                         &viewport.cursor,
@@ -694,12 +1099,12 @@ fn runTui(
                                         true,
                                         true,
                                     );
-                                } else if (pending == .git and c == 'U') {
+                                } else if (pending == .git and c == 'U' and root != null) {
                                     try dispatchStage(
                                         alloc,
                                         io,
-                                        git_cwd,
-                                        root.dir,
+                                        .{ .dir = root.?.dir },
+                                        root.?.dir,
                                         source,
                                         &diff_view,
                                         &viewport.cursor,
@@ -710,7 +1115,7 @@ fn runTui(
                                         true,
                                         false,
                                     );
-                                } else if (pending == .git and c == 'D') {
+                                } else if (pending == .git and c == 'D' and root != null) {
                                     beginGitDiscard(source, diff_view.rows, viewport.cursor, &confirm, &focus, true);
                                 } else if (pending == .git and c == 'g') {
                                     viewport.moveToFirst(size.cols, diff_view.rows, diff_view.sbs_slots);
@@ -748,38 +1153,38 @@ fn runTui(
                                             if (hit.wrapped) frame.note.set("search wrapped");
                                         },
                                     }
-                                } else if (c == ')') {
-                                    try jumpLiveComment(&review, &diff_view, alloc, io, root.dir, source, &viewport.cursor, &frame.note, .next);
-                                } else if (c == '(') {
-                                    try jumpLiveComment(&review, &diff_view, alloc, io, root.dir, source, &viewport.cursor, &frame.note, .prev);
-                                } else if (c == 'r') {
-                                    reloadReview(alloc, io, root.dir, &review, &frame.note);
-                                    reloadDiff(alloc, io, git_cwd, root.dir, source, &diff_view, &viewport.cursor, &frame.note);
-                                } else if (c == 'e') {
+                                } else if (c == ')' and root != null) {
+                                    try jumpLiveComment(&review, &diff_view, alloc, io, root.?.dir, source, &viewport.cursor, &frame.note, .next);
+                                } else if (c == '(' and root != null) {
+                                    try jumpLiveComment(&review, &diff_view, alloc, io, root.?.dir, source, &viewport.cursor, &frame.note, .prev);
+                                } else if (c == 'r' and root != null) {
+                                    reloadReview(alloc, io, root.?.dir, &review, &frame.note);
+                                    reloadDiff(alloc, io, .{ .dir = root.?.dir }, root.?.dir, source, &diff_view, &viewport.cursor, &frame.note);
+                                } else if (c == 'e' and root != null) {
                                     try expandCurrentHunk(
                                         alloc,
                                         io,
-                                        git_cwd,
-                                        root.dir,
+                                        .{ .dir = root.?.dir },
+                                        root.?.dir,
                                         source,
                                         &diff_view,
                                         &viewport.cursor,
                                         &frame.note,
                                     );
-                                } else if (c == 'i' or c == 'c') {
+                                } else if ((c == 'i' or c == 'c') and root != null) {
                                     if (try draft.begin(&review, alloc, diff_view.rows, diff_view.sbs_slots, layout, viewport.cursor, .new)) {
                                         focus = .commenting;
                                     }
-                                } else if (c == 'I' or c == 'C') {
+                                } else if ((c == 'I' or c == 'C') and root != null) {
                                     if (try draft.begin(&review, alloc, diff_view.rows, diff_view.sbs_slots, layout, viewport.cursor, .old)) {
                                         focus = .commenting;
                                     }
-                                } else if (c == 'a') {
+                                } else if (c == 'a' and root != null) {
                                     try dispatchApprove(
                                         alloc,
                                         io,
-                                        git_cwd,
-                                        root.dir,
+                                        .{ .dir = root.?.dir },
+                                        root.?.dir,
                                         source,
                                         &diff_view,
                                         &viewport.cursor,
@@ -790,12 +1195,12 @@ fn runTui(
                                         &confirm,
                                         false,
                                     );
-                                } else if (c == 'A') {
+                                } else if (c == 'A' and root != null) {
                                     try dispatchApprove(
                                         alloc,
                                         io,
-                                        git_cwd,
-                                        root.dir,
+                                        .{ .dir = root.?.dir },
+                                        root.?.dir,
                                         source,
                                         &diff_view,
                                         &viewport.cursor,
@@ -806,13 +1211,13 @@ fn runTui(
                                         &confirm,
                                         true,
                                     );
-                                } else if (c == 'd') {
-                                    dismissAt(&review, alloc, io, root.dir, diff_view.rows, diff_view.sbs_slots, layout, viewport.cursor, .new, &frame.note);
-                                } else if (c == 'D') {
-                                    dismissAt(&review, alloc, io, root.dir, diff_view.rows, diff_view.sbs_slots, layout, viewport.cursor, .old, &frame.note);
+                                } else if (c == 'd' and root != null) {
+                                    dismissAt(&review, alloc, io, root.?.dir, diff_view.rows, diff_view.sbs_slots, layout, viewport.cursor, .new, &frame.note);
+                                } else if (c == 'D' and root != null) {
+                                    dismissAt(&review, alloc, io, root.?.dir, diff_view.rows, diff_view.sbs_slots, layout, viewport.cursor, .old, &frame.note);
                                 }
                             },
-                            .enter => {
+                            .enter => if (root != null) {
                                 if (try draft.begin(&review, alloc, diff_view.rows, diff_view.sbs_slots, layout, viewport.cursor, .new)) {
                                     focus = .commenting;
                                 }
@@ -852,6 +1257,7 @@ fn runTui(
                     .comments => comment_list.win.wheel(dir),
                     .approved => approved_list.win.wheel(dir),
                     .commenting => draft.scrollWheel(dir, size),
+                    .projects, .adding => project_list.win.wheel(dir),
                     .searching, .git_error, .confirm => {},
                 } else if (mouse.button == .left and mouse.action == .press and focus == .normal) {
                     leader = .none;
@@ -860,8 +1266,16 @@ fn runTui(
             },
         }
         if (running) {
-            try presentFrame(alloc, &frame, &scr, size, &diff_view, &viewport, &review, source, focus, &draft, confirm, &marks);
-            if (focus == .helping) {
+            try presentFrame(alloc, &frame, &scr, size, &diff_view, &viewport, &review, source, projectBasename(&root), focus, &draft, confirm, &marks);
+            if (focus == .projects or focus == .adding) {
+                const current = if (root) |*live| live.path else null;
+                project_list.paint(&scr, size, &list, unsaved, current);
+                if (focus == .adding and frame.note.slice().len == 0) {
+                    path_prompt.paint(&scr, size);
+                } else {
+                    scr.hideCursor();
+                }
+            } else if (focus == .helping) {
                 help.paint(&scr, size);
                 scr.hideCursor();
             } else if (focus == .git_error) {
@@ -2385,9 +2799,21 @@ fn beginGitDiscard(
 }
 
 /// Key ownership: normal nav, comment draft, `/` search prompt, comment list,
-/// file list, approved list, help, git error overlay, or confirm overlay
-/// (discard, group, or approve).
-pub const Focus = enum { normal, commenting, searching, comments, files, approved, helping, git_error, confirm };
+/// file list, approved list, project list, add-path prompt, help, git error
+/// overlay, or confirm overlay (discard, group, or approve).
+pub const Focus = enum {
+    normal,
+    commenting,
+    searching,
+    comments,
+    files,
+    approved,
+    projects,
+    adding,
+    helping,
+    git_error,
+    confirm,
+};
 
 /// Confirm overlay for discard (`gd` / `gD`), group stage/unstage, and
 /// approve (`a` / `A` when the target has live comments). `yes` is the
@@ -4001,6 +4427,464 @@ const ApprovedList = struct {
     }
 };
 
+/// Saved paths, then the session-only cwd when that row is present.
+fn projectRowCount(list: *const projects.List, unsaved: ?[]const u8) usize {
+    return list.paths.items.len + @intFromBool(unsaved != null);
+}
+
+/// `index` is below `projectRowCount`. The last row is `unsaved` when set.
+fn projectRowPath(list: *const projects.List, unsaved: ?[]const u8, index: usize) []const u8 {
+    if (index < list.paths.items.len) return list.paths.items[index];
+    return unsaved.?;
+}
+
+/// Project-list overlay (`Space` `p`): saved order, unsaved cwd last.
+/// The current project is a `* ` prefix. Enter on that row only closes.
+const ProjectList = struct {
+    const Result = enum { open, closed, quit, help, add, remove, activate };
+
+    win: ListWin = .{},
+
+    fn open(self: *ProjectList, list: *const projects.List, unsaved: ?[]const u8, current: ?[]const u8) void {
+        self.win = .{};
+        const live = current orelse return;
+        const n = projectRowCount(list, unsaved);
+        var i: usize = 0;
+        while (i < n) : (i += 1) {
+            if (std.mem.eql(u8, projectRowPath(list, unsaved, i), live)) {
+                self.win.cursor = i;
+                return;
+            }
+        }
+    }
+
+    fn handleKey(
+        self: *ProjectList,
+        key: tui.Key,
+        list: *const projects.List,
+        unsaved: ?[]const u8,
+        current: ?[]const u8,
+    ) Result {
+        const n = projectRowCount(list, unsaved);
+        self.win.key(n, key);
+        switch (key) {
+            .esc => return .closed,
+            .enter => {
+                if (self.win.cursor >= n) return .open;
+                const path = projectRowPath(list, unsaved, self.win.cursor);
+                if (current) |live| if (std.mem.eql(u8, live, path)) return .closed;
+                return .activate;
+            },
+            .char => |c| {
+                if (c == 'q' or c == 'Q') return .quit;
+                if (c == '?') return .help;
+                if (c == 'a') return .add;
+                if (c == 'd') {
+                    if (self.win.cursor >= n) return .open;
+                    return .remove;
+                }
+            },
+            .ctrl_c => return .quit,
+            else => {},
+        }
+        return .open;
+    }
+
+    fn paint(
+        self: *ProjectList,
+        scr: *tui.Screen,
+        size: tui.Size,
+        list: *const projects.List,
+        unsaved: ?[]const u8,
+        current: ?[]const u8,
+    ) void {
+        const n = projectRowCount(list, unsaved);
+        const panel = tui.Panel.overlay(size.cols, size.rows, n);
+        panel.paint(scr, " projects ");
+        const inner = panel.inner;
+        self.win.place(inner.h, n);
+        if (inner.h == 0 or inner.w == 0 or n == 0) return;
+        const text_area = panel.text(n);
+        const width: usize = text_area.w;
+        const start = self.win.scroll;
+        var row: u16 = 0;
+        while (row < inner.h) : (row += 1) {
+            const idx = start + row;
+            if (idx >= n) break;
+            const y = inner.y + row;
+            const path = projectRowPath(list, unsaved, idx);
+            const marked = if (current) |live| std.mem.eql(u8, live, path) else false;
+            const st = if (idx == self.win.cursor) tui.Panel.row_cur else tui.Panel.body;
+            scr.fillRect(.{ .x = inner.x, .y = y, .w = inner.w, .h = 1 }, ' ', st);
+            scr.putStr(inner.x, y, if (marked) "* " else "  ", st, 0, text_area);
+            const base = std.fs.path.basename(path);
+            const name = if (base.len == 0) path else base;
+            if (width > 2) scr.putStr(inner.x + 2, y, name, st, 0, text_area);
+            // Absolute path only when the whole string fits on the rest of the row.
+            const used = 2 + name.len;
+            if (base.len > 0 and used + 1 + path.len <= width) {
+                var dim = st;
+                dim.dim = true;
+                const path_x: u16 = @intCast(used + 1);
+                scr.putStr(inner.x + path_x, y, path, dim, 0, text_area);
+            }
+        }
+        panel.paintBar(scr, n, start);
+    }
+};
+
+/// `+` footer prompt for adding a project path. Tab cycles matching
+/// directories. Type `/` and Tab again to go into the current one.
+/// `?` inserts. Empty Enter stays.
+const PathPrompt = struct {
+    const Result = enum { open, cancel, quit, submit };
+
+    /// Matches from the Tab that started this cycle. The next Tab advances
+    /// `index` while the text before the caret is still that match.
+    const Cycle = struct {
+        head: []u8,
+        names: [][]u8,
+        index: usize,
+    };
+
+    buf: std.ArrayList(u8) = .empty,
+    caret: usize = 0,
+    cycle: ?Cycle = null,
+
+    fn deinit(self: *PathPrompt, alloc: std.mem.Allocator) void {
+        self.clearCycle(alloc);
+        self.buf.deinit(alloc);
+        self.* = undefined;
+    }
+
+    fn begin(self: *PathPrompt, alloc: std.mem.Allocator) void {
+        self.clearCycle(alloc);
+        self.buf.clearRetainingCapacity();
+        self.caret = 0;
+    }
+
+    fn clearCycle(self: *PathPrompt, alloc: std.mem.Allocator) void {
+        const cycle = self.cycle orelse return;
+        alloc.free(cycle.head);
+        for (cycle.names) |name| alloc.free(name);
+        alloc.free(cycle.names);
+        self.cycle = null;
+    }
+
+    fn handleKey(
+        self: *PathPrompt,
+        alloc: std.mem.Allocator,
+        io: std.Io,
+        home: ?[]const u8,
+        cwd: []const u8,
+        key: tui.Key,
+    ) std.mem.Allocator.Error!Result {
+        switch (key) {
+            .esc => {
+                self.begin(alloc);
+                return .cancel;
+            },
+            .enter => {
+                if (self.buf.items.len == 0) return .open;
+                return .submit;
+            },
+            .backspace => {
+                if (self.caret > 0) {
+                    self.caret -= 1;
+                    _ = self.buf.orderedRemove(self.caret);
+                }
+            },
+            .tab => try self.complete(alloc, io, home, cwd),
+            .char => |c| {
+                if (c >= 0x20 and c < 0x7f) {
+                    try self.buf.insert(alloc, self.caret, @intCast(c));
+                    self.caret += 1;
+                }
+            },
+            .left => {
+                if (self.caret > 0) self.caret -= 1;
+            },
+            .right => {
+                if (self.caret < self.buf.items.len) self.caret += 1;
+            },
+            .ctrl_c => return .quit,
+            else => {},
+        }
+        return .open;
+    }
+
+    /// Replace the text before the caret with the next matching directory.
+    /// Text after the caret stays. A following Tab walks the same matches.
+    /// Any other edit makes the next Tab start again from what is typed.
+    fn complete(
+        self: *PathPrompt,
+        alloc: std.mem.Allocator,
+        io: std.Io,
+        home: ?[]const u8,
+        cwd: []const u8,
+    ) std.mem.Allocator.Error!void {
+        if (self.cycle) |cycle| {
+            const current = try std.fmt.allocPrint(alloc, "{s}{s}", .{ cycle.head, cycle.names[cycle.index] });
+            defer alloc.free(current);
+            if (std.mem.eql(u8, self.buf.items[0..self.caret], current)) {
+                const next = (cycle.index + 1) % cycle.names.len;
+                const text = try std.fmt.allocPrint(alloc, "{s}{s}", .{ cycle.head, cycle.names[next] });
+                defer alloc.free(text);
+                try self.spliceBefore(alloc, text);
+                self.cycle.?.index = next;
+                return;
+            }
+            self.clearCycle(alloc);
+        }
+
+        var matches = try projects.completePath(alloc, io, home, cwd, self.buf.items[0..self.caret]);
+        defer matches.deinit(alloc);
+        if (matches.text) |text| {
+            try self.spliceBefore(alloc, text);
+            return;
+        }
+        if (matches.names.len == 0) return;
+
+        const chosen = try std.fmt.allocPrint(alloc, "{s}{s}", .{ matches.head, matches.names[0] });
+        defer alloc.free(chosen);
+        try self.spliceBefore(alloc, chosen);
+        if (matches.names.len < 2) return;
+
+        // Keep this list so the next Tab can walk it.
+        const head = try alloc.dupe(u8, matches.head);
+        errdefer alloc.free(head);
+        const names = try alloc.alloc([]u8, matches.names.len);
+        errdefer alloc.free(names);
+        var filled: usize = 0;
+        errdefer for (names[0..filled]) |name| alloc.free(name);
+        for (matches.names) |name| {
+            names[filled] = try alloc.dupe(u8, name);
+            filled += 1;
+        }
+        self.cycle = .{ .head = head, .names = names, .index = 0 };
+    }
+
+    fn spliceBefore(self: *PathPrompt, alloc: std.mem.Allocator, text: []const u8) std.mem.Allocator.Error!void {
+        const suffix = try alloc.dupe(u8, self.buf.items[self.caret..]);
+        defer alloc.free(suffix);
+        self.buf.clearRetainingCapacity();
+        try self.buf.appendSlice(alloc, text);
+        try self.buf.appendSlice(alloc, suffix);
+        self.caret = text.len;
+    }
+
+    fn paint(self: *const PathPrompt, scr: *tui.Screen, size: tui.Size) void {
+        if (size.rows < 2) return;
+        const footer_style = tui.Style{
+            .fg = .{ .rgb = .{ .r = 0xee, .g = 0xee, .b = 0xee } },
+            .bg = .{ .rgb = .{ .r = 0x2a, .g = 0x3f, .b = 0x5f } },
+        };
+        const footer_y = size.rows - 1;
+        Frame.fillRow(scr, footer_y, footer_style);
+        var line_buf: [512]u8 = undefined;
+        const caret_byte = @min(self.caret, self.buf.items.len);
+        const prompt = Frame.bufPrintTrunc(&line_buf, "+{s}", .{self.buf.items});
+        scr.putStr(1, footer_y, prompt, footer_style, 0, null);
+        const max_x: u16 = if (size.cols == 0) 0 else size.cols - 1;
+        const raw_x: usize = 2 + caret_byte;
+        const cx: u16 = if (raw_x > max_x) max_x else @intCast(raw_x);
+        scr.setCursor(cx, footer_y);
+    }
+};
+
+/// Resolve `input` against the process cwd, append when it is new, and switch.
+/// A bad path stays in the prompt. Saving the list happens before the switch.
+fn acceptAddedPath(
+    alloc: std.mem.Allocator,
+    io: std.Io,
+    xdg: ?[]const u8,
+    home: ?[]const u8,
+    process_cwd: []const u8,
+    projects_path: ?[]const u8,
+    list: *projects.List,
+    unsaved: *?[]u8,
+    root: *?Root,
+    diff_view: *OpenDiff,
+    review: *store.Review,
+    viewport: *Viewport,
+    focus: *Focus,
+    note: *StatusNote,
+    input: []const u8,
+) std.mem.Allocator.Error!void {
+    // Realpath, then a work tree. Anything else keeps the typed text.
+    const resolved = projects.resolve(alloc, io, home, process_cwd, input) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => {
+            note.set("not a git repository");
+            return;
+        },
+    };
+    defer alloc.free(resolved);
+    const repo = projects.isWorkTree(alloc, io, resolved) catch |err| return err;
+    if (!repo) {
+        note.set("not a git repository");
+        return;
+    }
+
+    // Append a new path. An existing row stays where it is. Point current there.
+    const was_unsaved = if (unsaved.*) |p| std.mem.eql(u8, p, resolved) else false;
+    if (!try storeCurrent(alloc, io, projects_path, list, resolved)) {
+        note.set("cannot save projects");
+        return;
+    }
+    const idx = list.indexOf(resolved).?;
+    if (was_unsaved) {
+        const dropped = unsaved.*.?;
+        unsaved.* = null;
+        alloc.free(dropped);
+    }
+
+    switch (try switchProject(alloc, io, list.paths.items[idx], root, diff_view, review, viewport, note, xdg, home)) {
+        .failed => focus.* = .projects,
+        .switched, .unchanged => focus.* = .normal,
+    }
+}
+
+/// Enter on a row that is not the live project. A saved path updates `current`.
+fn activateProject(
+    alloc: std.mem.Allocator,
+    io: std.Io,
+    xdg: ?[]const u8,
+    home: ?[]const u8,
+    projects_path: ?[]const u8,
+    list: *projects.List,
+    unsaved: ?[]u8,
+    root: *?Root,
+    diff_view: *OpenDiff,
+    review: *store.Review,
+    viewport: *Viewport,
+    project_list: *ProjectList,
+    focus: *Focus,
+    note: *StatusNote,
+) std.mem.Allocator.Error!void {
+    const n = projectRowCount(list, unsaved);
+    if (project_list.win.cursor >= n) return;
+    const path = projectRowPath(list, unsaved, project_list.win.cursor);
+    if (root.*) |*live| if (std.mem.eql(u8, live.path, path)) {
+        focus.* = .normal;
+        return;
+    };
+
+    switch (try switchProject(alloc, io, path, root, diff_view, review, viewport, note, xdg, home)) {
+        .failed => return,
+        .switched, .unchanged => {
+            if (list.indexOf(path)) |idx| {
+                const prev = list.current;
+                if (list.setCurrent(idx)) {
+                    if (!saveProjects(alloc, io, projects_path, list)) {
+                        list.current = prev;
+                        note.set("cannot save projects");
+                    }
+                }
+            }
+            focus.* = .normal;
+        },
+    }
+}
+
+/// `d` drops the row. A saved path is removed from the file. The session-only
+/// cwd is dropped from the overlay only. Removing the live project opens the
+/// next work tree, scanning forward from the neighbor, then earlier rows.
+fn removeProjectRow(
+    alloc: std.mem.Allocator,
+    io: std.Io,
+    xdg: ?[]const u8,
+    home: ?[]const u8,
+    projects_path: ?[]const u8,
+    list: *projects.List,
+    unsaved: *?[]u8,
+    root: *?Root,
+    diff_view: *OpenDiff,
+    review: *store.Review,
+    viewport: *Viewport,
+    project_list: *ProjectList,
+    note: *StatusNote,
+) std.mem.Allocator.Error!void {
+    const idx = project_list.win.cursor;
+    const n = projectRowCount(list, unsaved.*);
+    if (idx >= n) return;
+    const path = projectRowPath(list, unsaved.*, idx);
+    const was_live = if (root.*) |*live| std.mem.eql(u8, live.path, path) else false;
+
+    // Saved rows persist. The unsaved cwd leaves the overlay and the file alone.
+    if (idx >= list.paths.items.len) {
+        const dropped = unsaved.*.?;
+        unsaved.* = null;
+        alloc.free(dropped);
+    } else {
+        const kept = try alloc.dupe(u8, path);
+        const prev = list.current;
+        list.remove(alloc, idx);
+        if (!saveProjects(alloc, io, projects_path, list)) {
+            list.paths.insert(alloc, idx, kept) catch {
+                alloc.free(kept);
+                return error.OutOfMemory;
+            };
+            list.current = prev;
+            note.set("cannot save projects");
+            return;
+        }
+        alloc.free(kept);
+    }
+
+    const left = projectRowCount(list, unsaved.*);
+    if (left == 0) {
+        project_list.win.cursor = 0;
+    } else if (idx >= left) {
+        project_list.win.cursor = left - 1;
+    } else {
+        project_list.win.cursor = idx;
+    }
+    if (!was_live) return;
+
+    // Neighbor first, then later rows, then earlier ones.
+    var found: ?usize = null;
+    if (left > 0) {
+        var i = project_list.win.cursor;
+        while (i < left) : (i += 1) {
+            if (try projects.isWorkTree(alloc, io, projectRowPath(list, unsaved.*, i))) {
+                found = i;
+                break;
+            }
+        }
+        if (found == null) {
+            i = project_list.win.cursor;
+            while (i > 0) {
+                i -= 1;
+                if (try projects.isWorkTree(alloc, io, projectRowPath(list, unsaved.*, i))) {
+                    found = i;
+                    break;
+                }
+            }
+        }
+    }
+    if (found) |row| {
+        const next = projectRowPath(list, unsaved.*, row);
+        switch (try switchProject(alloc, io, next, root, diff_view, review, viewport, note, xdg, home)) {
+            .failed => try clearProject(alloc, io, root, diff_view, review, viewport, xdg, home),
+            .switched, .unchanged => {
+                project_list.win.cursor = row;
+                if (row < list.paths.items.len) {
+                    const prev = list.current;
+                    if (list.setCurrent(row)) {
+                        if (!saveProjects(alloc, io, projects_path, list)) {
+                            list.current = prev;
+                            note.set("cannot save projects");
+                        }
+                    }
+                }
+            },
+        }
+    } else {
+        try clearProject(alloc, io, root, diff_view, review, viewport, xdg, home);
+    }
+}
+
 /// Dismissible git-error overlay: stderr text, keys, and paint.
 const GitError = struct {
     const Result = enum { open, closed, quit };
@@ -4041,6 +4925,89 @@ const GitError = struct {
         }
     }
 };
+
+test "project title names the live project and keeps the key hint" {
+    var buf: [128]u8 = undefined;
+    const title = "rv  a/A approve  i/I comment  ? help  q quit";
+    const named = projectTitle(&buf, "rv-regress", title);
+    try std.testing.expectEqualStrings(
+        "rv  rv-regress  a/A approve  i/I comment  ? help  q quit",
+        named,
+    );
+    try std.testing.expect(std.mem.indexOf(u8, named, "a/A approve") != null);
+    try std.testing.expectEqualStrings(title, projectTitle(&buf, null, title));
+    try std.testing.expectEqualStrings(title, projectTitle(&buf, "", title));
+    var tiny: [8]u8 = undefined;
+    try std.testing.expectEqualStrings(title, projectTitle(&tiny, "rv-regress", title));
+}
+
+test "project list opens on the current row and enter there only closes" {
+    const alloc = std.testing.allocator;
+    var list: projects.List = .{};
+    defer list.deinit(alloc);
+    try std.testing.expect(try list.append(alloc, "/a"));
+    try std.testing.expect(try list.append(alloc, "/b"));
+    var overlay: ProjectList = .{};
+    overlay.open(&list, null, "/b");
+    try std.testing.expectEqual(1, overlay.win.cursor);
+    try std.testing.expectEqual(ProjectList.Result.closed, overlay.handleKey(.enter, &list, null, "/b"));
+    overlay.win.cursor = 0;
+    try std.testing.expectEqual(ProjectList.Result.activate, overlay.handleKey(.enter, &list, null, "/b"));
+    try std.testing.expectEqual(ProjectList.Result.add, overlay.handleKey(.{ .char = 'a' }, &list, null, "/b"));
+    try std.testing.expectEqual(ProjectList.Result.remove, overlay.handleKey(.{ .char = 'd' }, &list, null, "/b"));
+    const unsaved: ?[]const u8 = "/c";
+    overlay.open(&list, unsaved, "/c");
+    try std.testing.expectEqual(2, overlay.win.cursor);
+    try std.testing.expectEqual(ProjectList.Result.closed, overlay.handleKey(.enter, &list, unsaved, "/c"));
+}
+
+test "add prompt keeps an empty enter and inserts question mark" {
+    const alloc = std.testing.allocator;
+    var prompt: PathPrompt = .{};
+    defer prompt.deinit(alloc);
+    try std.testing.expectEqual(PathPrompt.Result.open, try prompt.handleKey(alloc, std.testing.io, null, "/", .enter));
+    try std.testing.expectEqual(PathPrompt.Result.open, try prompt.handleKey(alloc, std.testing.io, null, "/", .{ .char = '?' }));
+    try std.testing.expectEqualStrings("?", prompt.buf.items);
+    try prompt.buf.appendSlice(alloc, "rel");
+    prompt.caret = prompt.buf.items.len;
+    try std.testing.expectEqual(PathPrompt.Result.submit, try prompt.handleKey(alloc, std.testing.io, null, "/", .enter));
+    try std.testing.expectEqual(PathPrompt.Result.cancel, try prompt.handleKey(alloc, std.testing.io, null, "/", .esc));
+    try std.testing.expectEqual(0, prompt.buf.items.len);
+}
+
+test "tab cycles matching directories and a slash starts the next level" {
+    if (builtin.os.tag == .wasi) return error.SkipZigTest;
+    const alloc = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = try IsolatedTmp.init(alloc, io);
+    defer tmp.deinit(alloc, io);
+    try tmp.dir.createDirPath(io, "aaa");
+    try tmp.dir.createDirPath(io, "aab");
+    try tmp.dir.createDirPath(io, "onlydir/leaf");
+
+    var prompt: PathPrompt = .{};
+    defer prompt.deinit(alloc);
+    try prompt.buf.appendSlice(alloc, "aaTAIL");
+    prompt.caret = 2;
+    try std.testing.expectEqual(PathPrompt.Result.open, try prompt.handleKey(alloc, io, null, tmp.path, .tab));
+    try std.testing.expectEqualStrings("aaaTAIL", prompt.buf.items);
+    try std.testing.expectEqual(3, prompt.caret);
+    try std.testing.expectEqual(PathPrompt.Result.open, try prompt.handleKey(alloc, io, null, tmp.path, .tab));
+    try std.testing.expectEqualStrings("aabTAIL", prompt.buf.items);
+    try std.testing.expectEqual(PathPrompt.Result.open, try prompt.handleKey(alloc, io, null, tmp.path, .tab));
+    try std.testing.expectEqualStrings("aaaTAIL", prompt.buf.items);
+
+    // A slash leaves this list. The next Tab cycles inside that directory.
+    prompt.begin(alloc);
+    try prompt.buf.appendSlice(alloc, "only");
+    prompt.caret = prompt.buf.items.len;
+    try std.testing.expectEqual(PathPrompt.Result.open, try prompt.handleKey(alloc, io, null, tmp.path, .tab));
+    try std.testing.expectEqualStrings("onlydir", prompt.buf.items);
+    try std.testing.expectEqual(PathPrompt.Result.open, try prompt.handleKey(alloc, io, null, tmp.path, .{ .char = '/' }));
+    try std.testing.expectEqualStrings("onlydir/", prompt.buf.items);
+    try std.testing.expectEqual(PathPrompt.Result.open, try prompt.handleKey(alloc, io, null, tmp.path, .tab));
+    try std.testing.expectEqualStrings("onlydir/leaf", prompt.buf.items);
+}
 
 test "empty footer local approved is not a clean worktree" {
     var buf: [64]u8 = undefined;
@@ -5359,6 +6326,26 @@ test "openProcessRoot is an opened directory, not AT_FDCWD" {
     try std.testing.expect(std.fs.path.isAbsolute(root.path));
     if (comptime @hasDecl(std.posix.AT, "FDCWD")) {
         try std.testing.expect(root.dir.handle != std.posix.AT.FDCWD);
+    }
+}
+
+test "commit and range load outside a work tree is not a repository" {
+    if (builtin.os.tag == .wasi) return error.SkipZigTest;
+
+    const io = std.testing.io;
+    const alloc = std.testing.allocator;
+    var tmp = try IsolatedTmp.init(alloc, io);
+    defer tmp.deinit(alloc, io);
+    var root = try openRoot(alloc, io, tmp.path);
+    defer root.deinit(alloc, io);
+
+    switch (loadOpenDiff(alloc, io, .{ .dir = root.dir }, root.dir, .{ .commit = "HEAD" })) {
+        .git => |err| try std.testing.expect(err == error.NotARepository),
+        else => return error.TestUnexpectedResult,
+    }
+    switch (loadOpenDiff(alloc, io, .{ .dir = root.dir }, root.dir, .{ .range = "HEAD~1..HEAD" })) {
+        .git => |err| try std.testing.expect(err == error.NotARepository),
+        else => return error.TestUnexpectedResult,
     }
 }
 

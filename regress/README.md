@@ -62,6 +62,19 @@ Scripts live in `regress/tui/` and are line-oriented. `#` starts a comment. Blan
 | `seed user TEXT` | before `rv` starts, append TEXT to the private user `config` |
 | `seed repo TEXT` | before `rv` starts, append TEXT to `dest/.rv/config` |
 | `restart` | start `rv` again in the same session |
+| `restart dest` | `cd` to the fixture, then start `rv` |
+| `restart norepo` | `cd` to the non-repo sibling, then start `rv` (needs `twin`) |
+| `twin` | before `rv` starts, copy the fixture to a sibling repo and make an empty non-repo directory |
+| `send-path dest` | type the fixture's absolute path (`other` types the twin, `tab` types `$dest-tab/aaat`) |
+| `tabdir` | make `$dest-tab/aaatabother`, `$dest-tab/aaatabtarget`, and a file `aaatabfile` |
+| `projects PATH…` | poll the private `projects` file until each absolute path is a line |
+| `projects-gone PATH` | poll until that absolute path is not a line |
+| `projects-order PATH…` | poll until the path lines are exactly these, in order |
+| `args TEXT` | arguments on the next `rv` launch (`args` alone clears them). `@dest` and `@other` expand |
+| `steady TOKEN` | TOKEN stays on the pane for eight polls |
+| `steady-gone TOKEN` | TOKEN stays off the pane for eight polls |
+
+`@dest` and `@other` in a `projects` path expand to the fixture and the twin. `@base` and `@otherbase` in `wait`, `gone`, `steady`, and `steady-gone` expand to those directory names. `twin` is a no-op while the script runs; the copy is made first.
 
 `seed` lines run before `rv`, in file order, wherever they sit in the script. `drive.sh` sets `XDG_CONFIG_HOME` to a private empty directory so a developer config file does not change the suite. `restart` uses that same directory.
 
@@ -71,7 +84,7 @@ Scripts live in `regress/tui/` and are line-oriented. `#` starts a comment. Blan
 
 Export of the mixed local statuses used to drive the TUI: unstaged modify/delete, staged rename, staged delete, staged new file, two hunks in one file, a nested path, staged+unstaged (`MM`) `fav.txt`, untracked `new.txt`/`tabs.txt` plus an empty file, a binary file, and a file with no trailing newline, seeded `.rv/approved.json` on `fav.txt`.
 
-Scripts: `boot`, `hunk-nav`, `ends` (`gg`/`ge` in the diff, the file list, the comment list, and the approved list), `click` (a left click jumps to that line), `approve-hunk`, `approve-file`, `unapprove`, `comment`, `layout`, `layout-narrow` (48 columns, footer `uni~`), `statuses`, `config` (user and repo files, session `t`, restart), `config-bad` (invalid file, no TUI).
+Scripts: `boot`, `hunk-nav`, `ends` (`gg`/`ge` in the diff, the file list, the comment list, and the approved list), `click` (a left click jumps to that line), `approve-hunk`, `approve-file`, `unapprove`, `comment`, `layout`, `layout-narrow` (48 columns, footer `uni~`), `statuses`, `config` (user and repo files, session `t`, restart), `config-bad` (invalid file, no TUI), `projects` (switch, add, remove, restore from a non-repo directory, `rv HEAD` ignores the list), `projects-path` (Tab in the add prompt, `rv <path>` saves that work tree).
 
 ## large
 

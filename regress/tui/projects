@@ -1,0 +1,109 @@
+# Switch, add, and remove. Quit and reopen. A non-repo directory restores
+# the saved list. Commit and range loads ignore Space p.
+twin
+wait Unstaged
+wait rv  @base  a
+send Space
+send p
+wait  projects 
+wait Enter switch
+send a
+wait Enter add
+send-path other
+send Enter
+wait othertoken
+wait rv  @otherbase  a
+projects @other
+projects-gone @dest
+send Space
+send c
+wait othercomment
+send Escape
+wait a/A approve
+send Space
+send p
+wait  projects 
+send d
+send Escape
+wait a/A approve
+gone othertoken
+wait rv  @base  a
+projects-gone @other
+send Space
+send p
+send a
+wait Enter add
+send-path dest
+send Enter
+wait rv  @base  a
+projects @dest
+projects-order @dest
+send q
+gone Unstaged
+restart
+wait Unstaged
+wait rv  @base  a
+send Space
+send p
+wait  projects 
+projects-order @dest
+send Escape
+wait a/A approve
+send q
+gone Unstaged
+restart norepo
+wait rv  @base  a
+wait Unstaged
+gone othertoken
+send Space
+send p
+send a
+wait Enter add
+send-path other
+send Enter
+wait othertoken
+wait rv  @otherbase  a
+projects-order @dest @other
+send q
+gone othertoken
+restart norepo
+wait othertoken
+wait rv  @otherbase  a
+send Space
+send p
+send d
+send Escape
+wait a/A approve
+gone othertoken
+wait rv  @base  a
+projects-order @dest
+send Space
+send p
+send d
+wait no project
+send a
+wait Enter add
+send-path dest
+send Enter
+wait rv  @base  a
+projects-order @dest
+send q
+gone Unstaged
+args HEAD
+restart dest
+wait nestbase
+steady a/A approve
+send Space
+send p
+steady a/A approve
+steady-gone Enter switch
+send q
+gone nestbase
+args HEAD~1..HEAD
+restart dest
+wait nestbase
+steady a/A approve
+send Space
+send p
+steady a/A approve
+steady-gone Enter switch

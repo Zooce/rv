@@ -3,8 +3,10 @@
 //! Subcommands: `status`, `approved`, `unapprove`, `list`, `show`, `resolve`,
 //! `export`, `version`, help. Comment-only commands do not load git.
 //! `status`, `approved`, and `unapprove` load the local diff (staged /
-//! unstaged / untracked). No raw TTY modes. Bare `rv`, `rv <commit>`, and
-//! `rv <range>` launch the review TUI from `main` (`classify`). `resolve` deletes ids.
+//! unstaged / untracked). No raw TTY modes. Bare `rv`, `rv <path>`,
+//! `rv <commit>`, and `rv <range>` launch the review TUI from `main`.
+//! An existing directory is a project path: `main` checks that before
+//! `classify`, so `..` in a path is not a range. `resolve` deletes ids.
 //! There is no reopen and no list/export filter.
 
 const std = @import("std");
@@ -76,7 +78,8 @@ pub fn classify(args: []const []const u8) error{Usage}!Launch {
     return error.Usage;
 }
 
-fn isCommand(s: []const u8) bool {
+/// True for a headless subcommand name, including help and version flags.
+pub fn isCommand(s: []const u8) bool {
     return isHelp(s) or
         isVersion(s) or
         std.mem.eql(u8, s, "status") or
@@ -167,13 +170,14 @@ fn parseExport(args: []const []const u8) error{Usage}!ExportOpts {
 }
 
 pub const usage_text =
-    \\usage: rv [<commit> | <range> | <command>] [args]
+    \\usage: rv [<commit> | <range> | <path> | <command>] [args]
     \\
     \\With no args, opens the review TUI on local changes (staged, unstaged,
     \\and untracked). A clean worktree opens empty. A git commit-ish (for
     \\example HEAD or a hash) opens the patch that commit introduced. A range
     \\that contains .. or ... (for example main...HEAD) opens `git diff <range>`
-    \\as written.
+    \\as written. An existing directory opens that work tree and adds it to
+    \\the project list.
     \\
     \\Commands:
     \\  status                         live comment count, approved count, and store paths
@@ -744,6 +748,7 @@ test "usage_text names approved commands and status approved lines" {
     try testing.expect(std.mem.indexOf(u8, usage_text, "store paths") != null);
     try testing.expect(std.mem.indexOf(u8, usage_text, "version, -v, --version") != null);
     try testing.expect(std.mem.indexOf(u8, usage_text, "install-skill") == null);
+    try testing.expect(std.mem.indexOf(u8, usage_text, "existing directory") != null);
 }
 
 test "build version is major.minor.0" {

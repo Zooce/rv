@@ -32,6 +32,7 @@ const entries = [_]Entry{
     .{ .item = .{ .key = "Space f", .label = "file list" } },
     .{ .item = .{ .key = "Space c", .label = "comment list" } },
     .{ .item = .{ .key = "Space a", .label = "approved list" } },
+    .{ .item = .{ .key = "Space p", .label = "project list" } },
     .blank,
     .{ .group = "Comments" },
     .{ .item = .{ .key = "i/c/Enter", .label = "create / edit new" } },
@@ -58,6 +59,8 @@ const entries = [_]Entry{
     .{ .item = .{ .key = "search", .label = "Enter jump · Esc cancel" } },
     .{ .item = .{ .key = "list", .label = "j/k gg/ge move · Enter jump · Esc close" } },
     .{ .item = .{ .key = "approved", .label = "j/k gg/ge · Enter unapprove (does not unstage) · Esc close" } },
+    .{ .item = .{ .key = "projects", .label = "j/k gg/ge · Enter switch · a add · d remove · Esc close" } },
+    .{ .item = .{ .key = "add path", .label = "Tab cycles directories · / then Tab goes in" } },
     .{ .item = .{ .key = "discard", .label = "No/yes · comments no/Yes · Esc cancel" } },
     .{ .item = .{ .key = "approve", .label = "No/yes · Esc cancel" } },
 };
@@ -131,8 +134,8 @@ pub fn paint(self: *Help, scr: *tui.Screen, size: tui.Size) void {
 test "help catalog includes normal bindings" {
     const required = [_][]const u8{
         "j/k", "click", "gg", "ge", "h/l", "0/$", "J/K", "[/]", "{/}", "(/)", "/", "n/N",
-        "Space f", "Space c", "Space a", "gs", "gS", "a", "A", "i", "I", "d", "D",
-        "t", "#", "w", "e", "r", "?", "q", "approved", "approve",
+        "Space f", "Space c", "Space a", "Space p", "gs", "gS", "a", "A", "i", "I", "d", "D",
+        "t", "#", "w", "e", "r", "?", "q", "approved", "approve", "add path",
     };
     for (required) |token| {
         var found = false;

@@ -559,6 +559,15 @@ fn ensureInsideWorkTree(alloc: Allocator, io: Io, cwd: std.process.Child.Cwd, st
     return error.NotARepository;
 }
 
+/// True when `cwd` is inside a git work tree. `NotARepository` is false.
+pub fn isWorkTree(alloc: Allocator, io: Io, cwd: std.process.Child.Cwd) Error!bool {
+    ensureInsideWorkTree(alloc, io, cwd, null) catch |err| switch (err) {
+        error.NotARepository => return false,
+        else => return err,
+    };
+    return true;
+}
+
 fn revExists(alloc: Allocator, io: Io, cwd: std.process.Child.Cwd, rev: []const u8, stats: ?*LoadStats) Error!bool {
     // `--verify` fails when the rev is missing; `--quiet` suppresses noise.
     // Append `^{commit}` so the rev must resolve to a commit object (git
