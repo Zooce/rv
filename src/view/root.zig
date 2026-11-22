@@ -1,6 +1,7 @@
 //! Display/review-list topic: comment helpers on rows.
 //! Row model is `row.zig`; window math is `window.zig`; side-by-side layout
 //! is `layout.zig`; structural nav is `nav.zig`; search is `search.zig`;
+//! fold state is `fold.zig`;
 //! body wrap is `wrap.zig` (a tab uses the screen's 4-column stops). No terminal drawing.
 
 const std = @import("std");
@@ -12,6 +13,7 @@ pub const window = @import("window.zig");
 pub const layout = @import("layout.zig");
 pub const nav = @import("nav.zig");
 pub const search = @import("search.zig");
+pub const fold = @import("fold.zig");
 pub const wrap = @import("wrap.zig");
 
 /// Comment target for `want` at `cursor`, or null if that side is missing.
@@ -76,6 +78,7 @@ test {
     _ = layout;
     _ = nav;
     _ = search;
+    _ = fold;
     _ = wrap;
 }
 

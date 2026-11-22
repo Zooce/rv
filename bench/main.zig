@@ -1,4 +1,4 @@
-//! Named-step wall timings for load → flatten → paint → present → approve.
+//! Named-step wall timings for load → flatten → paint → present → fold → approve.
 //!
 //! Each step is `Io.Clock.awake` around a public API, plus requested bytes
 //! and git spawn counts. This is not a sampling profiler; attach `samply`
@@ -332,6 +332,11 @@ fn benchFixture(alloc: Allocator, io: Io, kind: Kind) !Run {
     try scr.present(&sink);
     try steps.append(alloc, step("present_noop", t0, io, &count, 0));
 
+    // Large only. The rows above stay unfolded; fold copies a shorter list.
+    if (kind == .large) {
+        try benchFold(alloc, io, timed, &count, &steps, rows, frame, &scr);
+    }
+
     if (kind == .large_file) {
         try benchApproveFile(alloc, io, timed, &count, &steps, frame, &scr, tmp);
     } else if (firstStageTarget(&parsed)) |target| {
@@ -468,6 +473,80 @@ fn shownFor(
         .hints = .{},
         .area = .init(term_size, 1),
     };
+}
+
+/// One hunk, then the whole file: close, project, pair, paint, then open.
+/// Open does not project. Paint marks come from `alloc`, not the counter.
+fn benchFold(
+    alloc: Allocator,
+    io: Io,
+    timed: Allocator,
+    count: *CountAlloc,
+    steps: *std.ArrayList(Step),
+    rows: []const view.row.Row,
+    frame: Frame,
+    scr: *tui.Screen,
+) !void {
+    const hunk_i = blk: {
+        for (rows, 0..) |row, i| {
+            if (row == .hunk_header) break :blk i;
+        }
+        return error.FoldFailed;
+    };
+    const file_i = blk: {
+        for (rows, 0..) |row, i| {
+            if (row == .file_header) break :blk i;
+        }
+        return error.FoldFailed;
+    };
+
+    var fold: view.fold.Fold = .{};
+    defer fold.deinit(timed);
+
+    count.reset();
+    var t0 = nano(io);
+    if (!try fold.closeHunk(timed, rows, hunk_i)) return error.FoldFailed;
+    const hunk_rows = try fold.project(timed, rows);
+    defer timed.free(hunk_rows);
+    const hunk_slots = try view.layout.pairSideBySide(timed, hunk_rows);
+    defer timed.free(hunk_slots);
+    if (!(hunk_rows.len < rows.len)) return error.FoldFailed;
+    try steps.append(alloc, step("fold_hunk", t0, io, count, 0));
+    const hunk_n = hunk_rows.len;
+
+    const marks = try alloc.alloc(bool, rows.len);
+    defer alloc.free(marks);
+    @memset(marks, false);
+
+    count.reset();
+    t0 = nano(io);
+    frame.paint(scr, term_size, shownFor(hunk_rows, hunk_slots, marks[0..hunk_rows.len]));
+    try steps.append(alloc, step("paint_folded", t0, io, count, 0));
+
+    count.reset();
+    t0 = nano(io);
+    if (!fold.openHunk(timed, rows, hunk_i)) return error.FoldFailed;
+    try steps.append(alloc, step("unfold_hunk", t0, io, count, 0));
+
+    count.reset();
+    t0 = nano(io);
+    if (!try fold.closeFile(timed, rows, file_i)) return error.FoldFailed;
+    const file_rows = try fold.project(timed, rows);
+    defer timed.free(file_rows);
+    const file_slots = try view.layout.pairSideBySide(timed, file_rows);
+    defer timed.free(file_slots);
+    if (!(file_rows.len < hunk_n)) return error.FoldFailed;
+    try steps.append(alloc, step("fold_file", t0, io, count, 0));
+
+    count.reset();
+    t0 = nano(io);
+    frame.paint(scr, term_size, shownFor(file_rows, file_slots, marks[0..file_rows.len]));
+    try steps.append(alloc, step("paint_file_folded", t0, io, count, 0));
+
+    count.reset();
+    t0 = nano(io);
+    if (!fold.openFile(timed, rows, file_i)) return error.FoldFailed;
+    try steps.append(alloc, step("unfold_file", t0, io, count, 0));
 }
 
 fn paintRows(

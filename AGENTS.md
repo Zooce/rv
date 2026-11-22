@@ -98,6 +98,8 @@ Drive the keys the change uses. These notes are for keys that are easy to get wr
 |-----|--------|
 | `]` | Next hunk header. The first `]` from the section header is the first hunk. |
 | `}` | Next file header. |
+| `z`, then `c` / `o` | Fold / unfold the hunk. On a file header, fold / unfold that file. Two sends. A folded header ends with `…`. |
+| `z`, then `C` / `O` | Fold the file. `O` unfolds that file and every hunk in it, from a line or a folded header. |
 | `a` | Approve the hunk under the cursor: stage it, then hide it. No effect on a section header. No effect on a file header when that file has hunks. |
 | `A` | Approve the whole file, including from that file's header. |
 | Space, then `a` | Open the approved list. It opens on an approved identity in the file under the cursor, otherwise on the first row. From a section header the list cursor stays on the first row. |
@@ -105,6 +107,7 @@ Drive the keys the change uses. These notes are for keys that are easy to get wr
 | `i`, text, Enter | On a hunk header, open a hunk comment. The title contains `hunk comment`. Enter saves. |
 | `a` or `A` when that hunk has a live comment | Confirm dialog, No selected. `y` approves. |
 | `)` | Next comment, wrapping. A comment on a hidden hunk unapproves that hunk and lands on it. |
+| `?` | Help. Esc returns to the list that opened it, or to the diff. |
 | `q` | Quit to the shell. |
 
 After `a` hides the hunk under the cursor, the cursor rests on the next header. After Enter unapproves, the cursor rests on the restored hunk header, so the next `i` comments that hunk.

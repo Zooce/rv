@@ -45,7 +45,15 @@ One `a` is split on every fixture: `mutate` (`git apply --cached` or `git add`),
 
 On `large` only:
 
-- `approve_rest` — the remaining unstaged hunks in that file, one `a` each, one wall time. The store grows; later hunks can regroup into the staged neighbor.
+- `fold_hunk`: close the first hunk, copy the shorter row list, and pair it. The source rows stay as they were.
+- `paint_folded`: paint that shorter list.
+- `unfold_hunk`: drop that hunk key. No second copy.
+- `fold_file`: close the file, copy, and pair. Shorter than the one-hunk list.
+- `paint_file_folded`: paint the file-folded list.
+- `unfold_file`: drop that file key. No second copy.
+- `approve_rest`: the remaining unstaged hunks in that file, one `a` each, one wall time. The store grows; later hunks can regroup into the staged neighbor.
+
+With nothing folded, `paint`, `present`, and `approve` still time the original row list.
 
 On `large_file`:
 

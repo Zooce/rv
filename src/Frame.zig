@@ -799,6 +799,11 @@ pub fn formatRow(buf: []u8, row: view.row.Row, marked: bool) []const u8 {
             const prefix: []const u8 = if (marked) "* " else "  ";
             var path_buf: [512]u8 = undefined;
             const path = view.row.fileHeaderPathLabel(fh, &path_buf);
+            if (fh.folded) {
+                if (fh.is_binary)
+                    break :blk bufPrintTrunc(buf, "{s}{s}  (binary) …", .{ prefix, path });
+                break :blk bufPrintTrunc(buf, "{s}{s} …", .{ prefix, path });
+            }
             if (fh.is_binary)
                 break :blk bufPrintTrunc(buf, "{s}{s}  (binary)", .{ prefix, path });
             break :blk bufPrintTrunc(buf, "{s}{s}", .{ prefix, path });
@@ -807,6 +812,16 @@ pub fn formatRow(buf: []u8, row: view.row.Row, marked: bool) []const u8 {
             const prefix: []const u8 = if (marked) "* " else "  ";
             const oc = hh.old_count orelse 1;
             const nc = hh.new_count orelse 1;
+            if (hh.folded) {
+                if (hh.section.len > 0) {
+                    break :blk bufPrintTrunc(buf, "{s}@@ -{d},{d} +{d},{d} @@ {s} …", .{
+                        prefix, hh.old_start, oc, hh.new_start, nc, hh.section,
+                    });
+                }
+                break :blk bufPrintTrunc(buf, "{s}@@ -{d},{d} +{d},{d} @@ …", .{
+                    prefix, hh.old_start, oc, hh.new_start, nc,
+                });
+            }
             if (hh.section.len > 0) {
                 break :blk bufPrintTrunc(buf, "{s}@@ -{d},{d} +{d},{d} @@ {s}", .{
                     prefix, hh.old_start, oc, hh.new_start, nc, hh.section,
@@ -1030,6 +1045,22 @@ test "formatRow file header rename" {
         .old_path = "gone.txt",
     } };
     try testing.expectEqualStrings("  gone.txt", formatRow(&buf, deleted, false));
+    const folded: view.row.Row = .{ .file_header = .{
+        .path = "a.zig",
+        .is_binary = false,
+        .folded = true,
+    } };
+    try testing.expectEqualStrings("  a.zig …", formatRow(&buf, folded, false));
+    const folded_hunk: view.row.Row = .{ .hunk_header = .{
+        .path = "f",
+        .old_start = 1,
+        .old_count = 1,
+        .new_start = 1,
+        .new_count = 1,
+        .section = "name",
+        .folded = true,
+    } };
+    try testing.expectEqualStrings("  @@ -1,1 +1,1 @@ name …", formatRow(&buf, folded_hunk, false));
 }
 
 test "formatBodyGutter unified sbs meta and off" {

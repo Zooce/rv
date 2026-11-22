@@ -24,6 +24,8 @@ const entries = [_]Entry{
     .{ .item = .{ .key = "J/K", .label = "next / prev change" } },
     .{ .item = .{ .key = "[/]", .label = "hunk header" } },
     .{ .item = .{ .key = "{/}", .label = "file header" } },
+    .{ .item = .{ .key = "zc/zo", .label = "fold / unfold hunk (file header folds the file)" } },
+    .{ .item = .{ .key = "zC/zO", .label = "fold file / unfold file and its hunks" } },
     .{ .item = .{ .key = "(/)", .label = "prev / next comment (unapproves if needed)" } },
     .blank,
     .{ .group = "Search" },
@@ -135,7 +137,7 @@ test "help catalog includes normal bindings" {
     const required = [_][]const u8{
         "j/k", "click", "gg", "ge", "h/l", "0/$", "J/K", "[/]", "{/}", "(/)", "/", "n/N",
         "Space f", "Space c", "Space a", "Space p", "gs", "gS", "a", "A", "i", "I", "d", "D",
-        "t", "#", "w", "e", "r", "?", "q", "approved", "approve", "add path",
+        "t", "#", "w", "e", "r", "?", "q", "zc", "zo", "zC", "zO", "approved", "approve", "add path",
     };
     for (required) |token| {
         var found = false;

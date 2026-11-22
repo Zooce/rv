@@ -1,0 +1,139 @@
+# zc folds the hunk under the cursor. zo unfolds it.
+# zC folds the file. zO unfolds that file and every hunk in it.
+# A folded header ends with ….
+# twohunk.txt is hunks 7 and 8 of 14. ] lands on the hunk header.
+# [ from a body line lands on that hunk's header, so the folded hunk is the next [ back.
+wait Unstaged
+until HEAD  twohunk.txt }
+send ]
+wait HEAD  twohunk.txt  hunk 7/14
+send j
+wait alphatoken
+send z
+send c
+wait @@ -1,4 +1,4 @@ …
+gone alphatoken
+send ]
+wait HEAD  twohunk.txt  hunk 8/14
+send j
+send j
+send j
+send j
+wait omegatoken
+send [
+send [
+wait HEAD  twohunk.txt  hunk 7/14
+send z
+send o
+gone @@ -1,4 +1,4 @@ …
+send j
+wait alphatoken
+send ]
+wait HEAD  twohunk.txt  hunk 8/14
+wait @@ -1,4 +1,4 @@
+wait @@ -13,4 +13,4 @@
+send z
+send C
+wait twohunk.txt …
+gone @@ -1,4 +1,4 @@
+gone @@ -13,4 +13,4 @@
+send z
+send O
+wait @@ -1,4 +1,4 @@
+wait @@ -13,4 +13,4 @@
+gone twohunk.txt …
+send ]
+wait HEAD  twohunk.txt  hunk 7/14
+send j
+wait alphatoken
+send ]
+wait HEAD  twohunk.txt  hunk 8/14
+send j
+send j
+send j
+send j
+wait omegatoken
+send [
+send [
+wait HEAD  twohunk.txt  hunk 7/14
+send z
+send c
+wait @@ -1,4 +1,4 @@ …
+gone alphatoken
+send /
+send alphatoken
+send Enter
+wait alphatoken
+gone @@ -1,4 +1,4 @@ …
+# zO on a folded hunk header opens every hunk in the file.
+send [
+wait HEAD  twohunk.txt  hunk 7/14
+send z
+send c
+wait @@ -1,4 +1,4 @@ …
+send ]
+wait HEAD  twohunk.txt  hunk 8/14
+send z
+send c
+wait pad twelve …
+send z
+send O
+gone @@ -1,4 +1,4 @@ …
+gone pad twelve …
+send j
+send j
+send j
+send j
+wait omegatoken
+send [
+send [
+wait HEAD  twohunk.txt  hunk 7/14
+send j
+wait alphatoken
+# zO from a line opens a hunk folded elsewhere in the file.
+send [
+wait HEAD  twohunk.txt  hunk 7/14
+send z
+send c
+wait @@ -1,4 +1,4 @@ …
+gone alphatoken
+send ]
+wait HEAD  twohunk.txt  hunk 8/14
+send j
+send j
+send j
+send j
+wait omegatoken
+send z
+send O
+gone @@ -1,4 +1,4 @@ …
+send [
+send [
+wait HEAD  twohunk.txt  hunk 7/14
+gone @@ -1,4 +1,4 @@ …
+send j
+wait alphatoken
+# zO on the folded file header opens the file and a hunk folded inside it.
+send [
+wait HEAD  twohunk.txt  hunk 7/14
+send z
+send c
+wait @@ -1,4 +1,4 @@ …
+send z
+send C
+wait twohunk.txt …
+send z
+send O
+gone twohunk.txt …
+send ]
+wait HEAD  twohunk.txt  hunk 7/14
+gone @@ -1,4 +1,4 @@ …
+send j
+wait alphatoken
+send ]
+wait HEAD  twohunk.txt  hunk 8/14
+send j
+send j
+send j
+send j
+wait omegatoken

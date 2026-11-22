@@ -70,7 +70,7 @@
 //! `no` keeps them). Git discard runs first; comments are deleted only on
 //! success. Staged `gd`/`gD` are no-ops (unstage first). Range loads ignore
 //! git and approve keys. Exactly one leader at a time (`Space` lists, `g`
-//! git or a row end). `g` then `g` moves to the first row and `g` then `e`
+//! git or a row end, `z` fold). `g` then `g` moves to the first row and `g` then `e`
 //! to the last; a second press stays. An unmatched leader is dropped and
 //! the next key is handled as usual. Local `a` stages the current hunk then hides it; `A`
 //! stages the remaining hunks of that file in this group then hides them
@@ -78,13 +78,20 @@
 //! hide only. Unapprove does not unstage. Live comments on that hunk (`a`)
 //! or on the file / any of its hunks (`A`) open a confirm (No selected;
 //! `yes` proceeds). Range and commit loads ignore `a`/`A`.
-//! A git error opens a centered overlay with git’s stderr; Enter or Esc
-//! dismisses. The list is unchanged. Local load paints git and approve
+//! A git error opens a centered overlay with git’s stderr. Enter or Esc
+//! dismisses it and returns to the list the command started from, or to
+//! the diff. The diff rows are unchanged. Local load paints git and approve
 //! chords on the current file and hunk rows (no git/approve hints on a range
 //! load). `e` expands the current hunk’s context (local and range); a hunk
 //! that can still grow shows Expand (e) on the hunk header. Not bound while
 //! commenting, searching, or in a list/help overlay. `r` restores git’s
 //! default context and re-reads the comment file.
+//! `z` then `c` folds the hunk under the cursor, or the file when the cursor
+//! is on that file's header. `z` then `o` unfolds it. `z` then `C` folds the
+//! file from anywhere in it, and `z` then `O` unfolds that file and every
+//! hunk in it. A folded header ends with `…`. Folding builds a shorter row list once. With nothing
+//! folded, paint walks the same rows as before. Search and a comment jump
+//! open a fold that hides the match.
 //!
 //! Comment list: `Space` then `c` opens a centered overlay of live comments
 //! (same store as `rv list`). `j`/`k` move; Enter jumps with the same landing
@@ -111,7 +118,8 @@
 //!
 //! Help: `?` in normal (or from a file, comment, approved, or project list) opens a centered overlay
 //! with the grouped key catalog. `j`/`k` scroll when it does not fit. `?` or
-//! Esc closes; `q` still quits. Other keys are ignored. While commenting or
+//! Esc closes and returns to that list, or to the diff when help was opened
+//! from the diff. `q` still quits. Other keys are ignored. While commenting or
 //! searching, `?` inserts a question mark. The title bar is a short hint.
 
 const std = @import("std");
@@ -710,12 +718,15 @@ fn runTui(
     var viewport: Viewport = viewportFromConfig(display);
     var running = true;
     // Exactly one focus; cannot help, comment, search, and list at once.
+    // `under` is the list that help, confirm, and a git error return to.
     var focus: Focus = .normal;
+    var under: Focus = .normal;
     // Exactly one leader: `Space` lists (`f` files, `c` comments, `a`
     // approved, `p` projects), `g` git (`s`/`u`/`d` hunk, `S`/`U`/`D` file)
-    // or a row end (`g` first, `e` last). Cleared on the next key. Unmatched
-    // is dropped; the second key is handled as usual.
-    const Leader = enum { none, lists, git };
+    // or a row end (`g` first, `e` last), `z` fold (`c`/`o` hunk, `C`/`O`
+    // file). Cleared on the next key. Unmatched is dropped; the second key
+    // is handled as usual.
+    const Leader = enum { none, lists, git, fold };
     var leader: Leader = .none;
     var confirm: Confirm = .{};
     var draft: Draft = .{};
@@ -753,6 +764,7 @@ fn runTui(
             .key => |key| {
                 // Notes are one-shot; any key clears them (including keys that no-op).
                 frame.note.clear();
+                rememberUnder(focus, &under);
                 switch (focus) {
                     .commenting => switch (try draft.handleKey(alloc, io, root.?.dir, &review, source, key, size)) {
                         .closed => focus = .normal,
@@ -763,17 +775,19 @@ fn runTui(
                         },
                         .open => {},
                     },
-                    .searching => switch (try search.handleKey(
-                        alloc,
-                        key,
-                        diff_view.rows,
-                        viewport.cursor,
-                    )) {
+                    .searching => {
+                        const anchor = searchAnchor(&diff_view, viewport.cursor);
+                        switch (try search.handleKey(
+                            alloc,
+                            key,
+                            anchor.rows,
+                            anchor.at,
+                        )) {
                         .closed => focus = .normal,
                         .quit => running = false,
                         .jump => |hit| {
                             focus = .normal;
-                            viewport.cursor = hit.row;
+                            try diff_view.landSearch(alloc, &viewport.cursor, hit.row);
                             if (hit.wrapped) frame.note.set("search wrapped");
                         },
                         .missing => {
@@ -781,6 +795,7 @@ fn runTui(
                             frame.note.setFmt("Pattern not found: {s}", .{search.last_query.items});
                         },
                         .open => {},
+                        }
                     },
                     .comments => switch (comment_list.handleKey(key, diff_view.rows)) {
                         .closed => focus = .normal,
@@ -870,7 +885,7 @@ fn runTui(
                         .open => {},
                     },
                     .git_error => switch (git_error.handleKey(key)) {
-                        .closed => focus = .normal,
+                        .closed => focus = screenUnder(under),
                         .quit => running = false,
                         .open => {},
                     },
@@ -881,7 +896,7 @@ fn runTui(
                         diff_view.rows,
                         viewport.cursor,
                     )) {
-                        .closed => focus = if (confirm.return_to_files) .files else .normal,
+                        .closed => focus = screenUnder(under),
                         .quit => running = false,
                         .open => {},
                         .group => {
@@ -935,12 +950,11 @@ fn runTui(
                                 confirm.whole_file,
                             );
                             if (focus != .git_error) {
-                                if (confirm.return_to_files) {
+                                const back = screenUnder(under);
+                                if (back == .files) {
                                     try file_list.reload(alloc, diff_view.rows, file_list.win.cursor);
-                                    focus = .files;
-                                } else {
-                                    focus = .normal;
                                 }
+                                focus = back;
                             }
                         },
                     },
@@ -1011,7 +1025,7 @@ fn runTui(
                         .open => {},
                     },
                     .helping => switch (help.handleKey(key)) {
-                        .closed => focus = .normal,
+                        .closed => focus = screenUnder(under),
                         .quit => running = false,
                         .open => {},
                     },
@@ -1121,6 +1135,8 @@ fn runTui(
                                     viewport.moveToFirst(size.cols, diff_view.rows, diff_view.sbs_slots);
                                 } else if (pending == .git and c == 'e') {
                                     viewport.moveToLast(size.cols, diff_view.rows, diff_view.sbs_slots);
+                                } else if (pending == .fold and (c == 'c' or c == 'o' or c == 'C' or c == 'O')) {
+                                    try diff_view.foldAt(alloc, &viewport.cursor, c);
                                 } else if (viewport.handleKey(.{ .char = c }, size.cols, diff_view.rows, diff_view.sbs_slots) == .handled) {
                                     // j/k/h/l/0/$/J/K/[/]/{/}/t/#/w
                                 } else if (c == 'q' or c == 'Q') {
@@ -1132,24 +1148,28 @@ fn runTui(
                                     leader = .lists;
                                 } else if (c == 'g') {
                                     leader = .git;
+                                } else if (c == 'z') {
+                                    leader = .fold;
                                 } else if (c == '/') {
                                     search.begin();
                                     focus = .searching;
                                 } else if (c == 'n') {
-                                    switch (search.next(diff_view.rows, viewport.cursor)) {
+                                    const anchor = searchAnchor(&diff_view, viewport.cursor);
+                                    switch (search.next(anchor.rows, anchor.at)) {
                                         .none => {},
                                         .missing => frame.note.set("Pattern not found"),
                                         .hit => |hit| {
-                                            viewport.cursor = hit.row;
+                                            try diff_view.landSearch(alloc, &viewport.cursor, hit.row);
                                             if (hit.wrapped) frame.note.set("search wrapped");
                                         },
                                     }
                                 } else if (c == 'N') {
-                                    switch (search.prev(diff_view.rows, viewport.cursor)) {
+                                    const anchor = searchAnchor(&diff_view, viewport.cursor);
+                                    switch (search.prev(anchor.rows, anchor.at)) {
                                         .none => {},
                                         .missing => frame.note.set("Pattern not found"),
                                         .hit => |hit| {
-                                            viewport.cursor = hit.row;
+                                            try diff_view.landSearch(alloc, &viewport.cursor, hit.row);
                                             if (hit.wrapped) frame.note.set("search wrapped");
                                         },
                                     }
@@ -1313,6 +1333,11 @@ pub const OpenDiff = struct {
     sbs_slots: []view.layout.SbsSlot,
     /// Live approved identities still in `diff` after prune. 0 on range/commit loads.
     approved_n: usize,
+    /// Session folds. Empty means `rows` is the full list paint already walks.
+    fold: view.fold.Fold = .{},
+    /// Unfolded rows and slots, set only while `rows` is a folded projection.
+    full_rows: ?[]view.row.Row = null,
+    full_slots: ?[]view.layout.SbsSlot = null,
 
     fn maybeInit(
         alloc: std.mem.Allocator,
@@ -1347,10 +1372,12 @@ pub const OpenDiff = struct {
     }
 
     fn deinit(self: OpenDiff, alloc: std.mem.Allocator) void {
-        alloc.free(self.rows);
-        alloc.free(self.sbs_slots);
-        var parsed = self.diff;
-        parsed.deinit();
+        var live = self;
+        live.fold.deinit(alloc);
+        live.restoreUnfolded(alloc);
+        alloc.free(live.rows);
+        alloc.free(live.sbs_slots);
+        live.diff.deinit();
     }
 
     fn replaceRows(
@@ -1360,11 +1387,130 @@ pub const OpenDiff = struct {
         approved_n: usize,
     ) std.mem.Allocator.Error!void {
         const new_sbs = try view.layout.pairSideBySide(alloc, new_rows);
+        self.restoreUnfolded(alloc);
         alloc.free(self.rows);
         alloc.free(self.sbs_slots);
         self.rows = new_rows;
         self.sbs_slots = new_sbs;
         self.approved_n = approved_n;
+    }
+
+    /// Put the unfolded slices back. No-op when nothing is folded.
+    fn restoreUnfolded(self: *OpenDiff, alloc: std.mem.Allocator) void {
+        const full_rows = self.full_rows orelse return;
+        const full_slots = self.full_slots orelse return;
+        alloc.free(self.rows);
+        alloc.free(self.sbs_slots);
+        self.rows = full_rows;
+        self.sbs_slots = full_slots;
+        self.full_rows = null;
+        self.full_slots = null;
+    }
+
+    fn installFold(
+        self: *OpenDiff,
+        alloc: std.mem.Allocator,
+        rows: []view.row.Row,
+        slots: []view.layout.SbsSlot,
+    ) void {
+        if (self.full_rows == null) {
+            self.full_rows = self.rows;
+            self.full_slots = self.sbs_slots;
+        } else {
+            alloc.free(self.rows);
+            alloc.free(self.sbs_slots);
+        }
+        self.rows = rows;
+        self.sbs_slots = slots;
+    }
+
+    /// Rebuild the folded row list from the unfolded rows. No-op when no keys remain.
+    fn reproject(self: *OpenDiff, alloc: std.mem.Allocator) std.mem.Allocator.Error!void {
+        if (!self.fold.active()) {
+            self.restoreUnfolded(alloc);
+            return;
+        }
+        const full = self.full_rows orelse self.rows;
+        const filtered = try self.fold.project(alloc, full);
+        errdefer alloc.free(filtered);
+        const slots = try view.layout.pairSideBySide(alloc, filtered);
+        self.installFold(alloc, filtered, slots);
+    }
+
+    /// `cursor` indexes the unfolded rows. Project again when keys still match.
+    fn syncFold(self: *OpenDiff, alloc: std.mem.Allocator, cursor: *usize) std.mem.Allocator.Error!void {
+        if (!self.fold.active()) return;
+        self.fold.prune(alloc, self.rows);
+        if (!self.fold.active()) return;
+        const full_i = cursor.*;
+        try self.reproject(alloc);
+        const base = self.full_rows orelse self.rows;
+        cursor.* = view.fold.shownIndex(base, self.rows, full_i);
+    }
+
+    fn foldAt(self: *OpenDiff, alloc: std.mem.Allocator, cursor: *usize, key: u21) std.mem.Allocator.Error!void {
+        const full = self.full_rows orelse self.rows;
+        if (full.len == 0) return;
+        const full_i: usize = if (self.full_rows) |rows|
+            fullIndexOfHidden(rows, self.rows, cursor.*)
+        else
+            cursor.*;
+        const at = view.row.clampCursor(full_i, full.len);
+        if (full[at] == .section_header) return;
+        const on_file = full[at] == .file_header;
+        const changed = switch (key) {
+            'c' => if (on_file)
+                try self.fold.closeFile(alloc, full, full_i)
+            else
+                try self.fold.closeHunk(alloc, full, full_i),
+            'o' => if (on_file)
+                self.fold.openFile(alloc, full, full_i)
+            else
+                self.fold.openHunk(alloc, full, full_i),
+            'C' => try self.fold.closeFile(alloc, full, full_i),
+            'O' => self.fold.openInFile(alloc, full, full_i),
+            else => false,
+        };
+        if (!changed) return;
+        if (!self.fold.active()) {
+            self.restoreUnfolded(alloc);
+            cursor.* = full_i;
+            return;
+        }
+        try self.reproject(alloc);
+        const base = self.full_rows orelse self.rows;
+        cursor.* = view.fold.shownIndex(base, self.rows, full_i);
+    }
+
+    /// Open a fold that hides `loc`. False when `loc` is not in the unfolded rows.
+    fn revealLoc(self: *OpenDiff, alloc: std.mem.Allocator, loc: view.row.DiffLoc) std.mem.Allocator.Error!bool {
+        const full = self.full_rows orelse return false;
+        const full_row = view.rowForComment(full, loc) orelse return false;
+        if (!self.fold.reveal(alloc, full, full_row)) return false;
+        if (!self.fold.active()) {
+            self.restoreUnfolded(alloc);
+            return true;
+        }
+        try self.reproject(alloc);
+        return true;
+    }
+
+    /// Land on a search hit. `row_i` indexes the unfolded rows when a fold is open.
+    fn landSearch(self: *OpenDiff, alloc: std.mem.Allocator, cursor: *usize, row_i: usize) std.mem.Allocator.Error!void {
+        const full = self.full_rows orelse {
+            cursor.* = row_i;
+            return;
+        };
+        if (self.fold.reveal(alloc, full, row_i)) {
+            if (!self.fold.active()) {
+                self.restoreUnfolded(alloc);
+                cursor.* = row_i;
+                return;
+            }
+            try self.reproject(alloc);
+        }
+        const base = self.full_rows orelse self.rows;
+        cursor.* = view.fold.shownIndex(base, self.rows, row_i);
     }
 };
 
@@ -1858,9 +2004,13 @@ fn finishApply(
     result: Apply,
 ) std.mem.Allocator.Error!void {
     if (result.open) |loaded| {
+        const kept = open.fold;
+        open.fold = .{};
         open.deinit(alloc);
         open.* = loaded;
+        open.fold = kept;
         cursor.* = result.cursor;
+        try open.syncFold(alloc, cursor);
     } else if (result.reload_err) |err| {
         note.set(git.errorMessage(err));
     }
@@ -2198,13 +2348,22 @@ fn reloadDiff(
     note: *StatusNote,
 ) void {
     const loaded = OpenDiff.maybeInit(alloc, io, cwd, root, source, note) orelse return;
+    const mark_rows = diff_view.full_rows orelse diff_view.rows;
+    const mark_at: usize = if (diff_view.full_rows) |full|
+        fullIndexOfHidden(full, diff_view.rows, cursor.*)
+    else
+        cursor.*;
     const new_cursor: usize = blk: {
-        const mark = view.nav.cursorMarkAt(diff_view.rows, cursor.*);
+        const mark = view.nav.cursorMarkAt(mark_rows, mark_at);
         break :blk if (mark) |m| view.nav.restoreCursor(loaded.rows, m) else 0;
     };
+    const kept = diff_view.fold;
+    diff_view.fold = .{};
     diff_view.deinit(alloc);
     diff_view.* = loaded;
+    diff_view.fold = kept;
     cursor.* = new_cursor;
+    diff_view.syncFold(alloc, cursor) catch note.set("out of memory");
 }
 
 /// Grow the hunk under the cursor by `diff.expand_amount` context lines per
@@ -2258,6 +2417,7 @@ fn expandCurrentHunk(
         return;
     };
     cursor.* = restoreExpandCursor(diff_view.rows, mark, fh.path, fh.group, hh.old_start, hh.new_start);
+    try diff_view.syncFold(alloc, cursor);
 }
 
 fn restoreExpandCursor(
@@ -2463,6 +2623,7 @@ fn applyApprove(
         return;
     };
     cursor.* = restored;
+    try diff_view.syncFold(alloc, cursor);
 }
 
 /// Drop one matching store entry, prune, save, replace the hidden flatten.
@@ -2529,6 +2690,7 @@ fn applyUnapprove(
         item.kind,
     ) orelse 0;
     cursor.* = jump;
+    try diff_view.syncFold(alloc, cursor);
 }
 
 fn groupedFile(d: *const diff.Diff, path: []const u8, group: diff.Group) ?*const diff.File {
@@ -2815,6 +2977,42 @@ pub const Focus = enum {
     confirm,
 };
 
+fn screenUnder(under: Focus) Focus {
+    return switch (under) {
+        .files, .comments, .approved, .projects => under,
+        else => .normal,
+    };
+}
+
+fn rememberUnder(focus: Focus, under: *Focus) void {
+    switch (focus) {
+        .helping, .confirm, .git_error => {},
+        else => under.* = screenUnder(focus),
+    }
+}
+
+test "help, confirm, and a git error return to the list they opened on" {
+    const lists = [_]Focus{ .files, .comments, .approved, .projects };
+    for (lists) |list| {
+        var under: Focus = .normal;
+        rememberUnder(list, &under);
+        try std.testing.expectEqual(list, screenUnder(under));
+        rememberUnder(.helping, &under);
+        rememberUnder(.confirm, &under);
+        rememberUnder(.git_error, &under);
+        try std.testing.expectEqual(list, screenUnder(under));
+    }
+}
+
+test "help, confirm, and a git error opened off a list return to the diff" {
+    const screens = [_]Focus{ .normal, .commenting, .searching, .adding };
+    for (screens) |screen| {
+        var under: Focus = .files;
+        rememberUnder(screen, &under);
+        try std.testing.expectEqual(Focus.normal, screenUnder(under));
+    }
+}
+
 /// Confirm overlay for discard (`gd` / `gD`), group stage/unstage, and
 /// approve (`a` / `A` when the target has live comments). `yes` is the
 /// selected choice. Opens with **No** selected (Enter does not apply).
@@ -2835,9 +3033,6 @@ pub const Confirm = struct {
     whole_file: bool = false,
     yes: bool = false,
     comments: bool = false,
-    /// Approve confirm opened from the file list: Esc or a successful yes
-    /// returns to that overlay (refreshed after yes).
-    return_to_files: bool = false,
 
     fn handleKey(
         self: *Confirm,
@@ -3907,6 +4102,20 @@ fn rowEql(a: view.row.Row, b: view.row.Row) bool {
     }
 }
 
+/// Rows and cursor for `/`, `n`, and `N`. A fold searches the unfolded list.
+fn searchAnchor(diff_view: *const OpenDiff, cursor: usize) struct {
+    rows: []const view.row.Row,
+    at: usize,
+} {
+    if (diff_view.full_rows) |full| {
+        return .{
+            .rows = full,
+            .at = fullIndexOfHidden(full, diff_view.rows, cursor),
+        };
+    }
+    return .{ .rows = diff_view.rows, .at = cursor };
+}
+
 /// Hidden flatten is a subsequence of the unfiltered flatten. Map a hidden
 /// index onto that full list for comment next/prev.
 fn fullIndexOfHidden(full: []const view.row.Row, hidden: []const view.row.Row, hidden_i: usize) usize {
@@ -3939,6 +4148,18 @@ fn landComment(
         cursor.* = row;
         return true;
     }
+    if (diff_view.full_rows) |full| {
+        if (view.rowForComment(full, loc) != null) {
+            if (try diff_view.revealLoc(alloc, loc)) {
+                if (view.rowForComment(diff_view.rows, loc)) |row| {
+                    cursor.* = row;
+                    return true;
+                }
+            }
+            note.set("comment not in this diff");
+            return false;
+        }
+    }
     if (source != .local) {
         note.set("comment not in this diff");
         return false;
@@ -3962,7 +4183,19 @@ fn landComment(
         return false;
     };
     cursor.* = row;
-    return true;
+    try diff_view.syncFold(alloc, cursor);
+    if (view.rowForComment(diff_view.rows, loc)) |shown| {
+        cursor.* = shown;
+        return true;
+    }
+    if (try diff_view.revealLoc(alloc, loc)) {
+        if (view.rowForComment(diff_view.rows, loc)) |shown| {
+            cursor.* = shown;
+            return true;
+        }
+    }
+    note.set("comment not in this diff");
+    return false;
 }
 
 fn jumpLiveComment(
@@ -3980,16 +4213,19 @@ fn jumpLiveComment(
     defer if (full_buf) |owned| alloc.free(owned);
 
     const walk_rows: []const view.row.Row = blk: {
-        if (diff_view.approved_n == 0) break :blk diff_view.rows;
-        const owned = view.row.flatten(alloc, &diff_view.diff) catch {
-            note.set("out of memory");
-            return;
-        };
-        full_buf = owned;
-        break :blk owned;
+        if (diff_view.approved_n != 0) {
+            const owned = view.row.flatten(alloc, &diff_view.diff) catch {
+                note.set("out of memory");
+                return;
+            };
+            full_buf = owned;
+            break :blk owned;
+        }
+        if (diff_view.full_rows) |full| break :blk full;
+        break :blk diff_view.rows;
     };
 
-    const walk_cur = if (diff_view.approved_n == 0)
+    const walk_cur = if (walk_rows.ptr == diff_view.rows.ptr and walk_rows.len == diff_view.rows.len)
         cursor.*
     else
         fullIndexOfHidden(walk_rows, diff_view.rows, cursor.*);
@@ -4110,10 +4346,7 @@ fn applyListApprove(
     if (idx >= list.items.items.len) return;
     cursor.* = list.items.items[idx];
     try dispatchApprove(alloc, io, cwd, root, source, diff_view, cursor, note, focus, git_error, review, confirm, true);
-    if (focus.* == .confirm) {
-        confirm.return_to_files = true;
-        return;
-    }
+    if (focus.* == .confirm) return;
     if (focus.* == .git_error) return;
     try list.reload(alloc, diff_view.rows, idx);
 }

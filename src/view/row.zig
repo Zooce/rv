@@ -16,6 +16,8 @@ pub const FileHeader = struct {
     group: ?diff.Group = null,
     old_path: ?[]const u8 = null,
     new_path: ?[]const u8 = null,
+    /// Set on a copied header when this file's hunks are hidden.
+    folded: bool = false,
 };
 
 /// One renderable row in the review list. String slices borrow from the
@@ -34,6 +36,8 @@ pub const Row = union(enum) {
         section: []const u8,
         group: ?diff.Group = null,
         can_grow: bool = true,
+        /// Set on a copied header when this hunk's lines are hidden.
+        folded: bool = false,
     },
     line: struct {
         kind: diff.LineKind,

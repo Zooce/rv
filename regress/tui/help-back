@@ -1,0 +1,14 @@
+# Help opened from the file list returns to that list.
+wait Unstaged
+send Space
+send f
+wait Enter jump
+wait  files 
+send ?
+wait Esc close
+gone Enter jump
+gone  files 
+send Escape
+wait Enter jump
+wait  files 
+gone  help 

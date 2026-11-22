@@ -113,7 +113,7 @@ Changed words are colored on the line. Unchanged words on that line stay grey. A
 rv                 # local changes (staged, unstaged, untracked)
 ```
 
-`j` and `k` move the current line. `gg` and `ge` jump to the first and last row. A click jumps to that line. The scroll wheel moves the window and leaves that line selected. `h` and `l`, Shift+wheel, or a sideways trackpad scroll, pan the hunk. `e` grows the hunk's context.
+`j` and `k` move the current line. `gg` and `ge` jump to the first and last row. A click jumps to that line. The scroll wheel moves the window and leaves that line selected. `h` and `l`, Shift+wheel, or a sideways trackpad scroll, pan the hunk. `e` grows the hunk's context. `z` then `c` folds the hunk, or the file when the cursor is on that file. `z` then `o` unfolds it. `z` then `C` folds the file, and `z` then `O` unfolds that file and every hunk in it. A folded header ends with `…`.
 
 `a` approves the hunk at that line and `A` approves the whole file. Approving stages the change and hides it from the diff. `gs`, `gu`, and `gd` stage, unstage, and discard the hunk. `gS`, `gU`, and `gD` do the same for the file.
 

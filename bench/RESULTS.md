@@ -3,6 +3,7 @@
 Snapshot from `mise run bench` (`zig build bench -Doptimize=ReleaseSafe`).
 
 - Date: 2026-10-11
+- Fold rows (`fold_hunk` through `unfold_file`) were measured on 2026-11-20. The other rows stay the 2026-10-11 snapshot.
 - Host: AMD Ryzen AI 5 340, 12 CPUs, Linux 7.2.5-3-omarchy
 - git 2.55.0, Zig 0.17.0
 
@@ -58,6 +59,12 @@ large           1    167   1502  paint                    0.07       0 B       0
 large           1    167   1502  present                  0.03       0 B       0
 large           1    167   1502  paint_noop               0.06       0 B       0
 large           1    167   1502  present_noop             0.01       0 B       0
+large           1    167   1502  fold_hunk                0.19   219 KiB       0
+large           1    167   1502  paint_folded             0.14       0 B       0
+large           1    167   1502  unfold_hunk              0.00       0 B       0
+large           1    167   1502  fold_file                0.00     631 B       0
+large           1    167   1502  paint_file_folded        0.01       0 B       0
+large           1    167   1502  unfold_file              0.00       0 B       0
 large           1    167   1502  mutate                   1.15     659 B       1
 large           1    167   1502  reload_paths             2.77   993 KiB       2
 large           1    167   1502  approve_save             0.02     568 B       0
@@ -86,4 +93,5 @@ large_file      1    167   1502  approve_file             4.22  1241 KiB       3
 - One `a` is three git spawns: `mutate` (`git apply --cached` or `git add`) and `reload_paths` (unstaged + staged diffs of that path). Work-tree check, `HEAD` verify, and untracked listing are skipped. Matching (`place`), omit, and paint stay under 1 ms on these fixtures.
 - 166 further `a`s on the 167-hunk file (`approve_rest`) is ~0.75 s and 498 spawns. Each key still pays git. Matching is a hash lookup.
 - `A` on that file (`approve_file`) is one `git add` plus reload: ~4 ms, 3 spawns.
+- Folding one hunk of that file (`fold_hunk`) copies the shorter row list in 0.19 ms. Opening that fold (`unfold_hunk`) does not copy. Folding the whole file (`fold_file`) is the short list only. With nothing folded, paint still walks the original rows.
 - First `present` writes every cell (`dirty_all`). `present_noop` is the unchanged-state cell diff (goal 32).
